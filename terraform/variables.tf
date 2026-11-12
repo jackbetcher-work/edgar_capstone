@@ -46,6 +46,66 @@ variable "seed_native_financial_metrics" {
   default     = true
 }
 
+variable "seed_native_filing_chunks" {
+  description = "Whether to trigger a BigQuery load job seeding native filing_chunks from GCS manifests/bigquery_filing_chunks.jsonl."
+  type        = bool
+  default     = true
+}
+
+variable "embedding_model" {
+  description = "Vertex AI embedding model used for 10-K chunk embeddings."
+  type        = string
+  default     = "text-embedding-005"
+}
+
+variable "embedding_dimensions" {
+  description = "Dimensionality of dense vector embeddings stored in filing_chunks and Vertex AI Vector Search."
+  type        = number
+  default     = 768
+}
+
+variable "enable_vertex_vector_search" {
+  description = "Whether to provision the Vertex AI Vector Search index and index endpoint for metadata-filtered ANN retrieval."
+  type        = bool
+  default     = true
+}
+
+variable "enable_vertex_ai_search" {
+  description = "Whether to provision the Vertex AI Search (Discovery Engine) unstructured datastore and search engine."
+  type        = bool
+  default     = true
+}
+
+variable "artifact_registry_repo_id" {
+  description = "Artifact Registry repository ID for SEC EDGAR Analyst container images."
+  type        = string
+  default     = "sec-edgar-repo"
+}
+
+variable "cloud_run_service_name" {
+  description = "Google Cloud Run service name for the SEC EDGAR Analyst FastAPI & ADK backend."
+  type        = string
+  default     = "sec-edgar-analyst"
+}
+
+variable "enable_cloud_run_service" {
+  description = "Whether to manage the Cloud Run v2 service resource in Terraform."
+  type        = bool
+  default     = true
+}
+
+variable "cicd_service_account_id" {
+  description = "Account ID for the keyless GitHub Actions / Cloud Build CI/CD service account."
+  type        = string
+  default     = "sec-edgar-cicd-sa"
+}
+
+variable "github_repository" {
+  description = "GitHub repository (owner/name) trusted by Workload Identity Federation for push deployments."
+  type        = string
+  default     = "jackbetcher-work/edgar_capstone"
+}
+
 variable "deletion_protection" {
   description = "Enable Terraform deletion protection on BigQuery tables and datasets (set true in production)."
   type        = bool

@@ -9,10 +9,17 @@ description = "SEC EDGAR Natural Language Analyst - Curated 10-K Dataset & Hybri
 requires-python = ">=3.11"
 dependencies = [
     "edgartools>=5.0.0",
+    "fastapi>=0.110.0",
+    "google-adk>=2.0.0",
+    "google-auth>=2.28.0",
     "google-cloud-storage>=2.16.0",
+    "google-genai>=1.0.0",
     "httpx>=0.25.0",
+    "numpy>=1.26.0",
     "pandas>=2.0.0",
     "pydantic>=2.4.0",
+    "pyyaml>=6.0.0",
+    "uvicorn>=0.27.0",
 ]
 
 [project.optional-dependencies]
@@ -22,6 +29,8 @@ dev = [
 
 [project.scripts]
 build-sec-dataset = "scripts.build_sec_dataset:main"
+build-vector-db = "scripts.build_vector_db:main"
+verify-no-secrets = "scripts.verify_no_secrets:main"
 
 [tool.setuptools.packages.find]
 where = ["src", "."]

@@ -1,0 +1,177 @@
+name: SEC EDGAR Analyst CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - "**"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: sec-edgar-cicd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GCP_PROJECT_ID: iron-radio-514217-q7
+  GCP_REGION: us-central1
+  GAR_REPOSITORY: sec-edgar-repo
+  SERVICE_NAME: sec-edgar-analyst
+  RUNTIME_SERVICE_ACCOUNT: sec-analyst-sa@iron-radio-514217-q7.iam.gserviceaccount.com
+  IMAGE_URI: us-central1-docker.pkg.dev/iron-radio-514217-q7/sec-edgar-repo/sec-edgar-analyst
+
+jobs:
+  # ============================================================================
+  # Stage 1: Test — Secret leak verification, Terraform lint, and pytest suite
+  # ============================================================================
+  test:
+    name: Test Stage - Secret Scan, Lint & Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Verify no secrets or keys are exposed in pipeline or codebase
+        run: |
+          python scripts/verify_no_secrets.py
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.0"
+
+      - name: Check Terraform formatting
+        run: |
+          terraform fmt -check -recursive terraform/
+
+      - name: Run automated pytest suite
+        run: |
+          pytest -v --tb=short
+
+  # ============================================================================
+  # Stage 2: Build — Keyless WIF auth, Secret Manager lookup & Docker image push
+  # ============================================================================
+  build:
+    name: Build Stage - Container Image & Artifact Registry
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_digest_uri: ${{ steps.build_image.outputs.image_uri }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Retrieve build-time configuration from Google Cloud Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            SEC_EDGAR_USER_AGENT:${{ env.GCP_PROJECT_ID }}/sec-edgar-user-agent:latest
+          export_environment: false
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Google Artifact Registry
+        run: |
+          gcloud auth configure-docker "${{ env.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build and push container image (zero embedded secrets)
+        id: build_image
+        run: |
+          test -n "${{ steps.secrets.outputs.SEC_EDGAR_USER_AGENT }}"
+          IMAGE_TAG="${{ env.IMAGE_URI }}:${{ github.sha }}"
+          IMAGE_LATEST="${{ env.IMAGE_URI }}:latest"
+          docker build \
+            --build-arg COMMIT_SHA="${{ github.sha }}" \
+            --tag "${IMAGE_TAG}" \
+            --tag "${IMAGE_LATEST}" \
+            .
+          docker push "${IMAGE_TAG}"
+          docker push "${IMAGE_LATEST}"
+          echo "image_uri=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+
+  # ============================================================================
+  # Stage 3: Deploy — Secret Manager integration & Google Cloud Run deployment
+  # ============================================================================
+  deploy:
+    name: Deploy Stage - Google Cloud Run with Secret Manager
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
+          token_format: access_token
+
+      - name: Retrieve runtime secrets metadata from Google Cloud Secret Manager
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@v2
+        with:
+          secrets: |-
+            SEC_EDGAR_USER_AGENT:${{ env.GCP_PROJECT_ID }}/sec-edgar-user-agent:latest
+            GEMINI_API_KEY:${{ env.GCP_PROJECT_ID }}/sec-edgar-gemini-api-key:latest
+            INTERNAL_IAP_AUDIENCE:${{ env.GCP_PROJECT_ID }}/sec-edgar-iap-audience:latest
+          export_environment: false
+
+      - name: Deploy service to Google Cloud Run with Secret Manager mounts
+        id: deploy_cloud_run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${{ env.SERVICE_NAME }}
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          region: ${{ env.GCP_REGION }}
+          image: ${{ env.IMAGE_URI }}:${{ github.sha }}
+          service_account: ${{ env.RUNTIME_SERVICE_ACCOUNT }}
+          no_allow_unauthenticated: true
+          env_vars: |-
+            GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}
+            GCP_REGION=${{ env.GCP_REGION }}
+            BIGQUERY_DATASET_ID=sec_edgar
+            SEC_CORPUS_BUCKET=fde-sec-edgar-sandbox-dev-sec-corpus
+          secrets: |-
+            SEC_EDGAR_USER_AGENT=sec-edgar-user-agent:latest
+            GEMINI_API_KEY=sec-edgar-gemini-api-key:latest
+            INTERNAL_IAP_AUDIENCE=sec-edgar-iap-audience:latest
+          flags: >-
+            --cpu=2
+            --memory=4Gi
+            --concurrency=8
+            --min-instances=1
+            --max-instances=10
+            --timeout=300
+
+      - name: Verify deployed Cloud Run service health
+        run: |
+          SERVICE_URL="${{ steps.deploy_cloud_run.outputs.url }}"
+          ID_TOKEN="$(gcloud auth print-identity-token)"
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${ID_TOKEN}" \
+            "${SERVICE_URL}/healthz"

@@ -7,12 +7,21 @@ resource "google_project_service" "crm_api" {
 locals {
   required_services = toset([
     "aiplatform.googleapis.com",
+    "artifactregistry.googleapis.com",
     "bigquery.googleapis.com",
     "bigqueryconnection.googleapis.com",
     "bigquerystorage.googleapis.com",
+    "cloudbuild.googleapis.com",
+    "discoveryengine.googleapis.com",
     "iam.googleapis.com",
+    "iamcredentials.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com",
+    "run.googleapis.com",
+    "secretmanager.googleapis.com",
     "serviceusage.googleapis.com",
     "storage.googleapis.com",
+    "sts.googleapis.com",
   ])
 }
 
