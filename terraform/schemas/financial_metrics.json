@@ -1,0 +1,172 @@
+[
+  {
+    "name": "profile_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique company-year profile identifier ({TICKER}_{FY}, e.g., NVDA_2026)"
+  },
+  {
+    "name": "ticker",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Canonical SEC EDGAR company ticker symbol"
+  },
+  {
+    "name": "cik",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "10-digit zero-padded SEC Central Index Key"
+  },
+  {
+    "name": "company_name",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Official SEC registrant name"
+  },
+  {
+    "name": "gics_sector",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "GICS Sector classification (e.g., Information Technology, Financials)"
+  },
+  {
+    "name": "gics_sub_industry",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "GICS Sub-Industry classification"
+  },
+  {
+    "name": "form_type",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "SEC filing form type (10-K)"
+  },
+  {
+    "name": "fiscal_year",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Reporting fiscal year resolved from XBRL dei:DocumentFiscalYearFocus"
+  },
+  {
+    "name": "fiscal_period",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Fiscal period focus (FY)"
+  },
+  {
+    "name": "period_of_report",
+    "type": "DATE",
+    "mode": "NULLABLE",
+    "description": "Fiscal period end date (YYYY-MM-DD)"
+  },
+  {
+    "name": "filing_date",
+    "type": "DATE",
+    "mode": "NULLABLE",
+    "description": "SEC EDGAR filing submission date (YYYY-MM-DD)"
+  },
+  {
+    "name": "accession_number",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "SEC EDGAR accession number (e.g., 0001045810-26-000021)"
+  },
+  {
+    "name": "currency",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Reporting currency ISO code (USD)"
+  },
+  {
+    "name": "revenue",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Total annual revenue in raw currency units (USD)"
+  },
+  {
+    "name": "operating_income",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Annual operating income (or pre-tax continuing operations income for single-step filers) in USD"
+  },
+  {
+    "name": "net_income",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Annual net income attributable to parent in USD"
+  },
+  {
+    "name": "metric_provenance",
+    "type": "RECORD",
+    "mode": "NULLABLE",
+    "description": "XBRL concept provenance for Revenue, Operating Income, and Net Income",
+    "fields": [
+      {
+        "name": "revenue",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "XBRL concept or extractor source for revenue"
+      },
+      {
+        "name": "operating_income",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "XBRL concept or extractor source for operating_income"
+      },
+      {
+        "name": "net_income",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "XBRL concept or extractor source for net_income"
+      },
+      {
+        "name": "notes",
+        "type": "STRING",
+        "mode": "REPEATED",
+        "description": "Accounting notes (e.g., single-step pre-tax proxy notes)"
+      }
+    ]
+  },
+  {
+    "name": "extracted_sections",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "10-K sections extracted in the paired Markdown document (item_1a, item_7)"
+  },
+  {
+    "name": "unstructured_blob_path",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Relative GCS object path to unstructured 10-K Markdown"
+  },
+  {
+    "name": "structured_blob_path",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Relative GCS object path to structured financials JSON"
+  },
+  {
+    "name": "unstructured_gcs_uri",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Full gs:// URI for the paired unstructured 10-K Markdown file"
+  },
+  {
+    "name": "structured_gcs_uri",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Full gs:// URI for the paired structured financials JSON file"
+  },
+  {
+    "name": "sec_filing_url",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Direct public SEC EDGAR archive URL for source citation linking"
+  },
+  {
+    "name": "ingested_at",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE",
+    "description": "UTC timestamp when the Data Profile was generated"
+  }
+]

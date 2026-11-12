@@ -1,0 +1,9 @@
+project_id                     = "iron-radio-514217-q7"
+region                         = "us-central1"
+dataset_id                     = "sec_edgar"
+sec_corpus_bucket              = "fde-sec-edgar-sandbox-dev-sec-corpus"
+vertex_connection_id           = "vertex-ai-rag-conn"
+analyst_service_account_id     = "sec-analyst-sa"
+create_analyst_service_account = true
+seed_native_financial_metrics  = true
+deletion_protection            = false

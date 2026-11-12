@@ -1,0 +1,146 @@
+[
+  {
+    "name": "chunk_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique chunk identifier (e.g., NVDA_2026_item_1a_0001)"
+  },
+  {
+    "name": "profile_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Foreign key to financial_metrics.profile_id ({TICKER}_{FY})"
+  },
+  {
+    "name": "ticker",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Canonical SEC EDGAR company ticker symbol"
+  },
+  {
+    "name": "cik",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "10-digit zero-padded SEC Central Index Key"
+  },
+  {
+    "name": "company_name",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Official SEC registrant name"
+  },
+  {
+    "name": "gics_sector",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "GICS Sector classification for metadata-filtered RAG"
+  },
+  {
+    "name": "gics_sub_industry",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "GICS Sub-Industry classification"
+  },
+  {
+    "name": "form_type",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "SEC form type (10-K)"
+  },
+  {
+    "name": "fiscal_year",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Reporting fiscal year for longitudinal RAG filtering"
+  },
+  {
+    "name": "period_of_report",
+    "type": "DATE",
+    "mode": "NULLABLE",
+    "description": "Fiscal period end date (YYYY-MM-DD)"
+  },
+  {
+    "name": "filing_date",
+    "type": "DATE",
+    "mode": "NULLABLE",
+    "description": "SEC EDGAR filing submission date (YYYY-MM-DD)"
+  },
+  {
+    "name": "accession_number",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "SEC EDGAR accession number"
+  },
+  {
+    "name": "section_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Normalized 10-K section identifier (item_1a or item_7)"
+  },
+  {
+    "name": "section_title",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Human-readable section heading for grounded UI citations"
+  },
+  {
+    "name": "chunk_index",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "0-based sequential chunk index within the section"
+  },
+  {
+    "name": "chunk_text",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Markdown passage text for RAG synthesis and grounding"
+  },
+  {
+    "name": "char_count",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Character length of chunk_text"
+  },
+  {
+    "name": "token_estimate",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Approximate token count of chunk_text"
+  },
+  {
+    "name": "embedding",
+    "type": "FLOAT",
+    "mode": "REPEATED",
+    "description": "Dense vector embedding (ARRAY<FLOAT64>) for BigQuery VECTOR_SEARCH"
+  },
+  {
+    "name": "embedding_model",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Vertex AI embedding model identifier (e.g., text-embedding-005, gemini-embedding-001)"
+  },
+  {
+    "name": "unstructured_gcs_uri",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "GCS URI of the parent unstructured 10-K Markdown document"
+  },
+  {
+    "name": "structured_gcs_uri",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "GCS URI of the paired structured financial metrics JSON"
+  },
+  {
+    "name": "sec_filing_url",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Direct SEC EDGAR archive URL for split-pane citation viewing"
+  },
+  {
+    "name": "ingested_at",
+    "type": "TIMESTAMP",
+    "mode": "NULLABLE",
+    "description": "UTC timestamp when the chunk and embedding were indexed"
+  }
+]

@@ -1,0 +1,33 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Generated local dataset staging (keep data/sp500_constituents.csv tracked)
+data/curated_dataset/
+
+# Terraform local directories, plans, and state files (remote state lives in GCS)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+*.tfvars
+!*.tfvars.example
+crash.log
+crash.*.log
+
+# OS / IDE files
+.DS_Store
+.idea/
+.vscode/

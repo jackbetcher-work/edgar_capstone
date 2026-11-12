@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edgar-capstone"
+version = "0.1.0"
+description = "SEC EDGAR Natural Language Analyst - Curated 10-K Dataset & Hybrid RAG Pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "edgartools>=5.0.0",
+    "google-cloud-storage>=2.16.0",
+    "httpx>=0.25.0",
+    "pandas>=2.0.0",
+    "pydantic>=2.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+build-sec-dataset = "scripts.build_sec_dataset:main"
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["edgar_capstone*", "scripts*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
