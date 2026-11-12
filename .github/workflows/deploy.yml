@@ -149,8 +149,6 @@ jobs:
           project_id: ${{ env.GCP_PROJECT_ID }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.IMAGE_URI }}:${{ github.sha }}
-          service_account: ${{ env.RUNTIME_SERVICE_ACCOUNT }}
-          no_allow_unauthenticated: true
           env_vars: |-
             GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}
             GCP_REGION=${{ env.GCP_REGION }}
@@ -161,6 +159,8 @@ jobs:
             GEMINI_API_KEY=sec-edgar-gemini-api-key:latest
             INTERNAL_IAP_AUDIENCE=sec-edgar-iap-audience:latest
           flags: >-
+            --service-account=${{ env.RUNTIME_SERVICE_ACCOUNT }}
+            --no-allow-unauthenticated
             --cpu=2
             --memory=4Gi
             --concurrency=8
@@ -168,10 +168,19 @@ jobs:
             --max-instances=10
             --timeout=300
 
+      - name: Mint OIDC ID token for Cloud Run health check
+        id: id_token_auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ steps.deploy_cloud_run.outputs.url }}
+          id_token_include_email: true
+
       - name: Verify deployed Cloud Run service health
         run: |
           SERVICE_URL="${{ steps.deploy_cloud_run.outputs.url }}"
-          ID_TOKEN="$(gcloud auth print-identity-token)"
           curl --fail --silent --show-error \
-            --header "Authorization: Bearer ${ID_TOKEN}" \
+            --header "Authorization: Bearer ${{ steps.id_token_auth.outputs.id_token }}" \
             "${SERVICE_URL}/healthz"

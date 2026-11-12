@@ -412,30 +412,30 @@ resource "google_bigquery_table" "v_chunk_health_metrics" {
       ),
       grouped_metrics AS (
         SELECT
-          IF(GROUPING(gics_sector) = 1, 'ALL_SECTORS', gics_sector) AS gics_sector,
-          IF(GROUPING(section_id) = 1, 'ALL_SECTIONS', section_id) AS section_id,
+          IF(GROUPING(cb.gics_sector) = 1, 'ALL_SECTORS', cb.gics_sector) AS gics_sector,
+          IF(GROUPING(cb.section_id) = 1, 'ALL_SECTIONS', cb.section_id) AS section_id,
           COUNT(*) AS total_chunks,
-          COUNT(DISTINCT profile_id) AS distinct_profiles,
-          COUNT(DISTINCT ticker) AS distinct_tickers,
-          COUNTIF(embedding_dim = ${var.embedding_dimensions}) AS valid_embedding_count,
-          COUNTIF(embedding IS NULL OR embedding_dim = 0) AS missing_embedding_count,
-          COUNTIF(embedding_dim > 0 AND embedding_dim != ${var.embedding_dimensions}) AS dimension_mismatch_count,
-          ROUND(SAFE_DIVIDE(COUNTIF(embedding_dim = ${var.embedding_dimensions}), COUNT(*)), 4) AS embedding_coverage_ratio,
-          ROUND(AVG(char_count), 2) AS avg_char_count,
-          ROUND(AVG(token_estimate), 2) AS avg_token_estimate,
-          MIN(token_estimate) AS min_token_estimate,
-          MAX(token_estimate) AS max_token_estimate,
-          APPROX_QUANTILES(token_estimate, 100)[OFFSET(50)] AS p50_token_estimate,
-          APPROX_QUANTILES(token_estimate, 100)[OFFSET(95)] AS p95_token_estimate,
-          COUNTIF(char_count < 100 OR TRIM(chunk_text) = '') AS undersized_chunk_count,
-          COUNTIF(char_count > 8000 OR token_estimate > 2048) AS oversized_chunk_count,
+          COUNT(DISTINCT cb.profile_id) AS distinct_profiles,
+          COUNT(DISTINCT cb.ticker) AS distinct_tickers,
+          COUNTIF(cb.embedding_dim = ${var.embedding_dimensions}) AS valid_embedding_count,
+          COUNTIF(cb.embedding IS NULL OR cb.embedding_dim = 0) AS missing_embedding_count,
+          COUNTIF(cb.embedding_dim > 0 AND cb.embedding_dim != ${var.embedding_dimensions}) AS dimension_mismatch_count,
+          ROUND(SAFE_DIVIDE(COUNTIF(cb.embedding_dim = ${var.embedding_dimensions}), COUNT(*)), 4) AS embedding_coverage_ratio,
+          ROUND(AVG(cb.char_count), 2) AS avg_char_count,
+          ROUND(AVG(cb.token_estimate), 2) AS avg_token_estimate,
+          MIN(cb.token_estimate) AS min_token_estimate,
+          MAX(cb.token_estimate) AS max_token_estimate,
+          APPROX_QUANTILES(cb.token_estimate, 100)[OFFSET(50)] AS p50_token_estimate,
+          APPROX_QUANTILES(cb.token_estimate, 100)[OFFSET(95)] AS p95_token_estimate,
+          COUNTIF(cb.char_count < 100 OR TRIM(cb.chunk_text) = '') AS undersized_chunk_count,
+          COUNTIF(cb.char_count > 8000 OR cb.token_estimate > 2048) AS oversized_chunk_count,
           COUNTIF(
-            ticker IS NULL OR cik IS NULL OR gics_sector IS NULL OR gics_sector = 'Unknown'
-            OR section_title IS NULL OR sec_filing_url IS NULL OR unstructured_gcs_uri IS NULL
+            cb.ticker IS NULL OR cb.cik IS NULL OR cb.gics_sector IS NULL OR cb.gics_sector = 'Unknown'
+            OR cb.section_title IS NULL OR cb.sec_filing_url IS NULL OR cb.unstructured_gcs_uri IS NULL
           ) AS missing_metadata_count,
-          MAX(ingested_at) AS latest_ingested_at
-        FROM chunk_base
-        GROUP BY ROLLUP(gics_sector, section_id)
+          MAX(cb.ingested_at) AS latest_ingested_at
+        FROM chunk_base AS cb
+        GROUP BY ROLLUP(cb.gics_sector, cb.section_id)
       )
       SELECT
         g.gics_sector,

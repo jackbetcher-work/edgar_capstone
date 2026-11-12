@@ -91,7 +91,7 @@ resource "google_service_account_iam_member" "cicd_act_as_runtime_sa" {
 resource "google_iam_workload_identity_pool" "github_pool" {
   project                   = var.project_id
   workload_identity_pool_id = "sec-edgar-github-pool"
-  display_name              = "SEC EDGAR GitHub Actions WIF Pool"
+  display_name              = "SEC EDGAR GitHub WIF Pool"
   description               = "Keyless OIDC authentication pool for GitHub push deployment pipelines."
 
   depends_on = [google_project_service.required_apis]
