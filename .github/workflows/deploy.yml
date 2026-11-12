@@ -183,4 +183,4 @@ jobs:
           SERVICE_URL="${{ steps.deploy_cloud_run.outputs.url }}"
           curl --fail --silent --show-error \
             --header "Authorization: Bearer ${{ steps.id_token_auth.outputs.id_token }}" \
-            "${SERVICE_URL}/healthz"
+            "${SERVICE_URL}/health"

@@ -80,6 +80,10 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     for spec in MANAGED_SECRETS:
         assert spec.cloud_run_mount_spec() in secrets_mount
 
+    deploy_steps_str = json.dumps(deploy_job["steps"])
+    assert "${SERVICE_URL}/health" in deploy_steps_str
+    assert "${SERVICE_URL}/healthz" not in deploy_steps_str
+
 
 def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     cb_path = REPO_ROOT / "cloudbuild.yaml"
@@ -216,7 +220,7 @@ def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
 def test_fastapi_cloud_run_service_endpoints() -> None:
     client = TestClient(app)
 
-    health_resp = client.get("/healthz")
+    health_resp = client.get("/health")
     assert health_resp.status_code == 200
     assert health_resp.json()["status"] == "ok"
     assert health_resp.json()["root_agent"] == "RootOrchestrator"

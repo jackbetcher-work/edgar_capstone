@@ -12,6 +12,9 @@ htmlcov/
 *.egg-info/
 dist/
 build/
+node_modules/
+frontend/node_modules/
+frontend/dist/
 
 # Generated local dataset staging (keep data/sp500_constituents.csv and lightweight manifests tracked)
 data/curated_dataset/*

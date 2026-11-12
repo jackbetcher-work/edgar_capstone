@@ -2,19 +2,29 @@
 
 from __future__ import annotations
 
+import logging
 import os
-from typing import Any
+import time
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from edgar_capstone.agents.chat_engine import (
+    list_curated_companies,
+    run_conversational_rag_turn,
+)
 from edgar_capstone.agents.root_orchestrator import (
     RootOrchestrator,
     classify_query_intent,
 )
 from edgar_capstone.agents.tools import (
+    _get_dataset_dir,
+    _load_all_profiles_cached,
     calculate_period_variances,
     fetch_financial_metrics,
+    load_cached_10k_section,
     query_looker_financial_explore,
     search_10k_chunks_rag,
 )
@@ -24,6 +34,10 @@ from edgar_capstone.security.secrets import (
     SecretManagerClient,
 )
 
+logger = logging.getLogger(__name__)
+
+_FEEDBACK_AUDIT_LOG: list[dict[str, Any]] = []
+
 app = FastAPI(
     title="SEC EDGAR Natural Language Analyst API",
     version="0.1.0",
@@ -31,6 +45,19 @@ app = FastAPI(
         "Cloud Run FastAPI backend for deterministic SEC 10-K financial variance "
         "calculations, metadata-filtered Hybrid RAG search, and ADK RootOrchestrator routing."
     ),
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -55,9 +82,10 @@ class IntentClassifyRequest(BaseModel):
     tickers: list[str] | None = None
 
 
-@app.get("/healthz")
-def healthz() -> dict[str, Any]:
-    """Cloud Run liveness and readiness probe endpoint."""
+@app.get("/health")
+@app.get("/healthz", include_in_schema=False)
+def health() -> dict[str, Any]:
+    """Cloud Run external health check and internal probe endpoint."""
     return {
         "status": "ok",
         "service": os.environ.get("K_SERVICE", "sec-edgar-analyst"),
@@ -164,3 +192,133 @@ def get_looker_explore(
         start_year=start_year,
         end_year=end_year,
     )
+
+
+class ChatQueryRequest(BaseModel):
+    query: str = Field(..., min_length=2)
+    tickers: str = Field("ALL")
+    gics_sector: str = Field("ALL")
+    section_id: str = Field("ALL")
+    start_year: int = Field(2024, ge=2015, le=2035)
+    end_year: int = Field(2026, ge=2015, le=2035)
+    top_k: int = Field(8, ge=1, le=25)
+
+
+class SectionLoadRequest(BaseModel):
+    ticker: str = Field(..., min_length=1)
+    fiscal_year: int = Field(..., ge=2015, le=2035)
+    section_id: Literal["item_1a", "item_7"] = Field("item_7")
+    max_chars: int = Field(32000, ge=500, le=50000)
+
+
+class FeedbackRequest(BaseModel):
+    message_id: str = Field(..., min_length=1)
+    rating: Literal["up", "down"]
+    comment: str = Field(default="", max_length=1000)
+    query: str = Field(default="", max_length=1000)
+
+
+@app.get("/api/v1/companies")
+def get_companies() -> dict[str, Any]:
+    """List all curated S&P 500 issuers, GICS sectors, and available fiscal years."""
+    return list_curated_companies()
+
+
+@app.post("/api/v1/chat")
+def conversational_rag_chat(req: ChatQueryRequest) -> dict[str, Any]:
+    """Execute a source-grounded conversational Hybrid RAG query with ReAct trace & fact-check verification."""
+    return run_conversational_rag_turn(
+        query=req.query,
+        tickers=req.tickers,
+        gics_sector=req.gics_sector,
+        section_id=req.section_id,
+        start_year=req.start_year,
+        end_year=req.end_year,
+        top_k=req.top_k,
+    )
+
+
+def _enrich_section_response(
+    ticker: str,
+    fiscal_year: int,
+    section_id: str,
+    max_chars: int,
+) -> dict[str, Any]:
+    res = load_cached_10k_section(
+        ticker=ticker,
+        fiscal_year=fiscal_year,
+        section_id=section_id,
+        max_chars=max_chars,
+    )
+    if res.get("status") == "error":
+        raise HTTPException(status_code=404, detail=res.get("message", "Section not found"))
+
+    dataset_dir = _get_dataset_dir()
+    profiles = _load_all_profiles_cached(str(dataset_dir))
+    norm_t = ticker.strip().upper().replace(".", "-")
+    matched_prof = next(
+        (
+            p
+            for p in profiles
+            if p.ticker.upper().replace(".", "-") == norm_t and p.fiscal_year == fiscal_year
+        ),
+        None,
+    )
+    if matched_prof is not None:
+        res["cik"] = matched_prof.cik
+        res["accession_number"] = matched_prof.accession_number
+        res["filing_date"] = matched_prof.filing_date
+        res["period_of_report"] = matched_prof.period_of_report
+        res["gics_sector"] = matched_prof.gics_sector
+        res["gics_sub_industry"] = matched_prof.gics_sub_industry
+    return res
+
+
+@app.get("/api/v1/section")
+def get_cached_section(
+    ticker: str = "NVDA",
+    fiscal_year: int = 2026,
+    section_id: Literal["item_1a", "item_7"] = "item_7",
+    max_chars: int = 32000,
+) -> dict[str, Any]:
+    """Load a cached 10-K filing section (Item 1A Risk Factors or Item 7 MD&A) for the split-pane source viewer."""
+    return _enrich_section_response(
+        ticker=ticker,
+        fiscal_year=fiscal_year,
+        section_id=section_id,
+        max_chars=max_chars,
+    )
+
+
+@app.post("/api/v1/section")
+def post_cached_section(req: SectionLoadRequest) -> dict[str, Any]:
+    """Load a cached 10-K filing section via POST payload."""
+    return _enrich_section_response(
+        ticker=req.ticker,
+        fiscal_year=req.fiscal_year,
+        section_id=req.section_id,
+        max_chars=req.max_chars,
+    )
+
+
+@app.post("/api/v1/feedback")
+def submit_analyst_feedback(req: FeedbackRequest) -> dict[str, Any]:
+    """Record analyst thumbs-up/down audit feedback and optional comment."""
+    entry = {
+        "message_id": req.message_id,
+        "rating": req.rating,
+        "comment": req.comment.strip(),
+        "query": req.query.strip(),
+        "recorded_at_epoch": round(time.time(), 3),
+    }
+    _FEEDBACK_AUDIT_LOG.append(entry)
+    logger.info(
+        "Recorded analyst feedback message_id=%s rating=%s",
+        req.message_id,
+        req.rating,
+    )
+    return {
+        "status": "success",
+        "recorded": entry,
+        "total_feedback_count": len(_FEEDBACK_AUDIT_LOG),
+    }

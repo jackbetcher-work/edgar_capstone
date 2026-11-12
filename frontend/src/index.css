@@ -1,0 +1,288 @@
+@import "tailwindcss";
+
+/* ==========================================================================
+   SEC EDGAR Natural Language Analyst — Institutional Design System (Tailwind v4)
+   Curated HSL tokens: Warm Alabaster Paper (Default) & Deep Obsidian Desk (Dark)
+   ========================================================================== */
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-serif: "Newsreader", Georgia, Cambria, "Times New Roman", serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+}
+
+:root {
+  color-scheme: light;
+  --bg-canvas: hsl(42, 24%, 97%);
+  --bg-surface: hsl(0, 0%, 100%);
+  --bg-elevated: hsl(40, 20%, 99%);
+  --bg-subtle: hsl(38, 18%, 94.5%);
+  --bg-filing-sheet: hsl(42, 33%, 98.4%);
+  --bg-composer: hsl(0, 0%, 100%);
+
+  --text-primary: hsl(218, 32%, 12%);
+  --text-secondary: hsl(216, 18%, 34%);
+  --text-muted: hsl(215, 13%, 50%);
+
+  --border-hairline: hsl(36, 15%, 87%);
+  --border-strong: hsl(215, 16%, 76%);
+
+  --accent-ink: hsl(213, 74%, 34%);
+  --accent-ink-hover: hsl(213, 78%, 27%);
+  --accent-tint: hsl(212, 65%, 94.5%);
+
+  --positive-ink: hsl(158, 66%, 28%);
+  --positive-tint: hsl(156, 52%, 93.5%);
+
+  --negative-ink: hsl(4, 70%, 44%);
+  --negative-tint: hsl(4, 68%, 95%);
+
+  --amber-ink: hsl(32, 82%, 31%);
+  --amber-tint: hsl(38, 84%, 93.5%);
+
+  --highlight-mark: hsl(46, 95%, 83%);
+  --highlight-mark-active: hsl(43, 96%, 74%);
+
+  --shadow-soft: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 14px rgba(15, 23, 42, 0.035);
+  --shadow-elevated: 0 2px 6px rgba(15, 23, 42, 0.06), 0 12px 28px rgba(15, 23, 42, 0.06);
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-canvas: hsl(218, 24%, 8.5%);
+  --bg-surface: hsl(218, 22%, 11.5%);
+  --bg-elevated: hsl(217, 20%, 14%);
+  --bg-subtle: hsl(217, 19%, 15.5%);
+  --bg-filing-sheet: hsl(218, 21%, 10.5%);
+  --bg-composer: hsl(218, 21%, 12.5%);
+
+  --text-primary: hsl(40, 20%, 94%);
+  --text-secondary: hsl(214, 15%, 72%);
+  --text-muted: hsl(215, 12%, 54%);
+
+  --border-hairline: hsl(217, 16%, 20%);
+  --border-strong: hsl(216, 16%, 29%);
+
+  --accent-ink: hsl(208, 82%, 65%);
+  --accent-ink-hover: hsl(208, 88%, 73%);
+  --accent-tint: hsl(212, 46%, 19%);
+
+  --positive-ink: hsl(156, 62%, 58%);
+  --positive-tint: hsl(158, 42%, 16%);
+
+  --negative-ink: hsl(4, 78%, 68%);
+  --negative-tint: hsl(4, 42%, 18%);
+
+  --amber-ink: hsl(37, 86%, 66%);
+  --amber-tint: hsl(35, 45%, 18%);
+
+  --highlight-mark: hsl(43, 68%, 25%);
+  --highlight-mark-active: hsl(43, 78%, 32%);
+
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.32), 0 6px 16px rgba(0, 0, 0, 0.24);
+  --shadow-elevated: 0 4px 12px rgba(0, 0, 0, 0.45), 0 16px 34px rgba(0, 0, 0, 0.35);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  button,
+  select,
+  input,
+  textarea {
+    font-family: inherit;
+  }
+}
+
+/* Reusable Design System Component Surfaces & Tokens */
+.surface-canvas {
+  background-color: var(--bg-canvas);
+  color: var(--text-primary);
+}
+
+.surface-panel {
+  background-color: var(--bg-surface);
+  border-color: var(--border-hairline);
+  box-shadow: var(--shadow-soft);
+}
+
+.surface-elevated {
+  background-color: var(--bg-elevated);
+  border-color: var(--border-hairline);
+  box-shadow: var(--shadow-elevated);
+}
+
+.surface-subtle {
+  background-color: var(--bg-subtle);
+  border-color: var(--border-hairline);
+}
+
+.surface-filing-sheet {
+  background-color: var(--bg-filing-sheet);
+  border-color: var(--border-hairline);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), var(--shadow-soft);
+}
+
+.surface-composer {
+  background-color: var(--bg-composer);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-elevated);
+}
+
+.text-ink-primary {
+  color: var(--text-primary);
+}
+
+.text-ink-secondary {
+  color: var(--text-secondary);
+}
+
+.text-ink-muted {
+  color: var(--text-muted);
+}
+
+.border-hairline {
+  border-color: var(--border-hairline);
+}
+
+.border-strong {
+  border-color: var(--border-strong);
+}
+
+.badge-accent {
+  background-color: var(--accent-tint);
+  color: var(--accent-ink);
+}
+
+.badge-positive {
+  background-color: var(--positive-tint);
+  color: var(--positive-ink);
+}
+
+.badge-negative {
+  background-color: var(--negative-tint);
+  color: var(--negative-ink);
+}
+
+.badge-amber {
+  background-color: var(--amber-tint);
+  color: var(--amber-ink);
+}
+
+.btn-primary-ink {
+  background-color: var(--accent-ink);
+  color: #ffffff;
+  transition: background-color 150ms ease, transform 120ms ease, opacity 150ms ease;
+}
+
+[data-theme="dark"] .btn-primary-ink {
+  color: hsl(218, 28%, 9%);
+}
+
+.btn-primary-ink:hover:not(:disabled) {
+  background-color: var(--accent-ink-hover);
+}
+
+.btn-primary-ink:active:not(:disabled) {
+  transform: translateY(0.5px);
+}
+
+.citation-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.1rem 0.45rem;
+  margin: 0 0.15rem;
+  border-radius: 0.3rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 500;
+  line-height: 1.35;
+  background-color: var(--accent-tint);
+  color: var(--accent-ink);
+  border: 1px solid transparent;
+  cursor: pointer;
+  vertical-align: baseline;
+  transition: background-color 140ms ease, border-color 140ms ease, transform 120ms ease;
+}
+
+.citation-chip:hover {
+  border-color: var(--accent-ink);
+  transform: translateY(-0.5px);
+}
+
+.citation-chip-active {
+  background-color: var(--highlight-mark-active);
+  color: hsl(218, 32%, 11%);
+  border-color: hsl(36, 75%, 42%);
+}
+
+.filing-prose {
+  font-family: var(--font-serif);
+  font-size: 0.98rem;
+  line-height: 1.72;
+  letter-spacing: -0.003em;
+  color: var(--text-primary);
+}
+
+.tabular-nums-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.passage-highlight {
+  background-color: var(--highlight-mark);
+  color: inherit;
+  border-radius: 0.2rem;
+  padding: 0.05rem 0.2rem;
+}
+
+.passage-highlight-active {
+  background-color: var(--highlight-mark-active);
+  color: hsl(218, 32%, 10%);
+  border-radius: 0.25rem;
+  padding: 0.12rem 0.25rem;
+  box-shadow: 0 0 0 2px var(--highlight-mark-active);
+}
+
+/* Subtle custom scrollbars for split-pane inspection */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 9999px;
+}
+
+@keyframes subtleFadeSlide {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-turn-enter {
+  animation: subtleFadeSlide 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
