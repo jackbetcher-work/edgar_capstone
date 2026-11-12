@@ -45,6 +45,10 @@ COPY --from=builder --chown=appuser:appgroup /opt/venv /opt/venv
 COPY --chown=appuser:appgroup src/ ./src/
 COPY --chown=appuser:appgroup scripts/ ./scripts/
 COPY --chown=appuser:appgroup data/sp500_constituents.csv ./data/sp500_constituents.csv
+COPY --chown=appuser:appgroup data/curated_dataset/manifests/bigquery_financials.jsonl ./data/curated_dataset/manifests/bigquery_financials.jsonl
+COPY --chown=appuser:appgroup data/curated_dataset/manifests/chunk_health_report.json ./data/curated_dataset/manifests/chunk_health_report.json
+COPY --chown=appuser:appgroup data/curated_dataset/manifests/dataset_catalog.json ./data/curated_dataset/manifests/dataset_catalog.json
+COPY --chown=appuser:appgroup data/curated_dataset/manifests/vector_db_catalog.json ./data/curated_dataset/manifests/vector_db_catalog.json
 
 USER appuser
 

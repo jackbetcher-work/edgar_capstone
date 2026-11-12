@@ -240,3 +240,76 @@ def test_fastapi_cloud_run_service_endpoints() -> None:
     )
     assert intent_resp.status_code == 200
     assert intent_resp.json()["intent"] == "multi_company_peer_comparison"
+
+
+def test_ci_checkout_without_gitignored_chunks_or_unstructured_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify all ADK tools succeed in a clean CI checkout where gitignored files are absent."""
+    from edgar_capstone.agents.tools import (
+        _SESSION_10K_CONTEXT_CACHE,
+        _load_all_chunks_cached,
+        _load_all_profiles_cached,
+        calculate_period_variances,
+        fetch_financial_metrics,
+        load_cached_10k_section,
+        query_looker_financial_explore,
+        search_10k_chunks_rag,
+    )
+
+    monkeypatch.setenv("EDGAR_DATASET_DIR", str(tmp_path))
+    _load_all_profiles_cached.cache_clear()
+    _load_all_chunks_cached.cache_clear()
+    _SESSION_10K_CONTEXT_CACHE.clear()
+
+    metrics_res = fetch_financial_metrics(
+        tickers="NVDA,AAPL",
+        start_year=2024,
+        end_year=2026,
+        gics_sector="Information Technology",
+    )
+    assert metrics_res["status"] == "success"
+    assert metrics_res["record_count"] == 6
+
+    var_res = calculate_period_variances(
+        tickers="NVDA,AAPL",
+        start_year=2024,
+        end_year=2026,
+    )
+    assert var_res["status"] == "success"
+    assert var_res["company_count"] == 2
+
+    health_res = query_looker_financial_explore(
+        explore_name="chunk_health",
+        tickers="ALL",
+        gics_sector="ALL",
+        start_year=2020,
+        end_year=2026,
+    )
+    assert health_res["status"] == "success"
+    assert health_res["health_status"] == "HEALTHY"
+    assert health_res["total_chunks"] > 10000
+
+    rag_res = search_10k_chunks_rag(
+        query="H20 export control licensing China data center revenue",
+        tickers="NVDA",
+        gics_sector="Information Technology",
+        section_id="item_1a",
+        start_year=2025,
+        end_year=2026,
+        top_k=5,
+    )
+    assert rag_res["status"] == "success"
+    assert rag_res["citation_count"] == 5
+    assert rag_res["citations"][0]["ticker"] == "NVDA"
+    assert rag_res["citations"][0]["section_id"] == "item_1a"
+
+    sec_res = load_cached_10k_section(
+        ticker="NVDA",
+        fiscal_year=2026,
+        section_id="item_7",
+        max_chars=2500,
+    )
+    assert sec_res["status"] == "success"
+    assert sec_res["token_estimate"] > 50

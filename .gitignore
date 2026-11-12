@@ -13,8 +13,14 @@ htmlcov/
 dist/
 build/
 
-# Generated local dataset staging (keep data/sp500_constituents.csv tracked)
-data/curated_dataset/
+# Generated local dataset staging (keep data/sp500_constituents.csv and lightweight manifests tracked)
+data/curated_dataset/*
+!data/curated_dataset/manifests/
+data/curated_dataset/manifests/*
+!data/curated_dataset/manifests/bigquery_financials.jsonl
+!data/curated_dataset/manifests/chunk_health_report.json
+!data/curated_dataset/manifests/dataset_catalog.json
+!data/curated_dataset/manifests/vector_db_catalog.json
 
 # Terraform local directories, plans, and state files (remote state lives in GCS)
 **/.terraform/
