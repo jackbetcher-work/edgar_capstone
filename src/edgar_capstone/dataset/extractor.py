@@ -22,7 +22,7 @@ from edgar_capstone.dataset.models import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_SEC_USER_AGENT = (
-    "FDE SEC Edgar Capstone sec-analyst@fde-sec-edgar-sandbox-dev.iam.gserviceaccount.com"
+    "FDE SEC Edgar Capstone sec-analyst-sa@fde-sec-edgar-sandbox-dev.iam.gserviceaccount.com"
 )
 
 # Ordered US-GAAP fallback concepts when high-level helpers return None

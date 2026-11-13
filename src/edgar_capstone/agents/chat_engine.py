@@ -25,6 +25,13 @@ from edgar_capstone.agents.tools import (
     query_looker_financial_explore,
     search_10k_chunks_rag,
 )
+from edgar_capstone.security.agent_identity import (
+    VerifiedAgentS2SClaims,
+    authorize_agent_s2s_hop,
+    authorize_agent_tool_invocation,
+    get_agent_s2s_broker,
+)
+from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 
 _COMPANY_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bnvidia\b|\bnvda\b", re.IGNORECASE), "NVDA"),
@@ -515,16 +522,34 @@ def run_conversational_rag_turn(
     """Execute a full source-grounded Hybrid RAG conversational turn with ReAct trace & fact-checking."""
     turn_start = time.perf_counter()
     agent_trace: list[dict[str, Any]] = []
+    identities_used_by_agent: dict[str, dict[str, str]] = {}
+
+    def _track_agent_identity(claims: VerifiedAgentS2SClaims) -> None:
+        if claims.agent_name not in identities_used_by_agent:
+            identities_used_by_agent[claims.agent_name] = {
+                "agent_name": claims.agent_name,
+                "service_account_email": claims.service_account_email,
+                "spiffe_id": claims.spiffe_id,
+            }
 
     # Step 0: Model Armor Safety & Prompt-Injection Guardrail
     t0 = time.perf_counter()
     for pattern in _PROMPT_INJECTION_PATTERNS:
         if pattern.search(query):
+            guard_claims = authorize_agent_s2s_hop(
+                caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+                callee_agent="ModelArmorGuardrail",
+            )
+            _track_agent_identity(guard_claims)
             guard_ms = round((time.perf_counter() - t0) * 1000.0, 2)
             agent_trace.append(
                 {
                     "step": 1,
                     "agent": "ModelArmorGuardrail",
+                    "agent_service_account": guard_claims.service_account_email,
+                    "spiffe_id": guard_claims.spiffe_id,
+                    "s2s_target_service": guard_claims.target_service,
+                    "s2s_verified": True,
                     "tool": "before_model_safety_and_latency_callback",
                     "status": "blocked",
                     "duration_ms": guard_ms,
@@ -560,11 +585,18 @@ def run_conversational_rag_turn(
                     "model_latency_ms": guard_ms,
                 },
                 "agent_trace": agent_trace,
+                "agent_identities_used": list(identities_used_by_agent.values()),
                 "total_latency_ms": round((time.perf_counter() - turn_start) * 1000.0, 2),
             }
 
     # Step 1: Scope Resolution & RootOrchestrator Intent Routing
     t1 = time.perf_counter()
+    route_claims = authorize_agent_tool_invocation(
+        agent_name=RootOrchestrator.name,
+        tool_name="classify_query_intent",
+        caller=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+    )
+    _track_agent_identity(route_claims)
     scope = resolve_query_scope(
         query=query,
         tickers=tickers,
@@ -579,6 +611,10 @@ def run_conversational_rag_turn(
         {
             "step": 1,
             "agent": RootOrchestrator.name,
+            "agent_service_account": route_claims.service_account_email,
+            "spiffe_id": route_claims.spiffe_id,
+            "s2s_target_service": route_claims.target_service,
+            "s2s_verified": True,
             "tool": "classify_query_intent",
             "status": "completed",
             "duration_ms": route_ms,
@@ -590,14 +626,24 @@ def run_conversational_rag_turn(
         }
     )
 
-    # Step 2: Deterministic Calculation Engine / Looker Semantic Layer
+    # Step 2: Deterministic Calculation Engine / Looker Semantic Layer (RootOrchestrator -> FinancialAnalystAgent S2S hop)
     t2 = time.perf_counter()
+    authorize_agent_s2s_hop(
+        caller_agent=RootOrchestrator.name,
+        callee_agent="FinancialAnalystAgent",
+    )
     variance_reports: list[dict[str, Any]] = []
     sector_benchmarks: list[dict[str, Any]] = []
     chunk_health: dict[str, Any] | None = None
     calculated_variances_map: dict[str, Any] = {}
 
     if intent == "chunk_health_monitoring":
+        calc_claims = authorize_agent_tool_invocation(
+            agent_name="FinancialAnalystAgent",
+            tool_name="query_looker_financial_explore",
+            caller=RootOrchestrator.name,
+        )
+        _track_agent_identity(calc_claims)
         health_res = query_looker_financial_explore(
             explore_name="chunk_health",
             tickers=scope["tickers_csv"],
@@ -612,6 +658,10 @@ def run_conversational_rag_turn(
             {
                 "step": 2,
                 "agent": "FinancialAnalystAgent",
+                "agent_service_account": calc_claims.service_account_email,
+                "spiffe_id": calc_claims.spiffe_id,
+                "s2s_target_service": calc_claims.target_service,
+                "s2s_verified": True,
                 "tool": "query_looker_financial_explore(chunk_health)",
                 "status": "completed",
                 "duration_ms": calc_ms,
@@ -622,6 +672,12 @@ def run_conversational_rag_turn(
             }
         )
     elif scope["tickers"]:
+        calc_claims = authorize_agent_tool_invocation(
+            agent_name="FinancialAnalystAgent",
+            tool_name="calculate_period_variances",
+            caller=RootOrchestrator.name,
+        )
+        _track_agent_identity(calc_claims)
         var_res = calculate_period_variances(
             tickers=scope["tickers_csv"],
             start_year=scope["start_year"],
@@ -638,6 +694,10 @@ def run_conversational_rag_turn(
             {
                 "step": 2,
                 "agent": "FinancialAnalystAgent",
+                "agent_service_account": calc_claims.service_account_email,
+                "spiffe_id": calc_claims.spiffe_id,
+                "s2s_target_service": calc_claims.target_service,
+                "s2s_verified": True,
                 "tool": "calculate_period_variances",
                 "status": "completed",
                 "duration_ms": calc_ms,
@@ -648,6 +708,12 @@ def run_conversational_rag_turn(
             }
         )
     else:
+        calc_claims = authorize_agent_tool_invocation(
+            agent_name="FinancialAnalystAgent",
+            tool_name="query_looker_financial_explore",
+            caller=RootOrchestrator.name,
+        )
+        _track_agent_identity(calc_claims)
         bench_res = query_looker_financial_explore(
             explore_name="sector_benchmarks",
             tickers="ALL",
@@ -662,6 +728,10 @@ def run_conversational_rag_turn(
             {
                 "step": 2,
                 "agent": "FinancialAnalystAgent",
+                "agent_service_account": calc_claims.service_account_email,
+                "spiffe_id": calc_claims.spiffe_id,
+                "s2s_target_service": calc_claims.target_service,
+                "s2s_verified": True,
                 "tool": "query_looker_financial_explore(sector_benchmarks)",
                 "status": "completed",
                 "duration_ms": calc_ms,
@@ -674,6 +744,12 @@ def run_conversational_rag_turn(
 
     # Step 3: Metadata-Filtered Hybrid RAG Search (768-d Dense + Lexical Boost)
     t3 = time.perf_counter()
+    rag_claims = authorize_agent_tool_invocation(
+        agent_name="FinancialAnalystAgent",
+        tool_name="search_10k_chunks_rag",
+        caller=RootOrchestrator.name,
+    )
+    _track_agent_identity(rag_claims)
     citations, candidates_searched = _retrieve_balanced_citations(
         query=query,
         tickers=scope["tickers"],
@@ -688,6 +764,10 @@ def run_conversational_rag_turn(
         {
             "step": 3,
             "agent": "FinancialAnalystAgent",
+            "agent_service_account": rag_claims.service_account_email,
+            "spiffe_id": rag_claims.spiffe_id,
+            "s2s_target_service": rag_claims.target_service,
+            "s2s_verified": True,
             "tool": "search_10k_chunks_rag",
             "status": "completed",
             "duration_ms": rag_ms,
@@ -711,6 +791,11 @@ def run_conversational_rag_turn(
             if len(inferred_tickers) >= 2:
                 break
         if inferred_tickers:
+            authorize_agent_tool_invocation(
+                agent_name="FinancialAnalystAgent",
+                tool_name="calculate_period_variances",
+                caller=RootOrchestrator.name,
+            )
             var_res = calculate_period_variances(
                 tickers=",".join(inferred_tickers),
                 start_year=scope["start_year"],
@@ -723,10 +808,20 @@ def run_conversational_rag_turn(
                         f"{rep['ticker']}_{rep['start_year']}_{rep['end_year']}"
                     ] = rep
 
-    # Step 4: Context Cache Warmup for Top Cited 10-K Section
+    # Step 4: Context Cache Warmup for Top Cited 10-K Section (FinancialAnalystAgent -> ContextCacheManager S2S hop)
     context_cache_info: dict[str, Any] | None = None
     if citations:
         t4 = time.perf_counter()
+        authorize_agent_s2s_hop(
+            caller_agent="FinancialAnalystAgent",
+            callee_agent="ContextCacheManager",
+        )
+        cache_claims = authorize_agent_tool_invocation(
+            agent_name="ContextCacheManager",
+            tool_name="load_cached_10k_section",
+            caller="FinancialAnalystAgent",
+        )
+        _track_agent_identity(cache_claims)
         top_cit = citations[0]
         cache_res = load_cached_10k_section(
             ticker=top_cit["ticker"],
@@ -749,6 +844,10 @@ def run_conversational_rag_turn(
                 {
                     "step": 4,
                     "agent": "ContextCacheManager",
+                    "agent_service_account": cache_claims.service_account_email,
+                    "spiffe_id": cache_claims.spiffe_id,
+                    "s2s_target_service": cache_claims.target_service,
+                    "s2s_verified": True,
                     "tool": "load_cached_10k_section",
                     "status": "completed",
                     "duration_ms": cache_ms,
@@ -761,6 +860,17 @@ def run_conversational_rag_turn(
 
     # Step 5: Grounded Narrative Synthesis & Post-Generation Fact-Check Verification
     t5 = time.perf_counter()
+    s2s_broker = get_agent_s2s_broker()
+    raw_fc_assertion = s2s_broker.mint_s2s_assertion(
+        agent_name="FinancialAnalystAgent",
+        target_service="fact-check-verification-service",
+        caller=RootOrchestrator.name,
+    )
+    fc_claims = s2s_broker.verify_s2s_assertion(
+        raw_fc_assertion,
+        expected_target_service="fact-check-verification-service",
+    )
+    _track_agent_identity(fc_claims)
     answer_markdown = _synthesize_grounded_report(
         query=query,
         intent=intent,
@@ -782,6 +892,10 @@ def run_conversational_rag_turn(
         {
             "step": len(agent_trace) + 1,
             "agent": "FinancialAnalystAgent",
+            "agent_service_account": fc_claims.service_account_email,
+            "spiffe_id": fc_claims.spiffe_id,
+            "s2s_target_service": fc_claims.target_service,
+            "s2s_verified": True,
             "tool": "after_model_fact_check_callback",
             "status": "completed" if fact_check.passed else "warning",
             "duration_ms": synth_ms,
@@ -808,5 +922,6 @@ def run_conversational_rag_turn(
         "context_cache": context_cache_info,
         "fact_check": fact_check.model_dump(mode="json"),
         "agent_trace": agent_trace,
+        "agent_identities_used": list(identities_used_by_agent.values()),
         "total_latency_ms": total_latency_ms,
     }

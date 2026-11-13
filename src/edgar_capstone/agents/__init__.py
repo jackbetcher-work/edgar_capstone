@@ -4,7 +4,14 @@ from edgar_capstone.agents.callbacks import (
     after_model_fact_check_callback,
     before_agent_telemetry_callback,
     before_model_safety_and_latency_callback,
+    before_tool_agent_identity_callback,
     verify_narrative_against_calculations,
+)
+from edgar_capstone.agents.context_cache_agent import (
+    CONTEXT_CACHE_AGENT_INSTRUCTION,
+    ContextCacheAgent,
+    context_cache_agent,
+    create_context_cache_agent,
 )
 from edgar_capstone.agents.financial_analyst import (
     DEFAULT_ANALYST_MODEL,
@@ -51,7 +58,9 @@ from edgar_capstone.agents.tools import (
 
 __all__ = [
     "AnnualStepVariance",
+    "CONTEXT_CACHE_AGENT_INSTRUCTION",
     "CompanyVarianceReport",
+    "ContextCacheAgent",
     "ContextCacheTool",
     "DEFAULT_ANALYST_MODEL",
     "DEFAULT_ORCHESTRATOR_MODEL",
@@ -74,9 +83,11 @@ __all__ = [
     "after_model_fact_check_callback",
     "before_agent_telemetry_callback",
     "before_model_safety_and_latency_callback",
+    "before_tool_agent_identity_callback",
     "calculate_period_variances",
     "classify_query_intent",
-    "create_financial_analyst_agent",
+    "context_cache_agent",
+    "create_context_cache_agent",
     "create_root_orchestrator",
     "fetch_financial_metrics",
     "financial_analyst_agent",

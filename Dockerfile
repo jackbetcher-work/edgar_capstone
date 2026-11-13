@@ -49,7 +49,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080 \
     FRONTEND_DIST_DIR="/app/frontend/dist" \
     GCP_PROJECT_ID="iron-radio-514217-q7" \
+    GCP_PROJECT_NAME="fde-sec-edgar-sandbox-dev" \
     GCP_REGION="us-central1" \
+    RUNTIME_SERVICE_ACCOUNT_ID="sec-analyst-sa" \
     COMMIT_SHA="${COMMIT_SHA}"
 
 RUN groupadd --gid 10001 appgroup && \

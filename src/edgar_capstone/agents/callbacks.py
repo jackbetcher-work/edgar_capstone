@@ -10,9 +10,17 @@ from typing import Any
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
+from google.adk.tools.base_tool import BaseTool
 from google.genai import types as genai_types
 
 from edgar_capstone.agents.schemas import FactCheckVerification
+from edgar_capstone.security.agent_identity import (
+    AgentAuthorizationError,
+    authorize_agent_tool_invocation,
+    resolve_agent_identity,
+)
+from edgar_capstone.security.auth import record_security_audit_event
+from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
 logger = logging.getLogger(__name__)
@@ -34,7 +42,7 @@ _PERCENT_NUMBER_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*%")
 def before_agent_telemetry_callback(
     callback_context: CallbackContext,
 ) -> genai_types.Content | None:
-    """Initialize session state keys for variance grounding, citations, and latency tracking."""
+    """Initialize session state keys, bind per-agent identity, and track S2S attestations."""
     state = callback_context.state
     state.setdefault("calculated_variances", {})
     state.setdefault("fetched_metrics", [])
@@ -45,7 +53,94 @@ def before_agent_telemetry_callback(
     )
     state.setdefault("tool_telemetry", [])
     state.setdefault("latency_metrics", [])
+    state.setdefault("agent_identity_attestations", [])
+    state.setdefault("s2s_audit_trail", [])
     state["_agent_start_monotonic"] = time.perf_counter()
+
+    agent_name = getattr(callback_context, "agent_name", "") or ""
+    if isinstance(agent_name, str) and agent_name.strip():
+        try:
+            spec = resolve_agent_identity(agent_name.strip())
+            identity_record = spec.to_public_dict()
+            state["active_agent_identity"] = identity_record
+            attestations = list(state.get("agent_identity_attestations", []))
+            attestations.append(
+                {
+                    "agent_name": spec.agent_name,
+                    "service_account_email": identity_record["service_account_email"],
+                    "spiffe_id": identity_record["spiffe_id"],
+                    "allowed_tools": identity_record["allowed_tools"],
+                }
+            )
+            state["agent_identity_attestations"] = attestations
+        except AgentAuthorizationError:
+            logger.warning(
+                "Agent '%s' does not have a registered per-agent identity specification.",
+                agent_name,
+            )
+
+    return None
+
+
+def before_tool_agent_identity_callback(
+    tool: BaseTool,
+    args: dict[str, Any],
+    tool_context: Any,
+) -> dict[str, Any] | None:
+    """Enforce per-agent least-privilege tool & S2S service boundaries before tool execution."""
+    _ = args
+    state = getattr(tool_context, "state", None)
+    state_dict = state if isinstance(state, dict) or hasattr(state, "get") else {}
+
+    raw_agent_name = getattr(tool_context, "agent_name", None)
+    if not isinstance(raw_agent_name, str) or not raw_agent_name.strip():
+        active_id = state_dict.get("active_agent_identity") if state_dict else None
+        if isinstance(active_id, dict):
+            raw_agent_name = active_id.get("agent_name")
+
+    if not isinstance(raw_agent_name, str) or not raw_agent_name.strip():
+        return None
+
+    agent_name = raw_agent_name.strip()
+    tool_name = getattr(tool, "name", "") or str(tool)
+
+    try:
+        s2s_claims = authorize_agent_tool_invocation(
+            agent_name=agent_name,
+            tool_name=tool_name,
+            caller=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+        )
+    except AgentAuthorizationError as exc:
+        record_security_audit_event(
+            event_type="agent_s2s_denied",
+            user=None,
+            resource=f"tool://{tool_name}",
+            status_outcome="denied_403",
+            detail=f"agent={agent_name} target={exc.target}: {exc.message}",
+        )
+        return {
+            "status": "forbidden",
+            "error": "agent_least_privilege_violation",
+            "agent_name": agent_name,
+            "tool": tool_name,
+            "message": exc.message,
+        }
+
+    if state is not None and hasattr(state, "__setitem__"):
+        s2s_log = list(state_dict.get("s2s_audit_trail", []))
+        s2s_log.append(
+            {
+                "agent_name": s2s_claims.agent_name,
+                "service_account_email": s2s_claims.service_account_email,
+                "spiffe_id": s2s_claims.spiffe_id,
+                "tool_name": tool_name,
+                "target_service": s2s_claims.target_service,
+                "audience": s2s_claims.audience,
+                "jti": s2s_claims.jti,
+            }
+        )
+        state["s2s_audit_trail"] = s2s_log
+
     return None
 
 

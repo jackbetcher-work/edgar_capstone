@@ -11,6 +11,7 @@ from edgar_capstone.agents.callbacks import (
     after_model_fact_check_callback,
     before_agent_telemetry_callback,
     before_model_safety_and_latency_callback,
+    before_tool_agent_identity_callback,
 )
 from edgar_capstone.agents.tools import (
     ContextCacheTool,
@@ -75,6 +76,7 @@ def create_financial_analyst_agent(
         before_agent_callback=before_agent_telemetry_callback,
         before_model_callback=before_model_safety_and_latency_callback,
         after_model_callback=after_model_fact_check_callback,
+        before_tool_callback=before_tool_agent_identity_callback,
     )
 
 

@@ -23,14 +23,14 @@ resource "google_secret_manager_secret" "managed_secrets" {
   depends_on = [google_project_service.required_apis]
 }
 
-# Grant least-privilege Secret Accessor role to the Cloud Run runtime service account
+# Grant least-privilege Secret Accessor role exclusively to the custom Cloud Run runtime SA
 resource "google_secret_manager_secret_iam_member" "runtime_secret_accessor" {
-  for_each = var.create_analyst_service_account ? local.managed_secret_ids : toset([])
+  for_each = local.managed_secret_ids
 
   project   = var.project_id
   secret_id = google_secret_manager_secret.managed_secrets[each.key].secret_id
   role      = "roles/secretmanager.secretAccessor"
-  member    = "serviceAccount:${google_service_account.sec_analyst[0].email}"
+  member    = "serviceAccount:${local.runtime_service_account_email}"
 }
 
 # ------------------------------------------------------------------------------
@@ -81,11 +81,13 @@ resource "google_secret_manager_secret_iam_member" "cicd_secret_accessor" {
 }
 
 resource "google_service_account_iam_member" "cicd_act_as_runtime_sa" {
-  count = var.create_analyst_service_account ? 1 : 0
-
-  service_account_id = google_service_account.sec_analyst[0].name
-  role               = "roles/iam.serviceAccountUser"
-  member             = "serviceAccount:${google_service_account.cicd_runner.email}"
+  service_account_id = (
+    var.create_analyst_service_account
+    ? google_service_account.sec_analyst[0].name
+    : "projects/${var.project_id}/serviceAccounts/${local.runtime_service_account_email}"
+  )
+  role   = "roles/iam.serviceAccountUser"
+  member = "serviceAccount:${google_service_account.cicd_runner.email}"
 }
 
 resource "google_iam_workload_identity_pool" "github_pool" {
@@ -124,10 +126,10 @@ resource "google_service_account_iam_member" "github_wif_impersonation" {
 }
 
 # ------------------------------------------------------------------------------
-# 4. Google Cloud Run v2 Service with Native Secret Manager Volume/Env Mounts
+# 4. Google Cloud Run v2 Service with Custom SA, Cloud Identity RBAC, & Secrets
 # ------------------------------------------------------------------------------
 resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
-  count = var.enable_cloud_run_service && var.create_analyst_service_account ? 1 : 0
+  count = var.enable_cloud_run_service ? 1 : 0
 
   project             = var.project_id
   name                = var.cloud_run_service_name
@@ -137,7 +139,7 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
   labels              = var.labels
 
   template {
-    service_account                  = google_service_account.sec_analyst[0].email
+    service_account                  = local.runtime_service_account_email
     max_instance_request_concurrency = 8
     timeout                          = "300s"
 
@@ -162,8 +164,23 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "GCP_PROJECT_NAME"
+        value = var.project_name
+      }
+
+      env {
         name  = "GCP_REGION"
         value = var.region
+      }
+
+      env {
+        name  = "RUNTIME_SERVICE_ACCOUNT_ID"
+        value = var.analyst_service_account_id
+      }
+
+      env {
+        name  = "RUNTIME_SERVICE_ACCOUNT"
+        value = local.runtime_service_account_email
       }
 
       env {
@@ -179,6 +196,26 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       env {
         name  = "IAP_STRICT_MODE"
         value = "true"
+      }
+
+      env {
+        name  = "CLOUD_IDENTITY_DOMAIN"
+        value = var.cloud_identity_domain
+      }
+
+      env {
+        name  = "ADMIN_CLOUD_IDENTITY_GROUPS"
+        value = join(",", sort(local.rbac_admin_group_emails))
+      }
+
+      env {
+        name  = "ANALYST_CLOUD_IDENTITY_GROUPS"
+        value = join(",", sort(local.rbac_analyst_group_emails))
+      }
+
+      env {
+        name  = "VIEWER_CLOUD_IDENTITY_GROUPS"
+        value = join(",", sort(local.rbac_viewer_group_emails))
       }
 
       env {

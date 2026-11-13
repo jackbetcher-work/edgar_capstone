@@ -116,10 +116,20 @@ export interface FactCheckVerification {
 export interface AgentTraceStep {
   step: number
   agent: string
+  agent_service_account?: string
+  spiffe_id?: string
+  s2s_target_service?: string
+  s2s_verified?: boolean
   tool: string
   status: 'completed' | 'warning' | 'blocked'
   duration_ms: number
   summary: string
+}
+
+export interface AgentIdentitySummary {
+  agent_name: string
+  service_account_email: string
+  spiffe_id: string
 }
 
 export interface ContextCacheInfo {
@@ -155,6 +165,7 @@ export interface ChatTurnResponse {
   context_cache: ContextCacheInfo | null
   fact_check: FactCheckVerification
   agent_trace: AgentTraceStep[]
+  agent_identities_used?: AgentIdentitySummary[]
   total_latency_ms: number
   connection_mode?: 'live' | 'fallback'
 }
@@ -212,10 +223,23 @@ export interface AuthenticatedUserProfile {
   issuer: string
   audience: string
   groups: string[]
+  cloud_identity_groups?: string[]
   roles: string[]
+  permissions?: string[]
+  agent_identity?: string | null
+  spiffe_id?: string | null
   issued_at: number
   expires_at: number
   iap_assertion_verified: boolean
+}
+
+export interface CloudIdentityRoleSpec {
+  role: string
+  display_name: string
+  description: string
+  cloud_identity_groups: string[]
+  gcp_iam_roles: string[]
+  permissions: string[]
 }
 
 export interface AuthDiscoveryConfig {
@@ -240,8 +264,36 @@ export interface AuthDiscoveryConfig {
     strict_production_mode: boolean
     bearer_header: string
     assertion_header: string
+    agent_s2s_assertion_header?: string
     audience_configured: boolean
   }
+  rbac?: {
+    management_plane: string
+    principal_syntax: string
+    cloud_identity_domain: string
+    individual_user_bindings_allowed: boolean
+    roles: CloudIdentityRoleSpec[]
+  }
+  service_account?: {
+    account_id: string
+    email: string
+    project_name_email: string
+    pattern: string
+    project_id: string
+    project_name: string
+    default_compute_sa_prohibited: boolean
+  }
+  agent_identities?: Array<{
+    agent_name: string
+    service_account_id: string
+    service_account_email: string
+    spiffe_id: string
+    allowed_callers: string[]
+    allowed_target_services: string[]
+    allowed_tools: string[]
+    api_permissions: string[]
+    gcp_iam_roles: string[]
+  }>
 }
 
 export interface SsoSessionResponse {

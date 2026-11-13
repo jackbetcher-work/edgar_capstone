@@ -89,8 +89,31 @@ output "chunk_health_monitoring_dashboard_id" {
 }
 
 output "analyst_service_account_email" {
-  description = "Email of the least-privilege SEC Analyst runtime service account."
-  value       = var.create_analyst_service_account ? google_service_account.sec_analyst[0].email : null
+  description = "Email of the custom SEC Analyst runtime service account (sec-analyst-sa@<project>.iam.gserviceaccount.com)."
+  value       = local.runtime_service_account_email
+}
+
+output "analyst_service_account_project_name_email" {
+  description = "Logical project-name alias of the custom runtime service account (sec-analyst-sa@<project_name>.iam.gserviceaccount.com)."
+  value       = local.runtime_service_account_project_name_email
+}
+
+output "cloud_identity_rbac_groups" {
+  description = "Group-based RBAC access definitions managed via Google Cloud Identity Groups."
+  value = {
+    admins   = sort(local.rbac_admin_members)
+    analysts = sort(local.rbac_analyst_members)
+    viewers  = sort(local.rbac_viewer_members)
+  }
+}
+
+output "agent_service_account_emails" {
+  description = "Granular per-agent GCP service accounts enforcing Least Privilege for S2S communication."
+  value = (
+    var.create_agent_service_accounts
+    ? { for k, sa in google_service_account.agent_identities : local.agent_identities[k].agent_name => sa.email }
+    : {}
+  )
 }
 
 output "cicd_service_account_email" {
@@ -115,13 +138,13 @@ output "secret_manager_secret_ids" {
 
 output "cloud_run_service_uri" {
   description = "Deployed Google Cloud Run v2 service URI."
-  value       = var.enable_cloud_run_service && var.create_analyst_service_account ? google_cloud_run_v2_service.sec_edgar_analyst[0].uri : null
+  value       = var.enable_cloud_run_service ? google_cloud_run_v2_service.sec_edgar_analyst[0].uri : null
 }
 
 output "iap_backend_service_audience" {
   description = "Expected IAP JWT 'aud' claim string for the IAP-protected Cloud Run backend service."
   value = (
-    var.enable_iap_backend_service && var.enable_cloud_run_service && var.create_analyst_service_account
+    var.enable_iap_backend_service && var.enable_cloud_run_service
     ? "/projects/${data.google_project.current.number}/global/backendServices/${google_compute_backend_service.sec_edgar_iap_backend[0].generated_id}"
     : null
   )

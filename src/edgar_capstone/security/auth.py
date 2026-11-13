@@ -30,6 +30,24 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
 from fastapi import Depends, HTTPException, Request, status
 import httpx
 
+from edgar_capstone.security.agent_identity import (
+    AgentAuthorizationError,
+    S2S_AGENT_ASSERTION_HEADER,
+    get_agent_s2s_broker,
+    resolve_agent_by_service_account_id,
+    resolve_agent_identity,
+)
+from edgar_capstone.security.rbac import (
+    ANALYST_PERMISSIONS,
+    CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+    DEFAULT_CLOUD_IDENTITY_DOMAIN,
+    DEFAULT_PROJECT_NAME,
+    CloudIdentityRBACPolicy,
+    Permission,
+    RuntimeServiceAccountConfig,
+    is_default_gcp_service_account,
+    validate_custom_service_account_email,
+)
 from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID, SecretManagerClient
 
 logger = logging.getLogger(__name__)
@@ -265,6 +283,20 @@ class AuthSettings:
     allow_gcp_service_accounts: bool
     strict_production_mode: bool
     clock_skew_seconds: int = 30
+    viewer_workspace_groups: tuple[str, ...] = (
+        "sec-edgar-viewers",
+        "sec-edgar-auditors",
+        "compliance-auditors",
+    )
+    cloud_identity_domain: str = DEFAULT_CLOUD_IDENTITY_DOMAIN
+    runtime_service_account: str = (
+        f"{CUSTOM_RUNTIME_SA_ACCOUNT_ID}@{DEFAULT_PROJECT_ID}.iam.gserviceaccount.com"
+    )
+    allowed_service_account_projects: tuple[str, ...] = (
+        DEFAULT_PROJECT_ID,
+        DEFAULT_PROJECT_NAME,
+    )
+    allowed_custom_service_accounts: tuple[str, ...] = ()
 
     @classmethod
     def from_env(
@@ -322,16 +354,34 @@ class AuthSettings:
         admin_groups = tuple(
             g.lower()
             for g in (
-                _split_csv_env(os.environ.get("ADMIN_WORKSPACE_GROUPS"))
+                _split_csv_env(os.environ.get("ADMIN_CLOUD_IDENTITY_GROUPS"))
+                or _split_csv_env(os.environ.get("ADMIN_WORKSPACE_GROUPS"))
                 or ("sec-edgar-admins", "gcp-security-admins", "okta-sec-admins")
             )
         )
         analyst_groups = tuple(
             g.lower()
             for g in (
-                _split_csv_env(os.environ.get("ANALYST_WORKSPACE_GROUPS"))
+                _split_csv_env(os.environ.get("ANALYST_CLOUD_IDENTITY_GROUPS"))
+                or _split_csv_env(os.environ.get("ANALYST_WORKSPACE_GROUPS"))
                 or ("sec-edgar-analysts", "financial-analysts")
             )
+        )
+        viewer_groups = tuple(
+            g.lower()
+            for g in (
+                _split_csv_env(os.environ.get("VIEWER_CLOUD_IDENTITY_GROUPS"))
+                or _split_csv_env(os.environ.get("VIEWER_WORKSPACE_GROUPS"))
+                or ("sec-edgar-viewers", "sec-edgar-auditors", "compliance-auditors")
+            )
+        )
+        cloud_identity_domain = (
+            os.environ.get("CLOUD_IDENTITY_DOMAIN", "").strip().lower()
+            or (allowed_domains[0] if allowed_domains else DEFAULT_CLOUD_IDENTITY_DOMAIN)
+        )
+        runtime_sa_cfg = RuntimeServiceAccountConfig.from_env()
+        allowed_custom_sas = tuple(
+            sa.lower() for sa in _split_csv_env(os.environ.get("ALLOWED_CUSTOM_SERVICE_ACCOUNTS"))
         )
         allow_sa = os.environ.get("ALLOW_GCP_SERVICE_ACCOUNTS", "true").strip().lower() not in {
             "0",
@@ -351,6 +401,21 @@ class AuthSettings:
             analyst_workspace_groups=analyst_groups,
             allow_gcp_service_accounts=allow_sa,
             strict_production_mode=strict_mode,
+            viewer_workspace_groups=viewer_groups,
+            cloud_identity_domain=cloud_identity_domain,
+            runtime_service_account=runtime_sa_cfg.email,
+            allowed_service_account_projects=runtime_sa_cfg.allowed_projects(),
+            allowed_custom_service_accounts=allowed_custom_sas,
+        )
+
+    def rbac_policy(self) -> CloudIdentityRBACPolicy:
+        """Build the active Cloud Identity Group RBAC policy engine."""
+        return CloudIdentityRBACPolicy.from_groups(
+            admin_groups=self.admin_workspace_groups,
+            analyst_groups=self.analyst_workspace_groups,
+            viewer_groups=self.viewer_workspace_groups,
+            required_analyst_groups=self.required_analyst_groups,
+            cloud_identity_domain=self.cloud_identity_domain,
         )
 
     def authorization_endpoint(self) -> str | None:
@@ -365,7 +430,7 @@ class AuthSettings:
 
 @dataclass(frozen=True)
 class AuthenticatedUser:
-    """Verified user or service principal extracted from an IAP / Workspace / Okta JWT."""
+    """Verified user, custom runtime SA, or per-agent principal extracted from a JWT."""
 
     sub: str
     email: str
@@ -381,6 +446,10 @@ class AuthenticatedUser:
     expires_at: int
     token_fingerprint: str
     iap_assertion_verified: bool = False
+    permissions: tuple[str, ...] = ()
+    cloud_identity_groups: tuple[str, ...] = ()
+    agent_identity: str | None = None
+    spiffe_id: str | None = None
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -393,7 +462,11 @@ class AuthenticatedUser:
             "issuer": self.issuer,
             "audience": self.audience,
             "groups": list(self.groups),
+            "cloud_identity_groups": list(self.cloud_identity_groups),
             "roles": list(self.roles),
+            "permissions": list(self.permissions),
+            "agent_identity": self.agent_identity,
+            "spiffe_id": self.spiffe_id,
             "issued_at": self.issued_at,
             "expires_at": self.expires_at,
             "iap_assertion_verified": self.iap_assertion_verified,
@@ -515,6 +588,10 @@ def record_security_audit_event(
         "user_sub": user.sub if user else None,
         "hosted_domain": user.hosted_domain if user else None,
         "identity_provider": user.identity_provider if user else None,
+        "roles": list(user.roles) if user else [],
+        "cloud_identity_groups": list(user.cloud_identity_groups) if user else [],
+        "agent_identity": user.agent_identity if user else None,
+        "spiffe_id": user.spiffe_id if user else None,
         "iap_assertion_verified": user.iap_assertion_verified if user else False,
         "detail": detail,
     }
@@ -745,6 +822,86 @@ class IAPJwtVerifier:
 
         raise AuthenticationError("JWT audience ('aud') does not match configured IAP audience.")
 
+    def _enforce_service_account_and_agent_policy(
+        self,
+        email: str,
+    ) -> tuple[tuple[str, ...], tuple[str, ...], str | None, str | None]:
+        """Enforce custom runtime SA (`sec-analyst-sa`) and per-agent least-privilege S2S rules."""
+        if not self.settings.allow_gcp_service_accounts:
+            raise AuthorizationError(
+                "Service account principals are disabled by current access policy."
+            )
+
+        if is_default_gcp_service_account(email):
+            raise AuthorizationError(
+                f"Default GCP service account {email!r} is prohibited; only custom runtime "
+                f"({CUSTOM_RUNTIME_SA_ACCOUNT_ID}@<project>.iam.gserviceaccount.com) and "
+                "granular per-agent service accounts are permitted."
+            )
+
+        try:
+            account_id, project_name = validate_custom_service_account_email(
+                email,
+                expected_account_id=None,
+            )
+        except ValueError as exc:
+            raise AuthorizationError(str(exc)) from exc
+
+        is_explicitly_allowed = email in self.settings.allowed_custom_service_accounts
+        if (
+            not is_explicitly_allowed
+            and self.settings.allowed_service_account_projects
+            and project_name not in self.settings.allowed_service_account_projects
+        ):
+            raise AuthorizationError(
+                f"Service account project {project_name!r} is not authorized for SEC EDGAR S2S access."
+            )
+
+        runtime_account_id = self.settings.runtime_service_account.split("@", 1)[0].lower()
+        if account_id in {CUSTOM_RUNTIME_SA_ACCOUNT_ID, runtime_account_id}:
+            return (
+                ("authenticated", "service_account", "analyst"),
+                tuple(sorted(ANALYST_PERMISSIONS)),
+                None,
+                f"spiffe://{project_name}.svc.id.goog/ns/sec-edgar/sa/{account_id}",
+            )
+
+        agent_spec = resolve_agent_by_service_account_id(account_id)
+        if agent_spec is not None:
+            return (
+                (
+                    "authenticated",
+                    "service_account",
+                    "agent",
+                    f"agent:{agent_spec.agent_name}",
+                ),
+                tuple(sorted(agent_spec.api_permissions)),
+                agent_spec.agent_name,
+                agent_spec.spiffe_id(project_name),
+            )
+
+        if account_id == "sec-edgar-cicd-sa":
+            return (
+                ("authenticated", "service_account", "cicd_probe"),
+                (Permission.RBAC_INSPECT.value,),
+                None,
+                f"spiffe://{project_name}.svc.id.goog/ns/sec-edgar/sa/{account_id}",
+            )
+
+        if is_explicitly_allowed:
+            return (
+                ("authenticated", "service_account"),
+                (Permission.FILINGS_READ.value, Permission.RBAC_INSPECT.value),
+                None,
+                f"spiffe://{project_name}.svc.id.goog/ns/sec-edgar/sa/{account_id}",
+            )
+
+        raise AuthorizationError(
+            f"Unrecognized service account {email!r}; only custom runtime SA "
+            f"'{CUSTOM_RUNTIME_SA_ACCOUNT_ID}@<project>.iam.gserviceaccount.com' and registered "
+            "per-agent service accounts are authorized."
+        )
+
     def _enforce_workspace_and_rbac(
         self,
         *,
@@ -752,7 +909,14 @@ class IAPJwtVerifier:
         claims: dict[str, Any],
         idp: str,
         groups: tuple[str, ...],
-    ) -> tuple[str | None, tuple[str, ...]]:
+    ) -> tuple[
+        str | None,
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        str | None,
+        str | None,
+    ]:
         is_gcp_sa = email.endswith(".gserviceaccount.com")
 
         if idp == "google_workspace_oidc" and claims.get("email_verified") is False:
@@ -768,11 +932,10 @@ class IAPJwtVerifier:
             hosted_domain = None
 
         if is_gcp_sa:
-            if not self.settings.allow_gcp_service_accounts:
-                raise AuthorizationError(
-                    "Service account principals are disabled by current access policy."
-                )
-            return None, ("authenticated", "service_account", "analyst")
+            sa_roles, sa_perms, agent_id, spiffe_id = (
+                self._enforce_service_account_and_agent_policy(email)
+            )
+            return None, sa_roles, sa_perms, (), agent_id, spiffe_id
 
         if self.settings.allowed_workspace_domains:
             if not hosted_domain or hosted_domain not in self.settings.allowed_workspace_domains:
@@ -781,22 +944,17 @@ class IAPJwtVerifier:
                     "authorized for SEC EDGAR internal APIs."
                 )
 
-        group_names_short = {
-            g.split("@", 1)[0].removeprefix("group:") for g in groups
-        } | set(groups)
+        policy = self.settings.rbac_policy()
+        roles, permissions, matched_ci_groups = policy.resolve_human_access(
+            user_groups=groups,
+            hosted_domain=hosted_domain,
+        )
+        if not roles:
+            raise AuthorizationError(
+                "Authenticated Workspace/Okta user is not a member of any required Cloud Identity RBAC group."
+            )
 
-        is_admin = bool(group_names_short.intersection(self.settings.admin_workspace_groups))
-
-        if self.settings.required_analyst_groups and not is_admin:
-            if not group_names_short.intersection(self.settings.required_analyst_groups):
-                raise AuthorizationError(
-                    "Authenticated Workspace/Okta user is not a member of any required Cloud Identity analyst group."
-                )
-
-        roles: list[str] = ["authenticated", "analyst"]
-        if is_admin:
-            roles.append("admin")
-        return hosted_domain, tuple(roles)
+        return hosted_domain, roles, permissions, matched_ci_groups, None, None
 
     def verify_jwt(
         self,
@@ -864,7 +1022,14 @@ class IAPJwtVerifier:
         matched_aud = self._validate_audience(claims)
         email = self._normalize_email(claims)
         groups = self._extract_groups(claims)
-        hosted_domain, roles = self._enforce_workspace_and_rbac(
+        (
+            hosted_domain,
+            roles,
+            permissions,
+            cloud_identity_groups,
+            agent_identity,
+            spiffe_id,
+        ) = self._enforce_workspace_and_rbac(
             email=email,
             claims=claims,
             idp=idp,
@@ -880,7 +1045,11 @@ class IAPJwtVerifier:
 
         sso_federation = "google_workspace_okta_sso"
         if email.endswith(".gserviceaccount.com"):
-            sso_federation = "gcp_iam_service_account"
+            sso_federation = (
+                "gcp_agent_workload_identity"
+                if agent_identity
+                else "gcp_iam_service_account"
+            )
 
         return AuthenticatedUser(
             sub=sub.strip(),
@@ -897,6 +1066,10 @@ class IAPJwtVerifier:
             expires_at=exp,
             token_fingerprint=compute_token_fingerprint(token),
             iap_assertion_verified=(idp == "google_iap"),
+            permissions=permissions,
+            cloud_identity_groups=cloud_identity_groups,
+            agent_identity=agent_identity,
+            spiffe_id=spiffe_id,
         )
 
 
@@ -966,6 +1139,70 @@ def require_authenticated_user(
                 expires_at=user.expires_at,
                 token_fingerprint=user.token_fingerprint,
                 iap_assertion_verified=True,
+                permissions=tuple(dict.fromkeys((*user.permissions, *iap_user.permissions))),
+                cloud_identity_groups=tuple(
+                    dict.fromkeys((*user.cloud_identity_groups, *iap_user.cloud_identity_groups))
+                ),
+                agent_identity=user.agent_identity,
+                spiffe_id=user.spiffe_id,
+            )
+
+        # Per-agent S2S Least Privilege attenuation: when a service-to-service request
+        # carries an `X-Agent-Identity-Assertion` JWT, verify it cryptographically and
+        # attenuate effective permissions strictly to that agent's least-privilege scope.
+        s2s_assertion = request.headers.get(S2S_AGENT_ASSERTION_HEADER, "").strip()
+        if s2s_assertion:
+            if "service_account" not in user.roles:
+                raise AuthorizationError(
+                    f"{S2S_AGENT_ASSERTION_HEADER} header is restricted to service-to-service "
+                    "service account principals."
+                )
+            try:
+                s2s_claims = get_agent_s2s_broker().verify_s2s_assertion(s2s_assertion)
+            except AgentAuthorizationError as exc:
+                raise AuthorizationError(exc.message) from exc
+            except ValueError as exc:
+                raise AuthenticationError(str(exc)) from exc
+
+            # If Bearer token is itself a per-agent SA, ensure it matches the S2S assertion agent
+            if user.agent_identity and user.agent_identity != s2s_claims.agent_name:
+                raise AuthenticationError(
+                    f"Agent identity mismatch between Bearer SA ({user.agent_identity}) "
+                    f"and {S2S_AGENT_ASSERTION_HEADER} ({s2s_claims.agent_name})."
+                )
+
+            attenuated_permissions = tuple(
+                sorted(set(user.permissions).intersection(s2s_claims.permissions))
+            )
+            agent_roles = tuple(
+                dict.fromkeys(
+                    (
+                        "authenticated",
+                        "service_account",
+                        "agent",
+                        f"agent:{s2s_claims.agent_name}",
+                    )
+                )
+            )
+            user = AuthenticatedUser(
+                sub=user.sub,
+                email=user.email,
+                name=user.name,
+                hosted_domain=user.hosted_domain,
+                identity_provider=user.identity_provider,
+                sso_federation="gcp_agent_workload_identity",
+                issuer=user.issuer,
+                audience=user.audience,
+                groups=user.groups,
+                roles=agent_roles,
+                issued_at=user.issued_at,
+                expires_at=min(user.expires_at, s2s_claims.expires_at),
+                token_fingerprint=user.token_fingerprint,
+                iap_assertion_verified=user.iap_assertion_verified,
+                permissions=attenuated_permissions,
+                cloud_identity_groups=user.cloud_identity_groups,
+                agent_identity=s2s_claims.agent_name,
+                spiffe_id=s2s_claims.spiffe_id,
             )
 
         request.state.authenticated_user = user
@@ -1019,9 +1256,17 @@ def require_roles(*required_roles: str):
     """Build a FastAPI dependency requiring the authenticated user to hold at least one role."""
 
     def _dependency(
+        request: Request,
         user: AuthenticatedUser = Depends(require_authenticated_user),
     ) -> AuthenticatedUser:
         if not any(r in user.roles for r in required_roles):
+            record_security_audit_event(
+                event_type="api_authorization_denied",
+                user=user,
+                resource=request.url.path,
+                status_outcome="denied_403",
+                detail=f"Required one of roles {list(required_roles)}, got {list(user.roles)}.",
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail={
@@ -1030,6 +1275,76 @@ def require_roles(*required_roles: str):
                     "message": f"Required one of roles {list(required_roles)}, got {list(user.roles)}.",
                 },
             )
+        return user
+
+    return _dependency
+
+
+def require_permissions(
+    *required_permissions: str,
+    agent_tool: str | None = None,
+):
+    """Build a FastAPI dependency enforcing Cloud Identity RBAC or per-agent S2S permissions."""
+
+    def _dependency(
+        request: Request,
+        user: AuthenticatedUser = Depends(require_authenticated_user),
+    ) -> AuthenticatedUser:
+        missing = [p for p in required_permissions if p not in user.permissions]
+        if missing:
+            record_security_audit_event(
+                event_type="api_authorization_denied",
+                user=user,
+                resource=request.url.path,
+                status_outcome="denied_403",
+                detail=(
+                    f"Missing required permission(s) {missing}; "
+                    f"principal={user.email} roles={list(user.roles)} "
+                    f"agent_identity={user.agent_identity}."
+                ),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "status": "forbidden",
+                    "error": "insufficient_permissions",
+                    "message": (
+                        f"Principal '{user.email}' lacks required RBAC / agent permission(s): "
+                        f"{missing}."
+                    ),
+                    "required_permissions": list(required_permissions),
+                    "granted_permissions": list(user.permissions),
+                    "agent_identity": user.agent_identity,
+                },
+            )
+
+        if agent_tool is not None and user.agent_identity is not None:
+            agent_spec = resolve_agent_identity(user.agent_identity)
+            if agent_tool not in agent_spec.allowed_tools:
+                record_security_audit_event(
+                    event_type="agent_s2s_tool_boundary_denied",
+                    user=user,
+                    resource=request.url.path,
+                    status_outcome="denied_403",
+                    detail=(
+                        f"Agent '{agent_spec.agent_name}' ({user.email}) is forbidden from "
+                        f"calling endpoint bound to tool '{agent_tool}'."
+                    ),
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail={
+                        "status": "forbidden",
+                        "error": "agent_least_privilege_violation",
+                        "message": (
+                            f"Agent identity '{agent_spec.agent_name}' ({user.email}) is not "
+                            f"authorized for tool boundary '{agent_tool}' under Least Privilege."
+                        ),
+                        "agent_identity": agent_spec.agent_name,
+                        "required_tool": agent_tool,
+                        "allowed_tools": sorted(agent_spec.allowed_tools),
+                    },
+                )
         return user
 
     return _dependency

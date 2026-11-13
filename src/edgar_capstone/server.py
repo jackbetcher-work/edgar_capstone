@@ -30,6 +30,10 @@ from edgar_capstone.agents.tools import (
     query_looker_financial_explore,
     search_10k_chunks_rag,
 )
+from edgar_capstone.security.agent_identity import (
+    PER_AGENT_IDENTITIES,
+    S2S_AGENT_ASSERTION_HEADER,
+)
 from edgar_capstone.security.auth import (
     GOOGLE_IAP_ISSUER,
     AuthenticatedUser,
@@ -41,8 +45,12 @@ from edgar_capstone.security.auth import (
     issue_local_dev_workspace_sso_token,
     record_security_audit_event,
     require_authenticated_user,
-    require_roles,
+    require_permissions,
     revoke_bearer_token,
+)
+from edgar_capstone.security.rbac import (
+    Permission,
+    RuntimeServiceAccountConfig,
 )
 from edgar_capstone.security.secrets import (
     DEFAULT_PROJECT_ID,
@@ -75,7 +83,12 @@ app.add_middleware(
     ],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["Authorization", "Content-Type", "X-Goog-IAP-JWT-Assertion"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Goog-IAP-JWT-Assertion",
+        S2S_AGENT_ASSERTION_HEADER,
+    ],
     expose_headers=["WWW-Authenticate"],
 )
 
@@ -127,12 +140,16 @@ class DevWorkspaceSsoLoginRequest(BaseModel):
 @app.get("/healthz", include_in_schema=False)
 def health() -> dict[str, Any]:
     """Cloud Run external health check and internal probe endpoint."""
+    runtime_sa = RuntimeServiceAccountConfig.from_env()
     return {
         "status": "ok",
         "service": os.environ.get("K_SERVICE", "sec-edgar-analyst"),
         "project_id": os.environ.get("GCP_PROJECT_ID", DEFAULT_PROJECT_ID),
+        "runtime_service_account": runtime_sa.email,
+        "runtime_service_account_project_name": runtime_sa.project_name_alias_email,
         "root_agent": RootOrchestrator.name,
         "sub_agents": [sa.name for sa in RootOrchestrator.sub_agents],
+        "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
         "iap_jwt_auth_enabled": True,
     }
 
@@ -146,8 +163,9 @@ def health() -> dict[str, Any]:
 def auth_discovery_config(
     verifier: IAPJwtVerifier = Depends(get_auth_verifier),
 ) -> dict[str, Any]:
-    """Return public SSO & IAP authentication metadata (never exposes secret values)."""
+    """Return public SSO, IAP, Cloud Identity RBAC, and Agent Identity metadata (no secrets)."""
     settings = verifier.settings
+    runtime_sa = RuntimeServiceAccountConfig.from_env()
     return {
         "status": "ok",
         "auth_required": True,
@@ -170,8 +188,15 @@ def auth_discovery_config(
             "strict_production_mode": settings.strict_production_mode,
             "bearer_header": "Authorization",
             "assertion_header": "X-Goog-IAP-JWT-Assertion",
+            "agent_s2s_assertion_header": S2S_AGENT_ASSERTION_HEADER,
             "audience_configured": bool(settings.audiences),
         },
+        "rbac": settings.rbac_policy().to_public_dict(),
+        "service_account": runtime_sa.to_public_dict(),
+        "agent_identities": [
+            spec.to_public_dict(runtime_sa.project_id)
+            for spec in PER_AGENT_IDENTITIES.values()
+        ],
     }
 
 
@@ -316,7 +341,7 @@ def logout_authenticated_session(
 @app.get("/api/v1/auth/audit")
 def list_security_audit_trail(
     limit: int = Query(50, ge=1, le=500),
-    user: AuthenticatedUser = Depends(require_roles("analyst", "admin")),
+    user: AuthenticatedUser = Depends(require_permissions(Permission.AUDIT_READ.value)),
 ) -> dict[str, Any]:
     """Retrieve structured authentication and 10-K report access audit logs."""
     events = get_security_audit_events(limit=limit)
@@ -328,14 +353,70 @@ def list_security_audit_trail(
     }
 
 
+@app.get("/api/v1/auth/rbac")
+def inspect_rbac_and_agent_identities(
+    user: AuthenticatedUser = Depends(require_permissions(Permission.RBAC_INSPECT.value)),
+    verifier: IAPJwtVerifier = Depends(get_auth_verifier),
+) -> dict[str, Any]:
+    """Inspect active Cloud Identity Group RBAC role definitions, custom runtime SA, and per-agent S2S identities."""
+    record_security_audit_event(
+        event_type="rbac_policy_inspected",
+        user=user,
+        resource="/api/v1/auth/rbac",
+    )
+    runtime_sa = RuntimeServiceAccountConfig.from_env()
+    return {
+        "status": "ok",
+        "principal": {
+            "email": user.email,
+            "roles": list(user.roles),
+            "permissions": list(user.permissions),
+            "cloud_identity_groups": list(user.cloud_identity_groups),
+            "agent_identity": user.agent_identity,
+            "spiffe_id": user.spiffe_id,
+        },
+        "rbac_policy": verifier.settings.rbac_policy().to_public_dict(),
+        "runtime_service_account": runtime_sa.to_public_dict(),
+        "agent_identities": [
+            spec.to_public_dict(runtime_sa.project_id)
+            for spec in PER_AGENT_IDENTITIES.values()
+        ],
+    }
+
+
+@app.get("/api/v1/admin/rbac/policies")
+def admin_rbac_governance_policies(
+    user: AuthenticatedUser = Depends(require_permissions(Permission.RBAC_ADMIN.value)),
+    verifier: IAPJwtVerifier = Depends(get_auth_verifier),
+) -> dict[str, Any]:
+    """Administrative endpoint restricted strictly to Cloud Identity `admin` group principals."""
+    record_security_audit_event(
+        event_type="admin_rbac_governance_inspected",
+        user=user,
+        resource="/api/v1/admin/rbac/policies",
+    )
+    runtime_sa = RuntimeServiceAccountConfig.from_env()
+    return {
+        "status": "ok",
+        "administered_by": user.email,
+        "cloud_identity_groups": list(user.cloud_identity_groups),
+        "rbac_policy": verifier.settings.rbac_policy().to_public_dict(),
+        "runtime_service_account": runtime_sa.to_public_dict(),
+        "agent_identities": {
+            name: spec.to_public_dict(runtime_sa.project_id)
+            for name, spec in PER_AGENT_IDENTITIES.items()
+        },
+    }
+
+
 # ---------------------------------------------------------------------------
-# IAP JWT Bearer Protected Internal SEC EDGAR Analyst APIs
+# IAP JWT Bearer & Cloud Identity RBAC Protected Internal SEC EDGAR APIs
 # ---------------------------------------------------------------------------
 
 
 @app.get("/api/v1/secrets/status")
 def secrets_status(
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(require_permissions(Permission.SECRETS_INSPECT.value)),
 ) -> dict[str, Any]:
     """Report Secret Manager binding metadata without ever exposing secret values."""
     record_security_audit_event(
@@ -369,7 +450,12 @@ def secrets_status(
 @app.post("/api/v1/variances")
 def compute_variances(
     req: VarianceRequest,
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(
+        require_permissions(
+            Permission.VARIANCES_CALCULATE.value,
+            agent_tool="calculate_period_variances",
+        )
+    ),
 ) -> dict[str, Any]:
     """Compute deterministic period-over-period financial variances."""
     record_security_audit_event(
@@ -392,7 +478,12 @@ def compute_variances(
 @app.post("/api/v1/search")
 def rag_search(
     req: RagSearchRequest,
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(
+        require_permissions(
+            Permission.FILINGS_READ.value,
+            agent_tool="search_10k_chunks_rag",
+        )
+    ),
 ) -> dict[str, Any]:
     """Run metadata-filtered Hybrid RAG search over SEC 10-K filing chunks."""
     record_security_audit_event(
@@ -416,7 +507,12 @@ def rag_search(
 @app.post("/api/v1/intent")
 def classify_intent(
     req: IntentClassifyRequest,
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(
+        require_permissions(
+            Permission.CHAT_QUERY.value,
+            agent_tool="classify_query_intent",
+        )
+    ),
 ) -> dict[str, Any]:
     """Deterministically classify an analyst query into a RootOrchestrator routing intent."""
     record_security_audit_event(
@@ -440,7 +536,12 @@ def get_metrics(
     start_year: int = 2024,
     end_year: int = 2026,
     gics_sector: str = "ALL",
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(
+        require_permissions(
+            Permission.FILINGS_READ.value,
+            agent_tool="fetch_financial_metrics",
+        )
+    ),
 ) -> dict[str, Any]:
     """Retrieve structured SEC 10-K financial metrics."""
     record_security_audit_event(
@@ -465,7 +566,12 @@ def get_looker_explore(
     gics_sector: str = "ALL",
     start_year: int = 2024,
     end_year: int = 2026,
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(
+        require_permissions(
+            Permission.FILINGS_READ.value,
+            agent_tool="query_looker_financial_explore",
+        )
+    ),
 ) -> dict[str, Any]:
     """Query Looker BI semantic explores (yoy_variances, sector_benchmarks, peer_comparison, chunk_health)."""
     record_security_audit_event(
@@ -509,7 +615,7 @@ class FeedbackRequest(BaseModel):
 
 @app.get("/api/v1/companies")
 def get_companies(
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(require_permissions(Permission.FILINGS_READ.value)),
 ) -> dict[str, Any]:
     """List all curated S&P 500 issuers, GICS sectors, and available fiscal years."""
     record_security_audit_event(
@@ -523,7 +629,7 @@ def get_companies(
 @app.post("/api/v1/chat")
 def conversational_rag_chat(
     req: ChatQueryRequest,
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
 ) -> dict[str, Any]:
     """Execute a source-grounded conversational Hybrid RAG query with ReAct trace & fact-check verification."""
     turn_result = run_conversational_rag_turn(
@@ -548,6 +654,9 @@ def conversational_rag_chat(
         "email": user.email,
         "identity_provider": user.identity_provider,
         "iap_assertion_verified": user.iap_assertion_verified,
+        "roles": list(user.roles),
+        "cloud_identity_groups": list(user.cloud_identity_groups),
+        "agent_identity": user.agent_identity,
     }
     return turn_result
 
@@ -594,7 +703,12 @@ def get_cached_section(
     fiscal_year: int = 2026,
     section_id: Literal["item_1a", "item_7"] = "item_7",
     max_chars: int = 32000,
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(
+        require_permissions(
+            Permission.FILINGS_READ.value,
+            agent_tool="load_cached_10k_section",
+        )
+    ),
 ) -> dict[str, Any]:
     """Load a cached 10-K filing section (Item 1A Risk Factors or Item 7 MD&A) for the split-pane source viewer."""
     record_security_audit_event(
@@ -615,7 +729,12 @@ def get_cached_section(
 @app.post("/api/v1/section")
 def post_cached_section(
     req: SectionLoadRequest,
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(
+        require_permissions(
+            Permission.FILINGS_READ.value,
+            agent_tool="load_cached_10k_section",
+        )
+    ),
 ) -> dict[str, Any]:
     """Load a cached 10-K filing section via POST payload."""
     record_security_audit_event(
@@ -636,7 +755,7 @@ def post_cached_section(
 @app.post("/api/v1/feedback")
 def submit_analyst_feedback(
     req: FeedbackRequest,
-    user: AuthenticatedUser = Depends(require_authenticated_user),
+    user: AuthenticatedUser = Depends(require_permissions(Permission.FEEDBACK_SUBMIT.value)),
 ) -> dict[str, Any]:
     """Record analyst thumbs-up/down audit feedback and optional comment."""
     entry = {

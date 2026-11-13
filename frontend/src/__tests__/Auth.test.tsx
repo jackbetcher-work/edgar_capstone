@@ -162,6 +162,7 @@ describe('Google Workspace (Okta SSO) & IAP JWT Bearer Authentication UI', () =>
       ).toBeTruthy()
     })
     expect(screen.getByText('analyst@fde-workspace.corp')).toBeTruthy()
+    expect(screen.getByText('ANALYST')).toBeTruthy()
     expect(seenAuthHeaders['/api/v1/companies']).toBe(
       'Bearer signed.iap.es256.jwt'
     )

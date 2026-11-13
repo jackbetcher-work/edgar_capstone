@@ -13,14 +13,14 @@ from edgar_capstone.agents.callbacks import (
     after_model_fact_check_callback,
     before_agent_telemetry_callback,
     before_model_safety_and_latency_callback,
+    before_tool_agent_identity_callback,
 )
+from edgar_capstone.agents.context_cache_agent import create_context_cache_agent
 from edgar_capstone.agents.financial_analyst import (
     DEFAULT_ANALYST_MODEL,
     create_financial_analyst_agent,
 )
 from edgar_capstone.agents.tools import (
-    ContextCacheTool,
-    HybridSearchTool,
     LookerQueryTool,
     MetricFetchTool,
     VarianceCalculationTool,
@@ -91,6 +91,10 @@ def create_root_orchestrator(
         name="FinancialAnalystAgent",
         model=analyst_model,
     )
+    context_cache_sub_agent = create_context_cache_agent(
+        name="ContextCacheAgent",
+        model=analyst_model,
+    )
     return Agent(
         name=name,
         model=model,
@@ -98,17 +102,16 @@ def create_root_orchestrator(
             "Central supervisor for the SEC EDGAR Natural Language Analyst system. "
             "Routes queries across longitudinal single-company analysis, multi-company "
             "peer comparison, and thematic 10-K trend tracking, orchestrating "
-            "MetricFetchTool, LookerQueryTool, VarianceCalculationTool, and FinancialAnalystAgent."
+            "MetricFetchTool, LookerQueryTool, VarianceCalculationTool, FinancialAnalystAgent, "
+            "and ContextCacheAgent under granular per-agent least-privilege identities."
         ),
         instruction=ROOT_ORCHESTRATOR_INSTRUCTION,
         tools=[
             MetricFetchTool,
             LookerQueryTool,
             VarianceCalculationTool,
-            HybridSearchTool,
-            ContextCacheTool,
         ],
-        sub_agents=[analyst_sub_agent],
+        sub_agents=[analyst_sub_agent, context_cache_sub_agent],
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.1,
             max_output_tokens=4096,
@@ -117,6 +120,7 @@ def create_root_orchestrator(
         before_agent_callback=before_agent_telemetry_callback,
         before_model_callback=before_model_safety_and_latency_callback,
         after_model_callback=after_model_fact_check_callback,
+        before_tool_callback=before_tool_agent_identity_callback,
     )
 
 

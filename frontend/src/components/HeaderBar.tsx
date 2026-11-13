@@ -74,7 +74,11 @@ export function HeaderBar({
           <div
             id="authenticated-user-pill"
             className="hidden lg:inline-flex items-center gap-1.5 px-2 py-0.5 surface-subtle border border-hairline text-[11px] text-ink-secondary"
-            title={`Authenticated (${authenticatedUser.email})`}
+            title={`Authenticated (${authenticatedUser.email})${
+              authenticatedUser.cloud_identity_groups?.length
+                ? ` · Cloud Identity: ${authenticatedUser.cloud_identity_groups.join(', ')}`
+                : ''
+            }`}
           >
             <Lock
               className="w-3 h-3 shrink-0"
@@ -84,6 +88,20 @@ export function HeaderBar({
             <span className="truncate max-w-[190px] text-ink-primary">
               {authenticatedUser.email}
             </span>
+            {(() => {
+              const primaryRole = authenticatedUser.roles.includes('admin')
+                ? 'ADMIN'
+                : authenticatedUser.roles.includes('analyst')
+                  ? 'ANALYST'
+                  : authenticatedUser.roles.includes('viewer')
+                    ? 'VIEWER'
+                    : null
+              return primaryRole ? (
+                <span className="px-1 py-0 text-[9px] font-semibold uppercase tracking-wider border border-hairline text-ink-muted">
+                  {primaryRole}
+                </span>
+              ) : null
+            })()}
           </div>
         )}
 

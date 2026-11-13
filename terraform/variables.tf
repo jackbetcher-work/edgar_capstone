@@ -4,6 +4,12 @@ variable "project_id" {
   default     = "iron-radio-514217-q7"
 }
 
+variable "project_name" {
+  description = "Logical Google Cloud Project Name (used for custom service account alias metadata: sec-analyst-sa@<project_name>.iam.gserviceaccount.com)."
+  type        = string
+  default     = "fde-sec-edgar-sandbox-dev"
+}
+
 variable "region" {
   description = "GCP region for BigQuery dataset, Cloud Resource Connection, and GCS alignment."
   type        = string
@@ -29,13 +35,24 @@ variable "vertex_connection_id" {
 }
 
 variable "analyst_service_account_id" {
-  description = "Account ID for the SEC Analyst runtime service account referenced in project_reference.md."
+  description = "Account ID for the custom SEC Analyst runtime service account (sec-analyst-sa@<project>.iam.gserviceaccount.com)."
   type        = string
   default     = "sec-analyst-sa"
+
+  validation {
+    condition     = var.analyst_service_account_id == "sec-analyst-sa"
+    error_message = "Application must run under custom service account ID 'sec-analyst-sa' (sec-analyst-sa@<project>.iam.gserviceaccount.com)."
+  }
 }
 
 variable "create_analyst_service_account" {
   description = "Whether to create and grant least-privilege BigQuery/GCS IAM roles to sec-analyst-sa."
+  type        = bool
+  default     = true
+}
+
+variable "create_agent_service_accounts" {
+  description = "Whether to provision granular per-agent service accounts enforcing Least Privilege for S2S communication."
   type        = bool
   default     = true
 }
@@ -137,9 +154,63 @@ variable "okta_client_id" {
 }
 
 variable "iap_authorized_principals" {
-  description = "Cloud Identity / Google Workspace SSO principals granted roles/iap.httpsResourceAccessor (e.g. group:sec-edgar-analysts@example.com)."
+  description = "Cloud Identity / Google Workspace SSO group principals granted roles/iap.httpsResourceAccessor (e.g. group:sec-edgar-analysts@example.com)."
   type        = list(string)
   default     = []
+
+  validation {
+    condition     = alltrue([for p in var.iap_authorized_principals : !startswith(lower(trimspace(p)), "user:")])
+    error_message = "Individual user: bindings are prohibited under Cloud Identity Group RBAC; use group:<group-id>@<domain>."
+  }
+}
+
+variable "cloud_identity_domain" {
+  description = "Primary Google Workspace / Cloud Identity domain managing RBAC security groups."
+  type        = string
+  default     = "fde-workspace.corp"
+}
+
+variable "cloud_identity_customer_id" {
+  description = "Optional Google Cloud Identity / Workspace customer ID (e.g. C01234567) when provisioning google_cloud_identity_group resources."
+  type        = string
+  default     = ""
+}
+
+variable "manage_cloud_identity_groups" {
+  description = "Whether Terraform should create the Cloud Identity RBAC groups (requires cloud_identity_customer_id and Workspace group admin permissions)."
+  type        = bool
+  default     = false
+}
+
+variable "enable_cloud_identity_group_iam" {
+  description = "Whether to bind Cloud Identity RBAC group principals (admins, analysts, viewers) onto IAP, BigQuery, Discovery Engine, and Cloud Run."
+  type        = bool
+  default     = false
+}
+
+variable "cloud_identity_rbac_groups" {
+  description = "Group-based RBAC access definitions managed via Google Cloud Identity Groups."
+  type = object({
+    admins   = list(string)
+    analysts = list(string)
+    viewers  = list(string)
+  })
+  default = {
+    admins   = ["sec-edgar-admins@fde-workspace.corp"]
+    analysts = ["sec-edgar-analysts@fde-workspace.corp"]
+    viewers  = ["sec-edgar-viewers@fde-workspace.corp"]
+  }
+
+  validation {
+    condition = alltrue([
+      for g in concat(
+        var.cloud_identity_rbac_groups.admins,
+        var.cloud_identity_rbac_groups.analysts,
+        var.cloud_identity_rbac_groups.viewers
+      ) : !startswith(lower(trimspace(g)), "user:") && length(regexall("@", g)) == 1
+    ])
+    error_message = "Every RBAC definition must be a Cloud Identity Group email (<group>@<domain> or group:<group>@<domain>); individual user: bindings are prohibited."
+  }
 }
 
 variable "labels" {

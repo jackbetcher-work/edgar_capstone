@@ -16,10 +16,12 @@ concurrency:
 
 env:
   GCP_PROJECT_ID: iron-radio-514217-q7
+  GCP_PROJECT_NAME: fde-sec-edgar-sandbox-dev
   GCP_REGION: us-central1
   GAR_REPOSITORY: sec-edgar-repo
   SERVICE_NAME: sec-edgar-analyst
   RUNTIME_SERVICE_ACCOUNT: sec-analyst-sa@iron-radio-514217-q7.iam.gserviceaccount.com
+  CLOUD_IDENTITY_DOMAIN: fde-workspace.corp
   IMAGE_URI: us-central1-docker.pkg.dev/iron-radio-514217-q7/sec-edgar-repo/sec-edgar-analyst
 
 jobs:
@@ -169,7 +171,13 @@ jobs:
           image: ${{ env.IMAGE_URI }}:${{ github.sha }}
           env_vars: |-
             GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}
+            GCP_PROJECT_NAME=${{ env.GCP_PROJECT_NAME }}
             GCP_REGION=${{ env.GCP_REGION }}
+            RUNTIME_SERVICE_ACCOUNT=${{ env.RUNTIME_SERVICE_ACCOUNT }}
+            CLOUD_IDENTITY_DOMAIN=${{ env.CLOUD_IDENTITY_DOMAIN }}
+            ADMIN_CLOUD_IDENTITY_GROUPS=sec-edgar-admins@fde-workspace.corp
+            ANALYST_CLOUD_IDENTITY_GROUPS=sec-edgar-analysts@fde-workspace.corp
+            VIEWER_CLOUD_IDENTITY_GROUPS=sec-edgar-viewers@fde-workspace.corp
             BIGQUERY_DATASET_ID=sec_edgar
             SEC_CORPUS_BUCKET=fde-sec-edgar-sandbox-dev-sec-corpus
           secrets: |-

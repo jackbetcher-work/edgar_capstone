@@ -7,9 +7,14 @@
 
 substitutions:
   _REGION: us-central1
+  _PROJECT_NAME: fde-sec-edgar-sandbox-dev
   _GAR_REPOSITORY: sec-edgar-repo
   _SERVICE_NAME: sec-edgar-analyst
   _RUNTIME_SA: sec-analyst-sa@${PROJECT_ID}.iam.gserviceaccount.com
+  _CLOUD_IDENTITY_DOMAIN: fde-workspace.corp
+  _ADMIN_GROUPS: sec-edgar-admins@fde-workspace.corp
+  _ANALYST_GROUPS: sec-edgar-analysts@fde-workspace.corp
+  _VIEWER_GROUPS: sec-edgar-viewers@fde-workspace.corp
   _BIGQUERY_DATASET: sec_edgar
   _SEC_CORPUS_BUCKET: fde-sec-edgar-sandbox-dev-sec-corpus
 
@@ -90,7 +95,7 @@ steps:
           --min-instances=1 \
           --max-instances=10 \
           --timeout=300 \
-          --set-env-vars="GCP_PROJECT_ID=${PROJECT_ID},GCP_REGION=${_REGION},BIGQUERY_DATASET_ID=${_BIGQUERY_DATASET},SEC_CORPUS_BUCKET=${_SEC_CORPUS_BUCKET}" \
+          --set-env-vars="GCP_PROJECT_ID=${PROJECT_ID},GCP_PROJECT_NAME=${_PROJECT_NAME},GCP_REGION=${_REGION},RUNTIME_SERVICE_ACCOUNT=${_RUNTIME_SA},CLOUD_IDENTITY_DOMAIN=${_CLOUD_IDENTITY_DOMAIN},ADMIN_CLOUD_IDENTITY_GROUPS=${_ADMIN_GROUPS},ANALYST_CLOUD_IDENTITY_GROUPS=${_ANALYST_GROUPS},VIEWER_CLOUD_IDENTITY_GROUPS=${_VIEWER_GROUPS},BIGQUERY_DATASET_ID=${_BIGQUERY_DATASET},SEC_CORPUS_BUCKET=${_SEC_CORPUS_BUCKET}" \
           --set-secrets="SEC_EDGAR_USER_AGENT=sec-edgar-user-agent:latest,GEMINI_API_KEY=sec-edgar-gemini-api-key:latest,INTERNAL_IAP_AUDIENCE=sec-edgar-iap-audience:latest"
 
 images:
