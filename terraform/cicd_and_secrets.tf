@@ -194,6 +194,16 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "EDGAR_ANALYST_MODEL"
+        value = var.financial_reasoning_model
+      }
+
+      env {
+        name  = "EDGAR_FLASH_MODEL"
+        value = var.coding_and_evaluation_model
+      }
+
+      env {
         name  = "IAP_STRICT_MODE"
         value = "true"
       }

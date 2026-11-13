@@ -149,6 +149,52 @@ export interface ResolvedQueryScope {
   section_id: string
   start_year: number
   end_year: number
+  memory_inherited?: boolean
+}
+
+export interface ReActStepMetadata {
+  iteration: number
+  phase: string
+  thought: string
+  action: string
+  observation: string
+  agent: string
+  model_used?: string | null
+  context_tokens: number
+  cached_context_tokens: number
+  context_latency_ms: number
+  duration_ms: number
+  status?: string
+}
+
+export interface NarrativeEvaluationMetadata {
+  evaluator_model: string
+  task_category: string
+  grade: 'pass' | 'needs_revision' | 'fail'
+  overall_score: number
+  numeric_fidelity_score: number
+  citation_grounding_score: number
+  explanation_quality_score: number
+  thematic_consistency_score: number
+  rationale: string
+  context_tokens: number
+  context_latency_ms: number
+  total_latency_ms: number
+}
+
+export interface TurnContextLatencySummary {
+  total_calls: number
+  total_context_tokens: number
+  total_cached_context_tokens: number
+  total_uncached_context_tokens: number
+  mean_context_latency_ms: number
+  p50_context_latency_ms: number
+  p95_context_latency_ms: number
+  mean_total_model_latency_ms: number
+  p95_ttft_ms: number
+  ttft_slo_target_ms: number
+  ttft_slo_compliance_ratio: number
+  total_estimated_cache_latency_saved_ms: number
 }
 
 export interface ChatTurnResponse {
@@ -164,6 +210,19 @@ export interface ChatTurnResponse {
   candidates_searched?: number
   context_cache: ContextCacheInfo | null
   fact_check: FactCheckVerification
+  evaluation?: NarrativeEvaluationMetadata | null
+  react_execution?: {
+    strategy: string
+    iterations: number
+    steps: ReActStepMetadata[]
+  }
+  context_and_memory?: {
+    models: {
+      financial_reasoning_model: string
+      coding_and_evaluation_model: string
+    }
+    turn_context_latency?: TurnContextLatencySummary | null
+  }
   agent_trace: AgentTraceStep[]
   agent_identities_used?: AgentIdentitySummary[]
   total_latency_ms: number

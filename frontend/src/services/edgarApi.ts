@@ -700,6 +700,8 @@ export async function fetchCompaniesCatalog(): Promise<{
   }
 }
 
+const CLIENT_SESSION_ID = `edgar-session-${Date.now().toString(36)}`
+
 export async function executeConversationalRagQuery(
   query: string,
   filters: SearchScopeFilters
@@ -719,6 +721,7 @@ export async function executeConversationalRagQuery(
         start_year: filters.startYear,
         end_year: filters.endYear,
         top_k: filters.topK,
+        session_id: CLIENT_SESSION_ID,
       }),
     })
     if (res.status === 401 || res.status === 403) {

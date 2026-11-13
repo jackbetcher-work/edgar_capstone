@@ -11,6 +11,13 @@ from edgar_capstone.agents.callbacks import (
     _PROMPT_INJECTION_PATTERNS,
     verify_narrative_against_calculations,
 )
+from edgar_capstone.agents.context_memory import (
+    get_context_latency_tracker,
+    get_conversation_memory_manager,
+    get_model_strategy_metadata,
+    resolve_model_for_task,
+)
+from edgar_capstone.agents.react_loop import StructuredReActExecutor
 from edgar_capstone.agents.root_orchestrator import (
     RootOrchestrator,
     classify_query_intent,
@@ -21,6 +28,7 @@ from edgar_capstone.agents.tools import (
     _parse_ticker_list,
     _profile_to_metric_record,
     calculate_period_variances,
+    get_context_cache_runtime_stats,
     load_cached_10k_section,
     query_looker_financial_explore,
     search_10k_chunks_rag,
@@ -194,8 +202,9 @@ def resolve_query_scope(
     section_id: str = "ALL",
     start_year: int = 2024,
     end_year: int = 2026,
+    memory_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Combine explicit UI filter selections with natural-language entity & timeframe detection."""
+    """Combine explicit UI filter selections, natural-language detection, and session memory recall."""
     explicit_tickers = sorted(_parse_ticker_list(tickers))
     detected_tickers: list[str] = []
     for pattern, symbol in _COMPANY_ALIASES:
@@ -206,6 +215,7 @@ def resolve_query_scope(
         detected_tickers.append("V")
 
     effective_tickers = explicit_tickers if explicit_tickers else detected_tickers
+    memory_inherited = False
 
     effective_sector = gics_sector
     if not effective_sector or effective_sector.strip().upper() in ("ALL", "*"):
@@ -215,6 +225,25 @@ def resolve_query_scope(
                 if pattern.search(query):
                     effective_sector = sec_name
                     break
+
+    # Multi-turn follow-up entity recall from session memory when user asks a contextual follow-up
+    broad_corpus_query = bool(
+        re.search(
+            r"\b(?:across\s+all|chunk\s+health|embedding\s+coverage|vector\s+(?:db|database)\s+health)\b",
+            query,
+            re.IGNORECASE,
+        )
+    )
+    if (
+        not effective_tickers
+        and effective_sector == "ALL"
+        and not broad_corpus_query
+        and isinstance(memory_context, dict)
+        and memory_context.get("has_prior_memory")
+        and memory_context.get("remembered_tickers")
+    ):
+        effective_tickers = list(memory_context["remembered_tickers"])
+        memory_inherited = True
 
     effective_section = section_id
     if not effective_section or effective_section.strip().upper() in ("ALL", "*"):
@@ -242,6 +271,16 @@ def resolve_query_scope(
             yr = mentioned_years[0]
             eff_start = max(2020, yr - 1)
             eff_end = yr
+    elif (
+        memory_inherited
+        and start_year == 2024
+        and end_year == 2026
+        and isinstance(memory_context, dict)
+        and memory_context.get("last_start_year")
+        and memory_context.get("last_end_year")
+    ):
+        eff_start = int(memory_context["last_start_year"])
+        eff_end = int(memory_context["last_end_year"])
 
     if eff_start > eff_end:
         eff_start, eff_end = eff_end, eff_start
@@ -253,6 +292,7 @@ def resolve_query_scope(
         "section_id": effective_section,
         "start_year": eff_start,
         "end_year": eff_end,
+        "memory_inherited": memory_inherited,
     }
 
 
@@ -518,8 +558,10 @@ def run_conversational_rag_turn(
     start_year: int = 2024,
     end_year: int = 2026,
     top_k: int = 8,
+    session_id: str | None = None,
+    user_id: str = "analyst",
 ) -> dict[str, Any]:
-    """Execute a full source-grounded Hybrid RAG conversational turn with ReAct trace & fact-checking."""
+    """Execute a full source-grounded Hybrid RAG conversational turn with ReAct loop, context latency tracking, & fact-checking."""
     turn_start = time.perf_counter()
     agent_trace: list[dict[str, Any]] = []
     identities_used_by_agent: dict[str, dict[str, str]] = {}
@@ -531,6 +573,9 @@ def run_conversational_rag_turn(
                 "service_account_email": claims.service_account_email,
                 "spiffe_id": claims.spiffe_id,
             }
+
+    memory_mgr = get_conversation_memory_manager()
+    memory_ctx = memory_mgr.recall_session_context(session_id)
 
     # Step 0: Model Armor Safety & Prompt-Injection Guardrail
     t0 = time.perf_counter()
@@ -584,12 +629,25 @@ def run_conversational_rag_turn(
                     "discrepancies": [],
                     "model_latency_ms": guard_ms,
                 },
+                "react_execution": {
+                    "strategy": "structured_react_loop",
+                    "iterations": 0,
+                    "steps": [],
+                    "variance_evaluations": [],
+                    "cached_10k_explanations": [],
+                },
+                "context_and_memory": {
+                    "models": get_model_strategy_metadata(),
+                    "session_memory": memory_ctx,
+                    "turn_context_latency": None,
+                },
+                "evaluation": None,
                 "agent_trace": agent_trace,
                 "agent_identities_used": list(identities_used_by_agent.values()),
                 "total_latency_ms": round((time.perf_counter() - turn_start) * 1000.0, 2),
             }
 
-    # Step 1: Scope Resolution & RootOrchestrator Intent Routing
+    # Step 1: Scope Resolution, Session Memory Recall & RootOrchestrator Intent Routing
     t1 = time.perf_counter()
     route_claims = authorize_agent_tool_invocation(
         agent_name=RootOrchestrator.name,
@@ -604,13 +662,17 @@ def run_conversational_rag_turn(
         section_id=section_id,
         start_year=start_year,
         end_year=end_year,
+        memory_context=memory_ctx,
     )
     intent = classify_query_intent(query, tickers=scope["tickers"] or None)
+    orchestrator_model = resolve_model_for_task("orchestration")
     route_ms = round((time.perf_counter() - t1) * 1000.0, 2)
+    mem_suffix = " (recalled from session memory)" if scope.get("memory_inherited") else ""
     agent_trace.append(
         {
             "step": 1,
             "agent": RootOrchestrator.name,
+            "model_used": orchestrator_model,
             "agent_service_account": route_claims.service_account_email,
             "spiffe_id": route_claims.spiffe_id,
             "s2s_target_service": route_claims.target_service,
@@ -619,7 +681,7 @@ def run_conversational_rag_turn(
             "status": "completed",
             "duration_ms": route_ms,
             "summary": (
-                f"Routed to '{intent}' · Tickers: {scope['tickers_csv']} · "
+                f"Routed to '{intent}' ({orchestrator_model}) · Tickers: {scope['tickers_csv']}{mem_suffix} · "
                 f"Sector: {scope['gics_sector']} · Section: {scope['section_id']} · "
                 f"FY{scope['start_year']}–FY{scope['end_year']}"
             ),
@@ -778,8 +840,7 @@ def run_conversational_rag_turn(
         }
     )
 
-    # If user ran a broad thematic query without naming specific tickers, compute variances for top cited issuers
-    # ONLY if quantitative metrics are relevant or if single/peer comparison was detected
+    # If user ran a broad query without naming specific tickers, compute variances for top cited issuers
     if not variance_reports and citations and intent in (
         "longitudinal_single_company",
         "multi_company_peer_comparison",
@@ -808,9 +869,107 @@ def run_conversational_rag_turn(
                         f"{rep['ticker']}_{rep['start_year']}_{rep['end_year']}"
                     ] = rep
 
-    # Step 4: Context Cache Warmup for Top Cited 10-K Section (FinancialAnalystAgent -> ContextCacheManager S2S hop)
+    # Step 4 & Step 5: Structured ReAct Execution Loop
+    # (1. Evaluate calculated variances -> 2. Query cached 10-K context for explanation -> 3. Format grounded output + Flash eval)
+    last_cache_claims: VerifiedAgentS2SClaims | None = None
+
+    def _on_cache_s2s_call(_ticker: str, _fy: int, _sec: str) -> None:
+        nonlocal last_cache_claims
+        authorize_agent_s2s_hop(
+            caller_agent="FinancialAnalystAgent",
+            callee_agent="ContextCacheManager",
+        )
+        c_claims = authorize_agent_tool_invocation(
+            agent_name="ContextCacheManager",
+            tool_name="query_cached_10k_context",
+            caller="FinancialAnalystAgent",
+        )
+        _track_agent_identity(c_claims)
+        last_cache_claims = c_claims
+
+    react_result = StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query=query,
+        intent=intent,
+        scope=scope,
+        variance_reports=variance_reports,
+        citations=citations,
+        sector_benchmarks=sector_benchmarks,
+        chunk_health=chunk_health,
+        memory_tokens=int(memory_ctx.get("memory_tokens", 0) or 0),
+        memory_prep_latency_ms=float(memory_ctx.get("memory_lookup_latency_ms", 0.0) or 0.0),
+        on_cache_s2s_call=_on_cache_s2s_call,
+    )
+
+    answer_markdown: str = react_result["answer_markdown"]
+    citations = react_result["citations"]
+    variance_evaluations = react_result["variance_evaluations"]
+    cached_explanations = react_result["cached_explanations"]
+    react_steps = react_result["react_steps"]
+    eval_report = react_result["evaluation_report"]
+    turn_latency_records = react_result["turn_latency_records"]
+    turn_latency_summary = react_result["turn_latency_summary"]
+    reasoning_model: str = react_result["reasoning_model"]
+    evaluation_model: str = react_result["evaluation_model"]
+
+    # Record S2S-attested trace step for ReAct Step 1 (Evaluate Variances via FinancialAnalystAgent)
+    eval_var_step = react_steps[0]
+    agent_trace.append(
+        {
+            "step": len(agent_trace) + 1,
+            "agent": "FinancialAnalystAgent",
+            "model_used": reasoning_model,
+            "agent_service_account": rag_claims.service_account_email,
+            "spiffe_id": rag_claims.spiffe_id,
+            "s2s_target_service": rag_claims.target_service,
+            "s2s_verified": True,
+            "tool": "evaluate_calculated_variances",
+            "status": "completed",
+            "duration_ms": round(eval_var_step.duration_ms, 2),
+            "summary": (
+                f"ReAct [Thought→Action]: Evaluated {len(variance_evaluations)} variance report(s) "
+                f"using `{reasoning_model}` (context_latency={eval_var_step.context_latency_ms:.2f}ms)."
+            ),
+        }
+    )
+
+    # Populate context_cache_info & S2S-attested trace step for ReAct Step 2 (Query Cached 10-K Context)
     context_cache_info: dict[str, Any] | None = None
-    if citations:
+    if cached_explanations and last_cache_claims is not None:
+        primary_exp = cached_explanations[0]
+        cache_hits_count = sum(1 for e in cached_explanations if e.cache_hit)
+        total_cached_tokens = sum(e.token_estimate for e in cached_explanations)
+        total_lookup_ms = round(sum(e.lookup_latency_ms for e in cached_explanations), 2)
+        context_cache_info = {
+            "cache_key": primary_exp.cache_key,
+            "cache_hit": primary_exp.cache_hit,
+            "ticker": primary_exp.ticker,
+            "fiscal_year": primary_exp.fiscal_year,
+            "section_id": primary_exp.section_id,
+            "token_estimate": primary_exp.token_estimate,
+            "sec_filing_url": primary_exp.sec_filing_url,
+            "sections_queried_count": len(cached_explanations),
+            "cache_hits_count": cache_hits_count,
+            "total_section_tokens": total_cached_tokens,
+            "lookup_latency_ms": total_lookup_ms,
+        }
+        agent_trace.append(
+            {
+                "step": len(agent_trace) + 1,
+                "agent": "ContextCacheManager",
+                "agent_service_account": last_cache_claims.service_account_email,
+                "spiffe_id": last_cache_claims.spiffe_id,
+                "s2s_target_service": last_cache_claims.target_service,
+                "s2s_verified": True,
+                "tool": "query_cached_10k_context",
+                "status": "completed",
+                "duration_ms": total_lookup_ms,
+                "summary": (
+                    f"ReAct [Query Cached 10-K]: Queried {len(cached_explanations)} cached 10-K section(s) "
+                    f"(hits={cache_hits_count}/{len(cached_explanations)}, ~{total_cached_tokens:,} tokens)."
+                ),
+            }
+        )
+    elif citations:
         t4 = time.perf_counter()
         authorize_agent_s2s_hop(
             caller_agent="FinancialAnalystAgent",
@@ -839,10 +998,14 @@ def run_conversational_rag_turn(
                 "section_id": cache_res["section_id"],
                 "token_estimate": cache_res["token_estimate"],
                 "sec_filing_url": cache_res["sec_filing_url"],
+                "sections_queried_count": 1,
+                "cache_hits_count": 1 if cache_res["cache_hit"] else 0,
+                "total_section_tokens": cache_res["token_estimate"],
+                "lookup_latency_ms": cache_res.get("lookup_latency_ms", cache_ms),
             }
             agent_trace.append(
                 {
-                    "step": 4,
+                    "step": len(agent_trace) + 1,
                     "agent": "ContextCacheManager",
                     "agent_service_account": cache_claims.service_account_email,
                     "spiffe_id": cache_claims.spiffe_id,
@@ -858,7 +1021,7 @@ def run_conversational_rag_turn(
                 }
             )
 
-    # Step 5: Grounded Narrative Synthesis & Post-Generation Fact-Check Verification
+    # Post-Generation Numeric Fact-Check & Gemini 3.5 Flash Evaluation S2S Attestation
     t5 = time.perf_counter()
     s2s_broker = get_agent_s2s_broker()
     raw_fc_assertion = s2s_broker.mint_s2s_assertion(
@@ -871,40 +1034,57 @@ def run_conversational_rag_turn(
         expected_target_service="fact-check-verification-service",
     )
     _track_agent_identity(fc_claims)
-    answer_markdown = _synthesize_grounded_report(
-        query=query,
-        intent=intent,
-        scope=scope,
-        variance_reports=variance_reports,
-        citations=citations,
-        sector_benchmarks=sector_benchmarks,
-        chunk_health=chunk_health,
+    synth_step = next(
+        (s for s in react_steps if s.phase == "format_grounded_output"), react_steps[-1]
     )
-    synth_ms = round((time.perf_counter() - t5) * 1000.0, 2)
+    fc_ms = round((time.perf_counter() - t5) * 1000.0 + synth_step.duration_ms, 2)
 
     fact_check = verify_narrative_against_calculations(
         response_text=answer_markdown,
         calculated_variances=calculated_variances_map,
         retrieved_citations=citations,
-        model_latency_ms=synth_ms,
+        model_latency_ms=fc_ms,
     )
     agent_trace.append(
         {
             "step": len(agent_trace) + 1,
             "agent": "FinancialAnalystAgent",
+            "model_used": f"{reasoning_model} + {evaluation_model}",
             "agent_service_account": fc_claims.service_account_email,
             "spiffe_id": fc_claims.spiffe_id,
             "s2s_target_service": fc_claims.target_service,
             "s2s_verified": True,
             "tool": "after_model_fact_check_callback",
             "status": "completed" if fact_check.passed else "warning",
-            "duration_ms": synth_ms,
+            "duration_ms": fc_ms,
             "summary": (
-                f"Verified {fact_check.checked_metrics_count} deterministic variance figure(s) and "
-                f"{fact_check.matched_citations_count} inline 10-K citation tag(s) · "
-                f"Passed: {fact_check.passed}."
+                f"Formatted grounded report (`{reasoning_model}`) & evaluated (`{evaluation_model}`: "
+                f"grade={eval_report.grade}, score={eval_report.overall_score:.2f}) · "
+                f"Verified {fact_check.checked_metrics_count} variance figure(s) & "
+                f"{fact_check.matched_citations_count} citation tag(s) · Passed: {fact_check.passed}."
             ),
         }
+    )
+
+    # Persist turn into ConversationMemoryManager (with automatic Gemini 3.5 Flash compaction if over threshold)
+    variance_highlights = [
+        ev.material_findings[0]
+        for ev in variance_evaluations
+        if ev.material_findings
+    ]
+    memory_persist = memory_mgr.record_turn(
+        session_id=session_id,
+        user_id=user_id,
+        query=query,
+        intent=intent,
+        tickers=scope["tickers"],
+        gics_sector=scope["gics_sector"],
+        start_year=scope["start_year"],
+        end_year=scope["end_year"],
+        variance_highlights=variance_highlights,
+        cited_chunk_ids=[c["chunk_id"] for c in citations],
+        cached_10k_keys=[e.cache_key for e in cached_explanations],
+        answer_markdown=answer_markdown,
     )
 
     total_latency_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
@@ -921,6 +1101,33 @@ def run_conversational_rag_turn(
         "candidates_searched": candidates_searched,
         "context_cache": context_cache_info,
         "fact_check": fact_check.model_dump(mode="json"),
+        "evaluation": eval_report.model_dump(mode="json"),
+        "react_execution": {
+            "strategy": "structured_react_loop",
+            "iterations": len(react_steps),
+            "steps": [s.model_dump(mode="json") for s in react_steps],
+            "variance_evaluations": [
+                v.model_dump(mode="json") for v in variance_evaluations
+            ],
+            "cached_10k_explanations": [
+                e.model_dump(mode="json") for e in cached_explanations
+            ],
+        },
+        "context_and_memory": {
+            "models": get_model_strategy_metadata(),
+            "session_memory": {
+                **memory_ctx,
+                "persistence": memory_persist,
+            },
+            "turn_context_latency": turn_latency_summary.model_dump(mode="json"),
+            "model_call_records": [
+                r.model_dump(mode="json") for r in turn_latency_records
+            ],
+            "global_context_latency": (
+                get_context_latency_tracker().summarize().model_dump(mode="json")
+            ),
+            "context_cache_runtime": get_context_cache_runtime_stats(),
+        },
         "agent_trace": agent_trace,
         "agent_identities_used": list(identities_used_by_agent.values()),
         "total_latency_ms": total_latency_ms,

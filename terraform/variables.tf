@@ -75,6 +75,18 @@ variable "embedding_model" {
   default     = "text-embedding-005"
 }
 
+variable "financial_reasoning_model" {
+  description = "Gemini Pro model used by FinancialAnalystAgent and RootOrchestrator for complex multi-period financial reasoning."
+  type        = string
+  default     = "gemini-2.5-pro"
+}
+
+variable "coding_and_evaluation_model" {
+  description = "Gemini Flash model used for LLM-as-a-Judge evaluation, coding assistance, and context compaction."
+  type        = string
+  default     = "gemini-3.5-flash"
+}
+
 variable "embedding_dimensions" {
   description = "Dimensionality of dense vector embeddings stored in filing_chunks and Vertex AI Vector Search."
   type        = number

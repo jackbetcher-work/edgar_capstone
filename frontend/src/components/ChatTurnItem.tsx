@@ -170,6 +170,15 @@ export function ChatTurnItem({
                 </span>
               )}
 
+              {resp.context_and_memory?.turn_context_latency && (
+                <span
+                  className="px-1.5 py-0.2 text-[10px] uppercase text-ink-secondary border border-hairline"
+                  title={`Reasoning: ${resp.context_and_memory.models.financial_reasoning_model} | Eval/Coding: ${resp.context_and_memory.models.coding_and_evaluation_model} | Cached Tokens: ${resp.context_and_memory.turn_context_latency.total_cached_context_tokens}`}
+                >
+                  ReAct:{resp.react_execution?.iterations ?? resp.agent_trace.length} · CTX:{resp.context_and_memory.turn_context_latency.mean_context_latency_ms.toFixed(1)}ms
+                </span>
+              )}
+
               {resp.citations.length > 0 && (
                 <button
                   id={`btn-focus-citations-${turn.id}`}

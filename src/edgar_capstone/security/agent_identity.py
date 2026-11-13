@@ -119,6 +119,7 @@ TOOL_TARGET_SERVICE_MAP: dict[str, str] = {
     "calculate_period_variances": "variance-calculation-service",
     "search_10k_chunks_rag": "hybrid-rag-search-service",
     "load_cached_10k_section": "context-cache-service",
+    "query_cached_10k_context": "context-cache-service",
     "before_model_safety_and_latency_callback": "model-armor-service",
     "after_model_fact_check_callback": "fact-check-verification-service",
 }
@@ -129,6 +130,8 @@ AGENT_TARGET_SERVICE_IDS: dict[str, str] = {
     "ContextCacheManager": "context-cache-agent",
     "ContextCacheAgent": "context-cache-agent",
     "ModelArmorGuardrail": "model-armor-guardrail",
+    "NarrativeEvaluatorAgent": "fact-check-verification-service",
+    "CodingAssistantAgent": "financial-analyst-agent",
 }
 
 PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
@@ -207,6 +210,7 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
                 "query_looker_financial_explore",
                 "search_10k_chunks_rag",
                 "load_cached_10k_section",
+                "query_cached_10k_context",
             }
         ),
         api_permissions=frozenset(
@@ -246,7 +250,7 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
                 "gcs-sec-corpus-bucket",
             }
         ),
-        allowed_tools=frozenset({"load_cached_10k_section"}),
+        allowed_tools=frozenset({"load_cached_10k_section", "query_cached_10k_context"}),
         api_permissions=frozenset({Permission.FILINGS_READ.value}),
         gcp_iam_roles=(
             "roles/storage.objectViewer",
@@ -280,9 +284,11 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
     ),
 }
 
-# Alias ADK `ContextCacheAgent` to the shared `context-cache-agent-sa` identity spec
+# Alias specialist ADK sub-agents to their corresponding least-privilege identity specs
 AGENT_NAME_ALIASES: dict[str, str] = {
     "ContextCacheAgent": "ContextCacheManager",
+    "NarrativeEvaluatorAgent": "ModelArmorGuardrail",
+    "CodingAssistantAgent": "FinancialAnalystAgent",
 }
 
 SERVICE_ACCOUNT_ID_TO_AGENT: dict[str, AgentIdentitySpec] = {

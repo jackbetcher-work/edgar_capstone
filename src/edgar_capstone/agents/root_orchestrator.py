@@ -7,6 +7,7 @@ import re
 from typing import Literal
 
 from google.adk.agents import Agent
+from google.adk.planners import PlanReActPlanner
 from google.genai import types as genai_types
 
 from edgar_capstone.agents.callbacks import (
@@ -16,6 +17,12 @@ from edgar_capstone.agents.callbacks import (
     before_tool_agent_identity_callback,
 )
 from edgar_capstone.agents.context_cache_agent import create_context_cache_agent
+from edgar_capstone.agents.context_memory import after_agent_memory_callback
+from edgar_capstone.agents.evaluation_and_coding import (
+    DEFAULT_FLASH_MODEL,
+    create_coding_assistant_agent,
+    create_narrative_evaluator_agent,
+)
 from edgar_capstone.agents.financial_analyst import (
     DEFAULT_ANALYST_MODEL,
     create_financial_analyst_agent,
@@ -37,8 +44,8 @@ QueryIntentType = Literal[
     "chunk_health_monitoring",
 ]
 
-ROOT_ORCHESTRATOR_INSTRUCTION = """You are the RootOrchestrator for the SEC EDGAR Natural Language Analyst system.
-You supervise financial variance calculations, Looker/BigQuery metric retrieval, metadata-filtered 10-K RAG search, and the specialized `FinancialAnalystAgent`.
+ROOT_ORCHESTRATOR_INSTRUCTION = """You are the RootOrchestrator (`gemini-2.5-pro`) for the SEC EDGAR Natural Language Analyst system.
+You employ a structured ReAct execution loop to supervise deterministic financial variance calculations, Looker/BigQuery metric retrieval, cached 10-K reasoning (`FinancialAnalystAgent` on `gemini-2.5-pro`), and evaluation / coding specialists (`NarrativeEvaluatorAgent` and `CodingAssistantAgent` on `gemini-3.5-flash`).
 
 ### 1. Intent Routing & Classification
 Classify every incoming analyst request into one of the core workflows:
@@ -47,9 +54,10 @@ Classify every incoming analyst request into one of the core workflows:
 - **Thematic Trend Tracking**: Longitudinal tracking of qualitative shifts (e.g., AI risk disclosures, export controls, cybersecurity, supply chain risks) across multiple fiscal periods or GICS sectors in Item 1A (Risk Factors) and Item 7 (MD&A).
 - **Vector Database & Chunk Health Diagnostics**: Queries inspecting the health, embedding coverage, or section completeness of the 10-K RAG vector database via `query_looker_financial_explore(explore_name='chunk_health', ...)`.
 
-### 2. Orchestration & Tool Execution Rules
-- **Deterministic Calculations First**: Use `calculate_period_variances`, `fetch_financial_metrics`, and `query_looker_financial_explore` (`MetricFetchTool` / `LookerQueryTool`) to retrieve authoritative structured metrics and YoY variances before synthesizing explanations.
-- **Delegate Deep 10-K Reasoning to `FinancialAnalystAgent`**: For narrative variance explanations, thematic 10-K comparisons, or deep section extraction, delegate to `FinancialAnalystAgent` or invoke `search_10k_chunks_rag` and `load_cached_10k_section` so every claim is backed by grounded 10-K citations.
+### 2. Structured ReAct & Dual-Model Routing Rules
+- **Evaluate Variances First**: Invoke `calculate_period_variances`, `fetch_financial_metrics`, and `query_looker_financial_explore` (`MetricFetchTool` / `LookerQueryTool`) to obtain authoritative structured metrics and YoY variances before synthesizing explanations.
+- **Query Cached 10-K Context (`gemini-2.5-pro`)**: Delegate deep 10-K variance explanation and cross-filing synthesis to `FinancialAnalystAgent` (with `ContextCacheAgent` warming cached 10-K sections).
+- **Flash Evaluation & Coding Assistance (`gemini-3.5-flash`)**: Delegate narrative quality grading to `NarrativeEvaluatorAgent` and SQL / Python / LookML code generation to `CodingAssistantAgent`.
 - **100% Numeric & Citation Fidelity**: Never invent or alter numbers returned by the calculation engine. Ensure every 10-K claim includes its inline citation `[TICKER FYxxxx | Section Title | chunk_id](sec_filing_url)`.
 """
 
@@ -85,25 +93,35 @@ def create_root_orchestrator(
     name: str = "RootOrchestrator",
     model: str = DEFAULT_ORCHESTRATOR_MODEL,
     analyst_model: str = DEFAULT_ANALYST_MODEL,
+    flash_model: str = DEFAULT_FLASH_MODEL,
 ) -> Agent:
-    """Create the central `RootOrchestrator` ADK supervisor agent with sub-agents and tools."""
+    """Create the central `RootOrchestrator` ADK supervisor agent with ReAct planner and Pro/Flash sub-agents."""
     analyst_sub_agent = create_financial_analyst_agent(
         name="FinancialAnalystAgent",
         model=analyst_model,
     )
     context_cache_sub_agent = create_context_cache_agent(
         name="ContextCacheAgent",
-        model=analyst_model,
+        model=flash_model,
+    )
+    evaluator_sub_agent = create_narrative_evaluator_agent(
+        name="NarrativeEvaluatorAgent",
+        model=flash_model,
+    )
+    coding_sub_agent = create_coding_assistant_agent(
+        name="CodingAssistantAgent",
+        model=flash_model,
     )
     return Agent(
         name=name,
         model=model,
+        planner=PlanReActPlanner(),
         description=(
-            "Central supervisor for the SEC EDGAR Natural Language Analyst system. "
-            "Routes queries across longitudinal single-company analysis, multi-company "
-            "peer comparison, and thematic 10-K trend tracking, orchestrating "
-            "MetricFetchTool, LookerQueryTool, VarianceCalculationTool, FinancialAnalystAgent, "
-            "and ContextCacheAgent under granular per-agent least-privilege identities."
+            "Central Gemini 2.5 Pro ReAct supervisor for the SEC EDGAR Natural Language Analyst system. "
+            "Routes queries across longitudinal single-company analysis, multi-company peer comparison, "
+            "and thematic 10-K trend tracking, orchestrating FinancialAnalystAgent (gemini-2.5-pro) alongside "
+            "ContextCacheAgent, NarrativeEvaluatorAgent, and CodingAssistantAgent (gemini-3.5-flash) "
+            "under granular per-agent least-privilege identities."
         ),
         instruction=ROOT_ORCHESTRATOR_INSTRUCTION,
         tools=[
@@ -111,13 +129,19 @@ def create_root_orchestrator(
             LookerQueryTool,
             VarianceCalculationTool,
         ],
-        sub_agents=[analyst_sub_agent, context_cache_sub_agent],
+        sub_agents=[
+            analyst_sub_agent,
+            context_cache_sub_agent,
+            evaluator_sub_agent,
+            coding_sub_agent,
+        ],
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.1,
             max_output_tokens=4096,
         ),
         output_key="orchestrator_response",
         before_agent_callback=before_agent_telemetry_callback,
+        after_agent_callback=after_agent_memory_callback,
         before_model_callback=before_model_safety_and_latency_callback,
         after_model_callback=after_model_fact_check_callback,
         before_tool_callback=before_tool_agent_identity_callback,

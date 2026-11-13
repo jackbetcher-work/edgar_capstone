@@ -17,6 +17,14 @@ from edgar_capstone.agents.chat_engine import (
     list_curated_companies,
     run_conversational_rag_turn,
 )
+from edgar_capstone.agents.context_memory import (
+    get_context_latency_tracker,
+    get_model_strategy_metadata,
+)
+from edgar_capstone.agents.evaluation_and_coding import (
+    evaluate_variance_explanation,
+    generate_financial_coding_assistance,
+)
 from edgar_capstone.agents.root_orchestrator import (
     RootOrchestrator,
     classify_query_intent,
@@ -26,6 +34,7 @@ from edgar_capstone.agents.tools import (
     _load_all_profiles_cached,
     calculate_period_variances,
     fetch_financial_metrics,
+    get_context_cache_runtime_stats,
     load_cached_10k_section,
     query_looker_financial_explore,
     search_10k_chunks_rag,
@@ -141,6 +150,7 @@ class DevWorkspaceSsoLoginRequest(BaseModel):
 def health() -> dict[str, Any]:
     """Cloud Run external health check and internal probe endpoint."""
     runtime_sa = RuntimeServiceAccountConfig.from_env()
+    model_meta = get_model_strategy_metadata()
     return {
         "status": "ok",
         "service": os.environ.get("K_SERVICE", "sec-edgar-analyst"),
@@ -149,6 +159,11 @@ def health() -> dict[str, Any]:
         "runtime_service_account_project_name": runtime_sa.project_name_alias_email,
         "root_agent": RootOrchestrator.name,
         "sub_agents": [sa.name for sa in RootOrchestrator.sub_agents],
+        "reasoning_strategy": "structured_react_loop",
+        "models": {
+            "financial_reasoning": model_meta["financial_reasoning_model"],
+            "coding_and_evaluation": model_meta["coding_and_evaluation_model"],
+        },
         "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
         "iap_jwt_auth_enabled": True,
     }
@@ -597,6 +612,24 @@ class ChatQueryRequest(BaseModel):
     start_year: int = Field(2024, ge=2015, le=2035)
     end_year: int = Field(2026, ge=2015, le=2035)
     top_k: int = Field(8, ge=1, le=25)
+    session_id: str | None = Field(default=None, max_length=128)
+
+
+class EvaluationRequest(BaseModel):
+    query: str = Field(..., min_length=2)
+    response_markdown: str = Field(..., min_length=2)
+    variance_reports: list[dict[str, Any]] = Field(default_factory=list)
+    citations: list[dict[str, Any]] = Field(default_factory=list)
+    cached_explanations_count: int = Field(default=0, ge=0)
+
+
+class CodingAssistRequest(BaseModel):
+    prompt: str = Field(..., min_length=2, max_length=2000)
+    language: Literal["sql", "python", "lookml"] = Field("sql")
+    tickers: str = Field("NVDA,AAPL")
+    start_year: int = Field(2024, ge=2015, le=2035)
+    end_year: int = Field(2026, ge=2015, le=2035)
+    dataset_id: str = Field("sec_edgar", min_length=1, max_length=128)
 
 
 class SectionLoadRequest(BaseModel):
@@ -640,6 +673,8 @@ def conversational_rag_chat(
         start_year=req.start_year,
         end_year=req.end_year,
         top_k=req.top_k,
+        session_id=req.session_id,
+        user_id=user.email,
     )
     resolved_tickers = turn_result.get("resolved_scope", {}).get("tickers") or req.tickers
     record_security_audit_event(
@@ -659,6 +694,83 @@ def conversational_rag_chat(
         "agent_identity": user.agent_identity,
     }
     return turn_result
+
+
+@app.get("/api/v1/telemetry/context-latency")
+def get_context_latency_telemetry(
+    limit: int = Query(25, ge=1, le=250),
+    model: str | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_permissions(Permission.FILINGS_READ.value)),
+) -> dict[str, Any]:
+    """Return model-call context latency telemetry, KV-cache prefill savings, and Pro/Flash routing strategy."""
+    record_security_audit_event(
+        event_type="context_latency_telemetry_read",
+        user=user,
+        resource="/api/v1/telemetry/context-latency",
+        detail=f"limit={limit} model={model or 'ALL'}",
+    )
+    tracker = get_context_latency_tracker()
+    records = tracker.recent_records(limit=limit, model_name=model)
+    return {
+        "status": "ok",
+        "models": get_model_strategy_metadata(),
+        "context_cache_runtime": get_context_cache_runtime_stats(),
+        "summary": tracker.summarize().model_dump(mode="json"),
+        "record_count": len(records),
+        "recent_records": [r.model_dump(mode="json") for r in records],
+    }
+
+
+@app.post("/api/v1/evaluate")
+def evaluate_grounded_narrative(
+    req: EvaluationRequest,
+    user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
+) -> dict[str, Any]:
+    """Run Gemini 3.5 Flash LLM-as-a-Judge evaluation on a financial variance explanation."""
+    report = evaluate_variance_explanation(
+        query=req.query,
+        response_markdown=req.response_markdown,
+        variance_reports=req.variance_reports,
+        citations=req.citations,
+        cached_explanations_count=req.cached_explanations_count,
+    )
+    record_security_audit_event(
+        event_type="flash_narrative_evaluation",
+        user=user,
+        resource="/api/v1/evaluate",
+        detail=f"model={report.evaluator_model} grade={report.grade} score={report.overall_score}",
+    )
+    return {
+        "status": "success",
+        "evaluation": report.model_dump(mode="json"),
+    }
+
+
+@app.post("/api/v1/coding-assist")
+def coding_assistance_endpoint(
+    req: CodingAssistRequest,
+    user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
+) -> dict[str, Any]:
+    """Run Gemini 3.5 Flash analytical coding assistance (SQL, Python variance audit, or LookML)."""
+    report = generate_financial_coding_assistance(
+        prompt=req.prompt,
+        language=req.language,
+        tickers=req.tickers,
+        start_year=req.start_year,
+        end_year=req.end_year,
+        dataset_id=req.dataset_id,
+    )
+    record_security_audit_event(
+        event_type="flash_coding_assistance",
+        user=user,
+        resource="/api/v1/coding-assist",
+        tickers=report.tickers_referenced,
+        detail=f"model={report.assistant_model} language={report.language}",
+    )
+    return {
+        "status": "success",
+        "coding_assistance": report.model_dump(mode="json"),
+    }
 
 
 def _enrich_section_response(

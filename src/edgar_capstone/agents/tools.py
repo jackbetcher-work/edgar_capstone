@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 from google.adk.tools import FunctionTool, ToolContext
@@ -39,6 +40,37 @@ _WORD_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
 
 # In-memory process cache for context caching simulation & fast corpus access
 _SESSION_10K_CONTEXT_CACHE: dict[str, dict[str, Any]] = {}
+_CONTEXT_CACHE_RUNTIME_COUNTERS: dict[str, float | int] = {
+    "hits": 0,
+    "misses": 0,
+    "cached_tokens_saved": 0,
+    "total_hit_latency_ms": 0.0,
+    "total_miss_latency_ms": 0.0,
+}
+
+
+def get_context_cache_runtime_stats() -> dict[str, Any]:
+    """Return runtime Context Cache hit/miss counters, cached keys, and latency telemetry."""
+    hits = int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("hits", 0))
+    misses = int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("misses", 0))
+    total = hits + misses
+    hit_ms = float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_hit_latency_ms", 0.0))
+    miss_ms = float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_miss_latency_ms", 0.0))
+    return {
+        "cached_sections_count": len(_SESSION_10K_CONTEXT_CACHE),
+        "cached_keys": sorted(_SESSION_10K_CONTEXT_CACHE.keys()),
+        "total_cached_tokens_resident": sum(
+            int(v.get("token_estimate", 0)) for v in _SESSION_10K_CONTEXT_CACHE.values()
+        ),
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
+        "cached_tokens_saved": int(
+            _CONTEXT_CACHE_RUNTIME_COUNTERS.get("cached_tokens_saved", 0)
+        ),
+        "mean_hit_lookup_latency_ms": round(hit_ms / hits, 3) if hits > 0 else 0.0,
+        "mean_miss_load_latency_ms": round(miss_ms / misses, 3) if misses > 0 else 0.0,
+    }
 
 
 def _get_dataset_dir() -> Path:
@@ -785,7 +817,7 @@ def load_cached_10k_section(
 ) -> dict[str, Any]:
     """Loads and caches a company's 10-K section (Item 1A Risk Factors or Item 7 MD&A) via the Context Cache Manager.
 
-    Tracks Vertex AI Context Cache hits/misses and estimated cached-token cost discounts.
+    Tracks Vertex AI Context Cache hits/misses, lookup latency, and estimated cached-token cost discounts.
 
     Args:
         ticker: Company ticker symbol (e.g., 'NVDA', 'AAPL').
@@ -794,8 +826,9 @@ def load_cached_10k_section(
         max_chars: Maximum characters of section text to return in the tool response (e.g., 12000).
 
     Returns:
-        Dictionary with 'status', 'cache_hit', 'token_estimate', 'sec_filing_url', and grounded Markdown 'content'.
+        Dictionary with 'status', 'cache_hit', 'token_estimate', 'lookup_latency_ms', 'sec_filing_url', and grounded Markdown 'content'.
     """
+    t0 = time.perf_counter()
     dataset_dir = _get_dataset_dir()
     norm_ticker = ticker.strip().upper().replace(".", "-")
     sec_key = section_id.strip().lower()
@@ -847,6 +880,29 @@ def load_cached_10k_section(
     entry = _SESSION_10K_CONTEXT_CACHE[cache_id]
     effective_max = max(500, min(int(max_chars), 50000))
     excerpt = str(entry["full_text"])[:effective_max]
+    lookup_latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+
+    saved_tokens_delta = int(entry["token_estimate"] * 0.75) if cache_hit else 0
+    if cache_hit:
+        _CONTEXT_CACHE_RUNTIME_COUNTERS["hits"] = (
+            int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("hits", 0)) + 1
+        )
+        _CONTEXT_CACHE_RUNTIME_COUNTERS["cached_tokens_saved"] = (
+            int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("cached_tokens_saved", 0))
+            + saved_tokens_delta
+        )
+        _CONTEXT_CACHE_RUNTIME_COUNTERS["total_hit_latency_ms"] = (
+            float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_hit_latency_ms", 0.0))
+            + lookup_latency_ms
+        )
+    else:
+        _CONTEXT_CACHE_RUNTIME_COUNTERS["misses"] = (
+            int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("misses", 0)) + 1
+        )
+        _CONTEXT_CACHE_RUNTIME_COUNTERS["total_miss_latency_ms"] = (
+            float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_miss_latency_ms", 0.0))
+            + lookup_latency_ms
+        )
 
     if tool_context is not None and hasattr(tool_context, "state"):
         stats = dict(
@@ -857,11 +913,13 @@ def load_cached_10k_section(
         )
         if cache_hit:
             stats["hits"] = int(stats.get("hits", 0)) + 1
-            stats["cached_tokens_saved"] = int(stats.get("cached_tokens_saved", 0)) + int(
-                entry["token_estimate"] * 0.75
+            stats["cached_tokens_saved"] = (
+                int(stats.get("cached_tokens_saved", 0)) + saved_tokens_delta
             )
         else:
             stats["misses"] = int(stats.get("misses", 0)) + 1
+        stats["last_lookup_latency_ms"] = lookup_latency_ms
+        stats["last_cache_key"] = cache_id
         tool_context.state["context_cache_stats"] = stats
 
     return {
@@ -874,10 +932,153 @@ def load_cached_10k_section(
         "fiscal_year": entry["fiscal_year"],
         "section_id": entry["section_id"],
         "token_estimate": entry["token_estimate"],
+        "lookup_latency_ms": lookup_latency_ms,
         "sec_filing_url": entry["sec_filing_url"],
         "unstructured_gcs_uri": entry["unstructured_gcs_uri"],
         "content": excerpt,
         "truncated": len(str(entry["full_text"])) > effective_max,
+    }
+
+
+@with_tool_resilience(tool_name="query_cached_10k_context")
+def query_cached_10k_context(
+    ticker: str,
+    fiscal_year: int,
+    section_id: str,
+    variance_query: str,
+    max_passages: int,
+    tool_context: ToolContext | None = None,
+) -> dict[str, Any]:
+    """Queries a company's cached 10-K section (Item 7 MD&A or Item 1A Risk Factors) for variance explanations.
+
+    Warms the 10-K section in the Context Cache Manager on first access (or hits resident cache),
+    ranks paragraphs against the evaluated financial variance drivers, and links matching chunk IDs.
+
+    Args:
+        ticker: Company ticker symbol (e.g., 'NVDA', 'AAPL').
+        fiscal_year: Reporting fiscal year (e.g., 2026).
+        section_id: 10-K section to query: 'item_7' (MD&A) or 'item_1a' (Risk Factors).
+        variance_query: Variance explanation query (e.g., 'revenue growth operating margin expansion Blackwell').
+        max_passages: Maximum number of grounded explanation passages to return (1 to 10).
+
+    Returns:
+        Dictionary with 'status', 'cache_hit', 'token_estimate', 'lookup_latency_ms', 'explanations', and 'matched_chunk_ids'.
+    """
+    t0 = time.perf_counter()
+    cached_res = load_cached_10k_section(
+        ticker=ticker,
+        fiscal_year=fiscal_year,
+        section_id=section_id,
+        max_chars=50000,
+        tool_context=tool_context,
+    )
+    if cached_res.get("status") != "success":
+        return cached_res
+
+    full_text = str(cached_res.get("content") or "")
+    raw_blocks = [
+        blk.strip()
+        for blk in re.split(r"\n\s*\n+", full_text)
+        if len(blk.strip()) >= 45 and not blk.strip().startswith("#")
+    ]
+    if not raw_blocks and full_text.strip():
+        raw_blocks = [full_text.strip()[:800]]
+
+    q_terms = set(_WORD_TOKEN_RE.findall(variance_query.lower()))
+    q_vec = np.asarray(generate_deterministic_embedding(variance_query), dtype=np.float32)
+
+    scored_blocks: list[tuple[float, str]] = []
+    for blk in raw_blocks:
+        blk_vec = np.asarray(generate_deterministic_embedding(blk[:600]), dtype=np.float32)
+        dense_sim = float(blk_vec @ q_vec)
+        blk_lower = blk.lower()
+        lex_boost = 0.0
+        if q_terms:
+            hits = sum(1 for term in q_terms if term in blk_lower)
+            lex_boost = 0.40 * (hits / len(q_terms))
+        scored_blocks.append((dense_sim + lex_boost, blk))
+
+    scored_blocks.sort(key=lambda item: item[0], reverse=True)
+    eff_limit = max(1, min(int(max_passages), 10))
+    top_passages = [text for _, text in scored_blocks[:eff_limit]]
+
+    # Link cached section explanations to canonical chunk IDs for split-pane traceability
+    dataset_dir = _get_dataset_dir()
+    rows, _ = _load_all_chunks_cached(str(dataset_dir))
+    norm_ticker = cached_res["ticker"]
+    sec_key = cached_res["section_id"]
+    matched_chunk_ids: list[str] = []
+    matched_citations: list[dict[str, Any]] = []
+
+    section_chunks = [
+        r
+        for r in rows
+        if str(r.get("ticker", "")).upper() == norm_ticker.upper()
+        and int(r.get("fiscal_year", 0)) == int(fiscal_year)
+        and str(r.get("section_id", "")).lower() == sec_key
+    ]
+    for passage in top_passages:
+        snippet_probe = passage[:90].lower()
+        best_chunk = next(
+            (
+                r
+                for r in section_chunks
+                if snippet_probe[:48] in str(r.get("chunk_text", "")).lower()
+                or str(r.get("chunk_text", ""))[:48].lower() in passage.lower()
+            ),
+            section_chunks[0] if section_chunks else None,
+        )
+        if best_chunk is not None:
+            cid = str(best_chunk["chunk_id"])
+            if cid not in matched_chunk_ids:
+                matched_chunk_ids.append(cid)
+                cit = GroundedCitation(
+                    chunk_id=cid,
+                    profile_id=str(best_chunk["profile_id"]),
+                    ticker=str(best_chunk["ticker"]),
+                    company_name=str(best_chunk["company_name"]),
+                    gics_sector=str(best_chunk.get("gics_sector") or "Unknown"),
+                    fiscal_year=int(best_chunk["fiscal_year"]),
+                    section_id=best_chunk["section_id"],
+                    section_title=str(best_chunk.get("section_title") or sec_key),
+                    excerpt=str(best_chunk["chunk_text"]),
+                    sec_filing_url=str(best_chunk.get("sec_filing_url") or ""),
+                    unstructured_gcs_uri=str(best_chunk.get("unstructured_gcs_uri") or ""),
+                    score=0.95,
+                )
+                matched_citations.append(cit.model_dump(mode="json"))
+
+    if tool_context is not None and hasattr(tool_context, "state") and matched_citations:
+        existing_cits = list(tool_context.state.get("retrieved_citations", []))
+        seen_ids = {c.get("chunk_id") for c in existing_cits}
+        for mc in matched_citations:
+            if mc["chunk_id"] not in seen_ids:
+                existing_cits.append(mc)
+                seen_ids.add(mc["chunk_id"])
+        tool_context.state["retrieved_citations"] = existing_cits
+
+    total_lookup_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    section_title = (
+        "Item 7. Management's Discussion and Analysis"
+        if sec_key == "item_7"
+        else "Item 1A. Risk Factors"
+    )
+    return {
+        "status": "success",
+        "cache_key": cached_res["cache_key"],
+        "cache_hit": cached_res["cache_hit"],
+        "profile_id": cached_res["profile_id"],
+        "ticker": norm_ticker,
+        "company_name": cached_res["company_name"],
+        "fiscal_year": int(fiscal_year),
+        "section_id": sec_key,
+        "section_title": section_title,
+        "token_estimate": cached_res["token_estimate"],
+        "lookup_latency_ms": total_lookup_ms,
+        "sec_filing_url": cached_res["sec_filing_url"],
+        "explanations": top_passages,
+        "matched_chunk_ids": matched_chunk_ids,
+        "matched_citations": matched_citations,
     }
 
 
@@ -887,3 +1088,4 @@ LookerQueryTool = FunctionTool(query_looker_financial_explore)
 VarianceCalculationTool = FunctionTool(calculate_period_variances)
 HybridSearchTool = FunctionTool(search_10k_chunks_rag)
 ContextCacheTool = FunctionTool(load_cached_10k_section)
+QueryCached10KTool = FunctionTool(query_cached_10k_context)
