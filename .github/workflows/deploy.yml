@@ -24,10 +24,10 @@ env:
 
 jobs:
   # ============================================================================
-  # Stage 1: Test — Secret leak verification, Terraform lint, and pytest suite
+  # Stage 1: Test — Secret leak verification, Terraform lint, backend & frontend
   # ============================================================================
   test:
-    name: Test Stage - Secret Scan, Lint & Unit Tests
+    name: Test Stage - Secret Scan, Lint, Unit Tests & Frontend Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -60,6 +60,21 @@ jobs:
       - name: Run automated pytest suite
         run: |
           pytest -v --tb=short
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "frontend/package-lock.json"
+
+      - name: Install, lint, test, and build frontend bundle
+        run: |
+          npm --prefix frontend ci --no-audit --no-fund
+          npm --prefix frontend run lint
+          npm --prefix frontend test
+          npm --prefix frontend run build
+          test -f frontend/dist/index.html
 
   # ============================================================================
   # Stage 2: Build — Keyless WIF auth, Secret Manager lookup & Docker image push
@@ -97,8 +112,10 @@ jobs:
         run: |
           gcloud auth configure-docker "${{ env.GCP_REGION }}-docker.pkg.dev" --quiet
 
-      - name: Build and push container image (zero embedded secrets)
+      - name: Build and push container image with compiled frontend (zero embedded secrets)
         id: build_image
+        env:
+          DOCKER_BUILDKIT: "1"
         run: |
           test -n "${{ steps.secrets.outputs.SEC_EDGAR_USER_AGENT }}"
           IMAGE_TAG="${{ env.IMAGE_URI }}:${{ github.sha }}"
@@ -108,6 +125,7 @@ jobs:
             --tag "${IMAGE_TAG}" \
             --tag "${IMAGE_LATEST}" \
             .
+          docker run --rm --entrypoint test "${IMAGE_TAG}" -f /app/frontend/dist/index.html
           docker push "${IMAGE_TAG}"
           docker push "${IMAGE_LATEST}"
           echo "image_uri=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
@@ -178,9 +196,12 @@ jobs:
           id_token_audience: ${{ steps.deploy_cloud_run.outputs.url }}
           id_token_include_email: true
 
-      - name: Verify deployed Cloud Run service health
+      - name: Verify deployed Cloud Run service health and frontend UI
         run: |
           SERVICE_URL="${{ steps.deploy_cloud_run.outputs.url }}"
           curl --fail --silent --show-error \
             --header "Authorization: Bearer ${{ steps.id_token_auth.outputs.id_token }}" \
             "${SERVICE_URL}/health"
+          curl --fail --silent --show-error \
+            --header "Authorization: Bearer ${{ steps.id_token_auth.outputs.id_token }}" \
+            "${SERVICE_URL}/" > /dev/null

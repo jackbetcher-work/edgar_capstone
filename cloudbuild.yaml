@@ -34,7 +34,7 @@ steps:
         pytest -v --tb=short
 
   # ----------------------------------------------------------------------------
-  # Stage 2: Build — Build & push container image to Artifact Registry
+  # Stage 2: Build — Build frontend + backend container image & push to GAR
   # ----------------------------------------------------------------------------
   - id: build
     name: gcr.io/cloud-builders/docker
@@ -47,6 +47,7 @@ steps:
       - -c
       - |
         set -euo pipefail
+        export DOCKER_BUILDKIT=1
         test -n "$${SEC_EDGAR_USER_AGENT}"
         IMAGE_URI="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_GAR_REPOSITORY}/${_SERVICE_NAME}"
         docker build \
@@ -54,6 +55,7 @@ steps:
           --tag "$${IMAGE_URI}:${COMMIT_SHA}" \
           --tag "$${IMAGE_URI}:latest" \
           .
+        docker run --rm --entrypoint test "$${IMAGE_URI}:${COMMIT_SHA}" -f /app/frontend/dist/index.html
         docker push "$${IMAGE_URI}:${COMMIT_SHA}"
         docker push "$${IMAGE_URI}:latest"
 

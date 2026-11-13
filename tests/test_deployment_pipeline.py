@@ -47,14 +47,21 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     jobs = workflow.get("jobs", {})
     assert list(jobs.keys()) == ["test", "build", "deploy"]
 
-    # Stage 1: test
+    # Stage 1: test (backend + frontend lint, unit tests, and production bundle build)
     test_job = jobs["test"]
+    test_uses = [step.get("uses", "") for step in test_job["steps"]]
+    assert any("actions/setup-node@" in u for u in test_uses)
     test_steps_str = json.dumps(test_job["steps"])
     assert "verify_no_secrets.py" in test_steps_str
     assert "pytest" in test_steps_str
     assert "terraform fmt -check" in test_steps_str
+    assert "npm --prefix frontend ci" in test_steps_str
+    assert "npm --prefix frontend run lint" in test_steps_str
+    assert "npm --prefix frontend test" in test_steps_str
+    assert "npm --prefix frontend run build" in test_steps_str
+    assert "test -f frontend/dist/index.html" in test_steps_str
 
-    # Stage 2: build (depends on test, uses keyless WIF + Secret Manager)
+    # Stage 2: build (depends on test, uses keyless WIF + Secret Manager + frontend container check)
     build_job = jobs["build"]
     assert build_job.get("needs") == "test"
     build_uses = [step.get("uses", "") for step in build_job["steps"]]
@@ -62,6 +69,7 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert any("google-github-actions/get-secretmanager-secrets@" in u for u in build_uses)
     build_steps_str = json.dumps(build_job["steps"])
     assert "docker build" in build_steps_str
+    assert "/app/frontend/dist/index.html" in build_steps_str
     assert "docker push" in build_steps_str
 
     # Stage 3: deploy (depends on build, uses keyless WIF + Secret Manager + Cloud Run)
@@ -98,6 +106,9 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     build_step = next(s for s in steps if s["id"] == "build")
     assert build_step["waitFor"] == ["test"]
     assert "SEC_EDGAR_USER_AGENT" in build_step["secretEnv"]
+    build_cmd = " ".join(build_step["args"])
+    assert "DOCKER_BUILDKIT=1" in build_cmd
+    assert "/app/frontend/dist/index.html" in build_cmd
 
     deploy_step = next(s for s in steps if s["id"] == "deploy")
     assert deploy_step["waitFor"] == ["build"]
@@ -204,6 +215,10 @@ def test_secret_manager_client_retrieval_and_redaction(monkeypatch: pytest.Monke
 
 def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
     dockerfile_text = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "FROM node:22-slim AS frontend-builder" in dockerfile_text
+    assert "npm ci --no-audit --no-fund" in dockerfile_text
+    assert "npm run build" in dockerfile_text
+    assert "COPY --from=frontend-builder" in dockerfile_text
     assert "FROM python:3.11-slim AS builder" in dockerfile_text
     assert "USER appuser" in dockerfile_text
     assert "edgar_capstone.server:app" in dockerfile_text
@@ -221,6 +236,26 @@ def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
     assert 'resource "google_compute_backend_service" "sec_edgar_iap_backend"' in iap_tf
     assert "roles/iap.httpsResourceAccessor" in iap_tf
     assert "roles/run.invoker" in iap_tf
+
+
+def test_frontend_lockfile_uses_public_npm_registry() -> None:
+    pkg_json = json.loads((REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
+    lock_json = json.loads(
+        (REPO_ROOT / "frontend" / "package-lock.json").read_text(encoding="utf-8")
+    )
+    packages = lock_json.get("packages", {})
+    assert "" in packages
+    assert packages[""].get("dependencies") == pkg_json.get("dependencies")
+    assert packages[""].get("devDependencies") == pkg_json.get("devDependencies")
+
+    resolved_urls = [
+        meta["resolved"]
+        for key, meta in packages.items()
+        if key != "" and "resolved" in meta
+    ]
+    assert len(resolved_urls) > 0
+    bad_urls = [u for u in resolved_urls if not u.startswith("https://registry.npmjs.org/")]
+    assert bad_urls == [], f"Lockfile contains non-public npm registry URLs: {bad_urls[:5]}"
 
 
 def test_fastapi_cloud_run_service_endpoints() -> None:

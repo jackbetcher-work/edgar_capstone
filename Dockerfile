@@ -4,13 +4,15 @@
 # ==============================================================================
 FROM node:22-slim AS frontend-builder
 
+ARG NPM_REGISTRY="https://registry.npmjs.org/"
+
 WORKDIR /frontend
 
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci --no-audit --no-fund
+RUN npm ci --no-audit --no-fund --registry="${NPM_REGISTRY}"
 
 COPY frontend/ ./
-RUN npm run build
+RUN npm run build && test -f /frontend/dist/index.html
 
 # ==============================================================================
 # Stage 1: Builder — Build wheel & install Python runtime dependencies
@@ -45,6 +47,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH" \
     PORT=8080 \
+    FRONTEND_DIST_DIR="/app/frontend/dist" \
     GCP_PROJECT_ID="iron-radio-514217-q7" \
     GCP_REGION="us-central1" \
     COMMIT_SHA="${COMMIT_SHA}"

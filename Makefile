@@ -15,7 +15,7 @@ install: ## Install backend (.venv) and frontend dependencies
 	@test -d $(VENV) || python3 -m venv $(VENV)
 	$(VENV)/bin/pip install --upgrade pip
 	$(VENV)/bin/pip install -e ".[dev]" || $(VENV)/bin/pip install -r requirements.txt
-	cd frontend && npm install
+	cd frontend && npm ci --no-audit --no-fund
 
 dev: ## Run FastAPI backend (:8000) and Vite Terminal UI (:5173) together
 	@echo "Starting FastAPI (http://$(BACKEND_HOST):$(BACKEND_PORT)) + Terminal UI (http://127.0.0.1:$(FRONTEND_PORT))..."
