@@ -3,7 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import App from '../App'
 import { clearStoredBearerToken } from '../services/authService'
 
-const MOCK_AUTH_CONFIG = {
+const MOCK_DEV_AUTH_CONFIG = {
   status: 'ok',
   auth_required: true,
   access_pattern: 'iap_jwt_bearer',
@@ -26,6 +26,20 @@ const MOCK_AUTH_CONFIG = {
     bearer_header: 'Authorization',
     assertion_header: 'X-Goog-IAP-JWT-Assertion',
     audience_configured: true,
+  },
+}
+
+const MOCK_PROD_AUTH_CONFIG = {
+  ...MOCK_DEV_AUTH_CONFIG,
+  identity_provider: {
+    ...MOCK_DEV_AUTH_CONFIG.identity_provider,
+    okta_client_id: 'okta-prod-client-id',
+    authorization_endpoint: 'https://acme.okta.com/oauth2/default/v1/authorize',
+    local_sso_dev_broker_enabled: false,
+  },
+  iap: {
+    ...MOCK_DEV_AUTH_CONFIG.iap,
+    strict_production_mode: true,
   },
 }
 
@@ -91,7 +105,7 @@ describe('Google Workspace (Okta SSO) & IAP JWT Bearer Authentication UI', () =>
       seenAuthHeaders[url] = headers.Authorization
 
       if (url === '/api/v1/auth/config') {
-        return new Response(JSON.stringify(MOCK_AUTH_CONFIG), { status: 200 })
+        return new Response(JSON.stringify(MOCK_DEV_AUTH_CONFIG), { status: 200 })
       }
       if (url === '/api/v1/auth/sso/dev-token') {
         return new Response(
@@ -126,12 +140,13 @@ describe('Google Workspace (Okta SSO) & IAP JWT Bearer Authentication UI', () =>
 
     render(<App />)
 
-    // Verify single h1 and IAP Sign-In Gate rendered
+    // Verify single h1 and IAP Sign-In Gate rendered without dev-only sandbox clutter
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1)
     expect(
       await screen.findByText(/Sign in with Google Workspace/i)
     ).toBeTruthy()
-    expect(screen.getByText(/IAP Protected · Sign-In Required/i)).toBeTruthy()
+    expect(screen.getByText(/AUTH LOCKED/i)).toBeTruthy()
+    expect(screen.queryByText(/Local Dev Sandbox/i)).toBeNull()
 
     // Sign in via Google Workspace (Okta SSO)
     fireEvent.click(
@@ -140,7 +155,7 @@ describe('Google Workspace (Okta SSO) & IAP JWT Bearer Authentication UI', () =>
       })
     )
 
-    // Workspace unlocks and HeaderBar displays verified IAP · JWT identity
+    // Workspace unlocks and HeaderBar displays verified principal email
     await waitFor(() => {
       expect(
         screen.getByText(/Query audited financials and grounded 10-K disclosures/i)
@@ -161,11 +176,34 @@ describe('Google Workspace (Okta SSO) & IAP JWT Bearer Authentication UI', () =>
     )
   })
 
+  it('renders identical login controls in dev and strict production OIDC configurations', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      if (url === '/api/v1/auth/config') {
+        return new Response(JSON.stringify(MOCK_PROD_AUTH_CONFIG), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+
+    render(<App />)
+    expect(
+      await screen.findByRole('button', {
+        name: /Continue with Google Workspace \(Okta SSO\)/i,
+      })
+    ).toBeTruthy()
+    expect(
+      screen.getByRole('button', {
+        name: /Authenticate with IAP \/ OIDC Bearer JWT Token/i,
+      })
+    ).toBeTruthy()
+    expect(screen.queryByText(/Local Dev Sandbox/i)).toBeNull()
+  })
+
   it('supports direct IAP / OIDC Bearer JWT verification and surfaces 403 domain policy errors', async () => {
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
       const url = typeof input === 'string' ? input : input.toString()
       if (url === '/api/v1/auth/config') {
-        return new Response(JSON.stringify(MOCK_AUTH_CONFIG), { status: 200 })
+        return new Response(JSON.stringify(MOCK_DEV_AUTH_CONFIG), { status: 200 })
       }
       if (url === '/api/v1/auth/sso/exchange') {
         const body = JSON.parse(String(init?.body ?? '{}')) as {

@@ -105,3 +105,29 @@ def test_cached_10k_section_viewer_and_feedback_endpoints() -> None:
     assert fb_resp.status_code == 200
     assert fb_resp.json()["status"] == "success"
     assert fb_resp.json()["recorded"]["user_email"] == "analyst@fde-workspace.corp"
+
+
+def test_single_origin_terminal_ui_bundle_serving(tmp_path, monkeypatch) -> None:
+    dist_dir = tmp_path / "dist"
+    assets_dir = dist_dir / "assets"
+    assets_dir.mkdir(parents=True)
+    (dist_dir / "index.html").write_text(
+        "<!doctype html><html><title>EDGAR &lt;GO&gt;</title></html>",
+        encoding="utf-8",
+    )
+    (assets_dir / "app.js").write_text("console.log('terminal');", encoding="utf-8")
+
+    monkeypatch.setenv("FRONTEND_DIST_DIR", str(dist_dir))
+    client = TestClient(app)
+
+    root_resp = client.get("/")
+    assert root_resp.status_code == 200
+    assert "EDGAR &lt;GO&gt;" in root_resp.text
+
+    asset_resp = client.get("/assets/app.js")
+    assert asset_resp.status_code == 200
+    assert "console.log('terminal');" in asset_resp.text
+
+    unknown_api_resp = client.get("/api/v1/nonexistent")
+    assert unknown_api_resp.status_code == 404
+

@@ -1,6 +1,19 @@
 # syntax=docker/dockerfile:1
 # ==============================================================================
-# Stage 1: Builder — Build wheel & install runtime dependencies
+# Stage 0: Frontend Builder — Compile React + TypeScript Terminal UI bundle
+# ==============================================================================
+FROM node:22-slim AS frontend-builder
+
+WORKDIR /frontend
+
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY frontend/ ./
+RUN npm run build
+
+# ==============================================================================
+# Stage 1: Builder — Build wheel & install Python runtime dependencies
 # ==============================================================================
 FROM python:3.11-slim AS builder
 
@@ -42,6 +55,7 @@ RUN groupadd --gid 10001 appgroup && \
 WORKDIR /app
 
 COPY --from=builder --chown=appuser:appgroup /opt/venv /opt/venv
+COPY --from=frontend-builder --chown=appuser:appgroup /frontend/dist ./frontend/dist
 COPY --chown=appuser:appgroup src/ ./src/
 COPY --chown=appuser:appgroup scripts/ ./scripts/
 COPY --chown=appuser:appgroup data/sp500_constituents.csv ./data/sp500_constituents.csv

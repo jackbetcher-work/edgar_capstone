@@ -1,14 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import {
-  BookOpen,
-  ExternalLink,
-  FileCheck2,
-  FileText,
-  Layers,
-  Loader2,
-  Search,
-  X,
-} from 'lucide-react'
+import { ExternalLink, FileText, Loader2, Search, X } from 'lucide-react'
 import type {
   CachedSectionResponse,
   CompanySummary,
@@ -48,12 +39,23 @@ function highlightTextSnippet(
     const idx = cleaned.toLowerCase().indexOf(cleanTarget.toLowerCase())
     const matchLen = Math.min(
       cleaned.length - idx,
-      Math.max(cleanTarget.length, targetSnippet ? clean10kExcerpt(targetSnippet).length : 0)
+      Math.max(
+        cleanTarget.length,
+        targetSnippet ? clean10kExcerpt(targetSnippet).length : 0
+      )
     )
     return [
       { text: cleaned.slice(0, idx), active: false, matchedSearch: false },
-      { text: cleaned.slice(idx, idx + matchLen), active: true, matchedSearch: false },
-      { text: cleaned.slice(idx + matchLen), active: false, matchedSearch: false },
+      {
+        text: cleaned.slice(idx, idx + matchLen),
+        active: true,
+        matchedSearch: false,
+      },
+      {
+        text: cleaned.slice(idx + matchLen),
+        active: false,
+        matchedSearch: false,
+      },
     ]
   }
 
@@ -93,7 +95,6 @@ export function SourceInspectorPane({
   const citationCardRefs = useRef<Record<string, HTMLElement | null>>({})
   const highlightedDocMarkRef = useRef<HTMLElement | null>(null)
 
-  // Scroll to active citation card when selected inline in chat
   useEffect(() => {
     if (activeTab === 'citations' && activeChunkId) {
       const targetEl = citationCardRefs.current[activeChunkId]
@@ -103,7 +104,6 @@ export function SourceInspectorPane({
     }
   }, [activeChunkId, activeTab])
 
-  // Scroll to highlighted passage inside Full 10-K Document reader
   useEffect(() => {
     if (activeTab === 'document' && highlightedExcerpt && !isLoadingSection) {
       const timer = setTimeout(() => {
@@ -126,7 +126,6 @@ export function SourceInspectorPane({
     return citations.filter((c) => c.section_id === citationSectionFilter)
   }, [citations, citationSectionFilter])
 
-  // Distinct company-year profiles from current citations (plus defaults so reader is always usable)
   const filingTargets = useMemo(() => {
     const map = new Map<string, { ticker: string; fiscalYear: number }>()
     citations.forEach((c) => {
@@ -136,7 +135,7 @@ export function SourceInspectorPane({
       }
     })
     if (map.size === 0) {
-      companies.slice(0, 6).forEach((comp) => {
+      companies.slice(0, 12).forEach((comp) => {
         map.set(`${comp.ticker}_${comp.latest_fiscal_year}`, {
           ticker: comp.ticker,
           fiscalYear: comp.latest_fiscal_year,
@@ -160,24 +159,21 @@ export function SourceInspectorPane({
       aria-label="Grounded SEC Form 10-K Source Viewer"
       className="h-full flex flex-col surface-panel border-l border-hairline w-full"
     >
-      {/* Pane Header & Mode Switcher */}
-      <div className="px-4 py-2.5 border-b border-hairline flex items-center justify-between gap-2 shrink-0">
-        <div className="flex items-center gap-1 p-0.5 rounded-lg surface-subtle border border-hairline">
+      {/* Terminal Pane Tab Bar */}
+      <div className="px-3 h-9 surface-header border-b border-hairline flex items-center justify-between gap-2 shrink-0 tabular-nums-mono">
+        <div className="flex items-center gap-1">
           <button
             id="tab-grounded-citations"
             type="button"
             onClick={() => onChangeTab('citations')}
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer transition-colors ${
+            className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] uppercase tracking-wider cursor-pointer ${
               activeTab === 'citations'
-                ? 'surface-panel text-ink-primary shadow-xs'
-                : 'text-ink-secondary hover:text-ink-primary'
+                ? 'btn-terminal-key-active font-semibold'
+                : 'btn-terminal-key'
             }`}
           >
-            <Layers className="w-3.5 h-3.5" aria-hidden="true" />
             <span>Grounded Chunks</span>
-            <span className="tabular-nums-mono text-[11px] px-1.5 py-0.2 rounded badge-accent">
-              {citations.length}
-            </span>
+            <span className="text-[10px]">[{citations.length}]</span>
           </button>
 
           <button
@@ -193,13 +189,12 @@ export function SourceInspectorPane({
                 )
               }
             }}
-            className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium cursor-pointer transition-colors ${
+            className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] uppercase tracking-wider cursor-pointer ${
               activeTab === 'document'
-                ? 'surface-panel text-ink-primary shadow-xs'
-                : 'text-ink-secondary hover:text-ink-primary'
+                ? 'btn-terminal-key-active font-semibold'
+                : 'btn-terminal-key'
             }`}
           >
-            <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
             <span>Full 10-K Filing</span>
           </button>
         </div>
@@ -208,20 +203,18 @@ export function SourceInspectorPane({
           id="btn-close-source-pane-mobile"
           type="button"
           onClick={onCloseMobilePane}
-          className="lg:hidden p-1 rounded text-ink-muted hover:text-ink-primary cursor-pointer"
+          className="lg:hidden p-1 text-ink-muted hover:text-ink-primary cursor-pointer"
           aria-label="Close Source Viewer"
         >
-          <X className="w-4 h-4" />
+          <X className="w-3.5 h-3.5" />
         </button>
       </div>
 
       {/* TAB 1: Grounded Citations List */}
       {activeTab === 'citations' && (
         <div className="flex-1 flex flex-col min-h-0">
-          <div className="px-4 py-2 border-b border-hairline flex items-center justify-between gap-2 text-xs shrink-0 surface-subtle">
-            <span className="text-ink-muted text-[11px]">
-              Hybrid Relevance Ranked (768-d + Lexical)
-            </span>
+          <div className="px-3 py-1.5 border-b border-hairline flex items-center justify-between gap-2 surface-subtle tabular-nums-mono text-[10px] uppercase shrink-0">
+            <span className="text-ink-muted">SOURCE PASSAGES</span>
             <div className="flex items-center gap-1">
               {(['ALL', 'item_7', 'item_1a'] as const).map((secKey) => (
                 <button
@@ -229,35 +222,35 @@ export function SourceInspectorPane({
                   id={`btn-filter-cit-${secKey}`}
                   type="button"
                   onClick={() => setCitationSectionFilter(secKey)}
-                  className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+                  className={`px-1.5 py-0.2 cursor-pointer transition-colors ${
                     citationSectionFilter === secKey
-                      ? 'badge-accent'
+                      ? 'badge-amber font-semibold'
                       : 'text-ink-muted hover:text-ink-primary'
                   }`}
                 >
                   {secKey === 'ALL'
-                    ? 'All'
+                    ? 'ALL'
                     : secKey === 'item_7'
-                      ? 'Item 7'
-                      : 'Item 1A'}
+                      ? 'ITEM 7'
+                      : 'ITEM 1A'}
                 </button>
               ))}
             </div>
           </div>
 
-          <div className="flex-1 overflow-y-auto p-3.5 space-y-2.5">
+          <div className="flex-1 overflow-y-auto divide-y divide-[var(--border-hairline)]">
             {filteredCitations.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center px-6 py-12">
+              <div className="h-full flex flex-col items-center justify-center text-center px-6 py-10 tabular-nums-mono">
                 <FileText
-                  className="w-8 h-8 text-ink-muted mb-2.5 stroke-[1.5]"
+                  className="w-6 h-6 text-ink-muted mb-2 stroke-[1.5]"
                   aria-hidden="true"
                 />
-                <p className="text-sm font-medium text-ink-primary">
-                  No 10-K passages selected yet
+                <p className="text-xs font-semibold uppercase tracking-wider text-ink-primary">
+                  NO 10-K PASSAGES LOADED
                 </p>
-                <p className="text-xs text-ink-muted mt-1 leading-relaxed max-w-xs">
-                  Submit a natural language query or click any inline citation tag to
-                  inspect grounded Form 10-K excerpts and full cached sections here.
+                <p className="text-[11px] text-ink-muted mt-1 leading-relaxed max-w-xs font-sans">
+                  Execute a query or click an inline citation tag to inspect
+                  grounded Form 10-K excerpts here.
                 </p>
                 {filingTargets[0] && (
                   <button
@@ -271,10 +264,10 @@ export function SourceInspectorPane({
                         'item_7'
                       )
                     }}
-                    className="mt-4 px-3 py-1.5 rounded-md text-xs font-medium surface-subtle border border-hairline text-ink-primary hover:border-strong cursor-pointer"
+                    className="mt-3 px-2.5 py-1 text-[11px] uppercase tracking-wider btn-terminal-key cursor-pointer"
                   >
-                    Browse {filingTargets[0].ticker} FY{filingTargets[0].fiscalYear}{' '}
-                    Form 10-K
+                    OPEN {filingTargets[0].ticker} FY{filingTargets[0].fiscalYear}{' '}
+                    10-K
                   </button>
                 )}
               </div>
@@ -292,50 +285,58 @@ export function SourceInspectorPane({
                     onClick={() =>
                       onSelectChunkId(isSelected ? null : cit.chunk_id)
                     }
-                    className={`rounded-lg p-3.5 border transition-all cursor-pointer ${
+                    className={`p-3 transition-colors cursor-pointer ${
                       isSelected
-                        ? 'surface-filing-sheet border-strong ring-1 ring-[var(--border-strong)]'
-                        : 'surface-panel border-hairline hover:border-strong'
+                        ? 'surface-elevated border-l-2 border-l-[var(--bb-amber)]'
+                        : 'hover:bg-[var(--bg-subtle)]'
                     }`}
                   >
-                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                    <div className="flex items-center justify-between gap-2 mb-1 tabular-nums-mono">
                       <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="tabular-nums-mono text-[11px] font-semibold text-ink-primary">
-                          #{index + 1} · {cit.ticker} FY{cit.fiscal_year}
+                        <span className="text-[11px] text-ink-muted">
+                          #{index + 1}
+                        </span>
+                        <span className="text-[11px] font-bold text-bb-yellow">
+                          {cit.ticker}
+                        </span>
+                        <span className="text-[11px] text-ink-primary">
+                          FY{cit.fiscal_year}
                         </span>
                         <span
-                          className={`px-1.5 py-0.2 rounded text-[10px] font-semibold ${
+                          className={`px-1.5 py-0.2 text-[10px] font-semibold uppercase ${
                             isRisk ? 'badge-amber' : 'badge-accent'
                           }`}
                         >
-                          {isRisk ? 'Item 1A · Risk' : 'Item 7 · MD&A'}
+                          {isRisk ? 'ITEM 1A · RISK' : 'ITEM 7 · MD&A'}
                         </span>
                       </div>
 
                       <span
-                        className="tabular-nums-mono text-[11px] text-ink-muted"
-                        title="Hybrid Dense + Lexical Retrieval Score"
+                        className="text-[10px] text-ink-muted"
+                        title="Hybrid Retrieval Score"
                       >
-                        Score {cit.score.toFixed(3)}
+                        REL {cit.score.toFixed(3)}
                       </span>
                     </div>
 
-                    <div className="text-xs font-medium text-ink-secondary mb-1.5 truncate">
+                    <div className="text-[11px] font-medium text-ink-secondary mb-1.5 truncate tabular-nums-mono">
                       {cit.section_title}
                     </div>
 
                     <blockquote
-                      className={`filing-prose text-[13.5px] leading-relaxed rounded p-2.5 ${
-                        isSelected ? 'passage-highlight' : 'surface-subtle'
+                      className={`filing-prose text-xs leading-relaxed p-2 border-l-2 ${
+                        isSelected
+                          ? 'passage-highlight border-l-[var(--bb-amber)]'
+                          : 'surface-filing-sheet border-l-[var(--border-strong)]'
                       }`}
                     >
                       &ldquo;{clean10kExcerpt(cit.excerpt)}&rdquo;
                     </blockquote>
 
-                    <div className="mt-2.5 pt-2 border-t border-hairline flex items-center justify-between gap-2 text-[11px]">
-                      <code className="tabular-nums-mono text-[10px] text-ink-muted truncate">
+                    <div className="mt-2 flex items-center justify-between gap-2 text-[11px] tabular-nums-mono">
+                      <span className="text-[10px] text-ink-muted truncate">
                         {cit.chunk_id}
-                      </code>
+                      </span>
 
                       <div className="flex items-center gap-2.5 shrink-0">
                         <button
@@ -352,8 +353,7 @@ export function SourceInspectorPane({
                               cit.excerpt
                             )
                           }}
-                          className="font-medium hover:underline cursor-pointer"
-                          style={{ color: 'var(--accent-ink)' }}
+                          className="text-[11px] font-medium text-bb-cyan hover:underline cursor-pointer"
                         >
                           Open in 10-K Section
                         </button>
@@ -365,11 +365,11 @@ export function SourceInspectorPane({
                             target="_blank"
                             rel="noreferrer"
                             onClick={(e) => e.stopPropagation()}
-                            className="inline-flex items-center gap-0.5 text-ink-muted hover:text-ink-primary"
+                            className="inline-flex items-center gap-0.5 text-[10px] uppercase text-ink-muted hover:text-ink-primary"
                             title="Open official SEC EDGAR HTML archive"
                           >
                             <span>EDGAR</span>
-                            <ExternalLink className="w-3 h-3" />
+                            <ExternalLink className="w-2.5 h-2.5" />
                           </a>
                         )}
                       </div>
@@ -382,11 +382,10 @@ export function SourceInspectorPane({
         </div>
       )}
 
-      {/* TAB 2: Full Cached 10-K Section Document Reader */}
+      {/* TAB 2: Full Form 10-K Section Reader */}
       {activeTab === 'document' && (
         <div className="flex-1 flex flex-col min-h-0">
-          {/* Filing & Section Selector Controls */}
-          <div className="px-4 py-2.5 border-b border-hairline surface-subtle space-y-2 shrink-0">
+          <div className="px-3 py-2 border-b border-hairline surface-subtle space-y-1.5 shrink-0 tabular-nums-mono">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-1.5">
                 <label className="sr-only" htmlFor="select-doc-filing">
@@ -411,14 +410,14 @@ export function SourceInspectorPane({
                       )
                     }
                   }}
-                  className="px-2.5 py-1 rounded text-xs font-semibold tabular-nums-mono surface-panel border border-hairline text-ink-primary cursor-pointer"
+                  className="px-2 py-0.5 text-[11px] font-semibold surface-input border border-hairline text-bb-yellow cursor-pointer focus:outline-none focus:border-[var(--bb-amber)]"
                 >
                   {filingTargets.map((ft) => (
                     <option
                       key={`${ft.ticker}_${ft.fiscalYear}`}
                       value={`${ft.ticker}_${ft.fiscalYear}`}
                     >
-                      {ft.ticker} · FY{ft.fiscalYear} Form 10-K
+                      {ft.ticker} · FY{ft.fiscalYear} 10-K
                     </option>
                   ))}
                   {cachedSection &&
@@ -430,15 +429,16 @@ export function SourceInspectorPane({
                       <option
                         value={`${cachedSection.ticker}_${cachedSection.fiscal_year}`}
                       >
-                        {cachedSection.ticker} · FY{cachedSection.fiscal_year} Form
+                        {cachedSection.ticker} · FY{cachedSection.fiscal_year}{' '}
                         10-K
                       </option>
                     )}
                 </select>
 
-                <div className="inline-flex rounded surface-panel border border-hairline p-0.5">
+                <div className="inline-flex border border-hairline surface-input">
                   {(['item_7', 'item_1a'] as const).map((secId) => {
-                    const active = (cachedSection?.section_id ?? 'item_7') === secId
+                    const active =
+                      (cachedSection?.section_id ?? 'item_7') === secId
                     return (
                       <button
                         key={secId}
@@ -455,13 +455,13 @@ export function SourceInspectorPane({
                             2026
                           onRequestFilingSection(targetTicker, targetYear, secId)
                         }}
-                        className={`px-2 py-0.5 rounded text-[11px] font-medium cursor-pointer transition-colors ${
+                        className={`px-2 py-0.5 text-[10px] uppercase font-semibold cursor-pointer transition-colors ${
                           active
-                            ? 'badge-accent'
+                            ? 'badge-amber'
                             : 'text-ink-secondary hover:text-ink-primary'
                         }`}
                       >
-                        {secId === 'item_7' ? 'Item 7 · MD&A' : 'Item 1A · Risk'}
+                        {secId === 'item_7' ? 'ITEM 7 MD&A' : 'ITEM 1A RISK'}
                       </button>
                     )
                   })}
@@ -474,19 +474,17 @@ export function SourceInspectorPane({
                   href={cachedSection.sec_filing_url}
                   target="_blank"
                   rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-[11px] font-medium hover:underline"
-                  style={{ color: 'var(--accent-ink)' }}
+                  className="inline-flex items-center gap-1 text-[10px] uppercase font-semibold text-bb-cyan hover:underline"
                 >
-                  <span>SEC.gov Archive</span>
-                  <ExternalLink className="w-3 h-3" />
+                  <span>SEC.GOV</span>
+                  <ExternalLink className="w-2.5 h-2.5" />
                 </a>
               )}
             </div>
 
-            {/* In-Filing Keyword Search */}
             <div className="relative">
               <Search
-                className="w-3.5 h-3.5 text-ink-muted absolute left-2.5 top-1/2 -translate-y-1/2"
+                className="w-3 h-3 text-ink-muted absolute left-2 top-1/2 -translate-y-1/2"
                 aria-hidden="true"
               />
               <input
@@ -494,15 +492,15 @@ export function SourceInspectorPane({
                 type="text"
                 value={docKeyword}
                 onChange={(e) => setDocKeyword(e.target.value)}
-                placeholder="Find term within cached 10-K section..."
-                className="w-full pl-8 pr-7 py-1 rounded text-xs surface-panel border border-hairline text-ink-primary focus:outline-none focus:border-strong"
+                placeholder="FIND TERM IN 10-K SECTION..."
+                className="w-full pl-7 pr-6 py-0.5 text-[11px] surface-input border border-hairline text-ink-primary focus:outline-none focus:border-[var(--bb-amber)]"
               />
               {docKeyword && (
                 <button
                   id="btn-clear-filing-keyword"
                   type="button"
                   onClick={() => setDocKeyword('')}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-ink-muted hover:text-ink-primary cursor-pointer"
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 text-ink-muted hover:text-ink-primary cursor-pointer"
                 >
                   <X className="w-3 h-3" />
                 </button>
@@ -510,54 +508,56 @@ export function SourceInspectorPane({
             </div>
           </div>
 
-          {/* Document Body Sheet */}
-          <div className="flex-1 overflow-y-auto p-4 sm:p-5 surface-filing-sheet">
+          <div className="flex-1 overflow-y-auto p-3.5 surface-filing-sheet">
             {isLoadingSection ? (
-              <div className="py-16 flex flex-col items-center justify-center gap-2 text-xs text-ink-muted">
-                <Loader2 className="w-5 h-5 animate-spin" />
-                <span>Loading cached Form 10-K section from Context Cache...</span>
+              <div className="py-14 flex flex-col items-center justify-center gap-2 text-xs text-bb-amber tabular-nums-mono">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>LOADING SEC FORM 10-K SECTION...</span>
               </div>
             ) : cachedSection ? (
-              <div className="max-w-prose mx-auto">
+              <div>
                 {/* Official Filing Metadata Masthead */}
-                <div className="pb-3.5 mb-4 border-b border-hairline">
-                  <div className="flex items-center justify-between gap-2 flex-wrap mb-1">
-                    <span className="text-[11px] uppercase tracking-wider font-semibold text-ink-muted tabular-nums-mono">
+                <div className="pb-2.5 mb-3 border-b border-hairline tabular-nums-mono">
+                  <div className="flex items-center justify-between gap-2 flex-wrap mb-0.5">
+                    <span className="text-[10px] uppercase tracking-wider font-bold text-bb-amber">
                       UNITED STATES SEC · FORM 10-K
                     </span>
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded badge-positive text-[10px] tabular-nums-mono font-medium">
-                      <FileCheck2 className="w-3 h-3" />
-                      Cache {cachedSection.cache_hit ? 'HIT' : 'LOADED'} · ~
-                      {cachedSection.token_estimate.toLocaleString()} tok
+                    <span className="text-[10px] uppercase text-ink-muted">
+                      {cachedSection.section_id === 'item_1a'
+                        ? 'ITEM 1A · RISK FACTORS'
+                        : 'ITEM 7 · MD&A'}
                     </span>
                   </div>
 
-                  <h3 className="text-base font-semibold text-ink-primary">
-                    {cachedSection.company_name} ({cachedSection.ticker}) — FY
-                    {cachedSection.fiscal_year}
+                  <h3 className="text-sm font-semibold text-ink-primary">
+                    {cachedSection.company_name} (
+                    <span className="text-bb-yellow">{cachedSection.ticker}</span>
+                    ) — FY{cachedSection.fiscal_year}
                   </h3>
 
-                  <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-ink-muted tabular-nums-mono">
+                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-ink-muted">
                     {cachedSection.cik && <span>CIK: {cachedSection.cik}</span>}
                     {cachedSection.accession_number && (
-                      <span>Acc: {cachedSection.accession_number}</span>
+                      <span>ACC: {cachedSection.accession_number}</span>
                     )}
                     {cachedSection.period_of_report && (
-                      <span>Period End: {cachedSection.period_of_report}</span>
+                      <span>PERIOD: {cachedSection.period_of_report}</span>
                     )}
                     {cachedSection.filing_date && (
-                      <span>Filed: {cachedSection.filing_date}</span>
+                      <span>FILED: {cachedSection.filing_date}</span>
                     )}
                   </div>
                 </div>
 
-                {/* Editorial Serif 10-K Section Prose */}
-                <div className="filing-prose space-y-3.5">
+                {/* Terminal 10-K Section Prose */}
+                <div className="filing-prose space-y-3">
                   {documentParagraphs.map((para, pIdx) => {
                     const isHeading =
                       para.startsWith('## ') ||
                       para.startsWith('### ') ||
-                      (para.startsWith('**') && para.endsWith('**') && para.length < 140)
+                      (para.startsWith('**') &&
+                        para.endsWith('**') &&
+                        para.length < 140)
 
                     if (isHeading) {
                       const cleanTitle = para
@@ -566,7 +566,7 @@ export function SourceInspectorPane({
                       return (
                         <h4
                           key={`doc-h-${pIdx}`}
-                          className="font-sans text-xs font-bold uppercase tracking-wider text-ink-primary pt-3 pb-0.5"
+                          className="tabular-nums-mono text-[11px] font-bold uppercase tracking-wider text-bb-amber pt-2 pb-0.5 border-b border-hairline"
                         >
                           {clean10kDocumentBlock(cleanTitle)}
                         </h4>
@@ -617,8 +617,8 @@ export function SourceInspectorPane({
                 </div>
               </div>
             ) : (
-              <p className="text-xs text-ink-muted text-center py-12">
-                Select an issuer and Form 10-K section above to inspect the filing.
+              <p className="text-xs text-ink-muted text-center py-12 tabular-nums-mono uppercase">
+                SELECT AN EQUITY AND 10-K SECTION TO INSPECT FILING.
               </p>
             )}
           </div>

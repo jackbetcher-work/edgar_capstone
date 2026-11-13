@@ -1,5 +1,5 @@
 import { useEffect, useRef, type FormEvent, type KeyboardEvent } from 'react'
-import { CornerDownLeft, Loader2, Sparkles } from 'lucide-react'
+import { Loader2 } from 'lucide-react'
 import type { SearchScopeFilters } from '../types/edgar'
 
 interface QueryComposerProps {
@@ -19,15 +19,14 @@ export function QueryComposer({
 }: QueryComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
-  // Auto-resize textarea height
   useEffect(() => {
     const el = textareaRef.current
     if (!el) return
     el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+    el.style.height = `${Math.min(el.scrollHeight, 128)}px`
   }, [value])
 
-  // Press '/' anywhere outside inputs to focus the analyst prompt bar
+  // Press '/' anywhere outside inputs to focus the terminal command prompt
   useEffect(() => {
     function handleGlobalSlash(e: globalThis.KeyboardEvent) {
       if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return
@@ -63,25 +62,32 @@ export function QueryComposer({
 
   const scopeSummary = [
     filters.selectedTickers.length > 0
-      ? filters.selectedTickers.join(', ')
+      ? filters.selectedTickers.join(',')
       : filters.gicsSector !== 'ALL'
-        ? filters.gicsSector
-        : 'Auto Entity Detection',
-    `FY${filters.startYear}–FY${filters.endYear}`,
+        ? filters.gicsSector.toUpperCase()
+        : 'AUTO EQTY',
+    `FY${String(filters.startYear).slice(-2)}–FY${String(filters.endYear).slice(-2)}`,
     filters.sectionId === 'ALL'
-      ? 'Item 1A + Item 7'
+      ? '1A+7'
       : filters.sectionId === 'item_1a'
-        ? 'Item 1A Risk'
-        : 'Item 7 MD&A',
-  ].join(' · ')
+        ? '1A'
+        : '7',
+  ].join(' | ')
 
   return (
-    <div className="px-4 sm:px-6 pb-4 pt-2 shrink-0 bg-gradient-to-t from-[var(--bg-canvas)] via-[var(--bg-canvas)] to-transparent">
+    <div className="surface-header border-t border-hairline px-3 py-2 shrink-0">
       <form
         id="analyst-query-form"
         onSubmit={handleFormSubmit}
-        className="max-w-3xl mx-auto rounded-xl surface-composer border border-strong p-2.5 transition-all"
+        className="flex items-end gap-2 surface-input border border-strong px-2.5 py-1.5 focus-within:border-[var(--bb-amber)] transition-colors"
       >
+        <span
+          aria-hidden="true"
+          className="tabular-nums-mono text-xs font-bold text-bb-amber pb-1 shrink-0 select-none"
+        >
+          EDGR&gt;
+        </span>
+
         <label htmlFor="analyst-query-textarea" className="sr-only">
           Ask a natural language financial or SEC 10-K question
         </label>
@@ -93,35 +99,29 @@ export function QueryComposer({
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={handleKeyDown}
           disabled={isSubmitting}
-          placeholder="Ask about multi-year revenue & margin variances, peer comparisons, or 10-K risk disclosures... (Press / to focus)"
-          className="w-full resize-none bg-transparent px-2 py-1 text-sm text-ink-primary placeholder:text-[var(--text-muted)] focus:outline-none leading-relaxed max-h-40"
+          placeholder="Enter variance query, peer comparison, or 10-K risk prompt... [Press / to focus]"
+          className="flex-1 resize-none bg-transparent py-0.5 text-xs text-ink-primary placeholder:text-[var(--text-muted)] focus:outline-none leading-relaxed max-h-32 tabular-nums-mono"
         />
 
-        <div className="flex items-center justify-between gap-2 pt-2 px-1.5 border-t border-hairline mt-1">
-          <div className="flex items-center gap-1.5 text-[11px] text-ink-muted tabular-nums-mono truncate">
-            <Sparkles className="w-3 h-3 shrink-0" aria-hidden="true" />
-            <span className="truncate">{scopeSummary}</span>
-          </div>
+        <span className="hidden md:inline-block tabular-nums-mono text-[10px] text-ink-muted pb-1 shrink-0">
+          {scopeSummary}
+        </span>
 
-          <button
-            id="btn-submit-analyst-query"
-            type="submit"
-            disabled={!value.trim() || isSubmitting}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold btn-primary-ink disabled:opacity-40 cursor-pointer disabled:cursor-not-allowed shrink-0"
-          >
-            {isSubmitting ? (
-              <>
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                <span>Synthesizing</span>
-              </>
-            ) : (
-              <>
-                <span>Run Analysis</span>
-                <CornerDownLeft className="w-3.5 h-3.5" />
-              </>
-            )}
-          </button>
-        </div>
+        <button
+          id="btn-submit-analyst-query"
+          type="submit"
+          disabled={!value.trim() || isSubmitting}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] btn-terminal-go disabled:opacity-35 cursor-pointer disabled:cursor-not-allowed shrink-0"
+        >
+          {isSubmitting ? (
+            <>
+              <Loader2 className="w-3 h-3 animate-spin" />
+              <span>EXEC</span>
+            </>
+          ) : (
+            <span>&lt;GO&gt;</span>
+          )}
+        </button>
       </form>
     </div>
   )

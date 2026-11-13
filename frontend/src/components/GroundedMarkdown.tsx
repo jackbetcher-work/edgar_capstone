@@ -1,5 +1,4 @@
 import type { ReactNode } from 'react'
-import { FileText } from 'lucide-react'
 import {
   splitTextByInlineCitations,
   type ParsedInlineCitationToken,
@@ -13,7 +12,6 @@ interface GroundedMarkdownProps {
 }
 
 function renderFormattedInlineText(text: string, keyPrefix: string): ReactNode[] {
-  // Parse **bold**, `code`, and *italic* cleanly without dangerouslySetInnerHTML
   const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g
   const parts: ReactNode[] = []
   let lastIdx = 0
@@ -35,7 +33,7 @@ function renderFormattedInlineText(text: string, keyPrefix: string): ReactNode[]
       parts.push(
         <code
           key={k}
-          className="tabular-nums-mono text-[12px] px-1.5 py-0.2 rounded surface-subtle text-ink-primary"
+          className="tabular-nums-mono text-[11.5px] px-1 py-0.2 surface-subtle border border-hairline text-ink-primary"
         >
           {token.slice(1, -1)}
         </code>
@@ -75,8 +73,8 @@ function renderLineWithCitations(
       const { token } = seg
       const isActive = activeChunkId === token.chunkId
       const shortSec = token.sectionLabel.toLowerCase().includes('1a')
-        ? 'Item 1A'
-        : 'Item 7'
+        ? '1A'
+        : '7'
       nodes.push(
         <button
           key={`${turnId}-cit-${lineIdx}-${segIdx}-${token.chunkId}`}
@@ -86,9 +84,8 @@ function renderLineWithCitations(
           className={`citation-chip ${isActive ? 'citation-chip-active' : ''}`}
           title={`Inspect ${token.ticker} FY${token.fiscalYear} ${token.sectionLabel} (${token.chunkId}) in Source Viewer`}
         >
-          <FileText className="w-3 h-3 shrink-0" aria-hidden="true" />
           <span>
-            {token.ticker} FY{String(token.fiscalYear).slice(-2)} · {shortSec}
+            [{token.ticker} FY{String(token.fiscalYear).slice(-2)} · ITEM {shortSec}]
           </span>
         </button>
       )
@@ -113,12 +110,12 @@ export function GroundedMarkdown({
     blocks.push(
       <ul
         key={`${turnId}-ul-${keyIdx}`}
-        className="space-y-2.5 my-2.5 pl-4 list-disc marker:text-[var(--text-muted)]"
+        className="space-y-2 my-2 pl-4 list-square marker:text-[var(--bb-amber)]"
       >
         {bulletBuffer.map((item) => (
           <li
             key={`${turnId}-li-${item.idx}`}
-            className="text-[13.5px] leading-relaxed text-ink-secondary pl-1"
+            className="text-[12.5px] leading-relaxed text-ink-secondary pl-0.5"
           >
             {renderLineWithCitations(
               item.text,
@@ -146,7 +143,7 @@ export function GroundedMarkdown({
       blocks.push(
         <h4
           key={`${turnId}-h4-${idx}`}
-          className="text-xs font-semibold uppercase tracking-wider text-ink-muted mt-4 mb-1.5"
+          className="tabular-nums-mono text-[11px] font-semibold uppercase tracking-wider text-ink-muted mt-3 mb-1"
         >
           {trimmed.slice(5)}
         </h4>
@@ -159,7 +156,7 @@ export function GroundedMarkdown({
       blocks.push(
         <h3
           key={`${turnId}-h3-${idx}`}
-          className="text-sm font-semibold tracking-tight text-ink-primary mt-4 first:mt-0 mb-1.5"
+          className="tabular-nums-mono text-xs font-semibold uppercase tracking-wider text-bb-amber mt-3 first:mt-0 pb-1 mb-1.5 border-b border-hairline"
         >
           {trimmed.slice(4)}
         </h3>
@@ -176,7 +173,7 @@ export function GroundedMarkdown({
     blocks.push(
       <p
         key={`${turnId}-p-${idx}`}
-        className="text-[13.5px] leading-relaxed text-ink-secondary my-2"
+        className="text-[12.5px] leading-relaxed text-ink-secondary my-1.5"
       >
         {renderLineWithCitations(
           trimmed,

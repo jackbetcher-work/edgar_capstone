@@ -1,4 +1,4 @@
-# Exclude version control, local virtual environments, and caches
+# Exclude version control, local virtual environments, node_modules, and caches
 .git
 .github
 .venv
@@ -8,6 +8,9 @@ __pycache__
 .pytest_cache
 .coverage
 htmlcov
+node_modules
+frontend/node_modules
+frontend/dist
 
 # Exclude all local secrets, keys, credentials, and Terraform state
 .env

@@ -47,7 +47,6 @@ const DEFAULT_FILTERS: SearchScopeFilters = {
 }
 
 export function App() {
-  const [theme, setTheme] = useState<'light' | 'dark'>('light')
   const [isLiveBackend, setIsLiveBackend] = useState<boolean>(true)
 
   // IAP + Google Workspace Okta/SSO Authentication State
@@ -84,10 +83,6 @@ export function App() {
     null
   )
 
-  // Session telemetry
-  const [cacheHits, setCacheHits] = useState<number>(0)
-  const [lastLatencyMs, setLastLatencyMs] = useState<number | null>(null)
-
   const streamEndRef = useRef<HTMLDivElement | null>(null)
 
   const handleApiAuthFailure = useCallback((err: ApiAuthError) => {
@@ -113,10 +108,9 @@ export function App() {
     }
   }, [handleApiAuthFailure])
 
-  // Apply light/dark data-theme attribute
   useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme)
-  }, [theme])
+    document.documentElement.setAttribute('data-theme', 'terminal')
+  }, [])
 
   // Discover IAP / Google Workspace Okta SSO configuration & initialize session
   useEffect(() => {
@@ -128,7 +122,6 @@ export function App() {
       if (!active) return
 
       if (!backendReachable || !config) {
-        // Offline snapshot mode (no backend reachable)
         await loadCompaniesCatalog()
         return
       }
@@ -186,17 +179,22 @@ export function App() {
     }
   }, [loadCompaniesCatalog])
 
-  const handleWorkspaceOktaSignIn = async (params: {
-    email: string
-    name: string
-    groups: string[]
-  }) => {
+  const handleWorkspaceOktaSignIn = async () => {
     setAuthErrorMessage(null)
+
+    const defaultDomain =
+      authConfig?.identity_provider.allowed_workspace_domains[0] ||
+      'fde-workspace.corp'
+    const defaultGroups = authConfig?.identity_provider
+      .required_analyst_groups?.length
+      ? authConfig.identity_provider.required_analyst_groups
+      : ['sec-edgar-analysts']
+    const defaultEmail = `analyst@${defaultDomain}`
 
     if (authConfig) {
       const externalAuthorizeUrl = buildExternalOidcAuthorizeUrl(
         authConfig,
-        params.email
+        defaultEmail
       )
       if (externalAuthorizeUrl) {
         window.location.assign(externalAuthorizeUrl)
@@ -206,7 +204,11 @@ export function App() {
 
     setIsAuthenticating(true)
     try {
-      const user = await loginWithWorkspaceOktaDevBroker(params)
+      const user = await loginWithWorkspaceOktaDevBroker({
+        email: defaultEmail,
+        name: 'Senior Financial Analyst',
+        groups: defaultGroups,
+      })
       setAuthenticatedUser(user)
       setAuthErrorMessage(null)
       await loadCompaniesCatalog()
@@ -294,10 +296,6 @@ export function App() {
     try {
       const resp = await executeConversationalRagQuery(trimmed, snapshotFilters)
       setIsLiveBackend(resp.connection_mode !== 'fallback')
-      setLastLatencyMs(resp.total_latency_ms)
-      if (resp.context_cache?.cache_hit) {
-        setCacheHits((prev) => prev + 1)
-      }
 
       setTurns((prev) =>
         prev.map((t) =>
@@ -384,9 +382,6 @@ export function App() {
         sectionId
       )
       setCachedSection(sectionResp)
-      if (sectionResp.cache_hit) {
-        setCacheHits((prev) => prev + 1)
-      }
     } catch (err) {
       if (err instanceof ApiAuthError) {
         handleApiAuthFailure(err)
@@ -432,16 +427,9 @@ export function App() {
   return (
     <div className="h-screen w-screen overflow-hidden flex flex-col surface-canvas">
       <HeaderBar
-        isLiveBackend={isLiveBackend}
         companyCount={companies.length || 18}
         totalProfiles={totalProfiles}
         turnCount={turns.length}
-        cacheHits={cacheHits}
-        lastLatencyMs={lastLatencyMs}
-        theme={theme}
-        onToggleTheme={() =>
-          setTheme((prev) => (prev === 'light' ? 'dark' : 'light'))
-        }
         onResetConversation={handleResetConversation}
         isSourcePaneOpen={isSourcePaneOpen}
         onToggleSourcePane={() => setIsSourcePaneOpen((prev) => !prev)}
@@ -472,41 +460,45 @@ export function App() {
             onChangeFilters={setFilters}
           />
 
-          {/* Split-Pane Main Workspace */}
+          {/* Split-Pane Main Terminal Workspace */}
           <div className="flex-1 flex min-h-0 relative overflow-hidden">
-            {/* Left/Center Conversational Agentic RAG Stream */}
+            {/* Left Blotter & Command Stream */}
             <main
               id="rag-conversation-pane"
               className="flex-1 flex flex-col min-w-0 min-h-0"
             >
-              <div className="flex-1 overflow-y-auto px-4 sm:px-6">
-                <div className="max-w-3xl mx-auto">
-                  {turns.length === 0 ? (
-                    <StarterPrompts onSelectPreset={handleSelectStarter} />
-                  ) : (
-                    <div className="py-2">
-                      {turns.map((turn) => (
-                        <ChatTurnItem
-                          key={turn.id}
-                          turn={turn}
-                          activeChunkId={activeChunkId}
-                          onSelectInlineCitation={handleSelectInlineCitation}
-                          onFocusTurnCitations={(cits) => {
-                            setActiveCitations(cits)
-                            setActiveChunkId(cits[0]?.chunk_id ?? null)
-                            setSourceTab('citations')
-                            setIsSourcePaneOpen(true)
-                          }}
-                          onInspectFilingSection={(t, fy, sec) => {
-                            void handleLoadFilingSection(t, fy, sec)
-                          }}
-                          onSubmitFeedback={handleFeedback}
-                        />
-                      ))}
-                      <div ref={streamEndRef} />
-                    </div>
-                  )}
-                </div>
+              <div className="flex-1 overflow-y-auto px-3">
+                {turns.length === 0 ? (
+                  <StarterPrompts
+                    companies={companies}
+                    onSelectPreset={handleSelectStarter}
+                    onSelectIssuerFiling={(t, fy) => {
+                      void handleLoadFilingSection(t, fy, 'item_7')
+                    }}
+                  />
+                ) : (
+                  <div className="py-3">
+                    {turns.map((turn) => (
+                      <ChatTurnItem
+                        key={turn.id}
+                        turn={turn}
+                        activeChunkId={activeChunkId}
+                        onSelectInlineCitation={handleSelectInlineCitation}
+                        onFocusTurnCitations={(cits) => {
+                          setActiveCitations(cits)
+                          setActiveChunkId(cits[0]?.chunk_id ?? null)
+                          setSourceTab('citations')
+                          setIsSourcePaneOpen(true)
+                        }}
+                        onInspectFilingSection={(t, fy, sec) => {
+                          void handleLoadFilingSection(t, fy, sec)
+                        }}
+                        onSubmitFeedback={handleFeedback}
+                      />
+                    ))}
+                    <div ref={streamEndRef} />
+                  </div>
+                )}
               </div>
 
               <QueryComposer
@@ -520,9 +512,9 @@ export function App() {
               />
             </main>
 
-            {/* Right Split-Pane Grounded 10-K Source Viewer */}
+            {/* Right Split-Pane SEC Form 10-K Terminal Inspector */}
             {isSourcePaneOpen && (
-              <div className="fixed inset-y-0 right-0 z-30 w-full sm:w-[440px] lg:static lg:z-auto lg:w-[43%] xl:w-[44%] shrink-0 h-full shadow-2xl lg:shadow-none">
+              <div className="fixed inset-y-0 right-0 z-30 w-full sm:w-[440px] lg:static lg:z-auto lg:w-[44%] xl:w-[45%] shrink-0 h-full">
                 <SourceInspectorPane
                   citations={activeCitations}
                   companies={companies}

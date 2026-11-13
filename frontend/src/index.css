@@ -1,86 +1,58 @@
 @import "tailwindcss";
 
 /* ==========================================================================
-   SEC EDGAR Natural Language Analyst — Institutional Design System (Tailwind v4)
-   Curated HSL tokens: Warm Alabaster Paper (Default) & Deep Obsidian Desk (Dark)
+   EDGAR <GO> — Institutional Financial Terminal Design System
+   High-contrast dark CRT/OLED palette, crisp 1px grid geometry, tabular mono
    ========================================================================== */
 
 @theme {
-  --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-serif: "Newsreader", Georgia, Cambria, "Times New Roman", serif;
+  --font-sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
 }
 
 :root {
-  color-scheme: light;
-  --bg-canvas: hsl(42, 24%, 97%);
-  --bg-surface: hsl(0, 0%, 100%);
-  --bg-elevated: hsl(40, 20%, 99%);
-  --bg-subtle: hsl(38, 18%, 94.5%);
-  --bg-filing-sheet: hsl(42, 33%, 98.4%);
-  --bg-composer: hsl(0, 0%, 100%);
-
-  --text-primary: hsl(218, 32%, 12%);
-  --text-secondary: hsl(216, 18%, 34%);
-  --text-muted: hsl(215, 13%, 50%);
-
-  --border-hairline: hsl(36, 15%, 87%);
-  --border-strong: hsl(215, 16%, 76%);
-
-  --accent-ink: hsl(213, 74%, 34%);
-  --accent-ink-hover: hsl(213, 78%, 27%);
-  --accent-tint: hsl(212, 65%, 94.5%);
-
-  --positive-ink: hsl(158, 66%, 28%);
-  --positive-tint: hsl(156, 52%, 93.5%);
-
-  --negative-ink: hsl(4, 70%, 44%);
-  --negative-tint: hsl(4, 68%, 95%);
-
-  --amber-ink: hsl(32, 82%, 31%);
-  --amber-tint: hsl(38, 84%, 93.5%);
-
-  --highlight-mark: hsl(46, 95%, 83%);
-  --highlight-mark-active: hsl(43, 96%, 74%);
-
-  --shadow-soft: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 14px rgba(15, 23, 42, 0.035);
-  --shadow-elevated: 0 2px 6px rgba(15, 23, 42, 0.06), 0 12px 28px rgba(15, 23, 42, 0.06);
-}
-
-[data-theme="dark"] {
   color-scheme: dark;
-  --bg-canvas: hsl(218, 24%, 8.5%);
-  --bg-surface: hsl(218, 22%, 11.5%);
-  --bg-elevated: hsl(217, 20%, 14%);
-  --bg-subtle: hsl(217, 19%, 15.5%);
-  --bg-filing-sheet: hsl(218, 21%, 10.5%);
-  --bg-composer: hsl(218, 21%, 12.5%);
 
-  --text-primary: hsl(40, 20%, 94%);
-  --text-secondary: hsl(214, 15%, 72%);
-  --text-muted: hsl(215, 12%, 54%);
+  /* Core Terminal Surfaces */
+  --bg-canvas: hsl(220, 20%, 3.5%);
+  --bg-surface: hsl(220, 17%, 6%);
+  --bg-elevated: hsl(220, 16%, 9%);
+  --bg-subtle: hsl(220, 16%, 8%);
+  --bg-header: hsl(220, 19%, 7%);
+  --bg-filing-sheet: hsl(220, 18%, 5%);
+  --bg-input: hsl(220, 22%, 4%);
 
-  --border-hairline: hsl(217, 16%, 20%);
-  --border-strong: hsl(216, 16%, 29%);
+  /* High-Legibility Terminal Typography */
+  --text-primary: hsl(210, 20%, 93%);
+  --text-secondary: hsl(214, 13%, 70%);
+  --text-muted: hsl(215, 11%, 48%);
 
-  --accent-ink: hsl(208, 82%, 65%);
-  --accent-ink-hover: hsl(208, 88%, 73%);
-  --accent-tint: hsl(212, 46%, 19%);
+  /* Crisp 1px Structural Grid Lines */
+  --border-hairline: hsl(220, 14%, 15.5%);
+  --border-strong: hsl(220, 14%, 25%);
 
-  --positive-ink: hsl(156, 62%, 58%);
-  --positive-tint: hsl(158, 42%, 16%);
+  /* Bloomberg Functional Color Semantics */
+  --bb-amber: hsl(36, 100%, 50%);
+  --bb-amber-hover: hsl(38, 100%, 57%);
+  --bb-amber-tint: hsla(36, 100%, 50%, 0.13);
+  --bb-amber-border: hsla(36, 100%, 50%, 0.42);
 
-  --negative-ink: hsl(4, 78%, 68%);
-  --negative-tint: hsl(4, 42%, 18%);
+  --bb-yellow: hsl(45, 97%, 60%);
+  --bb-yellow-tint: hsla(45, 97%, 60%, 0.11);
 
-  --amber-ink: hsl(37, 86%, 66%);
-  --amber-tint: hsl(35, 45%, 18%);
+  --bb-cyan: hsl(198, 93%, 62%);
+  --bb-cyan-hover: hsl(198, 96%, 72%);
+  --bb-cyan-tint: hsla(198, 93%, 62%, 0.11);
+  --bb-cyan-border: hsla(198, 93%, 62%, 0.36);
 
-  --highlight-mark: hsl(43, 68%, 25%);
-  --highlight-mark-active: hsl(43, 78%, 32%);
+  --positive-ink: hsl(148, 80%, 48%);
+  --positive-tint: hsla(148, 80%, 48%, 0.11);
 
-  --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.32), 0 6px 16px rgba(0, 0, 0, 0.24);
-  --shadow-elevated: 0 4px 12px rgba(0, 0, 0, 0.45), 0 16px 34px rgba(0, 0, 0, 0.35);
+  --negative-ink: hsl(3, 86%, 62%);
+  --negative-tint: hsla(3, 86%, 62%, 0.12);
+
+  --highlight-mark: hsla(45, 97%, 55%, 0.22);
+  --highlight-mark-active: hsla(36, 100%, 50%, 0.32);
 }
 
 @layer base {
@@ -93,6 +65,7 @@
     background-color: var(--bg-canvas);
     color: var(--text-primary);
     font-family: var(--font-sans);
+    font-size: 13px;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
@@ -102,11 +75,16 @@
   select,
   input,
   textarea {
-    font-family: inherit;
+    font-family: var(--font-mono);
+  }
+
+  select option {
+    background-color: var(--bg-surface);
+    color: var(--text-primary);
   }
 }
 
-/* Reusable Design System Component Surfaces & Tokens */
+/* Terminal Surfaces */
 .surface-canvas {
   background-color: var(--bg-canvas);
   color: var(--text-primary);
@@ -115,13 +93,17 @@
 .surface-panel {
   background-color: var(--bg-surface);
   border-color: var(--border-hairline);
-  box-shadow: var(--shadow-soft);
+}
+
+.surface-header {
+  background-color: var(--bg-header);
+  border-color: var(--border-hairline);
 }
 
 .surface-elevated {
   background-color: var(--bg-elevated);
-  border-color: var(--border-hairline);
-  box-shadow: var(--shadow-elevated);
+  border-color: var(--border-strong);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.72);
 }
 
 .surface-subtle {
@@ -132,15 +114,14 @@
 .surface-filing-sheet {
   background-color: var(--bg-filing-sheet);
   border-color: var(--border-hairline);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), var(--shadow-soft);
 }
 
-.surface-composer {
-  background-color: var(--bg-composer);
+.surface-input {
+  background-color: var(--bg-input);
   border-color: var(--border-strong);
-  box-shadow: var(--shadow-elevated);
 }
 
+/* Semantic Typography */
 .text-ink-primary {
   color: var(--text-primary);
 }
@@ -153,6 +134,27 @@
   color: var(--text-muted);
 }
 
+.text-bb-amber {
+  color: var(--bb-amber);
+}
+
+.text-bb-yellow {
+  color: var(--bb-yellow);
+}
+
+.text-bb-cyan {
+  color: var(--bb-cyan);
+}
+
+.text-bb-pos {
+  color: var(--positive-ink);
+}
+
+.text-bb-neg {
+  color: var(--negative-ink);
+}
+
+/* Structural Borders */
 .border-hairline {
   border-color: var(--border-hairline);
 }
@@ -161,80 +163,108 @@
   border-color: var(--border-strong);
 }
 
+/* Bloomberg Functional Tags & Badges */
+.badge-amber {
+  background-color: var(--bb-amber-tint);
+  color: var(--bb-amber);
+  border: 1px solid var(--bb-amber-border);
+}
+
 .badge-accent {
-  background-color: var(--accent-tint);
-  color: var(--accent-ink);
+  background-color: var(--bb-cyan-tint);
+  color: var(--bb-cyan);
+  border: 1px solid var(--bb-cyan-border);
 }
 
 .badge-positive {
   background-color: var(--positive-tint);
   color: var(--positive-ink);
+  border: 1px solid hsla(148, 80%, 48%, 0.3);
 }
 
 .badge-negative {
   background-color: var(--negative-tint);
   color: var(--negative-ink);
+  border: 1px solid hsla(3, 86%, 62%, 0.32);
 }
 
-.badge-amber {
-  background-color: var(--amber-tint);
-  color: var(--amber-ink);
+/* Terminal Action Controls */
+.btn-terminal-go {
+  background-color: var(--bb-amber);
+  color: #050608;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  transition: background-color 100ms ease, opacity 100ms ease;
 }
 
-.btn-primary-ink {
-  background-color: var(--accent-ink);
-  color: #ffffff;
-  transition: background-color 150ms ease, transform 120ms ease, opacity 150ms ease;
+.btn-terminal-go:hover:not(:disabled) {
+  background-color: var(--bb-amber-hover);
 }
 
-[data-theme="dark"] .btn-primary-ink {
-  color: hsl(218, 28%, 9%);
+.btn-terminal-key {
+  background-color: var(--bg-subtle);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-hairline);
+  font-family: var(--font-mono);
+  transition: border-color 100ms ease, color 100ms ease, background-color 100ms ease;
 }
 
-.btn-primary-ink:hover:not(:disabled) {
-  background-color: var(--accent-ink-hover);
+.btn-terminal-key:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+  background-color: var(--bg-elevated);
 }
 
-.btn-primary-ink:active:not(:disabled) {
-  transform: translateY(0.5px);
+.btn-terminal-key-active {
+  background-color: var(--bb-amber-tint);
+  color: var(--bb-amber);
+  border: 1px solid var(--bb-amber-border);
 }
 
+/* Inline Source-Grounded Citation Tag */
 .citation-chip {
   display: inline-flex;
   align-items: center;
-  gap: 0.3rem;
-  padding: 0.1rem 0.45rem;
-  margin: 0 0.15rem;
-  border-radius: 0.3rem;
+  gap: 0.25rem;
+  padding: 0.05rem 0.38rem;
+  margin: 0 0.14rem;
   font-family: var(--font-mono);
-  font-size: 0.72rem;
+  font-size: 11px;
   font-weight: 500;
   line-height: 1.35;
-  background-color: var(--accent-tint);
-  color: var(--accent-ink);
-  border: 1px solid transparent;
+  background-color: var(--bb-cyan-tint);
+  color: var(--bb-cyan);
+  border: 1px solid var(--bb-cyan-border);
   cursor: pointer;
   vertical-align: baseline;
-  transition: background-color 140ms ease, border-color 140ms ease, transform 120ms ease;
+  transition: background-color 100ms ease, border-color 100ms ease, color 100ms ease;
 }
 
 .citation-chip:hover {
-  border-color: var(--accent-ink);
-  transform: translateY(-0.5px);
+  border-color: var(--bb-cyan);
+  color: var(--bb-cyan-hover);
 }
 
 .citation-chip-active {
-  background-color: var(--highlight-mark-active);
-  color: hsl(218, 32%, 11%);
-  border-color: hsl(36, 75%, 42%);
+  background-color: var(--bb-amber);
+  color: #050608;
+  border-color: var(--bb-amber);
+  font-weight: 600;
 }
 
+.citation-chip-active:hover {
+  color: #050608;
+  border-color: var(--bb-amber-hover);
+}
+
+/* Filing & Data Typography */
 .filing-prose {
-  font-family: var(--font-serif);
-  font-size: 0.98rem;
-  line-height: 1.72;
-  letter-spacing: -0.003em;
-  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.62;
+  color: var(--text-secondary);
 }
 
 .tabular-nums-mono {
@@ -244,45 +274,31 @@
 
 .passage-highlight {
   background-color: var(--highlight-mark);
-  color: inherit;
-  border-radius: 0.2rem;
-  padding: 0.05rem 0.2rem;
+  color: var(--text-primary);
+  padding: 0.05rem 0.15rem;
 }
 
 .passage-highlight-active {
   background-color: var(--highlight-mark-active);
-  color: hsl(218, 32%, 10%);
-  border-radius: 0.25rem;
-  padding: 0.12rem 0.25rem;
-  box-shadow: 0 0 0 2px var(--highlight-mark-active);
+  color: #ffffff;
+  padding: 0.08rem 0.2rem;
+  outline: 1px solid var(--bb-amber);
 }
 
-/* Subtle custom scrollbars for split-pane inspection */
+/* Crisp Rectangular Terminal Scrollbars */
 ::-webkit-scrollbar {
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: transparent;
+  background: var(--bg-canvas);
 }
 
 ::-webkit-scrollbar-thumb {
   background: var(--border-strong);
-  border-radius: 9999px;
 }
 
-@keyframes subtleFadeSlide {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.animate-turn-enter {
-  animation: subtleFadeSlide 200ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
 }

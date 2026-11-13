@@ -6,7 +6,7 @@ BACKEND_HOST ?= 127.0.0.1
 BACKEND_PORT ?= 8000
 FRONTEND_PORT ?= 5173
 
-.PHONY: help install dev backend frontend build test clean
+.PHONY: help install dev start backend frontend build test clean
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage: make <target>\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2 } END {printf "\n"}' $(MAKEFILE_LIST)
@@ -17,12 +17,15 @@ install: ## Install backend (.venv) and frontend dependencies
 	$(VENV)/bin/pip install -e ".[dev]" || $(VENV)/bin/pip install -r requirements.txt
 	cd frontend && npm install
 
-dev: ## Run FastAPI backend (:8000) and React frontend (:5173) together
-	@echo "Starting FastAPI (http://$(BACKEND_HOST):$(BACKEND_PORT)) + Vite UI (http://127.0.0.1:$(FRONTEND_PORT))..."
+dev: ## Run FastAPI backend (:8000) and Vite Terminal UI (:5173) together
+	@echo "Starting FastAPI (http://$(BACKEND_HOST):$(BACKEND_PORT)) + Terminal UI (http://127.0.0.1:$(FRONTEND_PORT))..."
 	@trap 'kill 0' INT TERM EXIT; \
 		$(PYTHON) -m uvicorn --app-dir src edgar_capstone.server:app --reload --host $(BACKEND_HOST) --port $(BACKEND_PORT) & \
 		(cd frontend && npm run dev -- --host 127.0.0.1 --port $(FRONTEND_PORT)) & \
 		wait
+
+start: build ## Build production UI bundle and serve unified single-origin app via FastAPI (:8000)
+	$(PYTHON) -m uvicorn --app-dir src edgar_capstone.server:app --host $(BACKEND_HOST) --port $(BACKEND_PORT)
 
 backend: ## Run FastAPI backend server only
 	$(PYTHON) -m uvicorn --app-dir src edgar_capstone.server:app --reload --host $(BACKEND_HOST) --port $(BACKEND_PORT)

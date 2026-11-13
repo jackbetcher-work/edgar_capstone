@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import App from '../App'
 
-describe('EDGAR Analyst Source-Grounded Hybrid RAG Workspace', () => {
+describe('EDGAR <GO> Financial Terminal Workspace', () => {
   beforeEach(() => {
     vi.restoreAllMocks()
     vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('offline test mode'))
@@ -12,12 +12,14 @@ describe('EDGAR Analyst Source-Grounded Hybrid RAG Workspace', () => {
     cleanup()
   })
 
-  it('renders single h1 heading, hybrid scope filters, starter prompts, and source viewer', async () => {
+  it('renders single h1 heading, terminal dark theme, scope bar, coverage monitor, and 10-K pane', async () => {
     render(<App />)
 
     const headings = screen.getAllByRole('heading', { level: 1 })
     expect(headings).toHaveLength(1)
     expect(headings[0].textContent).toBe('EDGAR Analyst')
+
+    expect(document.documentElement.getAttribute('data-theme')).toBe('terminal')
 
     expect(
       await screen.findByText(/Query audited financials and grounded 10-K disclosures/i)
@@ -26,6 +28,7 @@ describe('EDGAR Analyst Source-Grounded Hybrid RAG Workspace', () => {
     expect(screen.getByLabelText(/GICS Sector/i)).toBeTruthy()
     expect(screen.getByLabelText(/Form 10-K Section/i)).toBeTruthy()
     expect(screen.getByText(/Grounded Chunks/i)).toBeTruthy()
+    expect(screen.getByText(/S&P 500 COVERAGE MONITOR \(18 EQUITIES\)/i)).toBeTruthy()
   })
 
   it('executes a peer comparison RAG query, renders variance math, inline citations, and opens 10-K section', async () => {
@@ -60,15 +63,26 @@ describe('EDGAR Analyst Source-Grounded Hybrid RAG Workspace', () => {
     })
   })
 
-  it('toggles between light warm paper and dark desk themes', async () => {
+  it('focuses the EDGR> command line via / shortcut and executes a query with <GO>', async () => {
     render(<App />)
-    await screen.findByText(/Local Corpus Snapshot/i)
-    expect(document.documentElement.getAttribute('data-theme')).toBe('light')
+    await screen.findByText(/EDGR <GO>/i)
 
-    const toggleBtn = screen.getByRole('button', {
-      name: /Switch to dark desk theme/i,
+    fireEvent.keyDown(window, { key: '/' })
+    const cmdInput = screen.getByLabelText(
+      /Ask a natural language financial or SEC 10-K question/i
+    )
+    expect(document.activeElement).toBe(cmdInput)
+
+    fireEvent.change(cmdInput, {
+      target: { value: 'NVDA FY2024 to FY2026 revenue variance' },
     })
-    fireEvent.click(toggleBtn)
-    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    fireEvent.click(screen.getByRole('button', { name: /^<GO>$/ }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/CMD>/i)).toBeTruthy()
+      expect(
+        screen.getByText('NVDA FY2024 to FY2026 revenue variance')
+      ).toBeTruthy()
+    })
   })
 })

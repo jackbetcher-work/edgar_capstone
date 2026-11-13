@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   Check,
   Copy,
-  FileSearch,
   Loader2,
   ShieldCheck,
   ThumbsDown,
@@ -14,7 +13,6 @@ import {
   getIntentDisplayMeta,
   type ParsedInlineCitationToken,
 } from '../utils/formatters'
-import { AgentTraceAccordion } from './AgentTraceAccordion'
 import { GroundedMarkdown } from './GroundedMarkdown'
 import { VarianceTableCard } from './VarianceTableCard'
 
@@ -67,30 +65,39 @@ export function ChatTurnItem({
   return (
     <article
       id={`conversation-turn-${turn.id}`}
-      className="space-y-4 py-5 border-b border-hairline last:border-b-0 animate-turn-enter"
+      className="border border-hairline surface-panel mb-3"
     >
-      {/* Analyst Query Bubble */}
-      <div className="flex flex-col items-end">
-        <div className="max-w-2xl rounded-xl px-4 py-2.5 surface-subtle border border-hairline text-sm text-ink-primary leading-relaxed">
-          {turn.userQuery}
+      {/* Terminal Command Input Echo Line */}
+      <div className="px-3 py-1.5 surface-header border-b border-hairline flex flex-wrap items-center justify-between gap-2 tabular-nums-mono">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-[11px] font-bold text-bb-amber shrink-0">
+            CMD&gt;
+          </span>
+          <span className="text-xs font-medium text-ink-primary break-words">
+            {turn.userQuery}
+          </span>
         </div>
-        <div className="flex items-center gap-2 mt-1 text-[11px] text-ink-muted tabular-nums-mono">
+
+        <div className="flex items-center gap-1.5 text-[10px] text-ink-muted uppercase shrink-0">
           <span>
-            FY{turn.appliedFilters.startYear}–FY{turn.appliedFilters.endYear}
+            FY{String(turn.appliedFilters.startYear).slice(-2)}–FY
+            {String(turn.appliedFilters.endYear).slice(-2)}
           </span>
           {turn.appliedFilters.selectedTickers.length > 0 && (
             <>
-              <span>·</span>
-              <span>{turn.appliedFilters.selectedTickers.join(', ')}</span>
+              <span>|</span>
+              <span className="text-bb-yellow font-semibold">
+                {turn.appliedFilters.selectedTickers.join(',')}
+              </span>
             </>
           )}
           {turn.appliedFilters.sectionId !== 'ALL' && (
             <>
-              <span>·</span>
+              <span>|</span>
               <span>
                 {turn.appliedFilters.sectionId === 'item_1a'
-                  ? 'Item 1A'
-                  : 'Item 7'}
+                  ? 'ITEM 1A'
+                  : 'ITEM 7'}
               </span>
             </>
           )}
@@ -101,67 +108,61 @@ export function ChatTurnItem({
       {turn.isLoading && (
         <div
           id={`loading-turn-${turn.id}`}
-          className="rounded-lg surface-panel border border-hairline p-4 space-y-3"
+          className="p-3.5 space-y-2.5 tabular-nums-mono"
         >
-          <div className="flex items-center gap-2.5 text-xs font-medium text-ink-secondary">
-            <Loader2
-              className="w-4 h-4 animate-spin"
-              style={{ color: 'var(--accent-ink)' }}
-            />
-            <span>
-              RootOrchestrator executing deterministic variance math &amp; hybrid 10-K
-              search...
-            </span>
+          <div className="flex items-center gap-2 text-xs text-bb-amber">
+            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+            <span>COMPUTING XBRL VARIANCES &amp; RETRIEVING 10-K FILINGS...</span>
           </div>
-          <div className="space-y-2 pt-1">
-            <div className="h-3 rounded surface-subtle w-3/4 animate-pulse" />
-            <div className="h-3 rounded surface-subtle w-full animate-pulse" />
-            <div className="h-3 rounded surface-subtle w-2/3 animate-pulse" />
+          <div className="space-y-1.5">
+            <div className="h-2.5 surface-subtle w-3/4 animate-pulse" />
+            <div className="h-2.5 surface-subtle w-full animate-pulse" />
+            <div className="h-2.5 surface-subtle w-2/3 animate-pulse" />
           </div>
         </div>
       )}
 
       {/* Error State */}
       {turn.errorMessage && !turn.isLoading && (
-        <div className="rounded-lg badge-negative p-3.5 text-xs flex items-center gap-2">
-          <AlertTriangle className="w-4 h-4 shrink-0" />
+        <div className="m-3 p-2.5 badge-negative text-xs flex items-center gap-2 tabular-nums-mono">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
           <span>{turn.errorMessage}</span>
         </div>
       )}
 
-      {/* Grounded Agent Synthesis */}
+      {/* Grounded Terminal Dispatch Body */}
       {resp && !turn.isLoading && intentMeta && (
-        <div className="rounded-xl surface-panel border border-hairline p-4 sm:p-5">
-          {/* Verification & Routing Header */}
-          <div className="flex flex-wrap items-center justify-between gap-2 pb-3 mb-3 border-b border-hairline">
+        <div className="p-3">
+          {/* Status & Action Strip */}
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 mb-3 border-b border-hairline tabular-nums-mono text-[11px]">
             <div className="flex flex-wrap items-center gap-2">
               <span
-                className={`px-2 py-0.5 rounded text-[11px] font-semibold tabular-nums-mono badge-${intentMeta.tone}`}
+                className={`px-1.5 py-0.2 text-[10px] font-bold uppercase badge-${intentMeta.tone}`}
               >
                 {intentMeta.shortCode}
               </span>
-              <span className="text-xs font-medium text-ink-primary">
+              <span className="text-ink-secondary text-[11px]">
                 {intentMeta.label}
               </span>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 text-[11px] tabular-nums-mono">
+            <div className="flex flex-wrap items-center gap-1.5">
               {resp.model_armor_blocked ? (
-                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded badge-negative font-medium">
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-negative">
                   <AlertTriangle className="w-3 h-3" />
                   Guardrail Enforced
                 </span>
               ) : resp.fact_check.passed ? (
                 <span
-                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded badge-positive font-medium"
-                  title="Post-generation fact-check confirmed numeric & citation fidelity"
+                  className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-positive"
+                  title="Numeric & citation fidelity verified against XBRL & 10-K corpus"
                 >
                   <ShieldCheck className="w-3 h-3" />
                   Fact-Check Verified
                 </span>
               ) : (
                 <span
-                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded badge-amber font-medium"
+                  className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-amber"
                   title={resp.fact_check.discrepancies.join(' ')}
                 >
                   <AlertTriangle className="w-3 h-3" />
@@ -174,22 +175,67 @@ export function ChatTurnItem({
                   id={`btn-focus-citations-${turn.id}`}
                   type="button"
                   onClick={() => onFocusTurnCitations(resp.citations)}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded surface-subtle border border-hairline text-ink-secondary hover:text-ink-primary cursor-pointer"
+                  className="px-1.5 py-0.2 text-[10px] uppercase btn-terminal-key cursor-pointer"
                 >
-                  <FileSearch className="w-3 h-3" />
-                  {resp.citations.length} 10-K Sources
+                  [{resp.citations.length} SOURCES]
                 </button>
               )}
+
+              <button
+                id={`btn-copy-report-${turn.id}`}
+                type="button"
+                onClick={handleCopy}
+                className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase btn-terminal-key cursor-pointer"
+                title="Copy report markdown"
+              >
+                {copied ? (
+                  <>
+                    <Check className="w-3 h-3 text-bb-pos" />
+                    <span>COPIED</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3 h-3" />
+                    <span>COPY</span>
+                  </>
+                )}
+              </button>
+
+              <div className="inline-flex items-center gap-0.5 ml-0.5">
+                <button
+                  id={`btn-feedback-up-${turn.id}`}
+                  type="button"
+                  onClick={() => {
+                    onSubmitFeedback(turn.id, 'up', turn.feedbackComment || '')
+                  }}
+                  aria-label="Approve grounded synthesis"
+                  className={`p-1 cursor-pointer transition-colors ${
+                    turn.feedbackRating === 'up'
+                      ? 'badge-positive'
+                      : 'btn-terminal-key'
+                  }`}
+                >
+                  <ThumbsUp className="w-3 h-3" />
+                </button>
+                <button
+                  id={`btn-feedback-down-${turn.id}`}
+                  type="button"
+                  onClick={() => {
+                    setShowCommentInput(true)
+                    onSubmitFeedback(turn.id, 'down', turn.feedbackComment || '')
+                  }}
+                  aria-label="Flag synthesis issue"
+                  className={`p-1 cursor-pointer transition-colors ${
+                    turn.feedbackRating === 'down'
+                      ? 'badge-negative'
+                      : 'btn-terminal-key'
+                  }`}
+                >
+                  <ThumbsDown className="w-3 h-3" />
+                </button>
+              </div>
             </div>
           </div>
-
-          {/* ReAct Orchestration Trace */}
-          <AgentTraceAccordion
-            turnId={turn.id}
-            steps={resp.agent_trace}
-            totalLatencyMs={resp.total_latency_ms}
-            candidatesSearched={resp.candidates_searched}
-          />
 
           {/* Deterministic Variance Table */}
           {resp.variance_reports.length > 0 && (
@@ -210,82 +256,15 @@ export function ChatTurnItem({
             }
           />
 
-          {/* Analyst Action & Audit Feedback Footer */}
-          <div className="mt-4 pt-3 border-t border-hairline flex flex-wrap items-center justify-between gap-2 text-xs text-ink-muted">
-            <div className="flex items-center gap-2">
-              <button
-                id={`btn-copy-report-${turn.id}`}
-                type="button"
-                onClick={handleCopy}
-                className="inline-flex items-center gap-1 px-2 py-1 rounded hover:bg-[var(--bg-subtle)] text-ink-secondary cursor-pointer transition-colors"
-              >
-                {copied ? (
-                  <>
-                    <Check className="w-3.5 h-3.5" />
-                    <span>Copied</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy className="w-3.5 h-3.5" />
-                    <span>Copy Brief</span>
-                  </>
-                )}
-              </button>
-
-              {resp.context_cache && (
-                <span className="hidden sm:inline text-[11px] tabular-nums-mono">
-                  · Context Cache:{' '}
-                  {resp.context_cache.cache_hit ? 'HIT' : 'WARMED'} (
-                  {resp.context_cache.cache_key})
-                </span>
-              )}
-            </div>
-
-            <div className="flex items-center gap-1.5">
-              <span className="text-[11px] mr-1">Audit Rating:</span>
-              <button
-                id={`btn-feedback-up-${turn.id}`}
-                type="button"
-                onClick={() => {
-                  onSubmitFeedback(turn.id, 'up', turn.feedbackComment || '')
-                }}
-                aria-label="Approve grounded synthesis"
-                className={`p-1 rounded cursor-pointer transition-colors ${
-                  turn.feedbackRating === 'up'
-                    ? 'badge-positive'
-                    : 'hover:bg-[var(--bg-subtle)] text-ink-secondary'
-                }`}
-              >
-                <ThumbsUp className="w-3.5 h-3.5" />
-              </button>
-              <button
-                id={`btn-feedback-down-${turn.id}`}
-                type="button"
-                onClick={() => {
-                  setShowCommentInput(true)
-                  onSubmitFeedback(turn.id, 'down', turn.feedbackComment || '')
-                }}
-                aria-label="Flag synthesis issue"
-                className={`p-1 rounded cursor-pointer transition-colors ${
-                  turn.feedbackRating === 'down'
-                    ? 'badge-negative'
-                    : 'hover:bg-[var(--bg-subtle)] text-ink-secondary'
-                }`}
-              >
-                <ThumbsDown className="w-3.5 h-3.5" />
-              </button>
-            </div>
-          </div>
-
           {showCommentInput && (
-            <div className="mt-2.5 flex items-center gap-2">
+            <div className="mt-3 pt-2.5 border-t border-hairline flex items-center gap-2 tabular-nums-mono">
               <input
                 id={`input-feedback-note-${turn.id}`}
                 type="text"
                 value={commentDraft}
                 onChange={(e) => setCommentDraft(e.target.value)}
-                placeholder="Add optional audit note for compliance telemetry..."
-                className="flex-1 px-2.5 py-1.5 rounded text-xs surface-subtle border border-hairline text-ink-primary focus:outline-none"
+                placeholder="ENTER AUDIT NOTE..."
+                className="flex-1 px-2 py-1 text-xs surface-input border border-strong text-ink-primary focus:outline-none focus:border-[var(--bb-amber)]"
               />
               <button
                 id={`btn-save-feedback-note-${turn.id}`}
@@ -298,9 +277,9 @@ export function ChatTurnItem({
                   )
                   setShowCommentInput(false)
                 }}
-                className="px-2.5 py-1.5 rounded text-xs font-medium btn-primary-ink cursor-pointer"
+                className="px-2.5 py-1 text-[11px] btn-terminal-go cursor-pointer"
               >
-                Log Note
+                LOG
               </button>
             </div>
           )}
