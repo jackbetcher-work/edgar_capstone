@@ -177,6 +177,26 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "IAP_STRICT_MODE"
+        value = "true"
+      }
+
+      env {
+        name  = "ALLOWED_WORKSPACE_DOMAINS"
+        value = join(",", var.allowed_workspace_domains)
+      }
+
+      env {
+        name  = "OKTA_ISSUER_URI"
+        value = var.okta_issuer_uri
+      }
+
+      env {
+        name  = "OKTA_CLIENT_ID"
+        value = var.okta_client_id
+      }
+
+      env {
         name = "SEC_EDGAR_USER_AGENT"
         value_source {
           secret_key_ref {

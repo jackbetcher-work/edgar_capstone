@@ -201,3 +201,53 @@ export interface ConversationTurn {
   feedbackRating?: 'up' | 'down'
   feedbackComment?: string
 }
+
+export interface AuthenticatedUserProfile {
+  sub: string
+  email: string
+  name: string
+  hosted_domain: string | null
+  identity_provider: string
+  sso_federation: string
+  issuer: string
+  audience: string
+  groups: string[]
+  roles: string[]
+  issued_at: number
+  expires_at: number
+  iap_assertion_verified: boolean
+}
+
+export interface AuthDiscoveryConfig {
+  status: string
+  auth_required: boolean
+  access_pattern: string
+  identity_provider: {
+    name: string
+    protocol: string
+    google_issuer: string
+    iap_issuer: string
+    okta_issuer: string | null
+    okta_client_id: string | null
+    google_client_id: string | null
+    authorization_endpoint: string | null
+    allowed_workspace_domains: string[]
+    required_analyst_groups: string[]
+    local_sso_dev_broker_enabled: boolean
+  }
+  iap: {
+    enabled: boolean
+    strict_production_mode: boolean
+    bearer_header: string
+    assertion_header: string
+    audience_configured: boolean
+  }
+}
+
+export interface SsoSessionResponse {
+  status: string
+  token_type: string
+  access_token: string
+  expires_at: number
+  user: AuthenticatedUserProfile
+}

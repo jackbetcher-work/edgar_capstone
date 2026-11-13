@@ -117,3 +117,12 @@ output "cloud_run_service_uri" {
   description = "Deployed Google Cloud Run v2 service URI."
   value       = var.enable_cloud_run_service && var.create_analyst_service_account ? google_cloud_run_v2_service.sec_edgar_analyst[0].uri : null
 }
+
+output "iap_backend_service_audience" {
+  description = "Expected IAP JWT 'aud' claim string for the IAP-protected Cloud Run backend service."
+  value = (
+    var.enable_iap_backend_service && var.enable_cloud_run_service && var.create_analyst_service_account
+    ? "/projects/${data.google_project.current.number}/global/backendServices/${google_compute_backend_service.sec_edgar_iap_backend[0].generated_id}"
+    : null
+  )
+}

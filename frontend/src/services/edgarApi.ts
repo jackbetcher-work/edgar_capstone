@@ -8,6 +8,11 @@ import type {
   QueryIntentType,
   SearchScopeFilters,
 } from '../types/edgar'
+import {
+  ApiAuthError,
+  buildAuthorizedHeaders,
+  parseAuthErrorResponse,
+} from './authService'
 
 const FALLBACK_COMPANIES: CompanySummary[] = [
   {
@@ -508,13 +513,21 @@ export async function fetchCompaniesCatalog(): Promise<{
   live: boolean
 }> {
   try {
-    const res = await fetch('/api/v1/companies')
+    const res = await fetch('/api/v1/companies', {
+      headers: buildAuthorizedHeaders(),
+    })
+    if (res.status === 401 || res.status === 403) {
+      throw await parseAuthErrorResponse(res)
+    }
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`)
     }
     const data = (await res.json()) as CompaniesCatalogResponse
     return { catalog: data, live: true }
-  } catch {
+  } catch (err) {
+    if (err instanceof ApiAuthError) {
+      throw err
+    }
     const sectors = Array.from(new Set(FALLBACK_COMPANIES.map((c) => c.gics_sector))).sort()
     return {
       live: false,
@@ -541,7 +554,7 @@ export async function executeConversationalRagQuery(
   try {
     const res = await fetch('/api/v1/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: buildAuthorizedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         query,
         tickers: tickersPayload,
@@ -552,12 +565,18 @@ export async function executeConversationalRagQuery(
         top_k: filters.topK,
       }),
     })
+    if (res.status === 401 || res.status === 403) {
+      throw await parseAuthErrorResponse(res)
+    }
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`)
     }
     const data = (await res.json()) as ChatTurnResponse
     return { ...data, connection_mode: 'live' }
-  } catch {
+  } catch (err) {
+    if (err instanceof ApiAuthError) {
+      throw err
+    }
     return buildOfflineFallbackTurn(query, filters)
   }
 }
@@ -574,12 +593,20 @@ export async function fetchCached10kSection(
       section_id: sectionId,
       max_chars: '38000',
     })
-    const res = await fetch(`/api/v1/section?${params.toString()}`)
+    const res = await fetch(`/api/v1/section?${params.toString()}`, {
+      headers: buildAuthorizedHeaders(),
+    })
+    if (res.status === 401 || res.status === 403) {
+      throw await parseAuthErrorResponse(res)
+    }
     if (!res.ok) {
       throw new Error(`HTTP ${res.status}`)
     }
     return (await res.json()) as CachedSectionResponse
-  } catch {
+  } catch (err) {
+    if (err instanceof ApiAuthError) {
+      throw err
+    }
     const company =
       FALLBACK_COMPANIES.find((c) => c.ticker === ticker) ?? FALLBACK_COMPANIES[0]
     const matchingCits = FALLBACK_CITATIONS.filter(
@@ -623,7 +650,7 @@ export async function postAnalystFeedback(
   try {
     const res = await fetch('/api/v1/feedback', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: buildAuthorizedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         message_id: messageId,
         rating,
@@ -631,8 +658,14 @@ export async function postAnalystFeedback(
         query,
       }),
     })
+    if (res.status === 401 || res.status === 403) {
+      throw await parseAuthErrorResponse(res)
+    }
     return res.ok
-  } catch {
+  } catch (err) {
+    if (err instanceof ApiAuthError) {
+      throw err
+    }
     return false
   }
 }

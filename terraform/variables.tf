@@ -112,6 +112,36 @@ variable "deletion_protection" {
   default     = false
 }
 
+variable "enable_iap_backend_service" {
+  description = "Whether to provision the Identity-Aware Proxy (IAP) Serverless NEG and Backend Service protecting Cloud Run."
+  type        = bool
+  default     = true
+}
+
+variable "allowed_workspace_domains" {
+  description = "Allowed Google Workspace hosted domains (hd) federated via Okta SSO for JWT bearer verification."
+  type        = list(string)
+  default     = []
+}
+
+variable "okta_issuer_uri" {
+  description = "Optional Okta OIDC issuer URI integrated with Google Workspace SSO (e.g. https://org.okta.com/oauth2/default)."
+  type        = string
+  default     = ""
+}
+
+variable "okta_client_id" {
+  description = "Optional Okta OIDC client ID accepted as a programmatic JWT bearer audience."
+  type        = string
+  default     = ""
+}
+
+variable "iap_authorized_principals" {
+  description = "Cloud Identity / Google Workspace SSO principals granted roles/iap.httpsResourceAccessor (e.g. group:sec-edgar-analysts@example.com)."
+  type        = list(string)
+  default     = []
+}
+
 variable "labels" {
   description = "Standard resource labels applied across BigQuery resources."
   type        = map(string)

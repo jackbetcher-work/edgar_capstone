@@ -1,6 +1,8 @@
 import {
   BookOpenText,
   Database,
+  Lock,
+  LogOut,
   Moon,
   PanelRightClose,
   PanelRightOpen,
@@ -8,6 +10,7 @@ import {
   ShieldCheck,
   Sun,
 } from 'lucide-react'
+import type { AuthenticatedUserProfile } from '../types/edgar'
 
 interface HeaderBarProps {
   isLiveBackend: boolean
@@ -22,6 +25,9 @@ interface HeaderBarProps {
   isSourcePaneOpen: boolean
   onToggleSourcePane: () => void
   citationCount: number
+  authenticatedUser?: AuthenticatedUserProfile | null
+  isAuthLocked?: boolean
+  onLogout?: () => void
 }
 
 export function HeaderBar({
@@ -37,6 +43,9 @@ export function HeaderBar({
   isSourcePaneOpen,
   onToggleSourcePane,
   citationCount,
+  authenticatedUser = null,
+  isAuthLocked = false,
+  onLogout,
 }: HeaderBarProps) {
   return (
     <header
@@ -62,12 +71,18 @@ export function HeaderBar({
               <span
                 className="w-1.5 h-1.5 rounded-full inline-block"
                 style={{
-                  backgroundColor: isLiveBackend
-                    ? 'var(--positive-ink)'
-                    : 'var(--amber-ink)',
+                  backgroundColor: isAuthLocked
+                    ? 'var(--amber-ink)'
+                    : isLiveBackend
+                      ? 'var(--positive-ink)'
+                      : 'var(--amber-ink)',
                 }}
               />
-              {isLiveBackend ? 'Live FastAPI · RootOrchestrator' : 'Local Corpus Snapshot'}
+              {isAuthLocked
+                ? 'IAP Protected · Sign-In Required'
+                : isLiveBackend
+                  ? 'Live FastAPI · RootOrchestrator'
+                  : 'Local Corpus Snapshot'}
             </span>
             <span className="hidden sm:inline">·</span>
             <span className="hidden sm:inline-flex items-center gap-1">
@@ -84,7 +99,27 @@ export function HeaderBar({
       </div>
 
       <div className="flex items-center gap-2 shrink-0">
-        {turnCount > 0 && (
+        {authenticatedUser && (
+          <div
+            id="authenticated-user-pill"
+            className="hidden md:inline-flex items-center gap-2 px-2.5 py-1 rounded-md surface-subtle border border-hairline text-[11px] text-ink-secondary tabular-nums-mono"
+            title={`Authenticated via Google Workspace / Okta SSO (${authenticatedUser.identity_provider})`}
+          >
+            <Lock
+              className="w-3 h-3"
+              style={{ color: 'var(--positive-ink)' }}
+              aria-hidden="true"
+            />
+            <span className="badge-positive px-1.5 py-0.2 rounded text-[10px] font-semibold">
+              IAP · JWT
+            </span>
+            <span className="truncate max-w-[180px] text-ink-primary font-medium">
+              {authenticatedUser.email}
+            </span>
+          </div>
+        )}
+
+        {turnCount > 0 && !isAuthLocked && (
           <div
             id="session-telemetry-pill"
             className="hidden xl:flex items-center gap-2.5 px-2.5 py-1 rounded-md surface-subtle border border-hairline text-[11px] text-ink-secondary tabular-nums-mono"
@@ -100,7 +135,7 @@ export function HeaderBar({
           </div>
         )}
 
-        {turnCount > 0 && (
+        {turnCount > 0 && !isAuthLocked && (
           <button
             id="btn-new-analysis-thread"
             type="button"
@@ -118,8 +153,16 @@ export function HeaderBar({
           type="button"
           onClick={onToggleTheme}
           className="p-1.5 rounded-md surface-subtle border border-hairline text-ink-secondary hover:text-ink-primary cursor-pointer transition-colors"
-          aria-label={theme === 'light' ? 'Switch to dark desk theme' : 'Switch to warm paper theme'}
-          title={theme === 'light' ? 'Switch to dark desk theme' : 'Switch to warm paper theme'}
+          aria-label={
+            theme === 'light'
+              ? 'Switch to dark desk theme'
+              : 'Switch to warm paper theme'
+          }
+          title={
+            theme === 'light'
+              ? 'Switch to dark desk theme'
+              : 'Switch to warm paper theme'
+          }
         >
           {theme === 'light' ? (
             <Moon className="w-4 h-4" aria-hidden="true" />
@@ -128,26 +171,45 @@ export function HeaderBar({
           )}
         </button>
 
-        <button
-          id="btn-toggle-source-pane"
-          type="button"
-          onClick={onToggleSourcePane}
-          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium surface-subtle border border-hairline text-ink-primary cursor-pointer transition-colors"
-          aria-expanded={isSourcePaneOpen}
-          title={isSourcePaneOpen ? 'Collapse 10-K Source Viewer' : 'Expand 10-K Source Viewer'}
-        >
-          {isSourcePaneOpen ? (
-            <PanelRightClose className="w-4 h-4" aria-hidden="true" />
-          ) : (
-            <PanelRightOpen className="w-4 h-4" aria-hidden="true" />
-          )}
-          <span className="hidden sm:inline">10-K Sources</span>
-          {citationCount > 0 && (
-            <span className="badge-accent px-1.5 py-0.2 rounded text-[11px] tabular-nums-mono font-semibold">
-              {citationCount}
-            </span>
-          )}
-        </button>
+        {!isAuthLocked && (
+          <button
+            id="btn-toggle-source-pane"
+            type="button"
+            onClick={onToggleSourcePane}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium surface-subtle border border-hairline text-ink-primary cursor-pointer transition-colors"
+            aria-expanded={isSourcePaneOpen}
+            title={
+              isSourcePaneOpen
+                ? 'Collapse 10-K Source Viewer'
+                : 'Expand 10-K Source Viewer'
+            }
+          >
+            {isSourcePaneOpen ? (
+              <PanelRightClose className="w-4 h-4" aria-hidden="true" />
+            ) : (
+              <PanelRightOpen className="w-4 h-4" aria-hidden="true" />
+            )}
+            <span className="hidden sm:inline">10-K Sources</span>
+            {citationCount > 0 && (
+              <span className="badge-accent px-1.5 py-0.2 rounded text-[11px] tabular-nums-mono font-semibold">
+                {citationCount}
+              </span>
+            )}
+          </button>
+        )}
+
+        {authenticatedUser && onLogout && (
+          <button
+            id="btn-auth-logout"
+            type="button"
+            onClick={onLogout}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs font-medium surface-subtle border border-hairline text-ink-secondary hover:text-ink-primary cursor-pointer transition-colors"
+            title="Sign out and revoke IAP Bearer session"
+          >
+            <LogOut className="w-3.5 h-3.5" aria-hidden="true" />
+            <span className="hidden sm:inline">Sign Out</span>
+          </button>
+        )}
       </div>
     </header>
   )

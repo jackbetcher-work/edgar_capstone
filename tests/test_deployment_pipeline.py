@@ -16,6 +16,7 @@ from edgar_capstone.security import (
     MANAGED_SECRETS,
     RedactedSecret,
     SecretManagerClient,
+    issue_local_dev_workspace_sso_token,
     scan_repository_for_exposed_secrets,
     scan_text_for_exposed_secrets,
 )
@@ -216,6 +217,11 @@ def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
     assert 'resource "google_cloud_run_v2_service" "sec_edgar_analyst"' in cicd_tf
     assert "secret_key_ref" in cicd_tf
 
+    iap_tf = (REPO_ROOT / "terraform" / "iap_and_sso.tf").read_text(encoding="utf-8")
+    assert 'resource "google_compute_backend_service" "sec_edgar_iap_backend"' in iap_tf
+    assert "roles/iap.httpsResourceAccessor" in iap_tf
+    assert "roles/run.invoker" in iap_tf
+
 
 def test_fastapi_cloud_run_service_endpoints() -> None:
     client = TestClient(app)
@@ -224,8 +230,17 @@ def test_fastapi_cloud_run_service_endpoints() -> None:
     assert health_resp.status_code == 200
     assert health_resp.json()["status"] == "ok"
     assert health_resp.json()["root_agent"] == "RootOrchestrator"
+    assert health_resp.json()["iap_jwt_auth_enabled"] is True
 
-    secrets_resp = client.get("/api/v1/secrets/status")
+    # Internal APIs require IAP / Workspace Okta JWT Bearer authentication
+    unauth_resp = client.get("/api/v1/secrets/status")
+    assert unauth_resp.status_code == 401
+    assert "Bearer" in unauth_resp.headers.get("WWW-Authenticate", "")
+
+    bearer_jwt, _ = issue_local_dev_workspace_sso_token()
+    auth_headers = {"Authorization": f"Bearer {bearer_jwt}"}
+
+    secrets_resp = client.get("/api/v1/secrets/status", headers=auth_headers)
     assert secrets_resp.status_code == 200
     secrets_body = secrets_resp.json()
     assert secrets_body["secret_manager_enabled"] is True
@@ -233,6 +248,7 @@ def test_fastapi_cloud_run_service_endpoints() -> None:
 
     var_resp = client.post(
         "/api/v1/variances",
+        headers=auth_headers,
         json={"tickers": "NVDA,AAPL", "start_year": 2024, "end_year": 2026},
     )
     assert var_resp.status_code == 200
@@ -240,6 +256,7 @@ def test_fastapi_cloud_run_service_endpoints() -> None:
 
     intent_resp = client.post(
         "/api/v1/intent",
+        headers=auth_headers,
         json={"query": "Compare NVIDIA and Apple's R&D spend from 2024-2026"},
     )
     assert intent_resp.status_code == 200
