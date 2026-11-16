@@ -7,18 +7,24 @@ resource "google_vertex_ai_index" "sec_10k_chunks" {
   project             = var.project_id
   region              = var.region
   display_name        = "sec-edgar-10k-chunks-index"
-  description         = "Metadata-tagged SEC 10-K (Item 1A & Item 7) vector index backed by gs://${var.sec_corpus_bucket}/vector_search/embeddings."
+  description         = "Metadata-tagged SEC 10-K (Item 1A & Item 7) vector index backed by gs://${local.sec_corpus_bucket_name}/vector_search/embeddings."
   index_update_method = "BATCH_UPDATE"
   labels              = var.labels
 
   metadata {
-    contents_delta_uri = "gs://${var.sec_corpus_bucket}/vector_search/embeddings"
+    contents_delta_uri = (
+      var.seed_vertex_vector_index
+      ? "gs://${local.sec_corpus_bucket_name}/vector_search/embeddings"
+      : null
+    )
 
     config {
       dimensions                  = var.embedding_dimensions
       approximate_neighbors_count = 150
       distance_measure_type       = "COSINE_DISTANCE"
-      shard_size                  = "SHARD_SIZE_SMALL"
+      # Vertex AI requires UNIT_L2_NORM feature normalization for COSINE_DISTANCE indexes.
+      feature_norm_type = "UNIT_L2_NORM"
+      shard_size        = "SHARD_SIZE_SMALL"
 
       algorithm_config {
         tree_ah_config {
@@ -59,6 +65,14 @@ resource "google_discovery_engine_data_store" "sec_10k_corpus" {
   content_config              = "CONTENT_REQUIRED"
   solution_types              = ["SOLUTION_TYPE_SEARCH"]
   create_advanced_site_search = false
+
+  # The API populates a server-side default `document_processing_config` that is
+  # not declared here. Without ignoring it, every plan forces a destroy/recreate,
+  # which fails (HTTP 400) while the data store is attached to the search engine
+  # and would wipe the indexed corpus if it succeeded.
+  lifecycle {
+    ignore_changes = [document_processing_config]
+  }
 
   depends_on = [google_project_service.required_apis]
 }

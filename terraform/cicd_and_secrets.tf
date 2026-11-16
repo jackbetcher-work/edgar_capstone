@@ -23,6 +23,19 @@ resource "google_secret_manager_secret" "managed_secrets" {
   depends_on = [google_project_service.required_apis]
 }
 
+# Optional bootstrap placeholder versions for greenfield projects so Cloud Run
+# secret_key_ref (version = "latest") mounts succeed in a single-stage apply.
+resource "google_secret_manager_secret_version" "bootstrap_placeholders" {
+  for_each = var.seed_placeholder_secret_versions ? local.managed_secret_ids : toset([])
+
+  secret      = google_secret_manager_secret.managed_secrets[each.key].id
+  secret_data = "REPLACE_ME_IN_SECRET_MANAGER"
+
+  lifecycle {
+    ignore_changes = [secret_data]
+  }
+}
+
 # Grant least-privilege Secret Accessor role exclusively to the custom Cloud Run runtime SA
 resource "google_secret_manager_secret_iam_member" "runtime_secret_accessor" {
   for_each = local.managed_secret_ids
@@ -128,6 +141,15 @@ resource "google_service_account_iam_member" "github_wif_impersonation" {
 # ------------------------------------------------------------------------------
 # 4. Google Cloud Run v2 Service with Custom SA, Cloud Identity RBAC, & Secrets
 # ------------------------------------------------------------------------------
+# The `sec-edgar-analyst` service was created outside Terraform (e.g. by an earlier
+# `gcloud run deploy`), so adopt it into state instead of failing with HTTP 409.
+# Import blocks are idempotent: once the resource is in state this is a no-op.
+import {
+  for_each = var.enable_cloud_run_service ? toset(["0"]) : toset([])
+  to       = google_cloud_run_v2_service.sec_edgar_analyst[0]
+  id       = "projects/${var.project_id}/locations/${var.region}/services/${var.cloud_run_service_name}"
+}
+
 resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
   count = var.enable_cloud_run_service ? 1 : 0
 
@@ -149,7 +171,11 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
     }
 
     containers {
-      image = "${var.region}-docker.pkg.dev/${var.project_id}/${var.artifact_registry_repo_id}/${var.cloud_run_service_name}:latest"
+      # Bootstraps with a lightweight public Cloud Run placeholder image so initial
+      # `terraform apply` succeeds in a single stage before CI/CD pushes to GAR.
+      # Subsequent image updates deployed by Cloud Build / GitHub Actions are preserved
+      # via `lifecycle.ignore_changes` below.
+      image = var.cloud_run_initial_image
 
       resources {
         limits = {
@@ -210,7 +236,7 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
 
       env {
         name  = "SEC_CORPUS_BUCKET"
-        value = var.sec_corpus_bucket
+        value = local.sec_corpus_bucket_name
       }
 
       env {
@@ -355,8 +381,17 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
     }
   }
 
+  lifecycle {
+    ignore_changes = [
+      template[0].containers[0].image,
+      client,
+      client_version,
+    ]
+  }
+
   depends_on = [
     google_secret_manager_secret_iam_member.runtime_secret_accessor,
+    google_secret_manager_secret_version.bootstrap_placeholders,
     google_artifact_registry_repository.sec_edgar_repo,
   ]
 }

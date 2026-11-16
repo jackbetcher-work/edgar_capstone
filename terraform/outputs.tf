@@ -3,6 +3,16 @@ output "project_id" {
   value       = var.project_id
 }
 
+output "sec_corpus_bucket_name" {
+  description = "Managed GCS bucket name storing curated SEC 10-K filings, manifests, and vector embeddings."
+  value       = local.sec_corpus_bucket_name
+}
+
+output "sec_corpus_bucket_url" {
+  description = "gs:// URI of the SEC 10-K corpus GCS bucket."
+  value       = var.create_sec_corpus_bucket ? google_storage_bucket.sec_corpus[0].url : "gs://${var.sec_corpus_bucket}"
+}
+
 output "bigquery_dataset_id" {
   description = "BigQuery dataset ID hosting SEC 10-K financial metrics and RAG tables."
   value       = google_bigquery_dataset.sec_edgar.dataset_id
@@ -129,6 +139,11 @@ output "workload_identity_provider_name" {
 output "artifact_registry_repository_uri" {
   description = "Docker repository URI in Google Artifact Registry."
   value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.sec_edgar_repo.repository_id}"
+}
+
+output "cloud_run_target_image_uri" {
+  description = "Target Artifact Registry image repository URI pushed by CI/CD pipelines for Cloud Run."
+  value       = "${var.region}-docker.pkg.dev/${var.project_id}/${google_artifact_registry_repository.sec_edgar_repo.repository_id}/${var.cloud_run_service_name}"
 }
 
 output "secret_manager_secret_ids" {

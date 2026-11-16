@@ -26,6 +26,7 @@ from edgar_capstone.dataset.gcs_storage import (
     normalize_bucket_name,
     upload_staged_dataset,
 )
+from edgar_capstone.dataset.paths import CURATED_DATASET_DIRNAME, resolve_data_root
 from edgar_capstone.dataset.models import (
     DatasetBuildSummary,
     ExtractedFilingBundle,
@@ -35,9 +36,9 @@ from edgar_capstone.dataset.models import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OUTPUT_DIR = (
-    Path(__file__).resolve().parents[3] / "data" / "curated_dataset"
-)
+# Resolved via `paths.resolve_data_root()` so non-editable installs (e.g. the
+# Cloud Run container's /opt/venv site-packages) still locate `/app/data/curated_dataset`.
+DEFAULT_OUTPUT_DIR = resolve_data_root() / CURATED_DATASET_DIRNAME
 
 
 @dataclass(slots=True)

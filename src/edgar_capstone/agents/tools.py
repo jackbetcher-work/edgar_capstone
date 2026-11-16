@@ -47,6 +47,7 @@ from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_PROJECT_ID,
 )
 from edgar_capstone.dataset.models import FinancialDataProfile
+from edgar_capstone.dataset.paths import resolve_curated_dataset_dir
 from edgar_capstone.dataset.pipeline import DEFAULT_OUTPUT_DIR
 from edgar_capstone.vector_db.chunker import (
     chunk_filing_document,
@@ -1816,11 +1817,8 @@ def get_context_cache_runtime_stats() -> dict[str, Any]:
 
 
 def _get_dataset_dir() -> Path:
-    """Resolve the active curated dataset directory."""
-    env_dir = os.environ.get("EDGAR_DATASET_DIR")
-    if env_dir:
-        return Path(env_dir).resolve()
-    return DEFAULT_OUTPUT_DIR.resolve()
+    """Resolve the active curated dataset directory (`EDGAR_DATASET_DIR` / `EDGAR_DATA_ROOT` aware)."""
+    return resolve_curated_dataset_dir()
 
 
 def _synthesize_fallback_10k_markdown(profile: FinancialDataProfile) -> str:

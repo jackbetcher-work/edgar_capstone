@@ -5,6 +5,7 @@ Provisions the BigQuery data & vector search foundation, Vertex AI Vector Search
 ## Provisioned Resources
 
 - **Remote State Bucket** (`gs://iron-radio-514217-q7-tfstate`): Bootstrapped with object versioning, uniform bucket-level access, and enforced public access prevention.
+- **SEC 10-K Corpus Bucket (`gs://fde-sec-edgar-sandbox-dev-sec-corpus`, `terraform/storage.tf`):** Managed regional (`us-central1`) GCS bucket (`google_storage_bucket.sec_corpus`) with uniform bucket-level access, enforced public access prevention, object versioning, 7-day soft delete, and noncurrent-version / multipart lifecycle cleanup.
 - **BigQuery Dataset (`sec_edgar`, `us-central1`):**
   - `financial_metrics`: Native table partitioned by `fiscal_year` (`2015–2035`) and clustered by `gics_sector, ticker`, automatically seeded from `gs://fde-sec-edgar-sandbox-dev-sec-corpus/manifests/bigquery_financials.jsonl`.
   - `financial_metrics_ext`: Live GCS external table over `manifests/bigquery_financials.jsonl`.
@@ -54,23 +55,27 @@ Provisions the BigQuery data & vector search foundation, Vertex AI Vector Search
   - `google_secret_manager_secret.managed_secrets`: Provisions `sec-edgar-user-agent`, `sec-edgar-gemini-api-key`, and `sec-edgar-iap-audience` with automatic replication and zero plaintext secret values in IaC.
   - `google_artifact_registry_repository.sec_edgar_repo`: Docker container repository (`us-central1-docker.pkg.dev/iron-radio-514217-q7/sec-edgar-repo`).
   - `google_iam_workload_identity_pool.github_pool` & `google_iam_workload_identity_pool_provider.github_provider`: Keyless OIDC authentication for GitHub Actions push pipelines (`sec-edgar-cicd-sa@iron-radio-514217-q7.iam.gserviceaccount.com`).
-  - `google_cloud_run_v2_service.sec_edgar_analyst`: Cloud Run service running `sec-analyst-sa` with secrets mounted directly from Secret Manager (`value_source.secret_key_ref`).
+  - `google_cloud_run_v2_service.sec_edgar_analyst`: Cloud Run service running `sec-analyst-sa` with secrets mounted directly from Secret Manager (`value_source.secret_key_ref`). Bootstraps cleanly in a single-stage `terraform apply` via `var.cloud_run_initial_image` (`us-docker.pkg.dev/cloudrun/container/hello`) while preserving CI/CD container deployments via `lifecycle.ignore_changes`.
 
 ## Usage
 
 ```bash
-# 1. Build and populate the metadata-tagged vector DB manifests & chunk health metrics
-../.venv/bin/python ../scripts/build_vector_db.py
-
-# 2. Bootstrap the versioned GCS remote state bucket (idempotent)
+# 1. Bootstrap the versioned GCS remote state bucket (idempotent)
 ../.venv/bin/python ../scripts/bootstrap_tfstate_bucket.py
 
-# 3. Initialize, validate, plan, and apply Terraform
+# 2. Initialize, validate, plan, and apply the full Terraform stack in a single stage
+# (If gs://fde-sec-edgar-sandbox-dev-sec-corpus already exists in GCP, import it once first:
+#  terraform -chdir=terraform import 'google_storage_bucket.sec_corpus[0]' fde-sec-edgar-sandbox-dev-sec-corpus)
+# (On a brand-new GCP project without Secret Manager versions yet, pass -var="seed_placeholder_secret_versions=true" once)
 cd terraform
 terraform init
 terraform validate
 terraform plan
 terraform apply
+
+# 3. Populate curated SEC 10-K filings & vector DB manifests into the Terraform-managed bucket and BigQuery
+../.venv/bin/python ../scripts/build_sec_dataset.py --sp500 --no-create-bucket
+../.venv/bin/python ../scripts/build_vector_db.py --embedding-backend vertex_ai
 ```
 
 ## Example Metadata-Filtered RAG Query (`VECTOR_SEARCH`)

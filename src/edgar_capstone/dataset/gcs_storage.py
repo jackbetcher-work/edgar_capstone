@@ -83,6 +83,7 @@ def ensure_gcs_bucket(
         )
         new_bucket = client.bucket(normalized)
         new_bucket.iam_configuration.uniform_bucket_level_access_enabled = True
+        new_bucket.iam_configuration.public_access_prevention = "enforced"
         created = client.create_bucket(
             new_bucket,
             project=project_id,

@@ -12,6 +12,7 @@ from typing import Any, Literal
 import uuid
 
 import google.auth
+import google.auth.exceptions
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
 import httpx
@@ -20,6 +21,7 @@ from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_BUCKET_NAME,
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
+    GCSAccessError,
     ensure_gcs_bucket,
     normalize_bucket_name,
 )
@@ -189,12 +191,19 @@ def upload_vector_db_artifacts_to_gcs(
     storage_client: storage.Client | None = None,
 ) -> int:
     """Upload the vector database manifests and Vertex AI Vector Search files to GCS."""
+    try:
+        client = storage_client or storage.Client(project=project_id)
+    except google.auth.exceptions.DefaultCredentialsError as exc:
+        raise GCSAccessError(
+            f"Google Cloud Application Default Credentials not found for project '{project_id}': {exc}\n"
+            "Run `gcloud auth application-default login`, then re-run `build-vector-db --upload-only`."
+        ) from exc
     bucket = ensure_gcs_bucket(
+        client,
         project_id=project_id,
         bucket_name=bucket_name,
         location=location,
         create_if_missing=create_bucket_if_missing,
-        client=storage_client,
     )
     rel_paths = [
         "manifests/bigquery_filing_chunks.jsonl",

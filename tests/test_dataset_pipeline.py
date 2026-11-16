@@ -334,3 +334,22 @@ def test_cli_parse_args_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.start_year == 2020
     assert args.sp500 is False
 
+
+def test_terraform_manages_sec_corpus_bucket_and_wires_dependents() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    tf_dir = repo_root / "terraform"
+    storage_tf = (tf_dir / "storage.tf").read_text(encoding="utf-8")
+    vars_tf = (tf_dir / "variables.tf").read_text(encoding="utf-8")
+    bq_tf = (tf_dir / "bigquery.tf").read_text(encoding="utf-8")
+    iam_tf = (tf_dir / "iam.tf").read_text(encoding="utf-8")
+    outputs_tf = (tf_dir / "outputs.tf").read_text(encoding="utf-8")
+
+    assert 'resource "google_storage_bucket" "sec_corpus"' in storage_tf
+    assert "uniform_bucket_level_access = true" in storage_tf
+    assert 'public_access_prevention    = "enforced"' in storage_tf
+    assert "create_sec_corpus_bucket" in vars_tf
+    assert "local.sec_corpus_bucket_name" in bq_tf
+    assert "local.sec_corpus_bucket_name" in iam_tf
+    assert "sec_corpus_bucket_name" in outputs_tf
+    assert "sec_corpus_bucket_url" in outputs_tf
+

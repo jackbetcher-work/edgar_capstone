@@ -51,6 +51,7 @@ from edgar_capstone.vector_db.embedder import (  # noqa: E402
 from edgar_capstone.vector_db.pipeline import (  # noqa: E402
     VectorDBBuildConfig,
     run_vector_db_pipeline,
+    upload_vector_db_artifacts_to_gcs,
 )
 
 
@@ -190,6 +191,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Stage JSONL manifests and chunk health report locally without calling GCS/BQ/Monitoring.",
     )
     parser.add_argument(
+        "--upload-only",
+        action="store_true",
+        help=(
+            "Skip chunking/embedding and only publish already-staged vector DB artifacts "
+            "(bigquery_filing_chunks.jsonl, chunks_embeddings.json, chunk health report, catalog) "
+            "to GCS so containers can hydrate them via EDGAR_CORPUS_HYDRATION."
+        ),
+    )
+    parser.add_argument(
         "--no-load-bigquery",
         action="store_true",
         help="Skip triggering a direct BigQuery load job after uploading manifests to GCS.",
@@ -216,6 +226,29 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if args.upload_only:
+        try:
+            uploaded = upload_vector_db_artifacts_to_gcs(
+                output_dir=args.output_dir.resolve(),
+                project_id=args.project_id,
+                bucket_name=args.bucket,
+                location=args.location,
+            )
+        except GCSAccessError as exc:
+            logging.error("GCS access or authentication error:\n%s", exc)
+            return 2
+        except Exception as exc:
+            logging.error("Vector DB artifact upload failed: %s", exc)
+            return 1
+        if uploaded == 0:
+            logging.error(
+                "No staged vector DB artifacts found under %s; run build-vector-db first.",
+                args.output_dir,
+            )
+            return 1
+        print(f"Uploaded {uploaded} staged vector DB artifact(s) to gs://{args.bucket}/")
+        return 0
 
     config = VectorDBBuildConfig(
         project_id=args.project_id,

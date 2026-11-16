@@ -55,6 +55,28 @@ resource "google_compute_backend_service" "sec_edgar_iap_backend" {
   depends_on = [google_project_service.required_apis]
 }
 
+# The IAP service agent (service-<PROJECT_NUMBER>@gcp-sa-iap.iam.gserviceaccount.com)
+# is NOT created automatically when iap.googleapis.com is enabled; it must be
+# provisioned explicitly before it can be granted roles.
+resource "google_project_service_identity" "iap_service_agent" {
+  provider = google-beta
+  count    = var.enable_iap_backend_service && var.enable_cloud_run_service ? 1 : 0
+
+  project = var.project_id
+  service = "iap.googleapis.com"
+
+  depends_on = [google_project_service.required_apis]
+}
+
+# Newly created service agents take a short time to propagate through IAM.
+resource "time_sleep" "wait_for_iap_service_agent" {
+  count = var.enable_iap_backend_service && var.enable_cloud_run_service ? 1 : 0
+
+  create_duration = "60s"
+
+  depends_on = [google_project_service_identity.iap_service_agent]
+}
+
 # Restrict Cloud Run direct invocation to the Google-managed IAP Service Agent
 resource "google_cloud_run_v2_service_iam_member" "iap_service_agent_invoker" {
   count = var.enable_iap_backend_service && var.enable_cloud_run_service ? 1 : 0
@@ -63,7 +85,9 @@ resource "google_cloud_run_v2_service_iam_member" "iap_service_agent_invoker" {
   location = var.region
   name     = google_cloud_run_v2_service.sec_edgar_analyst[0].name
   role     = "roles/run.invoker"
-  member   = "serviceAccount:service-${data.google_project.current.number}@gcp-sa-iap.iam.gserviceaccount.com"
+  member   = "serviceAccount:${google_project_service_identity.iap_service_agent[0].email}"
+
+  depends_on = [time_sleep.wait_for_iap_service_agent]
 }
 
 # Grant IAP HTTPS Resource Accessor to Google Workspace / Okta SSO Cloud Identity groups

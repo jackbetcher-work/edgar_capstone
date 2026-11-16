@@ -181,7 +181,7 @@ resource "google_bigquery_dataset_iam_member" "sec_analyst_dataset_viewer" {
 resource "google_storage_bucket_iam_member" "sec_analyst_corpus_viewer" {
   count = var.create_analyst_service_account ? 1 : 0
 
-  bucket = var.sec_corpus_bucket
+  bucket = local.sec_corpus_bucket_name
   role   = "roles/storage.objectViewer"
   member = "serviceAccount:${google_service_account.sec_analyst[0].email}"
 }
@@ -363,7 +363,7 @@ resource "google_bigquery_dataset_iam_member" "financial_analyst_agent_dataset_v
 resource "google_storage_bucket_iam_member" "context_cache_agent_corpus_viewer" {
   count = var.create_agent_service_accounts ? 1 : 0
 
-  bucket = var.sec_corpus_bucket
+  bucket = local.sec_corpus_bucket_name
   role   = "roles/storage.objectViewer"
   member = "serviceAccount:${google_service_account.agent_identities["context_cache"].email}"
 }

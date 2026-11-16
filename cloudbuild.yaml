@@ -61,6 +61,17 @@ steps:
           --tag "$${IMAGE_URI}:latest" \
           .
         docker run --rm --entrypoint test "$${IMAGE_URI}:${COMMIT_SHA}" -f /app/frontend/dist/index.html
+        # Offline container corpus packaging smoke test (no BigQuery / Vertex / GCS access)
+        docker run --rm \
+          -e EDGAR_EXECUTION_MODE=deterministic \
+          -e EDGAR_DATA_BACKEND=local \
+          -e EDGAR_TELEMETRY_BACKEND=local \
+          -e EDGAR_FEEDBACK_BACKEND=local \
+          -e EDGAR_PROMPT_STORE_BACKEND=local \
+          -e EDGAR_MODEL_ARMOR_MODE=disabled \
+          --entrypoint python \
+          "$${IMAGE_URI}:${COMMIT_SHA}" \
+          scripts/container_smoke_test.py --in-process --expect-corpus baked
         docker push "$${IMAGE_URI}:${COMMIT_SHA}"
         docker push "$${IMAGE_URI}:latest"
 

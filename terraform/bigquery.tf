@@ -43,7 +43,7 @@ resource "google_project_iam_member" "bq_connection_vertex_user" {
 }
 
 resource "google_storage_bucket_iam_member" "bq_connection_corpus_viewer" {
-  bucket     = var.sec_corpus_bucket
+  bucket     = local.sec_corpus_bucket_name
   role       = "roles/storage.objectViewer"
   member     = "serviceAccount:${google_bigquery_connection.vertex_ai.cloud_resource[0].service_account_id}"
   depends_on = [time_sleep.wait_for_bq_connection_sa]
@@ -81,14 +81,14 @@ resource "google_bigquery_table" "financial_metrics_ext" {
   project             = var.project_id
   dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
   table_id            = "financial_metrics_ext"
-  description         = "Live BigQuery external table backed directly by gs://${var.sec_corpus_bucket}/manifests/bigquery_financials.jsonl."
+  description         = "Live BigQuery external table backed directly by gs://${local.sec_corpus_bucket_name}/manifests/bigquery_financials.jsonl."
   deletion_protection = var.deletion_protection
   labels              = var.labels
 
   external_data_configuration {
     autodetect            = false
     source_format         = "NEWLINE_DELIMITED_JSON"
-    source_uris           = ["gs://${var.sec_corpus_bucket}/manifests/bigquery_financials.jsonl"]
+    source_uris           = ["gs://${local.sec_corpus_bucket_name}/manifests/bigquery_financials.jsonl"]
     ignore_unknown_values = false
     schema                = file("${path.module}/schemas/financial_metrics.json")
   }
@@ -99,7 +99,7 @@ resource "google_bigquery_table" "financial_metrics_ext" {
 # ------------------------------------------------------------------------------
 data "google_storage_bucket_object" "financials_manifest" {
   count  = var.seed_native_financial_metrics ? 1 : 0
-  bucket = var.sec_corpus_bucket
+  bucket = local.sec_corpus_bucket_name
   name   = "manifests/bigquery_financials.jsonl"
 }
 
@@ -112,7 +112,7 @@ resource "google_bigquery_job" "seed_financial_metrics" {
 
   load {
     source_uris = [
-      "gs://${var.sec_corpus_bucket}/manifests/bigquery_financials.jsonl"
+      "gs://${local.sec_corpus_bucket_name}/manifests/bigquery_financials.jsonl"
     ]
 
     destination_table {
@@ -134,7 +134,7 @@ resource "google_bigquery_table" "unstructured_10k_objects" {
   project             = var.project_id
   dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
   table_id            = "unstructured_10k_objects"
-  description         = "BigQuery Object Table indexing unstructured 10-K Markdown documents in gs://${var.sec_corpus_bucket}/unstructured/."
+  description         = "BigQuery Object Table indexing unstructured 10-K Markdown documents in gs://${local.sec_corpus_bucket_name}/unstructured/."
   deletion_protection = var.deletion_protection
   labels              = var.labels
 
@@ -142,7 +142,7 @@ resource "google_bigquery_table" "unstructured_10k_objects" {
     connection_id   = google_bigquery_connection.vertex_ai.name
     autodetect      = false
     object_metadata = "SIMPLE"
-    source_uris     = ["gs://${var.sec_corpus_bucket}/unstructured/*"]
+    source_uris     = ["gs://${local.sec_corpus_bucket_name}/unstructured/*"]
   }
 
   depends_on = [google_storage_bucket_iam_member.bq_connection_corpus_viewer]
@@ -180,14 +180,14 @@ resource "google_bigquery_table" "filing_chunks_ext" {
   project             = var.project_id
   dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
   table_id            = "filing_chunks_ext"
-  description         = "Live BigQuery external table backed directly by gs://${var.sec_corpus_bucket}/manifests/bigquery_filing_chunks.jsonl."
+  description         = "Live BigQuery external table backed directly by gs://${local.sec_corpus_bucket_name}/manifests/bigquery_filing_chunks.jsonl."
   deletion_protection = var.deletion_protection
   labels              = var.labels
 
   external_data_configuration {
     autodetect            = false
     source_format         = "NEWLINE_DELIMITED_JSON"
-    source_uris           = ["gs://${var.sec_corpus_bucket}/manifests/bigquery_filing_chunks.jsonl"]
+    source_uris           = ["gs://${local.sec_corpus_bucket_name}/manifests/bigquery_filing_chunks.jsonl"]
     ignore_unknown_values = false
     schema                = file("${path.module}/schemas/filing_chunks.json")
   }
@@ -198,7 +198,7 @@ resource "google_bigquery_table" "filing_chunks_ext" {
 # ------------------------------------------------------------------------------
 data "google_storage_bucket_object" "filing_chunks_manifest" {
   count  = var.seed_native_filing_chunks ? 1 : 0
-  bucket = var.sec_corpus_bucket
+  bucket = local.sec_corpus_bucket_name
   name   = "manifests/bigquery_filing_chunks.jsonl"
 }
 
@@ -211,7 +211,7 @@ resource "google_bigquery_job" "seed_filing_chunks" {
 
   load {
     source_uris = [
-      "gs://${var.sec_corpus_bucket}/manifests/bigquery_filing_chunks.jsonl"
+      "gs://${local.sec_corpus_bucket_name}/manifests/bigquery_filing_chunks.jsonl"
     ]
 
     destination_table {

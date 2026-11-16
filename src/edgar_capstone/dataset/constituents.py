@@ -8,6 +8,8 @@ from pathlib import Path
 
 import httpx
 
+from edgar_capstone.dataset.paths import resolve_sp500_constituents_csv
+
 from edgar_capstone.dataset.models import CompanyConstituent
 
 logger = logging.getLogger(__name__)
@@ -16,9 +18,7 @@ SP500_UPSTREAM_CSV_URL = (
     "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 )
 
-DEFAULT_SP500_CSV_PATH = (
-    Path(__file__).resolve().parents[3] / "data" / "sp500_constituents.csv"
-)
+DEFAULT_SP500_CSV_PATH = resolve_sp500_constituents_csv()
 
 # 18 flagship S&P 500 companies spanning key GICS sectors (including NVDA & AAPL
 # highlighted in the project reference, tech peers, banks, healthcare, energy, retail).

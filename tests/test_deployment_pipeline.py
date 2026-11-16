@@ -230,6 +230,8 @@ def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
     assert 'resource "google_iam_workload_identity_pool" "github_pool"' in cicd_tf
     assert 'resource "google_iam_workload_identity_pool_provider" "github_provider"' in cicd_tf
     assert 'resource "google_cloud_run_v2_service" "sec_edgar_analyst"' in cicd_tf
+    assert "image = var.cloud_run_initial_image" in cicd_tf
+    assert "template[0].containers[0].image" in cicd_tf
     assert "secret_key_ref" in cicd_tf
 
     iap_tf = (REPO_ROOT / "terraform" / "iap_and_sso.tf").read_text(encoding="utf-8")

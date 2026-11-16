@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import logging
 import os
 from pathlib import Path
@@ -32,7 +35,9 @@ from edgar_capstone.agents.root_orchestrator import (
     classify_query_intent,
 )
 from edgar_capstone.agents.tools import (
+    _SESSION_10K_CONTEXT_CACHE,
     _get_dataset_dir,
+    _load_all_chunks_cached,
     _load_all_profiles_cached,
     calculate_period_variances,
     fetch_financial_metrics,
@@ -40,6 +45,10 @@ from edgar_capstone.agents.tools import (
     load_cached_10k_section,
     query_looker_financial_explore,
     search_10k_chunks_rag,
+)
+from edgar_capstone.dataset.corpus_hydration import (
+    get_corpus_status_metadata,
+    run_startup_corpus_hydration,
 )
 from edgar_capstone.security.agent_identity import (
     PER_AGENT_IDENTITIES,
@@ -79,7 +88,25 @@ logger = logging.getLogger(__name__)
 
 _FEEDBACK_AUDIT_LOG: list[dict[str, Any]] = []
 
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Optionally hydrate gitignored local corpus artifacts from GCS before serving traffic.
+
+    Controlled by `EDGAR_CORPUS_HYDRATION` (`off` by default). In `required` mode a
+    failed hydration raises and aborts startup so container smoke tests fail fast.
+    """
+    result = await asyncio.to_thread(run_startup_corpus_hydration)
+    if result.downloaded_objects:
+        # Newly materialized manifests / Markdown must replace any cached synthesized fallbacks.
+        _load_all_profiles_cached.cache_clear()
+        _load_all_chunks_cached.cache_clear()
+        _SESSION_10K_CONTEXT_CACHE.clear()
+    yield
+
+
 app = FastAPI(
+    lifespan=_app_lifespan,
     title="SEC EDGAR Natural Language Analyst API",
     version="0.2.0",
     description=(
@@ -186,6 +213,7 @@ def health() -> dict[str, Any]:
         },
         "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
         "iap_jwt_auth_enabled": True,
+        "corpus": get_corpus_status_metadata(),
     }
 
 

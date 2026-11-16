@@ -53,7 +53,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     GCP_PROJECT_NAME="fde-sec-edgar-sandbox-dev" \
     GCP_REGION="us-central1" \
     RUNTIME_SERVICE_ACCOUNT_ID="sec-analyst-sa" \
-    COMMIT_SHA="${COMMIT_SHA}"
+    COMMIT_SHA="${COMMIT_SHA}" \
+    EDGAR_DATA_ROOT="/app/data" \
+    EDGAR_DATASET_DIR="/app/data/curated_dataset" \
+    SEC_CORPUS_BUCKET="fde-sec-edgar-sandbox-dev-sec-corpus" \
+    EDGAR_CORPUS_HYDRATION="off" \
+    EDGAR_CORPUS_HYDRATION_SCOPES="chunks,unstructured"
 
 RUN groupadd --gid 10001 appgroup && \
     useradd --uid 10001 --gid appgroup --shell /sbin/nologin --create-home appuser
@@ -71,6 +76,23 @@ COPY --chown=appuser:appgroup data/curated_dataset/manifests/bigquery_financials
 COPY --chown=appuser:appgroup data/curated_dataset/manifests/chunk_health_report.json ./data/curated_dataset/manifests/chunk_health_report.json
 COPY --chown=appuser:appgroup data/curated_dataset/manifests/dataset_catalog.json ./data/curated_dataset/manifests/dataset_catalog.json
 COPY --chown=appuser:appgroup data/curated_dataset/manifests/vector_db_catalog.json ./data/curated_dataset/manifests/vector_db_catalog.json
+
+# ------------------------------------------------------------------------------
+# Container corpus packaging
+# - Only lightweight, git-tracked manifests are baked into the image. The gitignored
+#   heavyweight artifacts (manifests/bigquery_filing_chunks.jsonl, unstructured/*.md)
+#   are excluded via .dockerignore and served from BigQuery / Vertex AI Search / GCS
+#   in Cloud Run.
+# - For offline smoke tests, set EDGAR_CORPUS_HYDRATION=auto|required to download
+#   them from gs://${SEC_CORPUS_BUCKET}/ into the writable dataset dir on startup.
+# - EDGAR_DATASET_DIR pins the corpus location because the package is installed
+#   non-editable into /opt/venv (source-relative paths do not reach /app/data).
+# ------------------------------------------------------------------------------
+RUN mkdir -p /app/data/curated_dataset/manifests \
+             /app/data/curated_dataset/structured \
+             /app/data/curated_dataset/unstructured && \
+    chown -R appuser:appgroup /app/data && \
+    python -c "from edgar_capstone.dataset.corpus_hydration import describe_local_corpus as d; s = d(); assert s['profile_source'] != 'missing', s; print('Packaged corpus:', s)"
 
 USER appuser
 

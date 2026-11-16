@@ -26,3 +26,13 @@ terraform/*.tfstate*
 terraform/*.tfvars
 *.tfplan
 tfplan
+
+# Exclude gitignored heavyweight corpus artifacts from the build context. They are
+# served from BigQuery / Vertex AI Search / GCS in Cloud Run, or hydrated at startup
+# via EDGAR_CORPUS_HYDRATION for offline container smoke tests.
+data/curated_dataset/unstructured
+data/curated_dataset/structured
+data/curated_dataset/vector_search
+data/curated_dataset/manifests/bigquery_filing_chunks.jsonl
+data/curated_dataset/manifests/vertex_ai_search_metadata.jsonl
+*.egg-info

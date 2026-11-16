@@ -23,9 +23,26 @@ variable "dataset_id" {
 }
 
 variable "sec_corpus_bucket" {
-  description = "Existing GCS bucket holding the curated SEC 10-K Data Profiles and manifests."
+  description = "GCS bucket name holding the curated SEC 10-K Data Profiles, manifests, and vector embeddings."
   type        = string
   default     = "fde-sec-edgar-sandbox-dev-sec-corpus"
+
+  validation {
+    condition     = length(trimspace(var.sec_corpus_bucket)) > 0 && !startswith(lower(trimspace(var.sec_corpus_bucket)), "gs://") && length(regexall("/", trimspace(var.sec_corpus_bucket))) == 0
+    error_message = "sec_corpus_bucket must be a bare GCS bucket name without a 'gs://' prefix or slashes."
+  }
+}
+
+variable "create_sec_corpus_bucket" {
+  description = "Whether Terraform should create and manage the GCS bucket holding the curated SEC 10-K corpus and manifests."
+  type        = bool
+  default     = true
+}
+
+variable "sec_corpus_bucket_versioning" {
+  description = "Whether to enable GCS object versioning on the managed SEC 10-K corpus bucket."
+  type        = bool
+  default     = true
 }
 
 variable "vertex_connection_id" {
@@ -58,15 +75,21 @@ variable "create_agent_service_accounts" {
 }
 
 variable "seed_native_financial_metrics" {
-  description = "Whether to trigger a BigQuery load job seeding native financial_metrics from GCS manifests/bigquery_financials.jsonl."
+  description = "Whether to trigger a BigQuery load job seeding native financial_metrics from GCS manifests/bigquery_financials.jsonl (enable once manifests are uploaded)."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "seed_native_filing_chunks" {
-  description = "Whether to trigger a BigQuery load job seeding native filing_chunks from GCS manifests/bigquery_filing_chunks.jsonl."
+  description = "Whether to trigger a BigQuery load job seeding native filing_chunks from GCS manifests/bigquery_filing_chunks.jsonl (enable once vector manifests are uploaded, or populate via scripts/build_vector_db.py)."
   type        = bool
-  default     = true
+  default     = false
+}
+
+variable "seed_vertex_vector_index" {
+  description = "Whether to attach gs://<sec_corpus_bucket>/vector_search/embeddings as contents_delta_uri on the Vertex AI Vector Search index (enable once embeddings exist in GCS)."
+  type        = bool
+  default     = false
 }
 
 variable "embedding_model" {
@@ -163,6 +186,18 @@ variable "enable_cloud_run_service" {
   description = "Whether to manage the Cloud Run v2 service resource in Terraform."
   type        = bool
   default     = true
+}
+
+variable "cloud_run_initial_image" {
+  description = "Bootstrap container image used on initial Cloud Run v2 service creation so Terraform succeeds in a single stage before CI/CD pushes the first image to Artifact Registry."
+  type        = string
+  default     = "us-docker.pkg.dev/cloudrun/container/hello"
+}
+
+variable "seed_placeholder_secret_versions" {
+  description = "Whether to create initial placeholder versions for managed Secret Manager secrets on brand-new projects so Cloud Run secret mounts succeed in a single pass (leave false when secret versions already exist)."
+  type        = bool
+  default     = false
 }
 
 variable "cicd_service_account_id" {
