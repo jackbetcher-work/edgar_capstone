@@ -28,6 +28,7 @@ WORKDIR /build
 
 COPY pyproject.toml requirements.txt ./
 COPY src/ ./src/
+COPY prompts/ ./prompts/
 COPY scripts/ ./scripts/
 
 RUN python -m venv /opt/venv && \
@@ -62,6 +63,7 @@ WORKDIR /app
 COPY --from=builder --chown=appuser:appgroup /opt/venv /opt/venv
 COPY --from=frontend-builder --chown=appuser:appgroup /frontend/dist ./frontend/dist
 COPY --chown=appuser:appgroup src/ ./src/
+COPY --chown=appuser:appgroup prompts/ ./prompts/
 COPY --chown=appuser:appgroup scripts/ ./scripts/
 COPY --chown=appuser:appgroup data/sp500_constituents.csv ./data/sp500_constituents.csv
 COPY --chown=appuser:appgroup data/curated_dataset/manifests/bigquery_financials.jsonl ./data/curated_dataset/manifests/bigquery_financials.jsonl

@@ -37,7 +37,7 @@ from edgar_capstone.security.rbac import (
     Permission,
     RuntimeServiceAccountConfig,
 )
-from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID
+from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID, RedactedSecret
 
 S2S_AGENT_ASSERTION_HEADER = "X-Agent-Identity-Assertion"
 AGENT_IDENTITY_ISSUER = "https://agent-identity.sec-edgar.internal"
@@ -265,21 +265,23 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
         agent_name="ModelArmorGuardrail",
         service_account_id="model-armor-guardrail-sa",
         description=(
-            "Isolated prompt-safety and grounding-lock inspection identity with zero "
-            "access to BigQuery financial tables, GCS corpus buckets, or secrets."
+            "Isolated Model Armor, Sensitive Data Protection (SDP), and financial-projection "
+            "guardrail identity with zero access to BigQuery financial tables, GCS corpus buckets, or secrets."
         ),
         allowed_callers=frozenset(
             {"RootOrchestrator", "FinancialAnalystAgent", CUSTOM_RUNTIME_SA_ACCOUNT_ID}
         ),
-        allowed_target_services=frozenset({"model-armor-service"}),
+        allowed_target_services=frozenset({"model-armor-service", "sdp-dlp-service"}),
         allowed_tools=frozenset(),
         api_permissions=frozenset(),
         gcp_iam_roles=(
+            "roles/modelarmor.user",
+            "roles/dlp.user",
             "roles/aiplatform.user",
             "roles/logging.logWriter",
         ),
         oauth_scopes=(
-            "https://www.googleapis.com/auth/cloud-platform.read-only",
+            "https://www.googleapis.com/auth/cloud-platform",
         ),
     ),
 }
@@ -731,3 +733,43 @@ class GcpAgentIamCredentialsClient:
             "expire_time": data.get("expireTime"),
             "credential_present": bool(data.get("accessToken")),
         }
+
+    def mint_downscoped_agent_access_token(
+        self,
+        *,
+        agent_name: str,
+        target_service: str,
+        lifetime_seconds: int = 300,
+    ) -> RedactedSecret:
+        """Mint and return a `RedactedSecret` downscoped OAuth2 access token for GCP S2S calls."""
+        spec = resolve_agent_identity(agent_name)
+        if target_service not in spec.allowed_target_services:
+            raise AgentAuthorizationError(
+                f"Agent {spec.agent_name!r} is forbidden from requesting credentials for {target_service!r}.",
+                agent_name=spec.agent_name,
+                target=target_service,
+            )
+        bounded_lifetime = max(60, min(lifetime_seconds, MAX_AGENT_S2S_TTL_SECONDS))
+        agent_sa = spec.service_account_email(self.project_id)
+        url = (
+            f"https://iamcredentials.googleapis.com/v1/projects/-"
+            f"/serviceAccounts/{agent_sa}:generateAccessToken"
+        )
+        headers = {
+            "Authorization": f"Bearer {self._get_host_bearer_token()}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "scope": list(spec.oauth_scopes),
+            "lifetime": f"{bounded_lifetime}s",
+        }
+        if self._http_client is not None:
+            resp = self._http_client.post(url, headers=headers, json=payload)
+        else:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        raw_token = str(resp.json().get("accessToken") or "").strip()
+        if not raw_token:
+            raise RuntimeError(f"IAM Credentials API returned empty access token for {agent_sa}.")
+        return RedactedSecret(raw_token, name=f"{agent_sa}:{target_service}")

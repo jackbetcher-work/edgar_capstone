@@ -92,8 +92,10 @@ locals {
       agent_name   = "ModelArmorGuardrail"
       account_id   = "model-armor-guardrail-sa"
       display_name = "Model Armor Guardrail Agent Identity"
-      description  = "Isolated S2S safety guardrail identity with zero access to BigQuery, GCS, or secrets."
+      description  = "Isolated S2S safety guardrail identity invoking Model Armor & Cloud SDP with zero access to BigQuery, GCS, or secrets."
       project_roles = [
+        "roles/modelarmor.user",
+        "roles/dlp.user",
         "roles/aiplatform.user",
         "roles/logging.logWriter",
       ]
@@ -221,6 +223,22 @@ resource "google_project_iam_member" "sec_analyst_trace_agent" {
 
   project = var.project_id
   role    = "roles/cloudtrace.agent"
+  member  = "serviceAccount:${google_service_account.sec_analyst[0].email}"
+}
+
+resource "google_project_iam_member" "sec_analyst_modelarmor_user" {
+  count = var.create_analyst_service_account ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/modelarmor.user"
+  member  = "serviceAccount:${google_service_account.sec_analyst[0].email}"
+}
+
+resource "google_project_iam_member" "sec_analyst_dlp_user" {
+  count = var.create_analyst_service_account ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/dlp.user"
   member  = "serviceAccount:${google_service_account.sec_analyst[0].email}"
 }
 

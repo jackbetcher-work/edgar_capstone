@@ -1,7 +1,8 @@
-"""ADK lifecycle callbacks for latency tracking, prompt safety (Model Armor), and fact-checking."""
+"""ADK lifecycle callbacks for latency tracking, Google Cloud Model Armor, SDP, and fact-checking."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import time
@@ -26,22 +27,20 @@ from edgar_capstone.security.agent_identity import (
     resolve_agent_identity,
 )
 from edgar_capstone.security.auth import record_security_audit_event
+from edgar_capstone.security.model_armor import get_model_armor_guardrail
 from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 
 logger = logging.getLogger(__name__)
-
-_PROMPT_INJECTION_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|system)\s+instructions", re.IGNORECASE),
-    re.compile(r"bypass\s+(?:strict\s+)?grounding", re.IGNORECASE),
-    re.compile(r"reveal\s+(?:your\s+)?system\s+prompt", re.IGNORECASE),
-    re.compile(r"fabricate\s+financial\s+numbers", re.IGNORECASE),
-)
 
 _CITATION_TAG_RE = re.compile(
     r"(?:\b[A-Z]{1,5}_\d{4}_item_(?:1a|7)_\d{4}\b|\[[A-Z.\-]{1,6}\s+FY\d{4}[^\]]*\]|Item\s+(?:1A|7)\b)",
     re.IGNORECASE,
 )
 _PERCENT_NUMBER_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*%")
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def before_agent_telemetry_callback(
@@ -161,10 +160,12 @@ def before_model_safety_and_latency_callback(
     state = callback_context.state
 
     latest_user_text = ""
+    latest_user_part: genai_types.Part | None = None
     for content in llm_request.contents or []:
         for part in content.parts or []:
             if part.text and content.role == "user":
                 latest_user_text = part.text
+                latest_user_part = part
 
     breakdown = extract_llm_request_context_breakdown(llm_request, state=state)
     agent_name = str(getattr(callback_context, "agent_name", "") or "UnknownAgent")
@@ -179,33 +180,41 @@ def before_model_safety_and_latency_callback(
     state["last_model_name"] = resolved_model
     state["last_model_task_category"] = task_category
 
-    # Model Armor check for prompt injection or grounding bypass attempts
-    if latest_user_text:
-        for pattern in _PROMPT_INJECTION_PATTERNS:
-            if pattern.search(latest_user_text):
+    # Managed Google Cloud Model Armor + SDP + Financial Projection guardrail check
+    if latest_user_text.strip():
+        already_verified = (
+            state.get("_model_armor_verified_prompt_sha256") == _hash_text(latest_user_text)
+        )
+        if not already_verified:
+            decision = get_model_armor_guardrail().inspect_user_prompt(
+                latest_user_text,
+                caller_agent=agent_name,
+            )
+            state["model_armor_last_decision"] = decision.to_audit_dict()
+            if decision.blocked:
                 logger.warning(
-                    "Model Armor blocked prompt injection attempt in agent '%s'",
+                    "Model Armor blocked user prompt in agent '%s' (categories=%s)",
                     callback_context.agent_name,
+                    list(decision.matched_categories),
                 )
                 state["model_armor_blocked"] = True
+                state["model_armor_findings"] = list(decision.matched_categories)
                 return LlmResponse(
                     content=genai_types.Content(
                         role="model",
-                        parts=[
-                            genai_types.Part(
-                                text=(
-                                    "Request blocked by SEC Analyst safety and grounding guardrails: "
-                                    "I can only answer financial and SEC 10-K analysis queries grounded "
-                                    "in verified EDGAR filings and deterministic variance calculations."
-                                )
-                            )
-                        ],
+                        parts=[genai_types.Part(text=decision.block_message)],
                     )
                 )
+            if decision.sdp_redacted and latest_user_part is not None:
+                latest_user_part.text = decision.sanitized_text
+                state["sdp_redacted"] = True
+                state["sdp_info_types"] = list(decision.sdp_info_types)
+            state["_model_armor_verified_prompt_sha256"] = _hash_text(decision.sanitized_text)
 
     context_prep_ms = (time.perf_counter() - prep_start) * 1000.0
     state["_context_prep_latency_ms"] = round(context_prep_ms, 4)
     state["_model_call_start_monotonic"] = time.perf_counter()
+    state["_observed_ttft_ms"] = None
     return None
 
 
@@ -273,11 +282,33 @@ def after_model_fact_check_callback(
     callback_context: CallbackContext,
     llm_response: LlmResponse,
 ) -> LlmResponse | None:
-    """Track context-induced model call latency, record ReAct trace steps, and run grounding fact checks."""
+    """Track context-induced model call latency (including SSE streaming TTFT), record ReAct steps, and fact-check."""
     state = callback_context.state
     start_ts = state.get("_model_call_start_monotonic")
+
+    # In StreamingMode.SSE, ADK invokes after_model_callback for partial chunks before the final aggregated response.
+    # Capture exact wall-clock Time to First Thought / Token (TTFT) on the first non-empty partial chunk without double-counting.
+    if getattr(llm_response, "partial", False):
+        if state.get("_observed_ttft_ms") is None and start_ts is not None:
+            has_signal = False
+            if llm_response.content and llm_response.content.parts:
+                has_signal = any(
+                    bool(getattr(p, "text", None)) or getattr(p, "function_call", None) is not None
+                    for p in llm_response.content.parts
+                )
+            if has_signal:
+                state["_observed_ttft_ms"] = round(
+                    (time.perf_counter() - float(start_ts)) * 1000.0, 4
+                )
+        return None
+
     raw_inference_ms = (
         (time.perf_counter() - float(start_ts)) * 1000.0 if start_ts is not None else 0.0
+    )
+    raw_observed_ttft = state.get("_observed_ttft_ms")
+    state["_observed_ttft_ms"] = None
+    observed_ttft_ms = (
+        float(raw_observed_ttft) if raw_observed_ttft is not None else None
     )
     prep_ms = float(state.get("_context_prep_latency_ms", 0.0) or 0.0)
 
@@ -346,6 +377,7 @@ def after_model_fact_check_callback(
         thoughts_tokens=thoughts_tokens,
         raw_inference_latency_ms=raw_inference_ms,
         context_prep_latency_ms=prep_ms,
+        observed_ttft_ms=observed_ttft_ms,
     )
 
     latency_log = list(state.get("latency_metrics", []))
@@ -365,6 +397,10 @@ def after_model_fact_check_callback(
             "context_latency_ms": latency_rec.context_latency_ms,
             "generation_latency_ms": latency_rec.generation_latency_ms,
             "ttft_ms": latency_rec.ttft_ms,
+            "observed_ttft_ms": (
+                round(observed_ttft_ms, 3) if observed_ttft_ms is not None else None
+            ),
+            "streaming_ttft_captured": observed_ttft_ms is not None,
             "context_latency_ratio": latency_rec.context_latency_ratio,
             "latency_per_1k_context_tokens_ms": latency_rec.latency_per_1k_context_tokens_ms,
             "estimated_cache_latency_saved_ms": latency_rec.estimated_cache_latency_saved_ms,
@@ -394,8 +430,43 @@ def after_model_fact_check_callback(
     )
     state["react_trace"] = react_log
 
-    # Only run narrative fact-check on final text responses (not intermediate tool-call turns)
+    # Only run Model Armor output inspection & narrative fact-check on final text responses
     if response_text.strip() and not has_function_call:
+        sanitized_return_resp: LlmResponse | None = None
+        if state.get("_model_armor_verified_response_sha256") != _hash_text(response_text):
+            resp_decision = get_model_armor_guardrail().inspect_model_response(
+                response_text,
+                caller_agent=agent_name,
+            )
+            state["model_armor_last_response_decision"] = resp_decision.to_audit_dict()
+            if resp_decision.blocked:
+                logger.warning(
+                    "Model Armor blocked model response in agent '%s' (categories=%s)",
+                    agent_name,
+                    list(resp_decision.matched_categories),
+                )
+                state["model_armor_blocked"] = True
+                state["model_armor_findings"] = list(resp_decision.matched_categories)
+                return LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[genai_types.Part(text=resp_decision.block_message)],
+                    )
+                )
+            if resp_decision.sdp_redacted:
+                state["sdp_redacted"] = True
+                state["sdp_info_types"] = list(resp_decision.sdp_info_types)
+                response_text = resp_decision.sanitized_text
+                sanitized_return_resp = LlmResponse(
+                    content=genai_types.Content(
+                        role="model",
+                        parts=[genai_types.Part(text=resp_decision.sanitized_text)],
+                    ),
+                    usage_metadata=llm_response.usage_metadata,
+                    model_version=llm_response.model_version,
+                )
+            state["_model_armor_verified_response_sha256"] = _hash_text(response_text)
+
         calc_vars = dict(state.get("calculated_variances", {}))
         citations = list(state.get("retrieved_citations", []))
         verification = verify_narrative_against_calculations(
@@ -405,5 +476,7 @@ def after_model_fact_check_callback(
             model_latency_ms=latency_rec.total_model_latency_ms,
         )
         state["fact_check_report"] = verification.model_dump(mode="json")
+        if sanitized_return_resp is not None:
+            return sanitized_return_resp
 
     return None

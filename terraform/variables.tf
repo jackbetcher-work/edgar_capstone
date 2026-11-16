@@ -105,6 +105,24 @@ variable "enable_vertex_ai_search" {
   default     = true
 }
 
+variable "enable_model_armor" {
+  description = "Whether to provision Google Cloud Model Armor and Cloud SDP/DLP inspect & de-identify templates."
+  type        = bool
+  default     = true
+}
+
+variable "model_armor_template_id" {
+  description = "Regional Google Cloud Model Armor template ID enforcing prompt-injection, RAI, malicious URI, and SDP guardrails."
+  type        = string
+  default     = "sec-edgar-analyst-armor"
+}
+
+variable "prompt_store_backend" {
+  description = "Versioned prompt loader backend mode ('auto', 'local', 'gcs', or 'vertex')."
+  type        = string
+  default     = "auto"
+}
+
 variable "artifact_registry_repo_id" {
   description = "Artifact Registry repository ID for SEC EDGAR Analyst container images."
   type        = string

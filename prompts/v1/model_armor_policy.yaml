@@ -1,0 +1,90 @@
+prompt_id: "model_armor_policy"
+version: "1.0.0"
+release_tag: "v1"
+agent_name: "ModelArmorGuardrail"
+model: "policy"
+description: >
+  Versioned policy specification for Google Cloud Model Armor, Sensitive Data Protection
+  (SDP / Cloud DLP), and SEC 10-K financial projection / MNPI leak filters.
+variables:
+  default_template_id: "sec-edgar-analyst-armor"
+  max_verified_fiscal_year: "2026"
+policy:
+  blocked_prompt_message: >
+    Request blocked by SEC Analyst Model Armor & compliance guardrails: I can only answer
+    financial and SEC 10-K analysis queries grounded in verified historical EDGAR filings
+    and deterministic variance calculations.
+  blocked_projection_message: >
+    Request blocked by SEC Financial Projection & Grounding Compliance Filter: This workspace
+    is restricted to verified historical SEC Form 10-K disclosures (through FY2026) and
+    deterministic variance metrics, and cannot generate forward-looking financial projections,
+    future earnings forecasts, stock price targets, or investment recommendations.
+  blocked_response_message: >
+    Response withheld by Model Armor & SEC Compliance Filter: The generated output triggered
+    prompt-safety, sensitive-data (SDP), or ungrounded financial projection guardrails.
+  # Non-regex lexical policy descriptors used ONLY by the offline Model Armor wire emulator
+  # when GCP ADC credentials are unavailable in local/CI environments.
+  emulator_pi_token_clauses:
+    - ["ignore", "previous", "instructions"]
+    - ["ignore", "prior", "instructions"]
+    - ["ignore", "system", "instructions"]
+    - ["disregard", "previous", "instructions"]
+    - ["disregard", "system", "instructions"]
+    - ["override", "system", "instructions"]
+    - ["bypass", "grounding"]
+    - ["disable", "grounding"]
+    - ["disable", "safety"]
+    - ["bypass", "model", "armor"]
+    - ["reveal", "system", "prompt"]
+    - ["print", "system", "prompt"]
+    - ["dump", "system", "prompt"]
+    - ["leak", "system", "instructions"]
+    - ["fabricate", "financial", "numbers"]
+    - ["invent", "financial", "numbers"]
+    - ["developer", "mode", "jailbreak"]
+    - ["do", "anything", "now", "dan"]
+  projection_phrases:
+    - "price target"
+    - "target price"
+    - "12-month target"
+    - "12 month target"
+    - "stock price forecast"
+    - "share price prediction"
+    - "predict stock price"
+    - "forecast stock price"
+    - "strong buy"
+    - "strong sell"
+    - "buy rating"
+    - "sell rating"
+    - "should i buy"
+    - "should i sell"
+    - "guaranteed return"
+  mnpi_markers:
+    - "confidential mnpi"
+    - "material non-public information"
+    - "material nonpublic information"
+    - "non-public financial projection"
+    - "internal embargoed draft"
+    - "unreleased earnings preview"
+    - "pre-release earnings guidance"
+  future_fiscal_years:
+    - "2027"
+    - "2028"
+    - "2029"
+    - "2030"
+    - "2031"
+    - "2032"
+  projection_verbs_and_nouns:
+    - "forecast"
+    - "forecasts"
+    - "forecasted"
+    - "predict"
+    - "predicts"
+    - "prediction"
+    - "predictions"
+    - "project"
+    - "projection"
+    - "projections"
+    - "projected"
+template: |
+  Managed Google Cloud Model Armor (`{{default_template_id}}`) + Cloud SDP/DLP + SEC Financial Projection Compliance Policy (max verified fiscal year: FY{{max_verified_fiscal_year}}).

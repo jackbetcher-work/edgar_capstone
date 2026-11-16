@@ -1,0 +1,78 @@
+schema_version: "1.0"
+default_version: "v1"
+description: >
+  Versioned prompt registry for SEC EDGAR Natural Language Analyst ADK agents
+  and Model Armor safety/projection policy specifications.
+
+prompts:
+  root_orchestrator:
+    agent_name: "RootOrchestrator"
+    model: "gemini-2.5-pro"
+    latest: "v1"
+    versions:
+      v1:
+        semver: "1.0.0"
+        path: "v1/root_orchestrator.yaml"
+      "1.0.0":
+        semver: "1.0.0"
+        path: "v1/root_orchestrator.yaml"
+
+  financial_analyst:
+    agent_name: "FinancialAnalystAgent"
+    model: "gemini-2.5-pro"
+    latest: "v1"
+    versions:
+      v1:
+        semver: "1.0.0"
+        path: "v1/financial_analyst.yaml"
+      "1.0.0":
+        semver: "1.0.0"
+        path: "v1/financial_analyst.yaml"
+
+  context_cache_agent:
+    agent_name: "ContextCacheAgent"
+    model: "gemini-3.5-flash"
+    latest: "v1"
+    versions:
+      v1:
+        semver: "1.0.0"
+        path: "v1/context_cache_agent.yaml"
+      "1.0.0":
+        semver: "1.0.0"
+        path: "v1/context_cache_agent.yaml"
+
+  narrative_evaluator:
+    agent_name: "NarrativeEvaluatorAgent"
+    model: "gemini-3.5-flash"
+    latest: "v1"
+    versions:
+      v1:
+        semver: "1.0.0"
+        path: "v1/narrative_evaluator.yaml"
+      "1.0.0":
+        semver: "1.0.0"
+        path: "v1/narrative_evaluator.yaml"
+
+  coding_assistant:
+    agent_name: "CodingAssistantAgent"
+    model: "gemini-3.5-flash"
+    latest: "v1"
+    versions:
+      v1:
+        semver: "1.0.0"
+        path: "v1/coding_assistant.yaml"
+      "1.0.0":
+        semver: "1.0.0"
+        path: "v1/coding_assistant.yaml"
+
+  model_armor_policy:
+    agent_name: "ModelArmorGuardrail"
+    model: "policy"
+    latest: "v1"
+    versions:
+      v1:
+        semver: "1.0.0"
+        path: "v1/model_armor_policy.yaml"
+      "1.0.0":
+        semver: "1.0.0"
+        path: "v1/model_armor_policy.yaml"

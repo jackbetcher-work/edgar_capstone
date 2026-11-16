@@ -25,6 +25,8 @@ from edgar_capstone.agents.evaluation_and_coding import (
     evaluate_variance_explanation,
     generate_financial_coding_assistance,
 )
+from edgar_capstone.agents.live_runtime import get_live_runtime_status_metadata
+from edgar_capstone.agents.prompt_store import get_prompt_store_status_metadata
 from edgar_capstone.agents.root_orchestrator import (
     RootOrchestrator,
     classify_query_intent,
@@ -43,6 +45,7 @@ from edgar_capstone.security.agent_identity import (
     PER_AGENT_IDENTITIES,
     S2S_AGENT_ASSERTION_HEADER,
 )
+from edgar_capstone.security.model_armor import get_model_armor_status_metadata
 from edgar_capstone.security.auth import (
     GOOGLE_IAP_ISSUER,
     AuthenticatedUser,
@@ -164,6 +167,9 @@ def health() -> dict[str, Any]:
             "financial_reasoning": model_meta["financial_reasoning_model"],
             "coding_and_evaluation": model_meta["coding_and_evaluation_model"],
         },
+        "adk_runtime": get_live_runtime_status_metadata(),
+        "model_armor": get_model_armor_status_metadata(),
+        "prompt_store": get_prompt_store_status_metadata(),
         "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
         "iap_jwt_auth_enabled": True,
     }
@@ -613,6 +619,10 @@ class ChatQueryRequest(BaseModel):
     end_year: int = Field(2026, ge=2015, le=2035)
     top_k: int = Field(8, ge=1, le=25)
     session_id: str | None = Field(default=None, max_length=128)
+    execution_mode: Literal["auto", "live", "deterministic"] | None = Field(
+        default=None,
+        description="Optional ADK execution mode override ('auto', 'live', or 'deterministic')",
+    )
 
 
 class EvaluationRequest(BaseModel):
@@ -621,6 +631,10 @@ class EvaluationRequest(BaseModel):
     variance_reports: list[dict[str, Any]] = Field(default_factory=list)
     citations: list[dict[str, Any]] = Field(default_factory=list)
     cached_explanations_count: int = Field(default=0, ge=0)
+    execution_mode: Literal["auto", "live", "deterministic"] | None = Field(
+        default=None,
+        description="Optional ADK execution mode override ('auto', 'live', or 'deterministic')",
+    )
 
 
 class CodingAssistRequest(BaseModel):
@@ -630,6 +644,10 @@ class CodingAssistRequest(BaseModel):
     start_year: int = Field(2024, ge=2015, le=2035)
     end_year: int = Field(2026, ge=2015, le=2035)
     dataset_id: str = Field("sec_edgar", min_length=1, max_length=128)
+    execution_mode: Literal["auto", "live", "deterministic"] | None = Field(
+        default=None,
+        description="Optional ADK execution mode override ('auto', 'live', or 'deterministic')",
+    )
 
 
 class SectionLoadRequest(BaseModel):
@@ -664,18 +682,29 @@ def conversational_rag_chat(
     req: ChatQueryRequest,
     user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
 ) -> dict[str, Any]:
-    """Execute a source-grounded conversational Hybrid RAG query with ReAct trace & fact-check verification."""
-    turn_result = run_conversational_rag_turn(
-        query=req.query,
-        tickers=req.tickers,
-        gics_sector=req.gics_sector,
-        section_id=req.section_id,
-        start_year=req.start_year,
-        end_year=req.end_year,
-        top_k=req.top_k,
-        session_id=req.session_id,
-        user_id=user.email,
-    )
+    """Execute a source-grounded conversational Hybrid RAG query with ADK Runner / ReAct trace & fact-check."""
+    try:
+        turn_result = run_conversational_rag_turn(
+            query=req.query,
+            tickers=req.tickers,
+            gics_sector=req.gics_sector,
+            section_id=req.section_id,
+            start_year=req.start_year,
+            end_year=req.end_year,
+            top_k=req.top_k,
+            session_id=req.session_id,
+            user_id=user.email,
+            execution_mode=req.execution_mode,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "status": "error",
+                "error": "live_adk_unavailable",
+                "message": str(exc),
+            },
+        ) from exc
     resolved_tickers = turn_result.get("resolved_scope", {}).get("tickers") or req.tickers
     record_security_audit_event(
         event_type="conversational_rag_chat",
@@ -683,7 +712,7 @@ def conversational_rag_chat(
         resource="/api/v1/chat",
         tickers=resolved_tickers,
         status_outcome=str(turn_result.get("status", "success")),
-        detail=f"intent={turn_result.get('intent', 'unknown')}",
+        detail=f"intent={turn_result.get('intent', 'unknown')} mode={turn_result.get('execution_mode', 'auto')}",
     )
     turn_result["authenticated_principal"] = {
         "email": user.email,
@@ -713,6 +742,7 @@ def get_context_latency_telemetry(
     records = tracker.recent_records(limit=limit, model_name=model)
     return {
         "status": "ok",
+        "adk_runtime": get_live_runtime_status_metadata(),
         "models": get_model_strategy_metadata(),
         "context_cache_runtime": get_context_cache_runtime_stats(),
         "summary": tracker.summarize().model_dump(mode="json"),
@@ -727,13 +757,24 @@ def evaluate_grounded_narrative(
     user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
 ) -> dict[str, Any]:
     """Run Gemini 3.5 Flash LLM-as-a-Judge evaluation on a financial variance explanation."""
-    report = evaluate_variance_explanation(
-        query=req.query,
-        response_markdown=req.response_markdown,
-        variance_reports=req.variance_reports,
-        citations=req.citations,
-        cached_explanations_count=req.cached_explanations_count,
-    )
+    try:
+        report = evaluate_variance_explanation(
+            query=req.query,
+            response_markdown=req.response_markdown,
+            variance_reports=req.variance_reports,
+            citations=req.citations,
+            cached_explanations_count=req.cached_explanations_count,
+            execution_mode=req.execution_mode,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "status": "error",
+                "error": "live_adk_unavailable",
+                "message": str(exc),
+            },
+        ) from exc
     record_security_audit_event(
         event_type="flash_narrative_evaluation",
         user=user,
@@ -752,14 +793,25 @@ def coding_assistance_endpoint(
     user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
 ) -> dict[str, Any]:
     """Run Gemini 3.5 Flash analytical coding assistance (SQL, Python variance audit, or LookML)."""
-    report = generate_financial_coding_assistance(
-        prompt=req.prompt,
-        language=req.language,
-        tickers=req.tickers,
-        start_year=req.start_year,
-        end_year=req.end_year,
-        dataset_id=req.dataset_id,
-    )
+    try:
+        report = generate_financial_coding_assistance(
+            prompt=req.prompt,
+            language=req.language,
+            tickers=req.tickers,
+            start_year=req.start_year,
+            end_year=req.end_year,
+            dataset_id=req.dataset_id,
+            execution_mode=req.execution_mode,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "status": "error",
+                "error": "live_adk_unavailable",
+                "message": str(exc),
+            },
+        ) from exc
     record_security_audit_event(
         event_type="flash_coding_assistance",
         user=user,

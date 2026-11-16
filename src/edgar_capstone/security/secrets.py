@@ -302,6 +302,9 @@ def scan_repository_for_exposed_secrets(repo_root: Path) -> list[SecretFinding]:
         "Dockerfile",
         "terraform/*.tf",
         "terraform/*.tfvars.example",
+        "prompts/**/*.yaml",
+        "prompts/**/*.yml",
+        "prompts/**/*.md",
         "src/**/*.py",
         "scripts/**/*.py",
     )

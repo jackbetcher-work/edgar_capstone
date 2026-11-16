@@ -149,3 +149,18 @@ output "iap_backend_service_audience" {
     : null
   )
 }
+
+output "model_armor_template_name" {
+  description = "Full resource name of the regional Google Cloud Model Armor guardrail template."
+  value       = var.enable_model_armor ? google_model_armor_template.sec_edgar_analyst_armor[0].name : null
+}
+
+output "sdp_inspect_template_id" {
+  description = "Resource ID of the Google Cloud Sensitive Data Protection (DLP) inspect template."
+  value       = var.enable_model_armor ? google_data_loss_prevention_inspect_template.sec_edgar_sdp_inspect[0].id : null
+}
+
+output "sdp_deidentify_template_id" {
+  description = "Resource ID of the Google Cloud Sensitive Data Protection (DLP) de-identification template."
+  value       = var.enable_model_armor ? google_data_loss_prevention_deidentify_template.sec_edgar_sdp_deidentify[0].id : null
+}

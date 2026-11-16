@@ -171,8 +171,17 @@ jobs:
           image: ${{ env.IMAGE_URI }}:${{ github.sha }}
           env_vars: |-
             GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}
+            GOOGLE_CLOUD_PROJECT=${{ env.GCP_PROJECT_ID }}
             GCP_PROJECT_NAME=${{ env.GCP_PROJECT_NAME }}
             GCP_REGION=${{ env.GCP_REGION }}
+            GOOGLE_CLOUD_LOCATION=${{ env.GCP_REGION }}
+            GOOGLE_GENAI_USE_VERTEXAI=true
+            EDGAR_EXECUTION_MODE=auto
+            EDGAR_ANALYST_MODEL=gemini-2.5-pro
+            EDGAR_FLASH_MODEL=gemini-3.5-flash
+            EDGAR_MODEL_ARMOR_MODE=gcp
+            MODEL_ARMOR_TEMPLATE_ID=sec-edgar-analyst-armor
+            EDGAR_PROMPT_STORE_BACKEND=auto
             RUNTIME_SERVICE_ACCOUNT=${{ env.RUNTIME_SERVICE_ACCOUNT }}
             CLOUD_IDENTITY_DOMAIN=${{ env.CLOUD_IDENTITY_DOMAIN }}
             ADMIN_CLOUD_IDENTITY_GROUPS=sec-edgar-admins@fde-workspace.corp

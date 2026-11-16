@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from google.adk.agents import Agent
+from google.adk.models.base_llm import BaseLlm
 from google.genai import types as genai_types
 
 from edgar_capstone.agents.callbacks import (
@@ -15,18 +16,20 @@ from edgar_capstone.agents.context_memory import (
     FLASH_CODING_AND_EVAL_MODEL,
     after_agent_memory_callback,
 )
+from edgar_capstone.agents.prompt_store import (
+    load_agent_prompt,
+    make_adk_instruction_provider,
+)
 from edgar_capstone.agents.tools import ContextCacheTool
 
-CONTEXT_CACHE_AGENT_INSTRUCTION = """You are the ContextCacheAgent (`context-cache-agent-sa`), a least-privilege specialist agent powered by Gemini 3.5 Flash (`gemini-3.5-flash`).
-Your sole responsibility is loading and warming cached SEC Form 10-K sections (`item_1a` Risk Factors and `item_7` MD&A) from the curated SEC corpus bucket via `load_cached_10k_section` while tracking KV-cache hit/miss telemetry.
-You have zero access to financial calculation engines, BigQuery write operations, or Secret Manager secrets.
-"""
+CONTEXT_CACHE_AGENT_INSTRUCTION: str = load_agent_prompt("context_cache_agent")
 
 
 def create_context_cache_agent(
     *,
     name: str = "ContextCacheAgent",
-    model: str = FLASH_CODING_AND_EVAL_MODEL,
+    model: str | BaseLlm = FLASH_CODING_AND_EVAL_MODEL,
+    prompt_version: str | None = None,
 ) -> Agent:
     """Create the least-privilege `ContextCacheAgent` bound strictly to `ContextCacheTool`."""
     return Agent(
@@ -36,7 +39,7 @@ def create_context_cache_agent(
             "Least-privilege specialist agent (`context-cache-agent-sa`) scoped strictly to "
             "fetching curated SEC 10-K Markdown sections from GCS and warming session context cache."
         ),
-        instruction=CONTEXT_CACHE_AGENT_INSTRUCTION,
+        instruction=make_adk_instruction_provider("context_cache_agent", version=prompt_version),
         tools=[ContextCacheTool],
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.0,

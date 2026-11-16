@@ -4,7 +4,7 @@
   "location": "us-central1",
   "start_year": 2020,
   "end_year": 2026,
-  "generated_at": "2026-11-09T19:13:17Z",
+  "generated_at": "2026-11-13T19:09:40Z",
   "requested_tickers": [
     "NVDA",
     "AAPL",
@@ -47,7 +47,7 @@
   ],
   "failed_tickers": {},
   "total_profiles": 114,
-  "uploaded_to_gcs": true,
-  "uploaded_blob_count": 231,
+  "uploaded_to_gcs": false,
+  "uploaded_blob_count": 0,
   "warnings": []
 }

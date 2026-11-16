@@ -7,16 +7,17 @@ import re
 import time
 from typing import Any
 
-from edgar_capstone.agents.callbacks import (
-    _PROMPT_INJECTION_PATTERNS,
-    verify_narrative_against_calculations,
-)
+from google.adk.models.base_llm import BaseLlm
+
+from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
 from edgar_capstone.agents.context_memory import (
     get_context_latency_tracker,
     get_conversation_memory_manager,
     get_model_strategy_metadata,
     resolve_model_for_task,
 )
+from edgar_capstone.agents.live_runtime import get_live_runtime_status_metadata
+from edgar_capstone.agents.prompt_store import get_prompt_store_status_metadata
 from edgar_capstone.agents.react_loop import StructuredReActExecutor
 from edgar_capstone.agents.root_orchestrator import (
     RootOrchestrator,
@@ -38,6 +39,10 @@ from edgar_capstone.security.agent_identity import (
     authorize_agent_s2s_hop,
     authorize_agent_tool_invocation,
     get_agent_s2s_broker,
+)
+from edgar_capstone.security.model_armor import (
+    GuardrailDecision,
+    get_model_armor_guardrail,
 )
 from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 
@@ -560,8 +565,11 @@ def run_conversational_rag_turn(
     top_k: int = 8,
     session_id: str | None = None,
     user_id: str = "analyst",
+    execution_mode: str | None = None,
+    reasoning_llm: BaseLlm | None = None,
+    judge_llm: BaseLlm | None = None,
 ) -> dict[str, Any]:
-    """Execute a full source-grounded Hybrid RAG conversational turn with ReAct loop, context latency tracking, & fact-checking."""
+    """Execute a full source-grounded Hybrid RAG conversational turn with ADK Runner / ReAct loop & fact-checking."""
     turn_start = time.perf_counter()
     agent_trace: list[dict[str, Any]] = []
     identities_used_by_agent: dict[str, dict[str, str]] = {}
@@ -577,75 +585,115 @@ def run_conversational_rag_turn(
     memory_mgr = get_conversation_memory_manager()
     memory_ctx = memory_mgr.recall_session_context(session_id)
 
-    # Step 0: Model Armor Safety & Prompt-Injection Guardrail
+    # Step 0: Managed Google Cloud Model Armor, Cloud SDP/DLP & Financial Projection Guardrails
     t0 = time.perf_counter()
-    for pattern in _PROMPT_INJECTION_PATTERNS:
-        if pattern.search(query):
-            guard_claims = authorize_agent_s2s_hop(
-                caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-                callee_agent="ModelArmorGuardrail",
-            )
-            _track_agent_identity(guard_claims)
-            guard_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-            agent_trace.append(
-                {
-                    "step": 1,
-                    "agent": "ModelArmorGuardrail",
-                    "agent_service_account": guard_claims.service_account_email,
-                    "spiffe_id": guard_claims.spiffe_id,
-                    "s2s_target_service": guard_claims.target_service,
-                    "s2s_verified": True,
-                    "tool": "before_model_safety_and_latency_callback",
-                    "status": "blocked",
-                    "duration_ms": guard_ms,
-                    "summary": "Blocked prompt-injection or grounding-bypass pattern before model execution.",
-                }
-            )
-            return {
+    guardrail_svc = get_model_armor_guardrail()
+    prompt_decision = guardrail_svc.inspect_user_prompt(
+        query,
+        caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+    )
+    if prompt_decision.blocked:
+        guard_claims = authorize_agent_s2s_hop(
+            caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+            callee_agent="ModelArmorGuardrail",
+        )
+        _track_agent_identity(guard_claims)
+        guard_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        cats_str = ", ".join(prompt_decision.matched_categories) or "policy_violation"
+        agent_trace.append(
+            {
+                "step": 1,
+                "agent": "ModelArmorGuardrail",
+                "agent_service_account": guard_claims.service_account_email,
+                "spiffe_id": guard_claims.spiffe_id,
+                "s2s_target_service": guard_claims.target_service,
+                "s2s_verified": True,
+                "tool": "model_armor_sanitize_user_prompt",
                 "status": "blocked",
-                "model_armor_blocked": True,
-                "intent": "safety_guardrail_block",
-                "orchestrator": RootOrchestrator.name,
-                "resolved_scope": {
-                    "tickers": [],
-                    "gics_sector": gics_sector,
-                    "section_id": section_id,
-                    "start_year": start_year,
-                    "end_year": end_year,
-                },
-                "answer_markdown": (
-                    "### Request Blocked by Strict Grounding & Safety Guardrails\n\n"
-                    "Model Armor detected an attempt to override system instructions or bypass strict SEC 10-K grounding. "
-                    "This workspace only synthesizes verified EDGAR Form 10-K disclosures and deterministic financial metrics."
+                "duration_ms": guard_ms,
+                "summary": (
+                    f"Blocked user prompt via Google Cloud Model Armor / Compliance Filter "
+                    f"(categories=[{cats_str}], backend={prompt_decision.backend_used})."
                 ),
-                "variance_reports": [],
-                "citations": [],
-                "context_cache": None,
-                "fact_check": {
-                    "passed": True,
-                    "checked_metrics_count": 0,
-                    "matched_citations_count": 0,
-                    "has_required_citations": True,
-                    "discrepancies": [],
-                    "model_latency_ms": guard_ms,
-                },
-                "react_execution": {
-                    "strategy": "structured_react_loop",
-                    "iterations": 0,
-                    "steps": [],
-                    "variance_evaluations": [],
-                    "cached_10k_explanations": [],
-                },
-                "context_and_memory": {
-                    "models": get_model_strategy_metadata(),
-                    "session_memory": memory_ctx,
-                    "turn_context_latency": None,
-                },
-                "evaluation": None,
-                "agent_trace": agent_trace,
-                "agent_identities_used": list(identities_used_by_agent.values()),
-                "total_latency_ms": round((time.perf_counter() - turn_start) * 1000.0, 2),
             }
+        )
+        return {
+            "status": "blocked",
+            "model_armor_blocked": True,
+            "model_armor": prompt_decision.to_audit_dict(),
+            "execution_mode": "guardrail_blocked",
+            "adk_runtime": get_live_runtime_status_metadata(),
+            "prompt_store": get_prompt_store_status_metadata(),
+            "intent": (
+                "projection_compliance_block"
+                if prompt_decision.projection_blocked
+                else "safety_guardrail_block"
+            ),
+            "orchestrator": RootOrchestrator.name,
+            "resolved_scope": {
+                "tickers": [],
+                "gics_sector": gics_sector,
+                "section_id": section_id,
+                "start_year": start_year,
+                "end_year": end_year,
+            },
+            "answer_markdown": (
+                "### Request Blocked by Managed Model Armor & SEC Compliance Guardrails\n\n"
+                f"{prompt_decision.block_message}"
+            ),
+            "variance_reports": [],
+            "citations": [],
+            "context_cache": None,
+            "fact_check": {
+                "passed": True,
+                "checked_metrics_count": 0,
+                "matched_citations_count": 0,
+                "has_required_citations": True,
+                "discrepancies": [],
+                "model_latency_ms": guard_ms,
+            },
+            "react_execution": {
+                "strategy": "structured_react_loop",
+                "iterations": 0,
+                "steps": [],
+                "variance_evaluations": [],
+                "cached_10k_explanations": [],
+            },
+            "context_and_memory": {
+                "models": get_model_strategy_metadata(),
+                "session_memory": memory_ctx,
+                "turn_context_latency": None,
+            },
+            "evaluation": None,
+            "agent_trace": agent_trace,
+            "agent_identities_used": list(identities_used_by_agent.values()),
+            "total_latency_ms": round((time.perf_counter() - turn_start) * 1000.0, 2),
+        }
+
+    if prompt_decision.sdp_redacted:
+        query = prompt_decision.sanitized_text
+        guard_claims = authorize_agent_s2s_hop(
+            caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+            callee_agent="ModelArmorGuardrail",
+        )
+        _track_agent_identity(guard_claims)
+        agent_trace.append(
+            {
+                "step": len(agent_trace) + 1,
+                "agent": "ModelArmorGuardrail",
+                "agent_service_account": guard_claims.service_account_email,
+                "spiffe_id": guard_claims.spiffe_id,
+                "s2s_target_service": guard_claims.target_service,
+                "s2s_verified": True,
+                "tool": "cloud_sdp_deidentify_content",
+                "status": "sanitized",
+                "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                "summary": (
+                    f"De-identified sensitive PII in user prompt via SDP "
+                    f"(info_types={list(prompt_decision.sdp_info_types)})."
+                ),
+            }
+        )
 
     # Step 1: Scope Resolution, Session Memory Recall & RootOrchestrator Intent Routing
     t1 = time.perf_counter()
@@ -887,7 +935,11 @@ def run_conversational_rag_turn(
         _track_agent_identity(c_claims)
         last_cache_claims = c_claims
 
-    react_result = StructuredReActExecutor().execute_post_retrieval_reasoning(
+    react_result = StructuredReActExecutor(
+        execution_mode=execution_mode,
+        reasoning_llm=reasoning_llm,
+        judge_llm=judge_llm,
+    ).execute_post_retrieval_reasoning(
         query=query,
         intent=intent,
         scope=scope,
@@ -897,6 +949,9 @@ def run_conversational_rag_turn(
         chunk_health=chunk_health,
         memory_tokens=int(memory_ctx.get("memory_tokens", 0) or 0),
         memory_prep_latency_ms=float(memory_ctx.get("memory_lookup_latency_ms", 0.0) or 0.0),
+        memory_context=memory_ctx,
+        session_id=session_id,
+        user_id=user_id,
         on_cache_s2s_call=_on_cache_s2s_call,
     )
 
@@ -910,6 +965,8 @@ def run_conversational_rag_turn(
     turn_latency_summary = react_result["turn_latency_summary"]
     reasoning_model: str = react_result["reasoning_model"]
     evaluation_model: str = react_result["evaluation_model"]
+    active_execution_mode: str = react_result["execution_mode"]
+    adk_runtime_meta: dict[str, Any] = react_result["adk_runtime"]
 
     # Record S2S-attested trace step for ReAct Step 1 (Evaluate Variances via FinancialAnalystAgent)
     eval_var_step = react_steps[0]
@@ -1039,6 +1096,137 @@ def run_conversational_rag_turn(
     )
     fc_ms = round((time.perf_counter() - t5) * 1000.0 + synth_step.duration_ms, 2)
 
+    # Post-Generation Managed Model Armor, Cloud SDP & Projection Leak Filter
+    t_resp_armor = time.perf_counter()
+    if react_result.get("model_armor_response_blocked") is True:
+        raw_plugin_dec = react_result.get("model_armor_response_decision") or {}
+        resp_decision = GuardrailDecision(
+            action="blocked",
+            blocked=True,
+            sdp_redacted=bool(raw_plugin_dec.get("sdp_redacted", False)),
+            projection_blocked=bool(raw_plugin_dec.get("projection_blocked", False)),
+            original_text="",
+            sanitized_text="",
+            matched_categories=tuple(raw_plugin_dec.get("matched_categories") or ("policy_violation",)),
+            sdp_info_types=tuple(raw_plugin_dec.get("sdp_info_types") or ()),
+            block_message=str(
+                react_result.get("model_armor_response_block_message") or answer_markdown
+            ),
+            backend_used=str(raw_plugin_dec.get("backend_used") or "gcp_model_armor_v1"),
+            latency_ms=float(raw_plugin_dec.get("latency_ms") or 0.0),
+            s2s_service_account=str(raw_plugin_dec.get("s2s_service_account") or ""),
+            s2s_spiffe_id=str(raw_plugin_dec.get("s2s_spiffe_id") or ""),
+        )
+    else:
+        resp_decision = guardrail_svc.inspect_model_response(
+            answer_markdown,
+            caller_agent="FinancialAnalystAgent",
+        )
+    if resp_decision.blocked:
+        out_guard_claims = authorize_agent_s2s_hop(
+            caller_agent="FinancialAnalystAgent",
+            callee_agent="ModelArmorGuardrail",
+        )
+        _track_agent_identity(out_guard_claims)
+        out_guard_ms = round((time.perf_counter() - t_resp_armor) * 1000.0, 2)
+        cats_str = ", ".join(resp_decision.matched_categories) or "policy_violation"
+        agent_trace.append(
+            {
+                "step": len(agent_trace) + 1,
+                "agent": "ModelArmorGuardrail",
+                "agent_service_account": out_guard_claims.service_account_email,
+                "spiffe_id": out_guard_claims.spiffe_id,
+                "s2s_target_service": out_guard_claims.target_service,
+                "s2s_verified": True,
+                "tool": "model_armor_sanitize_model_response",
+                "status": "blocked",
+                "duration_ms": out_guard_ms,
+                "summary": (
+                    f"Withheld model response via Model Armor / SEC Projection Filter "
+                    f"(categories=[{cats_str}], backend={resp_decision.backend_used})."
+                ),
+            }
+        )
+        return {
+            "status": "blocked",
+            "model_armor_blocked": True,
+            "model_armor": {
+                "prompt_inspection": prompt_decision.to_audit_dict(),
+                "response_inspection": resp_decision.to_audit_dict(),
+            },
+            "execution_mode": "guardrail_blocked",
+            "adk_runtime": adk_runtime_meta,
+            "prompt_store": get_prompt_store_status_metadata(),
+            "intent": (
+                "projection_compliance_block"
+                if resp_decision.projection_blocked
+                else "safety_guardrail_block"
+            ),
+            "orchestrator": RootOrchestrator.name,
+            "resolved_scope": scope,
+            "answer_markdown": (
+                "### Response Withheld by Managed Model Armor & SEC Compliance Guardrails\n\n"
+                f"{resp_decision.block_message}"
+            ),
+            "variance_reports": variance_reports,
+            "citations": [],
+            "context_cache": context_cache_info,
+            "fact_check": {
+                "passed": False,
+                "checked_metrics_count": 0,
+                "matched_citations_count": 0,
+                "has_required_citations": False,
+                "discrepancies": list(resp_decision.matched_categories),
+                "model_latency_ms": out_guard_ms,
+            },
+            "react_execution": {
+                "strategy": "structured_react_loop",
+                "execution_mode": active_execution_mode,
+                "iterations": len(react_steps),
+                "steps": [s.model_dump(mode="json") for s in react_steps],
+                "variance_evaluations": [
+                    v.model_dump(mode="json") for v in variance_evaluations
+                ],
+                "cached_10k_explanations": [
+                    e.model_dump(mode="json") for e in cached_explanations
+                ],
+            },
+            "context_and_memory": {
+                "models": get_model_strategy_metadata(),
+                "session_memory": memory_ctx,
+                "turn_context_latency": turn_latency_summary.model_dump(mode="json"),
+            },
+            "evaluation": None,
+            "agent_trace": agent_trace,
+            "agent_identities_used": list(identities_used_by_agent.values()),
+            "total_latency_ms": round((time.perf_counter() - turn_start) * 1000.0, 2),
+        }
+
+    if resp_decision.sdp_redacted:
+        answer_markdown = resp_decision.sanitized_text
+        out_guard_claims = authorize_agent_s2s_hop(
+            caller_agent="FinancialAnalystAgent",
+            callee_agent="ModelArmorGuardrail",
+        )
+        _track_agent_identity(out_guard_claims)
+        agent_trace.append(
+            {
+                "step": len(agent_trace) + 1,
+                "agent": "ModelArmorGuardrail",
+                "agent_service_account": out_guard_claims.service_account_email,
+                "spiffe_id": out_guard_claims.spiffe_id,
+                "s2s_target_service": out_guard_claims.target_service,
+                "s2s_verified": True,
+                "tool": "cloud_sdp_deidentify_content",
+                "status": "sanitized",
+                "duration_ms": round((time.perf_counter() - t_resp_armor) * 1000.0, 2),
+                "summary": (
+                    f"De-identified sensitive PII in synthesized model response via SDP "
+                    f"(info_types={list(resp_decision.sdp_info_types)})."
+                ),
+            }
+        )
+
     fact_check = verify_narrative_against_calculations(
         response_text=answer_markdown,
         calculated_variances=calculated_variances_map,
@@ -1091,6 +1279,13 @@ def run_conversational_rag_turn(
     return {
         "status": "success",
         "model_armor_blocked": False,
+        "model_armor": {
+            "prompt_inspection": prompt_decision.to_audit_dict(),
+            "response_inspection": resp_decision.to_audit_dict(),
+        },
+        "execution_mode": active_execution_mode,
+        "adk_runtime": adk_runtime_meta,
+        "prompt_store": get_prompt_store_status_metadata(),
         "intent": intent,
         "orchestrator": RootOrchestrator.name,
         "resolved_scope": scope,
@@ -1104,6 +1299,8 @@ def run_conversational_rag_turn(
         "evaluation": eval_report.model_dump(mode="json"),
         "react_execution": {
             "strategy": "structured_react_loop",
+            "execution_mode": active_execution_mode,
+            "observed_ttft_ms": adk_runtime_meta.get("observed_ttft_ms"),
             "iterations": len(react_steps),
             "steps": [s.model_dump(mode="json") for s in react_steps],
             "variance_evaluations": [

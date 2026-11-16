@@ -10,11 +10,13 @@ Model Strategy:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import Any, Callable, Literal
 
 from google.adk.agents import Agent
+from google.adk.models.base_llm import BaseLlm
 from google.genai import types as genai_types
 
 from edgar_capstone.agents.callbacks import (
@@ -29,6 +31,15 @@ from edgar_capstone.agents.context_memory import (
     get_context_latency_tracker,
     resolve_model_for_task,
 )
+from edgar_capstone.agents.live_runtime import (
+    resolve_live_adk_runtime,
+    run_live_adk_coding_assistance,
+    run_live_adk_narrative_evaluation,
+)
+from edgar_capstone.agents.prompt_store import (
+    load_agent_prompt,
+    make_adk_instruction_provider,
+)
 from edgar_capstone.agents.schemas import (
     CodingAssistanceReport,
     ContextBreakdown,
@@ -37,32 +48,22 @@ from edgar_capstone.agents.schemas import (
 from edgar_capstone.agents.tools import _parse_ticker_list
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_FLASH_MODEL: str = FLASH_CODING_AND_EVAL_MODEL
 
-NARRATIVE_EVALUATOR_INSTRUCTION = """You are the NarrativeEvaluatorAgent powered by Gemini 3.5 Flash (`gemini-3.5-flash`).
-Your responsibility is fast, rigorous LLM-as-a-Judge evaluation of SEC 10-K financial variance reports across four axes:
-1. `numeric_fidelity_score`: 100% agreement between narrative USD/percentage figures and deterministic calculation engine outputs.
-2. `citation_grounding_score`: Every narrative business driver or risk claim is backed by an inline `[TICKER FYxxxx | Section | chunk_id](sec_filing_url)` citation.
-3. `explanation_quality_score`: Material variances (Revenue, Operating Income, Net Income, margins) are causally explained using cached Item 7 MD&A and Item 1A Risk Factor passages.
-4. `thematic_consistency_score`: Coherent multi-period or multi-company synthesis free of ungrounded speculation.
-"""
-
-CODING_ASSISTANT_INSTRUCTION = """You are the CodingAssistantAgent powered by Gemini 3.5 Flash (`gemini-3.5-flash`).
-You assist financial engineers and analysts with analytical code generation and validation:
-- BigQuery Standard SQL queries against `sec_edgar.v_financial_variances_yoy`, `sec_edgar.financial_metrics`, and `sec_edgar.filing_chunks`.
-- Deterministic Python verification scripts (`pydantic` / `pandas`) for period-over-period variance, margin bps, and CAGR audits.
-- Looker / LookML semantic explore snippets for variance and context-latency telemetry dashboards.
-Never hardcode credentials or fabricate financial figures in generated code.
-"""
+NARRATIVE_EVALUATOR_INSTRUCTION: str = load_agent_prompt("narrative_evaluator")
+CODING_ASSISTANT_INSTRUCTION: str = load_agent_prompt("coding_assistant")
 
 
 def create_narrative_evaluator_agent(
     *,
     name: str = "NarrativeEvaluatorAgent",
-    model: str | None = None,
+    model: str | BaseLlm | None = None,
+    prompt_version: str | None = None,
 ) -> Agent:
     """Create the `NarrativeEvaluatorAgent` ADK `LlmAgent` pinned to `gemini-3.5-flash`."""
-    resolved_model = model or resolve_model_for_task("evaluation")
+    resolved_model = model if model is not None else resolve_model_for_task("evaluation")
     return Agent(
         name=name,
         model=resolved_model,
@@ -70,7 +71,7 @@ def create_narrative_evaluator_agent(
             "Gemini 3.5 Flash LLM-as-a-Judge evaluation specialist scoring numeric fidelity, "
             "10-K citation grounding, variance explanation quality, and thematic coherence."
         ),
-        instruction=NARRATIVE_EVALUATOR_INSTRUCTION,
+        instruction=make_adk_instruction_provider("narrative_evaluator", version=prompt_version),
         output_schema=NarrativeEvaluationReport,
         output_key="narrative_evaluation_report",
         generate_content_config=genai_types.GenerateContentConfig(
@@ -87,10 +88,11 @@ def create_narrative_evaluator_agent(
 def create_coding_assistant_agent(
     *,
     name: str = "CodingAssistantAgent",
-    model: str | None = None,
+    model: str | BaseLlm | None = None,
+    prompt_version: str | None = None,
 ) -> Agent:
     """Create the `CodingAssistantAgent` ADK `LlmAgent` pinned to `gemini-3.5-flash`."""
-    resolved_model = model or resolve_model_for_task("coding_assistance")
+    resolved_model = model if model is not None else resolve_model_for_task("coding_assistance")
     return Agent(
         name=name,
         model=resolved_model,
@@ -98,7 +100,7 @@ def create_coding_assistant_agent(
             "Gemini 3.5 Flash coding assistance specialist generating BigQuery SQL, "
             "deterministic Python variance verification scripts, and LookML explores."
         ),
-        instruction=CODING_ASSISTANT_INSTRUCTION,
+        instruction=make_adk_instruction_provider("coding_assistant", version=prompt_version),
         output_schema=CodingAssistanceReport,
         output_key="coding_assistance_report",
         generate_content_config=genai_types.GenerateContentConfig(
@@ -120,16 +122,93 @@ def evaluate_variance_explanation(
     citations: list[dict[str, Any]],
     cached_explanations_count: int = 0,
     llm_judge_fn: Callable[[str, str], dict[str, Any]] | None = None,
+    execution_mode: str | None = None,
+    llm: BaseLlm | None = None,
 ) -> NarrativeEvaluationReport:
     """Evaluate a synthesized financial variance report using `gemini-3.5-flash` and track context latency."""
     prep_start = time.perf_counter()
-    eval_model = resolve_model_for_task("evaluation")
+    eval_model = llm.model if llm is not None else resolve_model_for_task("evaluation")
 
     calc_map = {
         f"{r.get('ticker', 'UNK')}_{r.get('start_year', 0)}_{r.get('end_year', 0)}": r
         for r in variance_reports
     }
-    sys_tokens = estimate_token_count(NARRATIVE_EVALUATOR_INSTRUCTION)
+    fc = verify_narrative_against_calculations(
+        response_text=response_markdown,
+        calculated_variances=calc_map,
+        retrieved_citations=citations,
+    )
+
+    if llm_judge_fn is None:
+        runtime_res = resolve_live_adk_runtime(
+            execution_mode=execution_mode,
+            custom_llm=llm,
+        )
+        if runtime_res.live_adk_enabled:
+            try:
+                raw_live_eval, stream_res = run_live_adk_narrative_evaluation(
+                    query=query,
+                    response_markdown=response_markdown,
+                    variance_reports=variance_reports,
+                    citations=citations,
+                    cached_explanations_count=cached_explanations_count,
+                    resolution=runtime_res,
+                    custom_llm=llm,
+                )
+                num_score = max(0.0, min(1.0, float(raw_live_eval.get("numeric_fidelity_score", 1.0 if fc.passed else 0.45))))
+                if not fc.passed:
+                    num_score = min(num_score, 0.45)
+                cit_score = max(0.0, min(1.0, float(raw_live_eval.get("citation_grounding_score", 1.0))))
+                if citations and not fc.has_required_citations:
+                    cit_score = min(cit_score, 0.25)
+                exp_score = max(0.0, min(1.0, float(raw_live_eval.get("explanation_quality_score", 1.0))))
+                thm_score = max(0.0, min(1.0, float(raw_live_eval.get("thematic_consistency_score", 1.0))))
+                rationale = str(
+                    raw_live_eval.get("rationale")
+                    or f"Evaluated via live ADK NarrativeEvaluatorAgent ({eval_model})."
+                )
+                overall = round(
+                    0.35 * num_score + 0.30 * cit_score + 0.20 * exp_score + 0.15 * thm_score,
+                    4,
+                )
+                if overall >= 0.80 and num_score >= 0.90:
+                    live_grade: Literal["pass", "needs_revision", "fail"] = "pass"
+                elif overall >= 0.55:
+                    live_grade = "needs_revision"
+                else:
+                    live_grade = "fail"
+
+                adk_lat = stream_res.latency_records[-1] if stream_res.latency_records else None
+                return NarrativeEvaluationReport(
+                    evaluator_model=adk_lat.model_name if adk_lat else eval_model,
+                    task_category="evaluation",
+                    grade=live_grade,
+                    overall_score=overall,
+                    numeric_fidelity_score=round(num_score, 4),
+                    citation_grounding_score=round(cit_score, 4),
+                    explanation_quality_score=round(exp_score, 4),
+                    thematic_consistency_score=round(thm_score, 4),
+                    rationale=rationale,
+                    context_tokens=(
+                        adk_lat.context_breakdown.total_context_tokens if adk_lat else 0
+                    ),
+                    context_latency_ms=adk_lat.context_latency_ms if adk_lat else 0.0,
+                    total_latency_ms=(
+                        adk_lat.total_model_latency_ms
+                        if adk_lat
+                        else stream_res.total_stream_latency_ms
+                    ),
+                )
+            except Exception as exc:
+                if runtime_res.requested_mode == "live":
+                    raise
+                logger.warning(
+                    "Live ADK NarrativeEvaluatorAgent call failed in auto mode (%s); "
+                    "degrading gracefully to deterministic rubric.",
+                    exc,
+                )
+
+    sys_tokens = estimate_token_count(load_agent_prompt("narrative_evaluator"))
     var_tokens = estimate_token_count(json.dumps(variance_reports, default=str))
     cit_tokens = estimate_token_count(json.dumps(citations[:8], default=str))
     prompt_tokens = estimate_token_count(f"{query}\n{response_markdown}")
@@ -144,11 +223,6 @@ def evaluate_variance_explanation(
         thm_score = float(raw_eval.get("thematic_consistency_score", 1.0))
         rationale = str(raw_eval.get("rationale") or "Evaluated via Gemini 3.5 Flash judge.")
     else:
-        fc = verify_narrative_against_calculations(
-            response_text=response_markdown,
-            calculated_variances=calc_map,
-            retrieved_citations=citations,
-        )
         num_score = 1.0 if fc.passed else 0.45
         if citations:
             cit_score = min(1.0, max(0.3, fc.matched_citations_count / max(1, min(len(citations), 3))))
@@ -237,14 +311,77 @@ def generate_financial_coding_assistance(
     end_year: int = 2026,
     dataset_id: str = "sec_edgar",
     llm_coder_fn: Callable[[str, str], dict[str, Any]] | None = None,
+    execution_mode: str | None = None,
+    llm: BaseLlm | None = None,
 ) -> CodingAssistanceReport:
     """Generate analytical SQL, Python verification code, or LookML explores via `gemini-3.5-flash`."""
     prep_start = time.perf_counter()
-    coder_model = resolve_model_for_task("coding_assistance")
+    coder_model = llm.model if llm is not None else resolve_model_for_task("coding_assistance")
     parsed_tickers = sorted(_parse_ticker_list(tickers)) or ["NVDA", "AAPL"]
     tickers_sql = ", ".join(f"'{t}'" for t in parsed_tickers)
 
-    sys_tokens = estimate_token_count(CODING_ASSISTANT_INSTRUCTION)
+    if llm_coder_fn is None:
+        runtime_res = resolve_live_adk_runtime(
+            execution_mode=execution_mode,
+            custom_llm=llm,
+        )
+        if runtime_res.live_adk_enabled:
+            try:
+                raw_live_code, stream_res = run_live_adk_coding_assistance(
+                    prompt=prompt,
+                    language=language,
+                    parsed_tickers=parsed_tickers,
+                    start_year=start_year,
+                    end_year=end_year,
+                    dataset_id=dataset_id,
+                    resolution=runtime_res,
+                    custom_llm=llm,
+                )
+                live_code_str = str(raw_live_code.get("code") or "").strip()
+                if not live_code_str:
+                    raise ValueError(
+                        "CodingAssistantAgent returned an empty code payload."
+                    )
+                live_title = str(
+                    raw_live_code.get("artifact_title")
+                    or f"Gemini 3.5 Flash {language.upper()} Analysis ({', '.join(parsed_tickers)})"
+                )
+                live_explanation = str(
+                    raw_live_code.get("explanation")
+                    or f"Generated via live ADK CodingAssistantAgent ({coder_model})."
+                )
+                live_tickers = [
+                    str(t) for t in (raw_live_code.get("tickers_referenced") or parsed_tickers)
+                ] or parsed_tickers
+                adk_lat = stream_res.latency_records[-1] if stream_res.latency_records else None
+                return CodingAssistanceReport(
+                    assistant_model=adk_lat.model_name if adk_lat else coder_model,
+                    task_category="coding_assistance",
+                    language=language,
+                    artifact_title=live_title,
+                    code=live_code_str,
+                    explanation=live_explanation,
+                    tickers_referenced=live_tickers,
+                    context_tokens=(
+                        adk_lat.context_breakdown.total_context_tokens if adk_lat else 0
+                    ),
+                    context_latency_ms=adk_lat.context_latency_ms if adk_lat else 0.0,
+                    total_latency_ms=(
+                        adk_lat.total_model_latency_ms
+                        if adk_lat
+                        else stream_res.total_stream_latency_ms
+                    ),
+                )
+            except Exception as exc:
+                if runtime_res.requested_mode == "live":
+                    raise
+                logger.warning(
+                    "Live ADK CodingAssistantAgent call failed in auto mode (%s); "
+                    "degrading gracefully to deterministic template.",
+                    exc,
+                )
+
+    sys_tokens = estimate_token_count(load_agent_prompt("coding_assistant"))
     prompt_tokens = estimate_token_count(
         f"{prompt} language={language} tickers={parsed_tickers} FY{start_year}-{end_year}"
     )

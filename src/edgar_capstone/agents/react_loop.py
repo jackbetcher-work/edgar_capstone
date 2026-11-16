@@ -16,9 +16,12 @@ from __future__ import annotations
 
 from collections import defaultdict
 import json
+import logging
 import re
 import time
 from typing import Any, Callable
+
+from google.adk.models.base_llm import BaseLlm
 
 from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
 from edgar_capstone.agents.context_memory import (
@@ -26,6 +29,11 @@ from edgar_capstone.agents.context_memory import (
     resolve_model_for_task,
 )
 from edgar_capstone.agents.evaluation_and_coding import evaluate_variance_explanation
+from edgar_capstone.agents.live_runtime import (
+    AdkStreamResult,
+    resolve_live_adk_runtime,
+    run_live_adk_financial_reasoning,
+)
 from edgar_capstone.agents.schemas import (
     Cached10KExplanation,
     ContextBreakdown,
@@ -36,6 +44,8 @@ from edgar_capstone.agents.schemas import (
 )
 from edgar_capstone.agents.tools import query_cached_10k_context
 from edgar_capstone.vector_db.chunker import estimate_token_count
+
+logger = logging.getLogger(__name__)
 
 
 def _fmt_usd(value: float | None) -> str:
@@ -529,10 +539,16 @@ class StructuredReActExecutor:
         max_iterations: int = 5,
         llm_reasoning_fn: Callable[[str, dict[str, Any]], str] | None = None,
         llm_judge_fn: Callable[[str, str], dict[str, Any]] | None = None,
+        execution_mode: str | None = None,
+        reasoning_llm: BaseLlm | None = None,
+        judge_llm: BaseLlm | None = None,
     ) -> None:
         self.max_iterations = max_iterations
         self.llm_reasoning_fn = llm_reasoning_fn
         self.llm_judge_fn = llm_judge_fn
+        self.execution_mode = execution_mode
+        self.reasoning_llm = reasoning_llm
+        self.judge_llm = judge_llm
 
     def execute_post_retrieval_reasoning(
         self,
@@ -546,12 +562,28 @@ class StructuredReActExecutor:
         chunk_health: dict[str, Any] | None,
         memory_tokens: int = 0,
         memory_prep_latency_ms: float = 0.0,
+        memory_context: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        user_id: str = "analyst",
         on_cache_s2s_call: Callable[[str, int, str], None] | None = None,
     ) -> dict[str, Any]:
         """Run the structured ReAct reasoning, cached 10-K querying, formatting, and Flash evaluation."""
-        reasoning_model = resolve_model_for_task("financial_reasoning")
-        eval_model = resolve_model_for_task("evaluation")
+        reasoning_model = (
+            self.reasoning_llm.model
+            if self.reasoning_llm is not None
+            else resolve_model_for_task("financial_reasoning")
+        )
+        eval_model = (
+            self.judge_llm.model
+            if self.judge_llm is not None
+            else resolve_model_for_task("evaluation")
+        )
         tracker = get_context_latency_tracker()
+        runtime_res = resolve_live_adk_runtime(
+            execution_mode=self.execution_mode,
+            custom_llm=self.reasoning_llm,
+        )
+        use_live_adk = runtime_res.live_adk_enabled and self.llm_reasoning_fn is None
 
         react_steps: list[ReActStep] = []
         turn_latency_records: list[ModelContextLatencyRecord] = []
@@ -575,25 +607,28 @@ class StructuredReActExecutor:
             json.dumps([v.model_dump(mode="json") for v in variance_evaluations], default=str)
         )
 
-        rec_step1 = tracker.record_call(
-            agent_name="FinancialAnalystAgent",
-            model_name=reasoning_model,
-            task_category="variance_explanation",
-            react_phase="evaluate_variances",
-            context_breakdown=ContextBreakdown(
-                system_instruction_tokens=sys_tokens,
-                memory_and_history_tokens=memory_tokens,
-                variance_payload_tokens=var_payload_tokens,
-                user_prompt_tokens=prompt_tokens,
-                total_context_tokens=step1_ctx_tokens,
-                uncached_context_tokens=step1_ctx_tokens,
-            ),
-            output_tokens=step1_out_tokens,
-            thoughts_tokens=max(16, step1_out_tokens // 3),
-            raw_inference_latency_ms=eval_ms,
-            context_prep_latency_ms=memory_prep_latency_ms,
-        )
-        turn_latency_records.append(rec_step1)
+        step1_ctx_latency_ms = round(eval_ms + memory_prep_latency_ms, 3)
+        if not use_live_adk:
+            rec_step1 = tracker.record_call(
+                agent_name="FinancialAnalystAgent",
+                model_name=reasoning_model,
+                task_category="variance_explanation",
+                react_phase="evaluate_variances",
+                context_breakdown=ContextBreakdown(
+                    system_instruction_tokens=sys_tokens,
+                    memory_and_history_tokens=memory_tokens,
+                    variance_payload_tokens=var_payload_tokens,
+                    user_prompt_tokens=prompt_tokens,
+                    total_context_tokens=step1_ctx_tokens,
+                    uncached_context_tokens=step1_ctx_tokens,
+                ),
+                output_tokens=step1_out_tokens,
+                thoughts_tokens=max(16, step1_out_tokens // 3),
+                raw_inference_latency_ms=eval_ms,
+                context_prep_latency_ms=memory_prep_latency_ms,
+            )
+            turn_latency_records.append(rec_step1)
+            step1_ctx_latency_ms = rec_step1.context_latency_ms
 
         if variance_evaluations:
             thought_1 = (
@@ -630,9 +665,9 @@ class StructuredReActExecutor:
                 observation=obs_1,
                 agent="FinancialAnalystAgent",
                 model_used=reasoning_model,
-                context_tokens=rec_step1.context_breakdown.total_context_tokens,
+                context_tokens=step1_ctx_tokens,
                 cached_context_tokens=0,
-                context_latency_ms=rec_step1.context_latency_ms,
+                context_latency_ms=step1_ctx_latency_ms,
                 duration_ms=round(eval_ms, 3),
             )
         )
@@ -772,7 +807,78 @@ class StructuredReActExecutor:
             for r in variance_reports
         }
         answer_markdown = deterministic_markdown
-        if self.llm_reasoning_fn is not None:
+        live_stream_result: AdkStreamResult | None = None
+        live_adk_executed = False
+        grounding_fallback_applied = False
+        fallback_reason: str | None = None
+        adk_response_blocked = False
+        adk_response_decision: dict[str, Any] | None = None
+        adk_response_block_message = ""
+
+        if use_live_adk:
+            try:
+                live_stream_result = run_live_adk_financial_reasoning(
+                    query=query,
+                    intent=intent,
+                    scope=scope,
+                    variance_reports=variance_reports,
+                    variance_evaluations=[
+                        v.model_dump(mode="json") for v in variance_evaluations
+                    ],
+                    cached_explanations=[
+                        c.model_dump(mode="json") for c in cached_explanations
+                    ],
+                    citations=merged_citations,
+                    sector_benchmarks=sector_benchmarks,
+                    chunk_health=chunk_health,
+                    memory_context=memory_context,
+                    session_id=session_id,
+                    user_id=user_id,
+                    resolution=runtime_res,
+                    custom_llm=self.reasoning_llm,
+                    summarizer_llm=self.judge_llm,
+                )
+                live_adk_executed = True
+                candidate_md = live_stream_result.final_text
+                if live_stream_result.session_state.get("model_armor_response_blocked") is True:
+                    adk_response_blocked = True
+                    raw_dec = live_stream_result.session_state.get(
+                        "model_armor_last_response_decision"
+                    )
+                    if isinstance(raw_dec, dict):
+                        adk_response_decision = raw_dec
+                    adk_response_block_message = str(
+                        live_stream_result.session_state.get(
+                            "model_armor_response_block_message"
+                        )
+                        or candidate_md
+                    )
+                    answer_markdown = candidate_md
+                else:
+                    check = verify_narrative_against_calculations(
+                        response_text=candidate_md,
+                        calculated_variances=calc_map,
+                        retrieved_citations=merged_citations,
+                    )
+                    if check.passed and candidate_md.strip():
+                        answer_markdown = candidate_md
+                    else:
+                        grounding_fallback_applied = True
+                        fallback_reason = (
+                            "; ".join(check.discrepancies)
+                            if check.discrepancies
+                            else "Empty or ungrounded live LLM output"
+                        )
+            except Exception as exc:
+                if runtime_res.requested_mode == "live":
+                    raise
+                fallback_reason = str(exc)
+                logger.warning(
+                    "Live ADK FinancialAnalystAgent execution failed in auto mode (%s); "
+                    "degrading gracefully to deterministic synthesis.",
+                    exc,
+                )
+        elif self.llm_reasoning_fn is not None:
             candidate_md = self.llm_reasoning_fn(
                 reasoning_model,
                 {
@@ -794,77 +900,114 @@ class StructuredReActExecutor:
             )
             if check.passed and candidate_md.strip():
                 answer_markdown = candidate_md
+            else:
+                grounding_fallback_applied = True
 
         synth_ms = (time.perf_counter() - t_synth) * 1000.0
-        rag_chunk_tokens = estimate_token_count(
-            "\n".join(c.get("excerpt", "") for c in merged_citations)
-        )
-        total_synth_ctx = (
-            sys_tokens
-            + memory_tokens
-            + var_payload_tokens
-            + cached_toks_hit
-            + uncached_toks_miss
-            + rag_chunk_tokens
-            + prompt_tokens
-        )
         synth_out_tokens = estimate_token_count(answer_markdown)
 
-        rec_synth = tracker.record_call(
-            agent_name="FinancialAnalystAgent",
-            model_name=reasoning_model,
-            task_category="financial_reasoning",
-            react_phase="format_grounded_output",
-            context_breakdown=ContextBreakdown(
-                system_instruction_tokens=sys_tokens,
-                memory_and_history_tokens=memory_tokens,
-                variance_payload_tokens=var_payload_tokens,
-                cached_10k_tokens=cached_toks_hit,
-                uncached_10k_and_tool_tokens=uncached_toks_miss + rag_chunk_tokens,
-                user_prompt_tokens=prompt_tokens,
-                total_context_tokens=total_synth_ctx,
-                cached_context_tokens=cached_toks_hit,
-                uncached_context_tokens=max(0, total_synth_ctx - cached_toks_hit),
-                cache_hit=cached_toks_hit > 0,
-            ),
-            output_tokens=synth_out_tokens,
-            thoughts_tokens=max(24, synth_out_tokens // 4),
-            raw_inference_latency_ms=synth_ms,
-            context_prep_latency_ms=cache_query_ms,
-        )
-        turn_latency_records.append(rec_synth)
+        if live_adk_executed and live_stream_result is not None and live_stream_result.latency_records:
+            turn_latency_records.extend(live_stream_result.latency_records)
+            rec_synth = live_stream_result.latency_records[-1]
+            synth_thought = (
+                live_stream_result.thoughts[-1]
+                if live_stream_result.thoughts
+                else (
+                    f"Executed live ADK Runner ({reasoning_model}, SSE streaming) combining deterministic "
+                    f"variances with {len(cached_explanations)} cached 10-K explanation(s) and "
+                    f"{len(merged_citations)} grounded citation(s)."
+                )
+            )
+            synth_action = "adk_runner.FinancialAnalystAgent(SSE)"
+            ttft_note = (
+                f", observed_ttft={live_stream_result.observed_ttft_ms:.2f}ms"
+                if live_stream_result.observed_ttft_ms is not None
+                else ""
+            )
+            synth_obs = (
+                f"Streamed grounded report via ADK Runner ({live_stream_result.partial_chunks_count} SSE chunk(s), "
+                f"{rec_synth.output_tokens} output tokens{ttft_note}; "
+                f"context_latency={rec_synth.context_latency_ms:.2f}ms, "
+                f"grounding_fallback={grounding_fallback_applied})."
+            )
+        else:
+            rag_chunk_tokens = estimate_token_count(
+                "\n".join(c.get("excerpt", "") for c in merged_citations)
+            )
+            total_synth_ctx = (
+                sys_tokens
+                + memory_tokens
+                + var_payload_tokens
+                + cached_toks_hit
+                + uncached_toks_miss
+                + rag_chunk_tokens
+                + prompt_tokens
+            )
+            rec_synth = tracker.record_call(
+                agent_name="FinancialAnalystAgent",
+                model_name=reasoning_model,
+                task_category="financial_reasoning",
+                react_phase="format_grounded_output",
+                context_breakdown=ContextBreakdown(
+                    system_instruction_tokens=sys_tokens,
+                    memory_and_history_tokens=memory_tokens,
+                    variance_payload_tokens=var_payload_tokens,
+                    cached_10k_tokens=cached_toks_hit,
+                    uncached_10k_and_tool_tokens=uncached_toks_miss + rag_chunk_tokens,
+                    user_prompt_tokens=prompt_tokens,
+                    total_context_tokens=total_synth_ctx,
+                    cached_context_tokens=cached_toks_hit,
+                    uncached_context_tokens=max(0, total_synth_ctx - cached_toks_hit),
+                    cache_hit=cached_toks_hit > 0,
+                ),
+                output_tokens=synth_out_tokens,
+                thoughts_tokens=max(24, synth_out_tokens // 4),
+                raw_inference_latency_ms=synth_ms,
+                context_prep_latency_ms=cache_query_ms,
+            )
+            turn_latency_records.append(rec_synth)
+            synth_thought = (
+                f"Combine deterministic variance figures with {len(cached_explanations)} cached 10-K explanation(s) "
+                f"and {len(merged_citations)} grounded chunk citation(s) using {reasoning_model}."
+            )
+            synth_action = "format_react_grounded_output"
+            synth_obs = (
+                f"Formatted grounded report ({synth_out_tokens} output tokens; "
+                f"context_latency={rec_synth.context_latency_ms:.2f}ms, "
+                f"cache_saved={rec_synth.estimated_cache_latency_saved_ms:.2f}ms)."
+            )
 
         react_steps.append(
             ReActStep(
                 iteration=len(react_steps) + 1,
                 phase="format_grounded_output",
-                thought=(
-                    f"Combine deterministic variance figures with {len(cached_explanations)} cached 10-K explanation(s) "
-                    f"and {len(merged_citations)} grounded chunk citation(s) using {reasoning_model}."
-                ),
-                action="format_react_grounded_output",
+                thought=synth_thought,
+                action=synth_action,
                 action_input={
                     "model": reasoning_model,
+                    "execution_mode": "live_adk" if live_adk_executed else "deterministic_fallback",
                     "cached_explanations_count": len(cached_explanations),
                     "citation_count": len(merged_citations),
                 },
-                observation=(
-                    f"Formatted grounded report ({synth_out_tokens} output tokens; "
-                    f"context_latency={rec_synth.context_latency_ms:.2f}ms, "
-                    f"cache_saved={rec_synth.estimated_cache_latency_saved_ms:.2f}ms)."
-                ),
+                observation=synth_obs,
                 agent="FinancialAnalystAgent",
                 model_used=reasoning_model,
                 context_tokens=rec_synth.context_breakdown.total_context_tokens,
                 cached_context_tokens=rec_synth.context_breakdown.cached_context_tokens,
                 context_latency_ms=rec_synth.context_latency_ms,
                 duration_ms=round(synth_ms, 3),
+                status="warning" if grounding_fallback_applied else "completed",
             )
         )
 
         # ------------------------------------------------------------------
         # ReAct Verification & Gemini 3.5 Flash Evaluation Step
         # ------------------------------------------------------------------
+        eval_exec_mode = (
+            self.execution_mode
+            if (live_adk_executed or self.judge_llm is not None)
+            else "deterministic"
+        )
         eval_report: NarrativeEvaluationReport = evaluate_variance_explanation(
             query=query,
             response_markdown=answer_markdown,
@@ -872,8 +1015,10 @@ class StructuredReActExecutor:
             citations=merged_citations,
             cached_explanations_count=len(cached_explanations),
             llm_judge_fn=self.llm_judge_fn,
+            execution_mode=eval_exec_mode,
+            llm=self.judge_llm,
         )
-        latest_flash_recs = tracker.recent_records(limit=1, model_name=eval_model)
+        latest_flash_recs = tracker.recent_records(limit=1, model_name=eval_report.evaluator_model)
         if latest_flash_recs:
             turn_latency_records.append(latest_flash_recs[-1])
 
@@ -882,18 +1027,18 @@ class StructuredReActExecutor:
                 iteration=len(react_steps) + 1,
                 phase="fact_check_and_eval",
                 thought=(
-                    f"Run post-generation numeric fact-check and {eval_model} quality evaluation "
+                    f"Run post-generation numeric fact-check and {eval_report.evaluator_model} quality evaluation "
                     f"to verify 100% calculation fidelity and citation grounding."
                 ),
                 action="evaluate_variance_explanation",
-                action_input={"evaluator_model": eval_model},
+                action_input={"evaluator_model": eval_report.evaluator_model},
                 observation=(
                     f"Grade={eval_report.grade} (overall_score={eval_report.overall_score:.2f}, "
                     f"numeric_fidelity={eval_report.numeric_fidelity_score:.2f}, "
                     f"citation_grounding={eval_report.citation_grounding_score:.2f})."
                 ),
                 agent="NarrativeEvaluatorAgent",
-                model_used=eval_model,
+                model_used=eval_report.evaluator_model,
                 context_tokens=eval_report.context_tokens,
                 cached_context_tokens=0,
                 context_latency_ms=eval_report.context_latency_ms,
@@ -903,6 +1048,25 @@ class StructuredReActExecutor:
         )
 
         turn_latency_summary = tracker.summarize(turn_latency_records)
+
+        adk_runtime_meta: dict[str, Any] = {
+            **runtime_res.to_public_dict(),
+            "executed_via_adk_runner": live_adk_executed,
+            "observed_ttft_ms": (
+                live_stream_result.observed_ttft_ms if live_stream_result is not None else None
+            ),
+            "streamed_chunks_count": (
+                live_stream_result.partial_chunks_count if live_stream_result is not None else 0
+            ),
+            "adk_events_count": (
+                live_stream_result.total_events_count if live_stream_result is not None else 0
+            ),
+            "adk_tool_calls": (
+                live_stream_result.function_calls if live_stream_result is not None else []
+            ),
+            "grounding_fallback_applied": grounding_fallback_applied,
+            "fallback_reason": fallback_reason,
+        }
 
         return {
             "answer_markdown": answer_markdown,
@@ -914,5 +1078,10 @@ class StructuredReActExecutor:
             "turn_latency_records": turn_latency_records,
             "turn_latency_summary": turn_latency_summary,
             "reasoning_model": reasoning_model,
-            "evaluation_model": eval_model,
+            "evaluation_model": eval_report.evaluator_model,
+            "execution_mode": "live_adk" if live_adk_executed else "deterministic_fallback",
+            "adk_runtime": adk_runtime_meta,
+            "model_armor_response_blocked": adk_response_blocked,
+            "model_armor_response_decision": adk_response_decision,
+            "model_armor_response_block_message": adk_response_block_message,
         }

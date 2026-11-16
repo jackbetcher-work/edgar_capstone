@@ -32,8 +32,10 @@ from google.adk.apps.app import EventsCompactionConfig
 from google.adk.apps.llm_event_summarizer import LlmEventSummarizer
 from google.adk.memory import InMemoryMemoryService
 from google.adk.models import Gemini
+from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
+from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
 
@@ -521,6 +523,17 @@ class ContextLatencyTracker:
             items = [r for r in items if r.model_name == model_name]
         return items[-max(1, limit) :]
 
+    def get_records_by_ids(
+        self,
+        call_ids: list[str],
+    ) -> list[ModelContextLatencyRecord]:
+        """Return latency records matching `call_ids` in their original recording order."""
+        if not call_ids:
+            return []
+        wanted = set(call_ids)
+        with self._lock:
+            return [r for r in self._records if r.call_id in wanted]
+
     def summarize(
         self,
         records: list[ModelContextLatencyRecord] | None = None,
@@ -855,6 +868,8 @@ class ConversationMemoryManager:
     def reset(self) -> None:
         with self._lock:
             self._sessions.clear()
+            self.adk_session_service = InMemorySessionService()
+            self.adk_memory_service = InMemoryMemoryService()
 
 
 _GLOBAL_MEMORY_MANAGER = ConversationMemoryManager()
@@ -892,20 +907,37 @@ def create_edgar_adk_app(
     cache_ttl_seconds: int = DEFAULT_CONTEXT_CACHE_TTL_SECONDS,
     compaction_token_threshold: int = DEFAULT_COMPACTION_TOKEN_THRESHOLD,
     compaction_retention_size: int = DEFAULT_COMPACTION_RETENTION_SIZE,
+    summarizer_llm: BaseLlm | None = None,
+    enable_context_cache: bool = True,
+    plugins: list[BasePlugin] | None = None,
 ) -> App:
-    """Create the production ADK `App` with Vertex AI Context Caching & Flash-powered Event Compaction."""
+    """Create the production ADK `App` with Model Armor safety plugin, Context Caching & Compaction."""
     flash_model = resolve_model_for_task("context_compaction")
-    return App(
-        name=app_name,
-        root_agent=root_agent,
-        context_cache_config=ContextCacheConfig(
+    cache_cfg = (
+        ContextCacheConfig(
             min_tokens=min_cache_tokens,
             ttl_seconds=cache_ttl_seconds,
             cache_intervals=DEFAULT_CONTEXT_CACHE_INTERVALS,
-        ),
+        )
+        if enable_context_cache
+        else None
+    )
+    if plugins is not None:
+        resolved_plugins: list[BasePlugin] = list(plugins)
+    else:
+        from edgar_capstone.security.model_armor import ModelArmorSafetyPlugin
+
+        resolved_plugins = [ModelArmorSafetyPlugin()]
+    return App(
+        name=app_name,
+        root_agent=root_agent,
+        plugins=resolved_plugins,
+        context_cache_config=cache_cfg,
         events_compaction_config=EventsCompactionConfig(
             token_threshold=compaction_token_threshold,
             event_retention_size=compaction_retention_size,
-            summarizer=LlmEventSummarizer(llm=Gemini(model=flash_model)),
+            summarizer=LlmEventSummarizer(
+                llm=summarizer_llm if summarizer_llm is not None else Gemini(model=flash_model)
+            ),
         ),
     )

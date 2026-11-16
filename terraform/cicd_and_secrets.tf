@@ -164,6 +164,11 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "GOOGLE_CLOUD_PROJECT"
+        value = var.project_id
+      }
+
+      env {
         name  = "GCP_PROJECT_NAME"
         value = var.project_name
       }
@@ -171,6 +176,21 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       env {
         name  = "GCP_REGION"
         value = var.region
+      }
+
+      env {
+        name  = "GOOGLE_CLOUD_LOCATION"
+        value = var.region
+      }
+
+      env {
+        name  = "GOOGLE_GENAI_USE_VERTEXAI"
+        value = "true"
+      }
+
+      env {
+        name  = "EDGAR_EXECUTION_MODE"
+        value = "auto"
       }
 
       env {
@@ -201,6 +221,31 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       env {
         name  = "EDGAR_FLASH_MODEL"
         value = var.coding_and_evaluation_model
+      }
+
+      env {
+        name  = "EDGAR_MODEL_ARMOR_MODE"
+        value = "gcp"
+      }
+
+      env {
+        name  = "MODEL_ARMOR_TEMPLATE_ID"
+        value = var.model_armor_template_id
+      }
+
+      env {
+        name  = "SDP_INSPECT_TEMPLATE_ID"
+        value = var.enable_model_armor ? google_data_loss_prevention_inspect_template.sec_edgar_sdp_inspect[0].id : ""
+      }
+
+      env {
+        name  = "SDP_DEIDENTIFY_TEMPLATE_ID"
+        value = var.enable_model_armor ? google_data_loss_prevention_deidentify_template.sec_edgar_sdp_deidentify[0].id : ""
+      }
+
+      env {
+        name  = "EDGAR_PROMPT_STORE_BACKEND"
+        value = var.prompt_store_backend
       }
 
       env {
