@@ -80,6 +80,14 @@ _TOTAL_REVENUE_LABEL_RE = re.compile(
     r"^\s*total\s+(?:revenues?|net\s+revenues?|operating\s+revenues?|net\s+sales|sales\s+and\s+revenues?)\s*:?\s*$",
     re.IGNORECASE,
 )
+# Statement top line for filers that present "Total revenues and other" (e.g., APA, EXE). Used to
+# sanity-check the chosen revenue concept: APA tags `us-gaap:Revenues` on a $1.1B sub-line in FY2021
+# and reports it at 2x the true total in FY2023-FY2025, while `apa_RevenuesAndOther` is reliable.
+_TOTAL_REVENUES_AND_OTHER_LABEL_RE = re.compile(
+    r"^\s*total\s+revenues?,?\s+and\s+other(?:\s+income)?\s*:?\s*$",
+    re.IGNORECASE,
+)
+_REVENUE_TOP_LINE_TOLERANCE = (0.5, 1.5)
 _OPERATING_INCOME_LABEL_RE = re.compile(
     r"^\s*(?:operating\s+(?:income|profit|loss|income\s*\(loss\)|loss\s*\(income\))|(?:income|loss)\s+from\s+operations)\s*:?\s*$",
     re.IGNORECASE,
@@ -1044,6 +1052,28 @@ def extract_financial_metrics(
         ):
             revenue = helper_rev
             provenance.revenue = "edgartools:Financials.get_revenue"
+
+    # Step 1d: Reconcile against the statement's "Total revenues and other" top line when present.
+    if revenue is not None and inc_df is not None:
+        top_line, top_tag = _lookup_by_label_or_suffix(
+            inc_df,
+            concept_suffixes=("_RevenuesAndOther",),
+            label_re=_TOTAL_REVENUES_AND_OTHER_LABEL_RE,
+            report_date_str=report_date_str,
+        )
+        low, high = _REVENUE_TOP_LINE_TOLERANCE
+        if (
+            top_line is not None
+            and top_line > 0
+            and not (low * top_line <= revenue <= high * top_line)
+        ):
+            provenance.notes.append(
+                f"Revenue concept {provenance.revenue}={revenue:,.0f} is outside {low}x-{high}x of the "
+                f"statement top line {top_tag} ('Total revenues and other')={top_line:,.0f}; "
+                "using the top line (mis-tagged or double-counted revenue concept)."
+            )
+            revenue = top_line
+            provenance.revenue = top_tag
 
     # --- 2. Operating Income (with Pre-Tax Continuing Operations fallback) ---
     operating_income: float | None = None

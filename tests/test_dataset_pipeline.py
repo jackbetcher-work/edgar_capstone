@@ -390,7 +390,9 @@ def test_resolve_and_reconcile_fiscal_year_dei_typos() -> None:
 
 
 def test_extract_financial_metrics_dimensional_reit_and_bank_cases() -> None:
-    # 1. APA case: fin.get_revenue() leaks a $35M dimensional breakdown row while consolidated is $19.47B
+    # 1. APA case: fin.get_revenue() leaks a $35M dimensional breakdown row while the consolidated
+    # us-gaap:Revenues row is $19.47B (that raw tag value is itself 2x the true top line; see
+    # test_revenue_reconciled_against_total_revenues_and_other_top_line)
     apa_df = pd.DataFrame(
         [
             {
@@ -799,3 +801,67 @@ def test_section_boundary_still_cuts_stubs_and_real_7a_sections() -> None:
         )
         == ""
     )
+
+
+def _income_tenk(rows: list[tuple[str, str, float]], col: str) -> SimpleNamespace:
+    df = pd.DataFrame(
+        [
+            {
+                "concept": concept,
+                "label": label,
+                col: value,
+                "dimension": False,
+                "is_breakdown": False,
+                "abstract": False,
+            }
+            for concept, label, value in rows
+        ]
+    )
+    return SimpleNamespace(
+        financials=SimpleNamespace(
+            get_revenue=lambda: None,
+            get_operating_income=lambda: None,
+            get_net_income=lambda: None,
+            income_statement=lambda: SimpleNamespace(to_dataframe=lambda: df),
+        )
+    )
+
+
+def test_revenue_reconciled_against_total_revenues_and_other_top_line() -> None:
+    # APA FY2021: us-gaap:Revenues tags a $1.08B sub-line; statement top line is $7.93B
+    apa_2021 = _income_tenk(
+        [
+            ("us-gaap_Revenues", "Total revenues", 1.082e9),
+            ("apa_RevenuesAndOther", "Total revenues and other", 7.928e9),
+            ("us-gaap_CostsAndExpenses", "Total operating expenses", 6.037e9),
+            ("us-gaap_ProfitLoss", "Net income including noncontrolling interests", 1.313e9),
+        ],
+        "2021-12-31 (FY)",
+    )
+    rev, _, _, prov = extract_financial_metrics(apa_2021, report_date_str="2021-12-31")
+    assert rev == 7.928e9
+    assert prov.revenue == "apa:RevenuesAndOther"
+    assert any("outside 0.5x-1.5x" in n for n in prov.notes)
+
+    # APA FY2024: us-gaap:Revenues reported at 2x the true total
+    apa_2024 = _income_tenk(
+        [
+            ("us-gaap_Revenues", "Total revenues", 19.474e9),
+            ("apa_RevenuesAndOther", "Total revenues and other", 9.737e9),
+        ],
+        "2024-12-31 (FY)",
+    )
+    assert extract_financial_metrics(apa_2024, report_date_str="2024-12-31")[0] == 9.737e9
+
+    # APA FY2022: revenue within tolerance of the top line -> keep the revenue concept
+    apa_2022 = _income_tenk(
+        [
+            ("us-gaap_Revenues", "Total revenues", 11.075e9),
+            ("apa_RevenuesAndOther", "Total revenues and other", 12.132e9),
+        ],
+        "2022-12-31 (FY)",
+    )
+    rev, _, _, prov = extract_financial_metrics(apa_2022, report_date_str="2022-12-31")
+    assert rev == 11.075e9
+    assert prov.revenue == "us-gaap:Revenues"
+    assert not any("outside 0.5x-1.5x" in n for n in prov.notes)
