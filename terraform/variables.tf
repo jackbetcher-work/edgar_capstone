@@ -123,6 +123,30 @@ variable "prompt_store_backend" {
   default     = "auto"
 }
 
+variable "enable_bigquery_logging_sink" {
+  description = "Whether to provision the Cloud Logging project sink routing structured telemetry and security audit logs to BigQuery."
+  type        = bool
+  default     = true
+}
+
+variable "enable_firestore_feedback" {
+  description = "Whether to provision the Firestore Native database for persistent analyst thumbs-up/down feedback and comments."
+  type        = bool
+  default     = true
+}
+
+variable "firestore_database_id" {
+  description = "Firestore Native database ID used to persist analyst feedback ratings and audit comments."
+  type        = string
+  default     = "(default)"
+}
+
+variable "firestore_feedback_collection" {
+  description = "Firestore collection name storing persisted analyst feedback documents."
+  type        = string
+  default     = "analyst_feedback"
+}
+
 variable "artifact_registry_repo_id" {
   description = "Artifact Registry repository ID for SEC EDGAR Analyst container images."
   type        = string

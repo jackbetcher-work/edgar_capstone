@@ -1,0 +1,200 @@
+[
+  {
+    "name": "turn_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique conversational turn telemetry identifier (insertId deduplication key)"
+  },
+  {
+    "name": "recorded_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "UTC timestamp when the conversational turn completed"
+  },
+  {
+    "name": "session_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Conversational session identifier"
+  },
+  {
+    "name": "turn_index",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "1-based turn index within the conversational session"
+  },
+  {
+    "name": "user_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Authenticated analyst or service principal executing the turn"
+  },
+  {
+    "name": "intent",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "RootOrchestrator classified query intent"
+  },
+  {
+    "name": "execution_mode",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "ADK execution mode (live_adk, deterministic_react, guardrail_blocked)"
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Turn completion outcome (success or blocked)"
+  },
+  {
+    "name": "tickers_analyzed",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Canonical SEC ticker symbols analyzed during the turn"
+  },
+  {
+    "name": "companies_analyzed_count",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Count of distinct companies analyzed in this turn"
+  },
+  {
+    "name": "gics_sector",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Active GICS sector scope filter"
+  },
+  {
+    "name": "start_year",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Start fiscal year of the analytical scope"
+  },
+  {
+    "name": "end_year",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "End fiscal year of the analytical scope"
+  },
+  {
+    "name": "report_generated",
+    "type": "BOOLEAN",
+    "mode": "REQUIRED",
+    "description": "Whether a grounded financial report was synthesized and returned"
+  },
+  {
+    "name": "variance_reports_count",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Number of deterministic CompanyVarianceReport records computed"
+  },
+  {
+    "name": "citations_count",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Number of grounded 10-K passage citations attached to the report"
+  },
+  {
+    "name": "tool_invocations",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Ordered list of ADK tools invoked during the turn"
+  },
+  {
+    "name": "tool_invocation_count",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Total number of ADK tool invocations in this turn"
+  },
+  {
+    "name": "llm_call_count",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Number of Gemini Pro/Flash calls attributed to this turn"
+  },
+  {
+    "name": "total_context_tokens",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Total input context tokens across all turn LLM calls"
+  },
+  {
+    "name": "cached_context_tokens",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Cached input tokens across all turn LLM calls"
+  },
+  {
+    "name": "output_tokens",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Generated output + reasoning tokens across all turn LLM calls"
+  },
+  {
+    "name": "total_cost_usd",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "Total LLM token cost in USD for the turn"
+  },
+  {
+    "name": "cached_token_savings_usd",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "USD saved via context-cached 10-K tokens on the turn"
+  },
+  {
+    "name": "ttft_ms",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "Observed or attributed Time to First Thought / Token (ms)"
+  },
+  {
+    "name": "total_latency_ms",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "End-to-end turn wall-clock latency (ms)"
+  },
+  {
+    "name": "session_cumulative_turns",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Cumulative turns executed in this session (session length)"
+  },
+  {
+    "name": "session_cumulative_companies_count",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Cumulative distinct companies analyzed in this session"
+  },
+  {
+    "name": "session_cumulative_reports_count",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Cumulative grounded reports generated in this session"
+  },
+  {
+    "name": "session_elapsed_seconds",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Elapsed session duration in seconds since session start"
+  },
+  {
+    "name": "fact_check_passed",
+    "type": "BOOLEAN",
+    "mode": "NULLABLE",
+    "description": "Whether deterministic post-generation numeric fact-check passed"
+  },
+  {
+    "name": "evaluation_grade",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Gemini 3.5 Flash LLM-as-a-Judge rubric grade (pass, needs_revision, fail)"
+  },
+  {
+    "name": "evaluation_score",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Gemini 3.5 Flash composite evaluation score [0.0, 1.0]"
+  }
+]

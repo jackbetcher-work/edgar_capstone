@@ -1,0 +1,212 @@
+[
+  {
+    "name": "call_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique LLM telemetry call identifier (insertId deduplication key)"
+  },
+  {
+    "name": "recorded_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "UTC timestamp when the LLM model call completed"
+  },
+  {
+    "name": "session_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Conversational session identifier associated with the call"
+  },
+  {
+    "name": "user_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Authenticated Workspace / IAP principal invoking the turn"
+  },
+  {
+    "name": "agent_name",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "ADK agent executing the model call (e.g., FinancialAnalystAgent, NarrativeEvaluatorAgent)"
+  },
+  {
+    "name": "model_name",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Gemini model identifier (gemini-2.5-pro or gemini-3.5-flash)"
+  },
+  {
+    "name": "task_category",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Workload classification routed across Pro vs Flash tiers"
+  },
+  {
+    "name": "react_phase",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Active ReAct loop phase during this model invocation"
+  },
+  {
+    "name": "system_instruction_tokens",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Tokens in system instructions and ReAct protocol headers"
+  },
+  {
+    "name": "memory_and_history_tokens",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Tokens from conversational session history and recalled memory"
+  },
+  {
+    "name": "variance_payload_tokens",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Tokens representing deterministic variance calculation payloads"
+  },
+  {
+    "name": "cached_10k_tokens",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Tokens served from cached 10-K filing sections"
+  },
+  {
+    "name": "uncached_10k_and_tool_tokens",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Uncached RAG chunks and tool response tokens"
+  },
+  {
+    "name": "user_prompt_tokens",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Tokens in the active analyst prompt"
+  },
+  {
+    "name": "total_context_tokens",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Total input context tokens supplied to the model call"
+  },
+  {
+    "name": "cached_context_tokens",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Input tokens served via Vertex AI / session context cache"
+  },
+  {
+    "name": "uncached_context_tokens",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Input tokens requiring full uncached prefill processing"
+  },
+  {
+    "name": "cache_hit",
+    "type": "BOOLEAN",
+    "mode": "REQUIRED",
+    "description": "Whether context cache hit accelerated this model call"
+  },
+  {
+    "name": "output_tokens",
+    "type": "INTEGER",
+    "mode": "REQUIRED",
+    "description": "Generated candidate response tokens"
+  },
+  {
+    "name": "thoughts_tokens",
+    "type": "INTEGER",
+    "mode": "NULLABLE",
+    "description": "Internal reasoning / thinking tokens"
+  },
+  {
+    "name": "total_model_latency_ms",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "End-to-end model call latency including context prep (ms)"
+  },
+  {
+    "name": "context_prep_latency_ms",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Latency spent loading memory/cache and assembling prompt context (ms)"
+  },
+  {
+    "name": "context_prefill_latency_ms",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Model prefill latency attributable to processing input context tokens (ms)"
+  },
+  {
+    "name": "context_latency_ms",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "Total latency attributable to context (prep + prefill, ms)"
+  },
+  {
+    "name": "generation_latency_ms",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Output token decode / generation latency (ms)"
+  },
+  {
+    "name": "ttft_ms",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "Time to First Thought / Token in milliseconds"
+  },
+  {
+    "name": "context_latency_ratio",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Fraction of total model call latency attributable to context"
+  },
+  {
+    "name": "latency_per_1k_context_tokens_ms",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Normalized context latency per 1,000 input context tokens (ms)"
+  },
+  {
+    "name": "estimated_cache_latency_saved_ms",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Estimated prefill latency saved via cached 10-K context tokens (ms)"
+  },
+  {
+    "name": "within_ttft_slo",
+    "type": "BOOLEAN",
+    "mode": "REQUIRED",
+    "description": "Whether TTFT satisfied the <= 3000ms p95 SLO"
+  },
+  {
+    "name": "input_cost_usd",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "USD cost of input tokens after applying cached-token discount"
+  },
+  {
+    "name": "output_cost_usd",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "USD cost of generated output and thinking tokens"
+  },
+  {
+    "name": "total_cost_usd",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "Total USD cost for this LLM invocation"
+  },
+  {
+    "name": "uncached_baseline_cost_usd",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "Hypothetical USD cost had all cached tokens been billed at uncached rate"
+  },
+  {
+    "name": "cached_token_savings_usd",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "USD cost saved via context-cached input tokens"
+  }
+]

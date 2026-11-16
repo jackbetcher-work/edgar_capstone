@@ -249,6 +249,41 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "EDGAR_TELEMETRY_BACKEND"
+        value = "gcp"
+      }
+
+      env {
+        name  = "EDGAR_FEEDBACK_BACKEND"
+        value = "gcp"
+      }
+
+      env {
+        name  = "BIGQUERY_LLM_TELEMETRY_TABLE"
+        value = google_bigquery_table.llm_telemetry_events.table_id
+      }
+
+      env {
+        name  = "BIGQUERY_SESSION_TELEMETRY_TABLE"
+        value = google_bigquery_table.session_telemetry_events.table_id
+      }
+
+      env {
+        name  = "BIGQUERY_AUDIT_LOGS_TABLE"
+        value = google_bigquery_table.security_audit_logs.table_id
+      }
+
+      env {
+        name  = "FIRESTORE_DATABASE_ID"
+        value = var.firestore_database_id
+      }
+
+      env {
+        name  = "FIRESTORE_FEEDBACK_COLLECTION"
+        value = var.firestore_feedback_collection
+      }
+
+      env {
         name  = "IAP_STRICT_MODE"
         value = "true"
       }

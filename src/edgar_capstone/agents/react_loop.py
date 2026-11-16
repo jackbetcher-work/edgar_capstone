@@ -626,6 +626,8 @@ class StructuredReActExecutor:
                 thoughts_tokens=max(16, step1_out_tokens // 3),
                 raw_inference_latency_ms=eval_ms,
                 context_prep_latency_ms=memory_prep_latency_ms,
+                session_id=session_id,
+                user_id=user_id,
             )
             turn_latency_records.append(rec_step1)
             step1_ctx_latency_ms = rec_step1.context_latency_ms
@@ -964,6 +966,8 @@ class StructuredReActExecutor:
                 thoughts_tokens=max(24, synth_out_tokens // 4),
                 raw_inference_latency_ms=synth_ms,
                 context_prep_latency_ms=cache_query_ms,
+                session_id=session_id,
+                user_id=user_id,
             )
             turn_latency_records.append(rec_synth)
             synth_thought = (

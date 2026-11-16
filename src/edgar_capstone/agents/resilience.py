@@ -37,6 +37,8 @@ def _is_retryable_exception(exc: BaseException) -> tuple[bool, float | None]:
     """Determine if an exception is a transient rate limit (HTTP 429) or timeout."""
     if isinstance(exc, RateLimitExceededError):
         return True, exc.retry_after_seconds
+    if hasattr(exc, "retry_after_seconds"):
+        return True, getattr(exc, "retry_after_seconds", None)
     if isinstance(exc, (UpstreamTimeoutError, TimeoutError, httpx.TimeoutException)):
         return True, None
     if isinstance(exc, httpx.HTTPStatusError):

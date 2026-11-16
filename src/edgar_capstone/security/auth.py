@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -49,6 +50,7 @@ from edgar_capstone.security.rbac import (
     validate_custom_service_account_email,
 )
 from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID, SecretManagerClient
+from edgar_capstone.telemetry import get_telemetry_sink
 
 logger = logging.getLogger(__name__)
 
@@ -577,9 +579,14 @@ def record_security_audit_event(
     else:
         ticker_list = []
 
+    now_epoch = round(time.time(), 3)
+    now_iso = datetime.fromtimestamp(now_epoch, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
     entry = {
         "event_id": f"aud-{uuid.uuid4().hex[:12]}",
-        "recorded_at_epoch": round(time.time(), 3),
+        "recorded_at": now_iso,
+        "recorded_at_epoch": now_epoch,
         "event_type": event_type,
         "status": status_outcome,
         "resource": resource,
@@ -598,6 +605,8 @@ def record_security_audit_event(
     with _AUDIT_LOG_LOCK:
         _SECURITY_AUDIT_LOG.appendleft(entry)
 
+    get_telemetry_sink().record_security_audit_log(entry)
+
     logger.info(
         "security_audit event_type=%s status=%s user=%s idp=%s resource=%s tickers=%s",
         event_type,
@@ -613,6 +622,12 @@ def record_security_audit_event(
 def get_security_audit_events(limit: int = 50) -> list[dict[str, Any]]:
     """Return the most recent structured security and 10-K access audit events."""
     bounded = max(1, min(limit, 500))
+    sink = get_telemetry_sink()
+    attempt_gcp, _ = sink._should_attempt_gcp()
+    if attempt_gcp:
+        bq_events = sink.query_security_audit_logs(limit=bounded)
+        if bq_events:
+            return bq_events
     with _AUDIT_LOG_LOCK:
         return list(_SECURITY_AUDIT_LOG)[:bounded]
 

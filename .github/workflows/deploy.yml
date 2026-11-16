@@ -189,6 +189,10 @@ jobs:
             VIEWER_CLOUD_IDENTITY_GROUPS=sec-edgar-viewers@fde-workspace.corp
             BIGQUERY_DATASET_ID=sec_edgar
             SEC_CORPUS_BUCKET=fde-sec-edgar-sandbox-dev-sec-corpus
+            EDGAR_TELEMETRY_BACKEND=gcp
+            EDGAR_FEEDBACK_BACKEND=gcp
+            FIRESTORE_DATABASE_ID=(default)
+            FIRESTORE_FEEDBACK_COLLECTION=analyst_feedback
           secrets: |-
             SEC_EDGAR_USER_AGENT=sec-edgar-user-agent:latest
             GEMINI_API_KEY=sec-edgar-gemini-api-key:latest

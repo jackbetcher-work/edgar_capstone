@@ -417,8 +417,10 @@ def generate_financial_coding_assistance(
     elif language == "lookml":
         title = f"LookML Semantic Explore: SEC 10-K YoY Variances ({dataset_id})"
         code = (
-            f"explore: sec_10k_yoy_variances {{\n"
+            f"include: \"/views/v_financial_variances_yoy.view.lkml\"\n\n"
+            f"explore: yoy_variances {{\n"
             f"  view_name: v_financial_variances_yoy\n"
+            f"  label: \"SEC 10-K YoY Financial Variances\"\n"
             f"  sql_always_where: ${{fiscal_year}} BETWEEN {start_year} AND {end_year} ;;\n"
             f"  always_filter: {{\n"
             f"    filters: [v_financial_variances_yoy.ticker: \"{','.join(parsed_tickers)}\"]\n"
@@ -426,8 +428,9 @@ def generate_financial_coding_assistance(
             f"}}\n"
         )
         explanation = (
-            "Defines a LookML semantic explore bound to the deterministic BigQuery view "
-            f"`{dataset_id}.v_financial_variances_yoy` scoped to {', '.join(parsed_tickers)}."
+            "Extends the `sec_edgar_analytics` LookML model (`looker/models/sec_edgar_analytics.model.lkml`) "
+            f"with an explore bound to BigQuery view `{dataset_id}.v_financial_variances_yoy` "
+            f"scoped to {', '.join(parsed_tickers)}."
         )
     else:
         title = f"BigQuery YoY Variance & Grounded 10-K Query ({', '.join(parsed_tickers)} FY{start_year}–FY{end_year})"

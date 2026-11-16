@@ -45,6 +45,7 @@ from edgar_capstone.security.model_armor import (
     get_model_armor_guardrail,
 )
 from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
+from edgar_capstone.telemetry import get_telemetry_sink
 
 _COMPANY_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bnvidia\b|\bnvda\b", re.IGNORECASE), "NVDA"),
@@ -617,6 +618,30 @@ def run_conversational_rag_turn(
                 ),
             }
         )
+        blocked_intent = (
+            "projection_compliance_block"
+            if prompt_decision.projection_blocked
+            else "safety_guardrail_block"
+        )
+        blocked_total_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
+        blocked_sess_tel = get_telemetry_sink().record_session_turn_telemetry(
+            session_id=session_id,
+            user_id=user_id,
+            intent=blocked_intent,
+            execution_mode="guardrail_blocked",
+            status_outcome="blocked",
+            tickers_analyzed=[],
+            gics_sector=gics_sector,
+            start_year=start_year,
+            end_year=end_year,
+            report_generated=False,
+            variance_reports_count=0,
+            citations_count=0,
+            agent_trace=agent_trace,
+            turn_latency_records=[],
+            total_latency_ms=blocked_total_ms,
+            fact_check_passed=True,
+        )
         return {
             "status": "blocked",
             "model_armor_blocked": True,
@@ -624,11 +649,7 @@ def run_conversational_rag_turn(
             "execution_mode": "guardrail_blocked",
             "adk_runtime": get_live_runtime_status_metadata(),
             "prompt_store": get_prompt_store_status_metadata(),
-            "intent": (
-                "projection_compliance_block"
-                if prompt_decision.projection_blocked
-                else "safety_guardrail_block"
-            ),
+            "intent": blocked_intent,
             "orchestrator": RootOrchestrator.name,
             "resolved_scope": {
                 "tickers": [],
@@ -663,11 +684,12 @@ def run_conversational_rag_turn(
                 "models": get_model_strategy_metadata(),
                 "session_memory": memory_ctx,
                 "turn_context_latency": None,
+                "session_telemetry": blocked_sess_tel["row"],
             },
             "evaluation": None,
             "agent_trace": agent_trace,
             "agent_identities_used": list(identities_used_by_agent.values()),
-            "total_latency_ms": round((time.perf_counter() - turn_start) * 1000.0, 2),
+            "total_latency_ms": blocked_total_ms,
         }
 
     if prompt_decision.sdp_redacted:
@@ -1147,6 +1169,30 @@ def run_conversational_rag_turn(
                 ),
             }
         )
+        resp_blocked_intent = (
+            "projection_compliance_block"
+            if resp_decision.projection_blocked
+            else "safety_guardrail_block"
+        )
+        resp_blocked_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
+        resp_blocked_tel = get_telemetry_sink().record_session_turn_telemetry(
+            session_id=session_id,
+            user_id=user_id,
+            intent=resp_blocked_intent,
+            execution_mode="guardrail_blocked",
+            status_outcome="blocked",
+            tickers_analyzed=scope["tickers"],
+            gics_sector=scope["gics_sector"],
+            start_year=scope["start_year"],
+            end_year=scope["end_year"],
+            report_generated=False,
+            variance_reports_count=len(variance_reports),
+            citations_count=0,
+            agent_trace=agent_trace,
+            turn_latency_records=turn_latency_records,
+            total_latency_ms=resp_blocked_ms,
+            fact_check_passed=False,
+        )
         return {
             "status": "blocked",
             "model_armor_blocked": True,
@@ -1157,11 +1203,7 @@ def run_conversational_rag_turn(
             "execution_mode": "guardrail_blocked",
             "adk_runtime": adk_runtime_meta,
             "prompt_store": get_prompt_store_status_metadata(),
-            "intent": (
-                "projection_compliance_block"
-                if resp_decision.projection_blocked
-                else "safety_guardrail_block"
-            ),
+            "intent": resp_blocked_intent,
             "orchestrator": RootOrchestrator.name,
             "resolved_scope": scope,
             "answer_markdown": (
@@ -1195,11 +1237,12 @@ def run_conversational_rag_turn(
                 "models": get_model_strategy_metadata(),
                 "session_memory": memory_ctx,
                 "turn_context_latency": turn_latency_summary.model_dump(mode="json"),
+                "session_telemetry": resp_blocked_tel["row"],
             },
             "evaluation": None,
             "agent_trace": agent_trace,
             "agent_identities_used": list(identities_used_by_agent.values()),
-            "total_latency_ms": round((time.perf_counter() - turn_start) * 1000.0, 2),
+            "total_latency_ms": resp_blocked_ms,
         }
 
     if resp_decision.sdp_redacted:
@@ -1276,6 +1319,33 @@ def run_conversational_rag_turn(
     )
 
     total_latency_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
+    analyzed_tickers = sorted(
+        {
+            *(scope.get("tickers") or []),
+            *(r["ticker"] for r in variance_reports if r.get("ticker")),
+            *(c["ticker"] for c in citations if c.get("ticker")),
+        }
+    )
+    session_tel = get_telemetry_sink().record_session_turn_telemetry(
+        session_id=session_id,
+        user_id=user_id,
+        intent=intent,
+        execution_mode=active_execution_mode,
+        status_outcome="success",
+        tickers_analyzed=analyzed_tickers,
+        gics_sector=scope["gics_sector"],
+        start_year=scope["start_year"],
+        end_year=scope["end_year"],
+        report_generated=bool(answer_markdown.strip()),
+        variance_reports_count=len(variance_reports),
+        citations_count=len(citations),
+        agent_trace=agent_trace,
+        turn_latency_records=turn_latency_records,
+        total_latency_ms=total_latency_ms,
+        fact_check_passed=fact_check.passed,
+        evaluation_grade=eval_report.grade,
+        evaluation_score=eval_report.overall_score,
+    )
     return {
         "status": "success",
         "model_armor_blocked": False,
@@ -1324,6 +1394,7 @@ def run_conversational_rag_turn(
                 get_context_latency_tracker().summarize().model_dump(mode="json")
             ),
             "context_cache_runtime": get_context_cache_runtime_stats(),
+            "session_telemetry": session_tel["row"],
         },
         "agent_trace": agent_trace,
         "agent_identities_used": list(identities_used_by_agent.values()),

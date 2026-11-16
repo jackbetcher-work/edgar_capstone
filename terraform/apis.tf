@@ -17,6 +17,7 @@ locals {
     "compute.googleapis.com",
     "discoveryengine.googleapis.com",
     "dlp.googleapis.com",
+    "firestore.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
     "iap.googleapis.com",

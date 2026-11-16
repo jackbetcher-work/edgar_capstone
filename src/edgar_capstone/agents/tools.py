@@ -59,6 +59,7 @@ from edgar_capstone.vector_db.embedder import (
     VertexAIEmbedder,
     generate_deterministic_embedding,
 )
+from edgar_capstone.telemetry import get_telemetry_sink
 
 logger = logging.getLogger(__name__)
 
@@ -2527,10 +2528,10 @@ def query_looker_financial_explore(
     end_year: int,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
-    """Queries the Looker BI semantic explore for YoY variances, sector benchmarks, peer comparisons, or chunk health.
+    """Queries the Looker BI semantic explore for YoY variances, sector benchmarks, peer comparisons, chunk health, telemetry/cost, session analytics, or audit trail.
 
     Args:
-        explore_name: Looker explore to query: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', or 'chunk_health'.
+        explore_name: Looker explore to query: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', 'chunk_health', 'llm_telemetry', 'session_analytics', or 'audit_trail'.
         tickers: Comma-separated ticker symbols (e.g., 'NVDA,AMD,AVGO') or 'ALL'.
         gics_sector: GICS Sector filter (e.g., 'Information Technology', 'Financials') or 'ALL'.
         start_year: Earliest fiscal year to include (e.g., 2024).
@@ -2539,19 +2540,28 @@ def query_looker_financial_explore(
     Returns:
         Dictionary with 'status', 'explore_name', 'row_count', and 'rows' from the requested BI explore.
     """
-    explore_key = explore_name.strip().lower()
+    raw_explore_key = explore_name.strip().lower()
+    alias_map = {
+        "llm_telemetry_and_cost": "llm_telemetry",
+        "security_audit_logs": "audit_trail",
+    }
+    explore_key = alias_map.get(raw_explore_key, raw_explore_key)
     if explore_key not in (
         "yoy_variances",
         "sector_benchmarks",
         "peer_comparison",
         "chunk_health",
+        "llm_telemetry",
+        "session_analytics",
+        "audit_trail",
     ):
         return {
             "status": "error",
             "explore_name": explore_name,
             "message": (
                 f"Unsupported explore_name '{explore_name}'. "
-                "Supported: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', 'chunk_health'."
+                "Supported: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', "
+                "'chunk_health', 'llm_telemetry', 'session_analytics', 'audit_trail'."
             ),
         }
 
@@ -2561,6 +2571,61 @@ def query_looker_financial_explore(
         if gics_sector and gics_sector.strip().upper() not in ("ALL", "*", "")
         else None
     )
+
+    if explore_key in ("llm_telemetry", "session_analytics", "audit_trail"):
+        sink = get_telemetry_sink()
+        if explore_key == "llm_telemetry":
+            tel_rows = sink.query_llm_telemetry_explore(limit=50)
+            tel_result: dict[str, Any] = {
+                "status": "success",
+                "explore_name": "llm_telemetry",
+                "lookml_model": "sec_edgar_analytics",
+                "lookml_explore": "llm_telemetry_and_cost",
+                "row_count": len(tel_rows),
+                "rows": tel_rows,
+            }
+        elif explore_key == "session_analytics":
+            sess_rows = sink.query_session_telemetry(limit=50)
+            if ticker_filter:
+                sess_rows = [
+                    r
+                    for r in sess_rows
+                    if ticker_filter.intersection(
+                        {str(t).upper() for t in (r.get("tickers_analyzed") or [])}
+                    )
+                ]
+            tel_result = {
+                "status": "success",
+                "explore_name": "session_analytics",
+                "lookml_model": "sec_edgar_analytics",
+                "lookml_explore": "session_analytics",
+                "summary": sink.summarize_session_telemetry(),
+                "row_count": len(sess_rows),
+                "rows": sess_rows,
+            }
+        else:
+            aud_rows = sink.query_security_audit_logs(limit=50)
+            if ticker_filter:
+                aud_rows = [
+                    r
+                    for r in aud_rows
+                    if ticker_filter.intersection(
+                        {str(t).upper() for t in (r.get("tickers") or [])}
+                    )
+                ]
+            tel_result = {
+                "status": "success",
+                "explore_name": "audit_trail",
+                "lookml_model": "sec_edgar_analytics",
+                "lookml_explore": "security_audit_logs",
+                "row_count": len(aud_rows),
+                "rows": aud_rows,
+            }
+        if tool_context is not None and hasattr(tool_context, "state"):
+            history = list(tool_context.state.get("looker_query_results", []))
+            history.append(tel_result)
+            tool_context.state["looker_query_results"] = history
+        return tel_result
 
     adapters, strict_gcp = _resolve_gcp_dispatch()
     if adapters is not None:

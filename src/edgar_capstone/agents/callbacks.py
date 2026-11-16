@@ -366,6 +366,18 @@ def after_model_fact_check_callback(
     else:
         react_phase = "format_grounded_output"
 
+    inv_ctx = getattr(callback_context, "_invocation_context", None)
+    adk_session = getattr(inv_ctx, "session", None)
+    cb_session_id = (
+        getattr(adk_session, "id", None)
+        or state.get("session_id")
+    )
+    cb_user_id = (
+        getattr(inv_ctx, "user_id", None)
+        or getattr(adk_session, "user_id", None)
+        or state.get("user_id")
+    )
+
     tracker = get_context_latency_tracker()
     latency_rec = tracker.record_call(
         agent_name=agent_name,
@@ -378,6 +390,8 @@ def after_model_fact_check_callback(
         raw_inference_latency_ms=raw_inference_ms,
         context_prep_latency_ms=prep_ms,
         observed_ttft_ms=observed_ttft_ms,
+        session_id=str(cb_session_id) if cb_session_id else None,
+        user_id=str(cb_user_id) if cb_user_id else None,
     )
 
     latency_log = list(state.get("latency_metrics", []))

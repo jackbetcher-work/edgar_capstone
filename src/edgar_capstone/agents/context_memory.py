@@ -45,6 +45,7 @@ from edgar_capstone.agents.schemas import (
     ModelContextLatencyRecord,
     ModelTaskCategory,
 )
+from edgar_capstone.telemetry import get_telemetry_sink
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ DEFAULT_COMPACTION_RETENTION_SIZE: int = 5
 
 @dataclass(frozen=True)
 class ModelPerformanceProfile:
-    """Calibrated token-throughput characteristics for attributing prefill vs decode latency."""
+    """Calibrated token-throughput and USD token pricing characteristics for prefill/decode & cost telemetry."""
 
     model_name: str
     tier: str
@@ -74,6 +75,9 @@ class ModelPerformanceProfile:
     uncached_prefill_ms_per_token: float
     cached_prefill_discount_factor: float  # Fraction of uncached prefill cost when cached (e.g. 0.20 = 5x faster)
     decode_ms_per_token: float
+    uncached_input_usd_per_1m: float = 1.25
+    cached_input_usd_per_1m: float = 0.3125
+    output_usd_per_1m: float = 10.00
 
 
 MODEL_PROFILES: dict[str, ModelPerformanceProfile] = {
@@ -90,6 +94,9 @@ MODEL_PROFILES: dict[str, ModelPerformanceProfile] = {
         uncached_prefill_ms_per_token=0.14,
         cached_prefill_discount_factor=0.20,
         decode_ms_per_token=1.85,
+        uncached_input_usd_per_1m=1.25,
+        cached_input_usd_per_1m=0.3125,
+        output_usd_per_1m=10.00,
     ),
     "gemini-3.5-flash": ModelPerformanceProfile(
         model_name="gemini-3.5-flash",
@@ -104,6 +111,9 @@ MODEL_PROFILES: dict[str, ModelPerformanceProfile] = {
         uncached_prefill_ms_per_token=0.045,
         cached_prefill_discount_factor=0.18,
         decode_ms_per_token=0.55,
+        uncached_input_usd_per_1m=0.30,
+        cached_input_usd_per_1m=0.075,
+        output_usd_per_1m=2.50,
     ),
 }
 
@@ -176,6 +186,14 @@ def get_model_strategy_metadata() -> dict[str, Any]:
             "token_threshold": DEFAULT_COMPACTION_TOKEN_THRESHOLD,
             "event_retention_size": DEFAULT_COMPACTION_RETENTION_SIZE,
             "summarizer_model": flash_model,
+        },
+        "pricing_per_1m_tokens_usd": {
+            name: {
+                "uncached_input_usd_per_1m": prof.uncached_input_usd_per_1m,
+                "cached_input_usd_per_1m": prof.cached_input_usd_per_1m,
+                "output_usd_per_1m": prof.output_usd_per_1m,
+            }
+            for name, prof in MODEL_PROFILES.items()
         },
         "ttft_slo_target_ms": TTFT_SLO_TARGET_MS,
     }
@@ -376,8 +394,10 @@ def attribute_context_latency(
     raw_inference_latency_ms: float,
     context_prep_latency_ms: float = 0.0,
     observed_ttft_ms: float | None = None,
+    session_id: str | None = None,
+    user_id: str | None = None,
 ) -> ModelContextLatencyRecord:
-    """Compute a `ModelContextLatencyRecord` isolating latency due to context vs generation."""
+    """Compute a `ModelContextLatencyRecord` isolating latency due to context vs generation and USD cost."""
     profile = _get_profile_for_model(model_name)
     prep_ms = max(0.0, float(context_prep_latency_ms))
     inf_ms = max(0.0, float(raw_inference_latency_ms))
@@ -435,6 +455,19 @@ def attribute_context_latency(
         * (1.0 - profile.cached_prefill_discount_factor)
     )
 
+    # USD token cost & cached-token discount savings
+    input_cost_usd = (
+        (uncached_toks / 1_000_000.0) * profile.uncached_input_usd_per_1m
+        + (cached_toks / 1_000_000.0) * profile.cached_input_usd_per_1m
+    )
+    uncached_input_baseline_usd = (
+        (uncached_toks + cached_toks) / 1_000_000.0
+    ) * profile.uncached_input_usd_per_1m
+    output_cost_usd = (gen_toks / 1_000_000.0) * profile.output_usd_per_1m
+    total_cost_usd = input_cost_usd + output_cost_usd
+    uncached_baseline_cost_usd = uncached_input_baseline_usd + output_cost_usd
+    cached_token_savings_usd = max(0.0, uncached_input_baseline_usd - input_cost_usd)
+
     return ModelContextLatencyRecord(
         call_id=f"llm-ctx-{uuid.uuid4().hex[:12]}",
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -455,6 +488,13 @@ def attribute_context_latency(
         latency_per_1k_context_tokens_ms=round(per_1k_ms, 3),
         estimated_cache_latency_saved_ms=round(cache_saved_ms, 3),
         within_ttft_slo=ttft_ms <= TTFT_SLO_TARGET_MS,
+        input_cost_usd=round(input_cost_usd, 8),
+        output_cost_usd=round(output_cost_usd, 8),
+        total_cost_usd=round(total_cost_usd, 8),
+        uncached_baseline_cost_usd=round(uncached_baseline_cost_usd, 8),
+        cached_token_savings_usd=round(cached_token_savings_usd, 8),
+        session_id=session_id,
+        user_id=user_id,
     )
 
 
@@ -491,8 +531,10 @@ class ContextLatencyTracker:
         raw_inference_latency_ms: float = 0.0,
         context_prep_latency_ms: float = 0.0,
         observed_ttft_ms: float | None = None,
+        session_id: str | None = None,
+        user_id: str | None = None,
     ) -> ModelContextLatencyRecord:
-        """Attribute and store a model call's context latency telemetry record."""
+        """Attribute, store, and stream a model call's context latency & cost telemetry record."""
         rec = attribute_context_latency(
             agent_name=agent_name,
             model_name=model_name,
@@ -504,11 +546,14 @@ class ContextLatencyTracker:
             raw_inference_latency_ms=raw_inference_latency_ms,
             context_prep_latency_ms=context_prep_latency_ms,
             observed_ttft_ms=observed_ttft_ms,
+            session_id=session_id,
+            user_id=user_id,
         )
         with self._lock:
             self._records.append(rec)
             if len(self._records) > self._max_records:
                 self._records = self._records[-self._max_records :]
+        get_telemetry_sink().record_llm_telemetry(rec)
         return rec
 
     def recent_records(
@@ -576,13 +621,27 @@ class ContextLatencyTracker:
                 "cached_context_tokens": sum(
                     x.context_breakdown.cached_context_tokens for x in m_recs
                 ),
+                "output_tokens": sum(x.output_tokens for x in m_recs),
                 "mean_context_latency_ms": round(sum(m_ctx) / len(m_ctx), 3),
                 "p95_context_latency_ms": round(_percentile(m_ctx, 95.0), 3),
                 "mean_total_model_latency_ms": round(sum(m_tot) / len(m_tot), 3),
                 "estimated_cache_latency_saved_ms": round(
                     sum(x.estimated_cache_latency_saved_ms for x in m_recs), 3
                 ),
+                "total_cost_usd": round(sum(x.total_cost_usd for x in m_recs), 8),
+                "cached_token_savings_usd": round(
+                    sum(x.cached_token_savings_usd for x in m_recs), 8
+                ),
             }
+
+        total_cost = sum(r.total_cost_usd for r in items)
+        total_baseline_cost = sum(r.uncached_baseline_cost_usd for r in items)
+        total_savings = sum(r.cached_token_savings_usd for r in items)
+        savings_pct = (
+            round((total_savings / total_baseline_cost) * 100.0, 2)
+            if total_baseline_cost > 0.0
+            else 0.0
+        )
 
         return ContextLatencySummary(
             total_calls=len(items),
@@ -595,6 +654,8 @@ class ContextLatencyTracker:
             total_uncached_context_tokens=sum(
                 r.context_breakdown.uncached_context_tokens for r in items
             ),
+            total_output_tokens=sum(r.output_tokens for r in items),
+            total_thoughts_tokens=sum(r.thoughts_tokens for r in items),
             mean_context_latency_ms=round(sum(ctx_latencies) / len(ctx_latencies), 3),
             p50_context_latency_ms=round(_percentile(ctx_latencies, 50.0), 3),
             p95_context_latency_ms=round(_percentile(ctx_latencies, 95.0), 3),
@@ -611,6 +672,10 @@ class ContextLatencyTracker:
             total_estimated_cache_latency_saved_ms=round(
                 sum(r.estimated_cache_latency_saved_ms for r in items), 3
             ),
+            total_cost_usd=round(total_cost, 8),
+            total_uncached_baseline_cost_usd=round(total_baseline_cost, 8),
+            total_cached_token_savings_usd=round(total_savings, 8),
+            cache_cost_savings_pct=savings_pct,
             by_model=by_model_summary,
         )
 

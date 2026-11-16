@@ -1,0 +1,104 @@
+[
+  {
+    "name": "event_id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Unique security/access audit event identifier (insertId deduplication key)"
+  },
+  {
+    "name": "recorded_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "UTC timestamp when the audit event occurred"
+  },
+  {
+    "name": "recorded_at_epoch",
+    "type": "FLOAT",
+    "mode": "REQUIRED",
+    "description": "Unix epoch timestamp in seconds (millisecond precision)"
+  },
+  {
+    "name": "event_type",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Audit event category (e.g., conversational_rag_chat, filing_10k_section_read, analyst_feedback_submitted)"
+  },
+  {
+    "name": "status",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Authorization or execution status outcome (allowed, denied_401, denied_403, success, blocked)"
+  },
+  {
+    "name": "resource",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Protected FastAPI route or internal resource accessed"
+  },
+  {
+    "name": "tickers",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "SEC 10-K issuer tickers accessed during the request"
+  },
+  {
+    "name": "user_email",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Authenticated user email, runtime SA, or 'unauthenticated'"
+  },
+  {
+    "name": "user_sub",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "OIDC / IAP JWT subject identifier"
+  },
+  {
+    "name": "hosted_domain",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Google Workspace hosted domain (hd claim)"
+  },
+  {
+    "name": "identity_provider",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Verified identity provider (google_iap, okta_sso, google_workspace_oidc, agent_s2s)"
+  },
+  {
+    "name": "roles",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Resolved RBAC roles for the principal"
+  },
+  {
+    "name": "cloud_identity_groups",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Matched Cloud Identity security groups"
+  },
+  {
+    "name": "agent_identity",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Per-agent S2S workload identity when invoked by an ADK sub-agent"
+  },
+  {
+    "name": "spiffe_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Cryptographic SPIFFE ID when S2S agent assertion is present"
+  },
+  {
+    "name": "iap_assertion_verified",
+    "type": "BOOLEAN",
+    "mode": "REQUIRED",
+    "description": "Whether an X-Goog-IAP-JWT-Assertion header was cryptographically verified"
+  },
+  {
+    "name": "detail",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Additional structured context (fiscal period, section_id, intent, rating)"
+  }
+]

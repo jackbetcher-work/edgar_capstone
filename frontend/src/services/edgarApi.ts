@@ -812,6 +812,7 @@ export async function postAnalystFeedback(
       headers: buildAuthorizedHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         message_id: messageId,
+        session_id: CLIENT_SESSION_ID,
         rating,
         comment,
         query,

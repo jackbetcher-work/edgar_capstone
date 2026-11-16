@@ -164,3 +164,28 @@ output "sdp_deidentify_template_id" {
   description = "Resource ID of the Google Cloud Sensitive Data Protection (DLP) de-identification template."
   value       = var.enable_model_armor ? google_data_loss_prevention_deidentify_template.sec_edgar_sdp_deidentify[0].id : null
 }
+
+output "llm_telemetry_table_fqn" {
+  description = "Fully-qualified BigQuery streaming sink table for per-call LLM token, cost, cached-token savings, and latency telemetry."
+  value       = "${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.llm_telemetry_events.table_id}"
+}
+
+output "session_telemetry_table_fqn" {
+  description = "Fully-qualified BigQuery streaming sink table for conversational session length, companies analyzed, report counts, and ADK tool usage."
+  value       = "${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.session_telemetry_events.table_id}"
+}
+
+output "security_audit_logs_table_fqn" {
+  description = "Fully-qualified BigQuery streaming sink table for IAP/Okta/Workspace auth and 10-K filing access audit logs."
+  value       = "${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.security_audit_logs.table_id}"
+}
+
+output "telemetry_cost_and_latency_view_fqn" {
+  description = "Fully-qualified BigQuery BI view aggregating daily LLM token cost, cached-token savings, and p95 latency for Looker."
+  value       = "${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.v_telemetry_cost_and_latency.table_id}"
+}
+
+output "firestore_feedback_database_name" {
+  description = "Firestore Native database resource name persisting analyst thumbs-up/down feedback and comments."
+  value       = var.enable_firestore_feedback ? google_firestore_database.analyst_feedback_db[0].name : null
+}

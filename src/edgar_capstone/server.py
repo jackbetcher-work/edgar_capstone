@@ -69,6 +69,11 @@ from edgar_capstone.security.secrets import (
     MANAGED_SECRETS,
     SecretManagerClient,
 )
+from edgar_capstone.telemetry import (
+    get_feedback_store,
+    get_telemetry_sink,
+    load_lookml_project_catalog,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +159,7 @@ def health() -> dict[str, Any]:
     """Cloud Run external health check and internal probe endpoint."""
     runtime_sa = RuntimeServiceAccountConfig.from_env()
     model_meta = get_model_strategy_metadata()
+    lookml_cat = load_lookml_project_catalog()
     return {
         "status": "ok",
         "service": os.environ.get("K_SERVICE", "sec-edgar-analyst"),
@@ -170,6 +176,14 @@ def health() -> dict[str, Any]:
         "adk_runtime": get_live_runtime_status_metadata(),
         "model_armor": get_model_armor_status_metadata(),
         "prompt_store": get_prompt_store_status_metadata(),
+        "telemetry_sink": get_telemetry_sink().status_metadata(),
+        "feedback_store": get_feedback_store().status_metadata(),
+        "lookml_semantic_layer": {
+            "status": lookml_cat["status"],
+            "model_count": lookml_cat.get("model_count", 0),
+            "view_count": lookml_cat.get("view_count", 0),
+            "dashboard_count": lookml_cat.get("dashboard_count", 0),
+        },
         "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
         "iap_jwt_auth_enabled": True,
     }
@@ -610,6 +624,19 @@ def get_looker_explore(
     )
 
 
+@app.get("/api/v1/looker/catalog")
+def get_lookml_semantic_catalog(
+    user: AuthenticatedUser = Depends(require_permissions(Permission.FILINGS_READ.value)),
+) -> dict[str, Any]:
+    """Inspect repository LookML semantic models, views, explores, and dashboards."""
+    record_security_audit_event(
+        event_type="lookml_catalog_inspected",
+        user=user,
+        resource="/api/v1/looker/catalog",
+    )
+    return load_lookml_project_catalog()
+
+
 class ChatQueryRequest(BaseModel):
     query: str = Field(..., min_length=2)
     tickers: str = Field("ALL")
@@ -662,6 +689,9 @@ class FeedbackRequest(BaseModel):
     rating: Literal["up", "down"]
     comment: str = Field(default="", max_length=1000)
     query: str = Field(default="", max_length=1000)
+    session_id: str | None = Field(default=None, max_length=128)
+    tickers: list[str] = Field(default_factory=list)
+    intent: str = Field(default="", max_length=128)
 
 
 @app.get("/api/v1/companies")
@@ -740,14 +770,42 @@ def get_context_latency_telemetry(
     )
     tracker = get_context_latency_tracker()
     records = tracker.recent_records(limit=limit, model_name=model)
+    sink = get_telemetry_sink()
     return {
         "status": "ok",
         "adk_runtime": get_live_runtime_status_metadata(),
         "models": get_model_strategy_metadata(),
         "context_cache_runtime": get_context_cache_runtime_stats(),
+        "telemetry_sink": sink.status_metadata(),
+        "session_summary": sink.summarize_session_telemetry(),
         "summary": tracker.summarize().model_dump(mode="json"),
         "record_count": len(records),
         "recent_records": [r.model_dump(mode="json") for r in records],
+    }
+
+
+@app.get("/api/v1/telemetry/sessions")
+def get_session_and_tool_telemetry(
+    limit: int = Query(50, ge=1, le=500),
+    session_id: str | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_permissions(Permission.AUDIT_READ.value)),
+) -> dict[str, Any]:
+    """Retrieve conversational session length, companies analyzed, report counts, tool usage, and BigQuery sink metrics."""
+    record_security_audit_event(
+        event_type="session_telemetry_read",
+        user=user,
+        resource="/api/v1/telemetry/sessions",
+        detail=f"limit={limit} session_id={session_id or 'ALL'}",
+    )
+    sink = get_telemetry_sink()
+    events = sink.query_session_telemetry(limit=limit, session_id=session_id)
+    return {
+        "status": "ok",
+        "requested_by": user.email,
+        "telemetry_sink": sink.status_metadata(),
+        "summary": sink.summarize_session_telemetry(),
+        "event_count": len(events),
+        "events": events,
     }
 
 
@@ -921,33 +979,65 @@ def submit_analyst_feedback(
     req: FeedbackRequest,
     user: AuthenticatedUser = Depends(require_permissions(Permission.FEEDBACK_SUBMIT.value)),
 ) -> dict[str, Any]:
-    """Record analyst thumbs-up/down audit feedback and optional comment."""
-    entry = {
-        "message_id": req.message_id,
-        "rating": req.rating,
-        "comment": req.comment.strip(),
-        "query": req.query.strip(),
-        "user_email": user.email,
-        "identity_provider": user.identity_provider,
-        "recorded_at_epoch": round(time.time(), 3),
-    }
+    """Persist analyst thumbs-up/down audit feedback and optional comment to Firestore."""
+    persisted = get_feedback_store().record_feedback(
+        message_id=req.message_id,
+        rating=req.rating,
+        comment=req.comment,
+        query=req.query,
+        user_email=user.email,
+        identity_provider=user.identity_provider,
+        session_id=req.session_id,
+        tickers=req.tickers,
+        intent=req.intent,
+    )
+    entry = persisted["entry"]
     _FEEDBACK_AUDIT_LOG.append(entry)
     record_security_audit_event(
         event_type="analyst_feedback_submitted",
         user=user,
         resource="/api/v1/feedback",
-        detail=f"message_id={req.message_id} rating={req.rating}",
+        tickers=req.tickers,
+        detail=f"message_id={req.message_id} rating={req.rating} backend={persisted['backend_used']}",
     )
     logger.info(
-        "Recorded analyst feedback message_id=%s rating=%s user=%s",
+        "Recorded analyst feedback message_id=%s rating=%s user=%s backend=%s",
         req.message_id,
         req.rating,
         user.email,
+        persisted["backend_used"],
     )
     return {
         "status": "success",
         "recorded": entry,
-        "total_feedback_count": len(_FEEDBACK_AUDIT_LOG),
+        "persistence": {
+            "backend": persisted["backend_used"],
+            "database_id": persisted["database_id"],
+            "collection": persisted["collection"],
+            "document_name": persisted["document_name"],
+        },
+        "total_feedback_count": persisted["total_feedback_count"],
+    }
+
+
+@app.get("/api/v1/feedback")
+def list_analyst_feedback(
+    limit: int = Query(50, ge=1, le=500),
+    rating: Literal["up", "down"] | None = Query(default=None),
+    user: AuthenticatedUser = Depends(require_permissions(Permission.AUDIT_READ.value)),
+) -> dict[str, Any]:
+    """List persisted analyst feedback ratings and audit comments from Firestore."""
+    record_security_audit_event(
+        event_type="analyst_feedback_listed",
+        user=user,
+        resource="/api/v1/feedback",
+        detail=f"limit={limit} rating={rating or 'ALL'}",
+    )
+    result = get_feedback_store().list_feedback(limit=limit, rating=rating)
+    return {
+        "status": "ok",
+        "requested_by": user.email,
+        **result,
     }
 
 

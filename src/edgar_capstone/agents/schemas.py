@@ -115,6 +115,9 @@ class LookerExploreQuery(BaseModel):
         "sector_benchmarks",
         "peer_comparison",
         "chunk_health",
+        "llm_telemetry",
+        "session_analytics",
+        "audit_trail",
     ] = Field(
         ...,
         description="Target Looker semantic explore view to query",
@@ -289,15 +292,48 @@ class ModelContextLatencyRecord(BaseModel):
     within_ttft_slo: bool = Field(
         default=True, description="Whether TTFT satisfied the <= 3000ms p95 SLO"
     )
+    input_cost_usd: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="USD cost of input context tokens after applying cached-token discount",
+    )
+    output_cost_usd: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="USD cost of generated output and reasoning tokens",
+    )
+    total_cost_usd: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Total USD cost for this LLM invocation (input_cost_usd + output_cost_usd)",
+    )
+    uncached_baseline_cost_usd: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Hypothetical USD cost had all cached tokens been billed at uncached prefill rate",
+    )
+    cached_token_savings_usd: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="USD cost saved on this call via context-cached input tokens",
+    )
+    session_id: str | None = Field(
+        default=None, description="Optional conversational session ID associated with the call"
+    )
+    user_id: str | None = Field(
+        default=None, description="Optional authenticated principal associated with the call"
+    )
 
 
 class ContextLatencySummary(BaseModel):
-    """Aggregated context-induced latency metrics across model tiers and sessions."""
+    """Aggregated context-induced latency and USD cost metrics across model tiers and sessions."""
 
     total_calls: int = 0
     total_context_tokens: int = 0
     total_cached_context_tokens: int = 0
     total_uncached_context_tokens: int = 0
+    total_output_tokens: int = 0
+    total_thoughts_tokens: int = 0
     mean_context_latency_ms: float = 0.0
     p50_context_latency_ms: float = 0.0
     p95_context_latency_ms: float = 0.0
@@ -308,6 +344,10 @@ class ContextLatencySummary(BaseModel):
     mean_context_latency_ratio: float = 0.0
     mean_latency_per_1k_context_tokens_ms: float = 0.0
     total_estimated_cache_latency_saved_ms: float = 0.0
+    total_cost_usd: float = 0.0
+    total_uncached_baseline_cost_usd: float = 0.0
+    total_cached_token_savings_usd: float = 0.0
+    cache_cost_savings_pct: float = 0.0
     by_model: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
