@@ -24,7 +24,7 @@ make dev
 # 3. Or build the frontend bundle and serve the single-origin app from FastAPI (:8000)
 make start
 
-# 4. Run secret scan, backend pytest suite (135 tests), ESLint, and frontend Vitest suite (6 tests)
+# 4. Run secret scan, backend pytest suite (139 tests), ESLint, and frontend Vitest suite (6 tests)
 make test
 
 # 5. Run the CI lint/format gates (ruff check + format --check, terraform fmt/validate, ESLint),
@@ -143,7 +143,7 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 ├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI
 ├── scripts/                         # CLI entrypoints: dataset build, vector DB build (+ --upload-only), corpus hydration, container smoke test, secret scanner
 ├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP + HTTPS LB, Cloud Build triggers, log-based latency metric
-├── tests/                           # Automated pytest suite (135 tests across agents, live ADK, GCP adapters, telemetry, observability, APIs, IaC, container packaging)
+├── tests/                           # Automated pytest suite (139 tests across agents, live ADK, GCP adapters, telemetry, observability, APIs, IaC, container packaging)
 ├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + Python 3.11 runtime) with baked manifests + build-time corpus check
 ├── .dockerignore                    # Keeps secrets and gitignored heavy corpus artifacts out of the build context
 ├── cloudbuild.yaml                  # Cloud Build: parallel lint/test gates -> build (+ offline smoke test) -> push + deploy (main) / verify-only (PRs)
@@ -170,7 +170,7 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
   - Executes ADK `Agent`s inside `create_edgar_adk_app` (`ModelArmorSafetyPlugin`, `ContextCacheConfig`, and `EventsCompactionConfig`) via `google.adk.runners.Runner` (`StreamingMode.SSE`, `InMemorySessionService`, `InMemoryMemoryService`) with `HttpRetryOptions` backoff (`429`, `500`, `502`, `503`, `504`) against Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`) or Gemini API (`GEMINI_API_KEY` / `GOOGLE_API_KEY`).
   - Captures real wall-clock streaming Time-to-First-Thought / Time-to-First-Token (`observed_ttft_ms`) on the first partial SSE chunk (`llm_response.partial == True`) in `after_model_fact_check_callback`, reconciles Gemini `usage_metadata` token counts on the final chunk, enforces post-generation `verify_narrative_against_calculations` grounding locks, and falls back deterministically when offline (`EDGAR_EXECUTION_MODE=auto`).
 - **Tools, Live GCP Adapters & Resilience (`tools.py`, `resilience.py`):** Explicit ADK `FunctionTool` definitions (`MetricFetchTool`, `LookerQueryTool`, `VarianceCalculationTool`, `HybridSearchTool`, `ContextCacheTool`, `QueryCached10KTool`) backed by live GCP client adapters (`BigQueryAdapter`, `VertexAISearchAdapter`, `VertexVectorSearchAdapter`, `GcsCorpusAdapter`, and `VertexAIEmbedder` `text-embedding-005`) with `EDGAR_DATA_BACKEND` (`"auto"` | `"gcp"` | `"local"`) dispatch and `@with_tool_resilience` HTTP 429 exponential backoff and timeout handling. `@with_tool_resilience` also runs every tool inside a `tool.<name>` OpenTelemetry span that records attempts, `tool.retry` events, and error status.
-- **Structured ReAct Execution Loop (`react_loop.py`, `chat_engine.py`):** Evaluates deterministic period variances first, queries cached 10-K sections + metadata-filtered hybrid search for causal explanations, synthesizes inline-cited Markdown (`[TICKER FYxxxx | Section | chunk_id](sec_filing_url)`) via live `FinancialAnalystAgent` or offline template synthesis, and runs post-generation numeric and citation fact-checks (`verify_narrative_against_calculations`).
+- **Structured ReAct Execution Loop (`react_loop.py`, `chat_engine.py`):** Evaluates deterministic period variances first, pre-queries 10-K passages and metadata-filtered hybrid search (evidence leads and the offline fallback), lets the live agent retrieve the rest itself, synthesizes inline-cited Markdown (`[TICKER FYxxxx | Section | chunk_id](sec_filing_url)`) via live `FinancialAnalystAgent` or offline template synthesis, and runs post-generation numeric and citation fact-checks (`verify_narrative_against_calculations`).
 - **Context Latency, Cost Telemetry & Session Memory (`context_memory.py`, `telemetry.py`, `callbacks.py`):**
   - `ContextLatencyTracker` decomposes every model call into context preparation + prefill latency vs. decode latency, computes exact USD input/output cost and cached-token discount savings (`gemini-3.8-flash`, `gemini-3.5-flash`, and legacy `gemini-2.5-pro` profiles), monitors TTFT against the `<= 3000 ms` target, and streams per-call records directly to BigQuery (`sec_edgar.llm_telemetry_events`) via `BigQueryTelemetrySink` (`tabledata.insertAll` + structured Cloud Logging sink records).
   - `BigQueryTelemetrySink` also streams conversational turn/session metrics (`session_telemetry_events`: cumulative session length, companies analyzed, reports generated, ADK tool usage, and latency/cost) and authentication / 10-K access audit trails (`security_audit_logs`), with `"auto"` | `"gcp"` | `"local"` fallback (`EDGAR_TELEMETRY_BACKEND`).
@@ -272,12 +272,16 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 **Closed since the last revision (removed from the gap list):**
 - **Container corpus packaging** *(Secs. 4, 6)*: data paths resolve correctly for every install layout, the corpus can be hydrated from GCS at startup, `/health` reports where the corpus comes from, and Cloud Build and GitHub Actions run an offline smoke test inside the image before `docker push`. The one leftover step, publishing the vector DB artifacts, is now part of gap 1 below.
 - **External HTTPS load balancer in front of IAP** *(Sec. 8)*: `terraform/load_balancer.tf` provisions a global IP, a Google-managed certificate, a `RESTRICTED` TLS policy, a URL map, an HTTPS proxy, a 443 forwarding rule, and an 80→443 redirect. It is now optional (`cloud_run_access_mode = "load_balancer"`); the default is IAP directly on Cloud Run (see gap 2).
-- **Vertex AI Context Caching for 10-K sections** *(Secs. 2, 6, 7)*: see `tenk_context_cache.py` above.
-  - Full sections are now shared across Cloud Run instances as remote `CachedContent` resources, and the local section cache is bounded.
-  - **Verified live on 2026-11-16.**
-    - Setup: `serviceconsumermanagement.googleapis.com` had to be enabled (now in `terraform/apis.tf`). The first cache in a project waits about 2 minutes while Vertex provisions it, so that first call times out and trips the circuit breaker; later calls work normally.
-    - Results: a 34k-token NVDA FY2026 bundle was created in about 4 s, a generate call served 29,402 of 29,419 prompt tokens from the cache, and a second manager instance found the same cache in about 0.2 s.
-    - **Model note:** this project can't reach `gemini-2.5-pro` (HTTP 404 in both `us-central1` and `global`), so the financial reasoning model is now `gemini-3.8-flash`, served from the `global` endpoint (`EDGAR_GEMINI_LOCATION=global`). The live verification above used `gemini-3.5-flash` on `global`. A full live `/api/v1/chat` turn on 2026-11-16 (NVDA FY2024–FY2026) worked end to end: `gemini-3.8-flash` synthesis read 32,384 of 39,587 context tokens from a shared 10-K `CachedContent`, the numeric and citation fact-check passed, and `gemini-3.5-flash` ran the judge. **TTFT was ~27.7 s, far above the 3 s target.** This is driven by default-effort thinking over about 40k tokens of context.
+- **10-K context for synthesis** *(Secs. 2, 6, 7)*: now agent-driven retrieval (see "Agent-Driven 10-K Retrieval" above), replacing the forced full-section `CachedContent` bundle.
+  - Context caching comes from ADK's App-level `ContextCacheConfig` over the instruction, tools, and retrieved passages within a turn. It needs `serviceconsumermanagement.googleapis.com` (in `terraform/apis.tf`); the first cache in a project waits about 2 minutes while Vertex provisions it.
+  - The financial reasoning model is `gemini-3.8-flash` on the `global` endpoint (`EDGAR_GEMINI_LOCATION=global`), because this project can't reach `gemini-2.5-pro` (HTTP 404).
+  - **Live comparison on 2026-11-16** (NVDA FY2024–FY2026 export-control question):
+    - The forced 34k-token bundle took about 27.7 s to first token.
+    - With agent-driven retrieval across five runs, the first request was about 7.8k tokens and first token arrived in about 3.0–4.0 s; one run took 6.9 s. Time to first token here is the first streamed thought.
+    - The agent made 5–6 targeted retrieval calls covering FY2024, FY2025, and FY2026. Every cited `chunk_id` resolved, and the fact-check passed.
+    - Within a turn, up to about 32k context tokens were served from ADK's cache.
+    - End-to-end turns take about 65–78 s, because of multiple model calls and long reports.
+  - **Open grounding issue:** the analyst sometimes adds facts from outside the corpus. For example, a "$4.5 billion H20 charge" appears in reports but in no retrieved passage or corpus file. The numeric fact-check only checks percentages, and the judge doesn't reliably catch these.
 - **Cloud Build trigger and lint/format gates** *(Sec. 8: CI/CD)*:
   - `terraform/cloudbuild.tf` manages the GitHub connection, the `main` deploy trigger, the PR verify trigger, and the dedicated `sec-edgar-cloudbuild-sa` service account. Set `enable_cloudbuild_trigger = true` after the one-time GitHub App and token setup described in [`terraform/README.md`](terraform/README.md).
   - `cloudbuild.yaml` gates the build on `ruff check` / `ruff format --check`, `terraform fmt` / `validate`, ESLint + Vitest, the secret scan, and pytest.
@@ -373,7 +377,7 @@ These limit who can reach the app and data, but unlike a perimeter they don't st
 **Reference requirement:** A golden dataset of 20+ query–variance–explanation mappings in BigQuery; Gemini 3.5 Flash LLM-as-a-Judge regression checks through `make eval-all` before deployment; >80% pytest coverage; ≥92% grounding recall; 100% numeric agreement and citation coverage; p95 TTFT ≤ 3.0 s; 100% safety compliance.
 
 **Current state:**
-- 135 pytest tests with mocked LLM and Search APIs.
+- 139 pytest tests with mocked LLM and Search APIs.
 - `NarrativeEvaluatorAgent` (4-axis rubric) and `/api/v1/evaluate`.
 - `verify_narrative_against_calculations` enforces numeric and citation locks for each response.
 - No golden dataset or BigQuery eval tables, no `make eval-all` target, and `pytest-cov` is not installed, so coverage is unmeasured.

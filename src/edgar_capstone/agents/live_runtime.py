@@ -22,7 +22,6 @@ import contextvars
 import json
 import logging
 import os
-import re
 import time
 import uuid
 from collections.abc import Coroutine
@@ -749,33 +748,40 @@ def run_live_adk_financial_reasoning(**kwargs: Any) -> AdkStreamResult:
     return _run_coro_sync(run_live_adk_financial_reasoning_async(**kwargs))
 
 
-_JUDGE_MAX_CITATIONS = 16
-_JUDGE_EXCERPT_CHARS = 900
-_CITED_CHUNK_ID_IN_REPORT_RE = re.compile(r"\[[^\]|]+\|[^\]|]+\|\s*([^\]|]+?)\s*\]\(")
+_JUDGE_MIN_CITATIONS = 16
+_JUDGE_MAX_CITATIONS = 30
+_JUDGE_EXCERPT_CHARS = 4000
 
 
 def select_citations_for_judge(
     response_markdown: str,
     citations: list[dict[str, Any]],
     *,
+    min_citations: int = _JUDGE_MIN_CITATIONS,
     max_citations: int = _JUDGE_MAX_CITATIONS,
 ) -> list[dict[str, Any]]:
-    """Give the judge the passages the report actually cites, then other retrieved evidence.
+    """Give the judge every passage the report references (full excerpts), then other evidence.
 
     With agent-driven retrieval, the passages the analyst cites are usually ones it fetched
-    itself, which sit at the end of the turn's citation list. Taking the first N citations
-    hid them from the judge and made valid citations look hallucinated.
+    itself, which sit at the end of the turn's citation list. Taking the first N citations, or
+    truncating their excerpts, hid the supporting text from the judge, so valid claims and
+    citations were scored as hallucinated. A chunk counts as referenced when its chunk_id
+    appears anywhere in the report: inline tags or the closing citation table.
     """
-    cited = list(
-        dict.fromkeys(m.strip() for m in _CITED_CHUNK_ID_IN_REPORT_RE.findall(response_markdown))
-    )
     by_id: dict[str, dict[str, Any]] = {}
     for c in citations:
-        by_id.setdefault(str(c.get("chunk_id") or ""), c)
-    ordered = [by_id[cid] for cid in cited if cid in by_id]
-    ordered += [c for c in citations if str(c.get("chunk_id") or "") not in set(cited)]
+        cid = str(c.get("chunk_id") or "")
+        if cid:
+            by_id.setdefault(cid, c)
+    referenced = sorted(
+        (cid for cid in by_id if cid in response_markdown),
+        key=response_markdown.index,
+    )
+    limit = min(max_citations, max(min_citations, len(referenced)))
+    ordered = [by_id[cid] for cid in referenced]
+    ordered += [c for cid, c in by_id.items() if cid not in set(referenced)]
     selected: list[dict[str, Any]] = []
-    for c in ordered[:max_citations]:
+    for c in ordered[:limit]:
         trimmed = dict(c)
         trimmed["excerpt"] = str(c.get("excerpt") or "")[:_JUDGE_EXCERPT_CHARS]
         selected.append(trimmed)

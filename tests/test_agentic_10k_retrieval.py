@@ -296,22 +296,28 @@ def test_judge_sees_the_passages_the_report_cites() -> None:
     from edgar_capstone.agents.live_runtime import select_citations_for_judge
 
     citations = [
-        {"chunk_id": f"NVDA_2026_item_1a_{i:04d}", "excerpt": "x" * 2000} for i in range(30)
+        {"chunk_id": f"NVDA_2026_item_1a_{i:04d}", "excerpt": "x" * 5000} for i in range(40)
     ]
     report = (
         "Export rules tightened [NVDA FY2026 | Item 1A. Risk Factors | NVDA_2026_item_1a_0025]"
         "(https://sec.gov/a) and China sales fell "
-        "[NVDA FY2026 | Item 1A. Risk Factors | NVDA_2026_item_1a_0012](https://sec.gov/b)."
+        "[NVDA FY2026 | Item 1A. Risk Factors | NVDA_2026_item_1a_0012](https://sec.gov/b).\n\n"
+        "| chunk_id |\n|---|\n| NVDA_2026_item_1a_0033 |\n"  # table-only reference
     )
     selected = select_citations_for_judge(report, citations)
-    assert [c["chunk_id"] for c in selected[:2]] == [
+    assert [c["chunk_id"] for c in selected[:3]] == [
         "NVDA_2026_item_1a_0025",
         "NVDA_2026_item_1a_0012",
+        "NVDA_2026_item_1a_0033",
     ]
     assert len(selected) == 16
     assert len({c["chunk_id"] for c in selected}) == 16
-    assert all(len(c["excerpt"]) == 900 for c in selected)
-    assert len(citations[0]["excerpt"]) == 2000  # inputs are not mutated
+    assert all(len(c["excerpt"]) == 4000 for c in selected)
+    assert len(citations[0]["excerpt"]) == 5000  # inputs are not mutated
+
+    # Reports referencing more than 16 chunks get all of them (up to 30)
+    many = " ".join(f"NVDA_2026_item_1a_{i:04d}" for i in range(22))
+    assert len(select_citations_for_judge(many, citations)) == 22
 
 
 class _TextActionLlm(BaseLlm):
