@@ -26,7 +26,13 @@ resource "google_secret_manager_secret" "managed_secrets" {
 # Optional bootstrap placeholder versions for greenfield projects so Cloud Run
 # secret_key_ref (version = "latest") mounts succeed in a single-stage apply.
 resource "google_secret_manager_secret_version" "bootstrap_placeholders" {
-  for_each = var.seed_placeholder_secret_versions ? local.managed_secret_ids : toset([])
+  # The IAP audience is derived from Terraform-managed infrastructure, so it gets a
+  # real value (see iap_audience below) instead of a placeholder.
+  for_each = (
+    var.seed_placeholder_secret_versions
+    ? (local.iap_backend_audience != null ? setsubtract(local.managed_secret_ids, ["sec-edgar-iap-audience"]) : local.managed_secret_ids)
+    : toset([])
+  )
 
   secret      = google_secret_manager_secret.managed_secrets[each.key].id
   secret_data = "REPLACE_ME_IN_SECRET_MANAGER"
@@ -34,6 +40,16 @@ resource "google_secret_manager_secret_version" "bootstrap_placeholders" {
   lifecycle {
     ignore_changes = [secret_data]
   }
+}
+
+# Keep the IAP JWT audience secret in sync with the real backend service. If the
+# backend service is ever recreated, a new version is written automatically and
+# Cloud Run (pinned to this version below) rolls a new revision to pick it up.
+resource "google_secret_manager_secret_version" "iap_audience" {
+  count = local.iap_backend_audience != null ? 1 : 0
+
+  secret      = google_secret_manager_secret.managed_secrets["sec-edgar-iap-audience"].id
+  secret_data = local.iap_backend_audience
 }
 
 # Grant least-privilege Secret Accessor role exclusively to the custom Cloud Run runtime SA
@@ -315,6 +331,23 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "VERTEX_VECTOR_SEARCH_ENDPOINT_ID"
+        value = var.enable_vertex_vector_search ? google_vertex_ai_index_endpoint.sec_10k_chunks_endpoint[0].id : ""
+      }
+
+      env {
+        name  = "VERTEX_VECTOR_SEARCH_PUBLIC_DOMAIN"
+        value = var.enable_vertex_vector_search ? google_vertex_ai_index_endpoint.sec_10k_chunks_endpoint[0].public_endpoint_domain_name : ""
+      }
+
+      env {
+        name = "VERTEX_VECTOR_SEARCH_DEPLOYED_INDEX_ID"
+        # Uses the variable (not the resource) so Cloud Run updates don't block on
+        # the 20-40 minute index deployment.
+        value = var.enable_vertex_vector_search && var.deploy_vertex_vector_index ? var.vector_search_deployed_index_id : ""
+      }
+
+      env {
         name  = "CLOUD_IDENTITY_DOMAIN"
         value = var.cloud_identity_domain
       }
@@ -374,7 +407,7 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.managed_secrets["sec-edgar-iap-audience"].secret_id
-            version = "latest"
+            version = length(google_secret_manager_secret_version.iap_audience) > 0 ? google_secret_manager_secret_version.iap_audience[0].version : "latest"
           }
         }
       }

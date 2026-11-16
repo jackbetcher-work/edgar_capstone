@@ -158,11 +158,7 @@ output "cloud_run_service_uri" {
 
 output "iap_backend_service_audience" {
   description = "Expected IAP JWT 'aud' claim string for the IAP-protected Cloud Run backend service."
-  value = (
-    var.enable_iap_backend_service && var.enable_cloud_run_service
-    ? "/projects/${data.google_project.current.number}/global/backendServices/${google_compute_backend_service.sec_edgar_iap_backend[0].generated_id}"
-    : null
-  )
+  value       = local.iap_backend_audience
 }
 
 output "model_armor_template_name" {
@@ -203,4 +199,19 @@ output "telemetry_cost_and_latency_view_fqn" {
 output "firestore_feedback_database_name" {
   description = "Firestore Native database resource name persisting analyst thumbs-up/down feedback and comments."
   value       = var.enable_firestore_feedback ? google_firestore_database.analyst_feedback_db[0].name : null
+}
+
+output "lb_ip_address" {
+  description = "Static global IPv4 address of the HTTPS load balancer (point your DNS A record here if lb_domain is set)."
+  value       = local.enable_https_lb ? google_compute_global_address.sec_edgar_lb_ip[0].address : null
+}
+
+output "app_url" {
+  description = "Public IAP-protected application URL served through the HTTPS load balancer."
+  value       = local.enable_https_lb ? "https://${local.lb_domain}" : null
+}
+
+output "vertex_vector_search_deployed_index_id" {
+  description = "Deployed index ID on the Vector Search endpoint (VERTEX_VECTOR_SEARCH_DEPLOYED_INDEX_ID)."
+  value       = length(google_vertex_ai_index_endpoint_deployed_index.sec_10k_chunks_deployed) > 0 ? google_vertex_ai_index_endpoint_deployed_index.sec_10k_chunks_deployed[0].deployed_index_id : null
 }

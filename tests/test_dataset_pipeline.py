@@ -18,10 +18,13 @@ from edgar_capstone.dataset.constituents import (
     normalize_edgar_ticker,
 )
 from edgar_capstone.dataset.extractor import (
+    _extract_single_section,
     clean_markdown_section,
     extract_company_10k_bundles,
     extract_financial_metrics,
     format_combined_10k_markdown,
+    is_substantive_section_markdown,
+    reconcile_company_fiscal_years,
     resolve_fiscal_year,
 )
 from edgar_capstone.dataset.gcs_storage import (
@@ -352,4 +355,321 @@ def test_terraform_manages_sec_corpus_bucket_and_wires_dependents() -> None:
     assert "local.sec_corpus_bucket_name" in iam_tf
     assert "sec_corpus_bucket_name" in outputs_tf
     assert "sec_corpus_bucket_url" in outputs_tf
+
+
+def test_resolve_and_reconcile_fiscal_year_dei_typos() -> None:
+    # June-Dec period ends must never adopt a stale prior-year DEI tag (ALB, ACGL, COHR bugs)
+    assert resolve_fiscal_year(dei_fiscal_year="2021", report_date_str="2022-12-31") == 2022
+    assert resolve_fiscal_year(dei_fiscal_year="2020", report_date_str="2021-12-31") == 2021
+    assert resolve_fiscal_year(dei_fiscal_year="2020", report_date_str="2021-06-30") == 2021
+
+    # Out-of-range Jan-May DEI tags fall back to report_date
+    assert resolve_fiscal_year(dei_fiscal_year="2022", report_date_str="2025-01-31") == 2025
+
+    # CRWD Jan 31 mixed DEI offsets (4 filings with offset 0, 3 filings with offset -1)
+    crwd_series = [
+        ("2026-01-31", 2026),
+        ("2025-01-31", 2024),
+        ("2024-01-31", 2023),
+        ("2023-01-31", 2022),
+        ("2022-01-31", 2022),
+        ("2021-01-31", 2021),
+        ("2020-01-31", 2020),
+    ]
+    assert reconcile_company_fiscal_years(crwd_series) == [
+        2026,
+        2025,
+        2024,
+        2023,
+        2022,
+        2021,
+        2020,
+    ]
+
+    # Consistent -1 retail convention (e.g., Home Depot Feb year-end) stays untouched
+    hd_series = [("2026-02-01", 2025), ("2025-02-02", 2024), ("2024-01-28", 2023)]
+    assert reconcile_company_fiscal_years(hd_series) == [2025, 2024, 2023]
+
+
+def test_extract_financial_metrics_dimensional_reit_and_bank_cases() -> None:
+    # 1. APA case: fin.get_revenue() leaks a $35M dimensional breakdown row while consolidated is $19.47B
+    apa_df = pd.DataFrame(
+        [
+            {
+                "concept": "us-gaap_Revenues",
+                "label": "Total revenues",
+                "2024-12-31 (FY)": 19474000000.0,
+                "dimension": False,
+                "is_breakdown": False,
+                "abstract": False,
+            },
+            {
+                "concept": "us-gaap_Revenues",
+                "label": "Kinetik",
+                "2024-12-31 (FY)": 35000000.0,
+                "dimension": True,
+                "is_breakdown": True,
+                "abstract": False,
+            },
+        ]
+    )
+    apa_tenk = SimpleNamespace(
+        financials=SimpleNamespace(
+            get_revenue=lambda: 35000000.0,
+            get_operating_income=lambda: 1535000000.0,
+            get_net_income=lambda: 1118000000.0,
+            income_statement=lambda: SimpleNamespace(to_dataframe=lambda: apa_df),
+        )
+    )
+    rev, op_inc, net_inc, _ = extract_financial_metrics(apa_tenk, report_date_str="2024-12-31")
+    assert rev == 19474000000.0
+    assert op_inc == 1535000000.0
+    assert net_inc == 1118000000.0
+
+    # 2. CPT Equity REIT case: ASC 842 OperatingLeaseLeaseIncome ($1.54B) vs minor ASC 606 fees ($7.14M)
+    cpt_df = pd.DataFrame(
+        [
+            {
+                "concept": "us-gaap_OperatingLeaseLeaseIncome",
+                "label": "Property revenues",
+                "2024-12-31 (FY)": 1543842000.0,
+                "dimension": False,
+                "is_breakdown": False,
+                "abstract": False,
+            },
+            {
+                "concept": "us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax",
+                "label": "Fee and asset management",
+                "2024-12-31 (FY)": 7137000.0,
+                "dimension": False,
+                "is_breakdown": False,
+                "abstract": False,
+            },
+            {
+                "concept": "us-gaap_OperatingIncomeLoss",
+                "label": "Operating income",
+                "2024-12-31 (FY)": 173766000.0,
+                "dimension": False,
+                "is_breakdown": False,
+                "abstract": False,
+            },
+            {
+                "concept": "us-gaap_NetIncomeLoss",
+                "label": "Net income",
+                "2024-12-31 (FY)": 163293000.0,
+                "dimension": False,
+                "is_breakdown": False,
+                "abstract": False,
+            },
+        ]
+    )
+    cpt_tenk = SimpleNamespace(
+        financials=SimpleNamespace(
+            get_revenue=lambda: 7137000.0,
+            get_operating_income=lambda: 173766000.0,
+            get_net_income=lambda: 163293000.0,
+            income_statement=lambda: SimpleNamespace(to_dataframe=lambda: cpt_df),
+        )
+    )
+    cpt_rev, _, _, cpt_prov = extract_financial_metrics(cpt_tenk, report_date_str="2024-12-31")
+    assert cpt_rev == 1543842000.0
+    assert cpt_prov.revenue == "us-gaap:OperatingLeaseLeaseIncome"
+
+    # 3. BK / CASY company-extension total revenue & pre-tax income fallback
+    bk_df = pd.DataFrame(
+        [
+            {
+                "concept": "bk_TotalRevenuesIncludingRevenueGeneratedByVariableInterestEntities",
+                "label": "Total revenue",
+                "2025-12-31 (FY)": 20080000000.0,
+                "dimension": False,
+                "is_breakdown": False,
+                "abstract": False,
+            },
+            {
+                "concept": "bk_IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
+                "label": "Income before income taxes",
+                "2025-12-31 (FY)": 7058000000.0,
+                "dimension": False,
+                "is_breakdown": False,
+                "abstract": False,
+            },
+            {
+                "concept": "us-gaap_NetIncomeLoss",
+                "label": "Net income",
+                "2025-12-31 (FY)": 5549000000.0,
+                "dimension": False,
+                "is_breakdown": False,
+                "abstract": False,
+            },
+        ]
+    )
+    bk_tenk = SimpleNamespace(
+        financials=SimpleNamespace(
+            get_revenue=lambda: None,
+            get_operating_income=lambda: None,
+            get_net_income=lambda: 5549000000.0,
+            income_statement=lambda: SimpleNamespace(to_dataframe=lambda: bk_df),
+        )
+    )
+    bk_rev, bk_op, bk_ni, bk_prov = extract_financial_metrics(bk_tenk)
+    assert bk_rev == 20080000000.0
+    assert bk_op == 7058000000.0
+    assert bk_ni == 5549000000.0
+    assert bk_prov.notes
+
+
+def test_section_validation_and_exhibit_fallbacks() -> None:
+    # Reject cross-reference stubs and wrong footnote/item anchors
+    stub_7 = (
+        "The information required by Item 7 is set forth in Exhibit 13 "
+        "and is incorporated herein by reference. " * 3
+    )
+    assert not is_substantive_section_markdown(stub_7, item_id="item_7")
+    assert not is_substantive_section_markdown(
+        "7. Property, Plant and Equipment, Net\n\n" + ("Depreciation schedule details. " * 120),
+        item_id="item_7",
+    )
+    assert not is_substantive_section_markdown(
+        "**Item 1. Business**\n\n" + ("Company overview and history. " * 120),
+        item_id="item_1a",
+    )
+
+    # Full-filing Markdown fallback for `# ITEM 1.A. RISK FACTORS` + EX-13 exhibit fallback for MD&A
+    stub_sec_7 = SimpleNamespace(markdown=lambda: stub_7)
+    fake_tenk = SimpleNamespace(
+        sections={"part_ii_item_7": stub_sec_7},
+        risk_factors=None,
+        management_discussion=stub_7,
+    )
+    full_10k_md = (
+        "| Item 1.A. | Risk Factors | 12 |\n"
+        "| Item 1.B. | Unresolved Staff Comments | 25 |\n\n"
+        "# ITEM 1.A. RISK FACTORS\n\n"
+        + ("Supply chain and raw material inflation risk analysis. " * 120)
+        + "\n\n# ITEM 1.B. UNRESOLVED STAFF COMMENTS\n\nNone.\n"
+    )
+    ex13_md = (
+        "## MANAGEMENT'S DISCUSSION AND ANALYSIS OF FINANCIAL CONDITION AND RESULTS OF OPERATIONS\n\n"
+        + ("Consolidated net sales increased 8% driven by volume and price mix. " * 120)
+        + "\n\n## Report of Independent Registered Public Accounting Firm\n\nAudit opinion text.\n"
+    )
+    fake_ex13 = SimpleNamespace(
+        document_type="EX-13.1",
+        document="annual_report.htm",
+        markdown=lambda: ex13_md,
+    )
+    fake_filing = SimpleNamespace(
+        markdown=lambda: full_10k_md,
+        attachments=[fake_ex13],
+    )
+
+    cache: dict[str, object] = {}
+    extracted_1a = _extract_single_section(
+        fake_tenk,
+        section_keys=("part_i_item_1a", "item_1a"),
+        fallback_attr="risk_factors",
+        item_key="Item 1A",
+        item_id="item_1a",
+        filing=fake_filing,
+        markdown_cache=cache,
+    )
+    extracted_7 = _extract_single_section(
+        fake_tenk,
+        section_keys=("part_ii_item_7", "item_7"),
+        fallback_attr="management_discussion",
+        item_key="Item 7",
+        item_id="item_7",
+        filing=fake_filing,
+        markdown_cache=cache,
+    )
+    assert extracted_1a is not None and "Supply chain and raw material" in extracted_1a
+    assert extracted_7 is not None and "Consolidated net sales increased 8%" in extracted_7
+
+
+def test_unhealthy_cache_invalidation_and_stale_pruning(tmp_path: Path) -> None:
+    # Pre-seed an unhealthy cached bundle where 2022-12-31 was mis-saved under FY2021
+    struct_dir = tmp_path / "structured" / "ALB"
+    unstruct_dir = tmp_path / "unstructured" / "ALB"
+    struct_dir.mkdir(parents=True)
+    unstruct_dir.mkdir(parents=True)
+
+    bad_md = format_combined_10k_markdown(
+        ticker="ALB",
+        company_name="ALBEMARLE CORP",
+        cik="0000915913",
+        gics_sector="Materials",
+        gics_sub_industry="Specialty Chemicals",
+        fiscal_year=2021,
+        period_of_report="2022-12-31",
+        filing_date="2023-02-15",
+        accession_number="0000915913-23-000039",
+        sec_filing_url="https://www.sec.gov/Archives/edgar/data/915913/alb-20221231.htm",
+        item_1a_markdown="Lithium market risk factors. " * 25,
+        item_7_markdown="Lithium segment results and outlook. " * 25,
+    )
+    (unstruct_dir / "2021_10k.md").write_text(bad_md, encoding="utf-8")
+    (struct_dir / "2021_financials.json").write_text(
+        json.dumps(
+            {
+                "profile_id": "ALB_2021",
+                "ticker": "ALB",
+                "cik": "0000915913",
+                "company_name": "ALBEMARLE CORP",
+                "gics_sector": "Materials",
+                "gics_sub_industry": "Specialty Chemicals",
+                "form_type": "10-K",
+                "fiscal_year": 2021,
+                "fiscal_period": "FY",
+                "period_of_report": "2022-12-31",
+                "filing_date": "2023-02-15",
+                "accession_number": "0000915913-23-000039",
+                "currency": "USD",
+                "revenue": 7320104000.0,
+                "operating_income": 2470061000.0,
+                "net_income": 2689816000.0,
+                "extracted_sections": ["item_1a", "item_7"],
+                "unstructured_blob_path": "unstructured/ALB/2021_10k.md",
+                "structured_blob_path": "structured/ALB/2021_financials.json",
+                "unstructured_gcs_uri": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/ALB/2021_10k.md",
+                "structured_gcs_uri": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/structured/ALB/2021_financials.json",
+                "sec_filing_url": "https://www.sec.gov/Archives/edgar/data/915913/alb-20221231.htm",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    filing_2022 = _make_fake_filing(
+        accession_no="0000915913-23-000039",
+        filing_date="2023-02-15",
+        report_date="2022-12-31",
+        dei_fy="2021",  # Filer DEI typo!
+        revenue=7320104000.0,
+    )
+    fake_collection = MagicMock()
+    fake_collection.filter.return_value = [filing_2022]
+    fake_company = MagicMock()
+    fake_company.not_found = False
+    fake_company.cik = 915913
+    fake_company.name = "ALBEMARLE CORP"
+    fake_company.get_filings.return_value = fake_collection
+
+    cfg = DatasetBuildConfig(
+        output_dir=tmp_path,
+        start_year=2021,
+        end_year=2022,
+        tickers=["ALB"],
+        skip_existing=True,
+        local_only=True,
+    )
+    with patch("edgar_capstone.dataset.extractor.edgar.Company", return_value=fake_company):
+        summary = run_dataset_pipeline(cfg)
+
+    assert summary.total_profiles == 1
+    # Mis-keyed 2021 file was invalidated and pruned; 2022 file was created
+    assert not (struct_dir / "2021_financials.json").exists()
+    assert not (unstruct_dir / "2021_10k.md").exists()
+    assert (struct_dir / "2022_financials.json").exists()
+    assert (unstruct_dir / "2022_10k.md").exists()
+
 

@@ -9,6 +9,13 @@ data "google_project" "current" {
 }
 
 locals {
+  # Expected IAP JWT `aud` claim; stored in the sec-edgar-iap-audience secret.
+  iap_backend_audience = (
+    var.enable_iap_backend_service && var.enable_cloud_run_service
+    ? "/projects/${data.google_project.current.number}/global/backendServices/${google_compute_backend_service.sec_edgar_iap_backend[0].generated_id}"
+    : null
+  )
+
   effective_iap_group_principals = setunion(
     toset(var.iap_authorized_principals),
     local.bind_cloud_identity_groups ? local.all_rbac_group_members : toset([]),
@@ -24,7 +31,9 @@ resource "google_compute_region_network_endpoint_group" "sec_edgar_serverless_ne
   region                = var.region
 
   cloud_run {
-    service = google_cloud_run_v2_service.sec_edgar_analyst[0].name
+    # Reference by name (not the resource) to avoid a dependency cycle:
+    # Cloud Run -> IAP audience secret -> backend service -> NEG -> Cloud Run.
+    service = var.cloud_run_service_name
   }
 
   depends_on = [google_project_service.required_apis]

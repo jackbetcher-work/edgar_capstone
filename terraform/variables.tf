@@ -311,3 +311,56 @@ variable "labels" {
     managed_by  = "terraform"
   }
 }
+
+# ------------------------------------------------------------------------------
+# HTTPS Load Balancer
+# ------------------------------------------------------------------------------
+variable "enable_https_load_balancer" {
+  description = "Whether to provision the global external HTTPS load balancer in front of the IAP backend service."
+  type        = bool
+  default     = true
+}
+
+variable "lb_domain" {
+  description = "FQDN for the Google-managed TLS certificate. Leave empty to use <lb-ip>.nip.io (no DNS setup needed). If set, create an A record pointing to the lb_ip_address output."
+  type        = string
+  default     = ""
+}
+
+# ------------------------------------------------------------------------------
+# Vertex AI Vector Search Index Deployment
+# ------------------------------------------------------------------------------
+variable "deploy_vertex_vector_index" {
+  description = "Whether to deploy the Vector Search index to the index endpoint (incurs always-on node cost)."
+  type        = bool
+  default     = true
+}
+
+variable "vector_search_deployed_index_id" {
+  description = "Deployed index ID on the endpoint (letters, numbers, underscores; must start with a letter)."
+  type        = string
+  default     = "deployed_sec_10k_chunks_v1"
+
+  validation {
+    condition     = can(regex("^[A-Za-z][A-Za-z0-9_]*$", var.vector_search_deployed_index_id))
+    error_message = "deployed_index_id must start with a letter and contain only letters, numbers, and underscores."
+  }
+}
+
+variable "vector_search_machine_type" {
+  description = "Machine type serving the deployed index (e2-standard-2 is the cheapest option for SHARD_SIZE_SMALL)."
+  type        = string
+  default     = "e2-standard-2"
+}
+
+variable "vector_search_min_replicas" {
+  description = "Minimum replicas for the deployed index."
+  type        = number
+  default     = 1
+}
+
+variable "vector_search_max_replicas" {
+  description = "Maximum replicas for the deployed index."
+  type        = number
+  default     = 1
+}

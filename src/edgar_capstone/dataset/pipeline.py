@@ -7,6 +7,7 @@ from datetime import date
 import json
 import logging
 from pathlib import Path
+import re
 
 from google.cloud import storage
 
@@ -16,8 +17,11 @@ from edgar_capstone.dataset.constituents import (
 )
 from edgar_capstone.dataset.extractor import (
     DEFAULT_SEC_USER_AGENT,
+    MIN_SUBSTANTIVE_SECTION_CHARS,
     configure_sec_identity,
     extract_company_10k_bundles,
+    is_substantive_section_markdown,
+    resolve_fiscal_year,
 )
 from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_BUCKET_NAME,
@@ -26,7 +30,6 @@ from edgar_capstone.dataset.gcs_storage import (
     normalize_bucket_name,
     upload_staged_dataset,
 )
-from edgar_capstone.dataset.paths import CURATED_DATASET_DIRNAME, resolve_data_root
 from edgar_capstone.dataset.models import (
     DatasetBuildSummary,
     ExtractedFilingBundle,
@@ -36,9 +39,15 @@ from edgar_capstone.dataset.models import (
 
 logger = logging.getLogger(__name__)
 
-# Resolved via `paths.resolve_data_root()` so non-editable installs (e.g. the
-# Cloud Run container's /opt/venv site-packages) still locate `/app/data/curated_dataset`.
-DEFAULT_OUTPUT_DIR = resolve_data_root() / CURATED_DATASET_DIRNAME
+DEFAULT_OUTPUT_DIR = (
+    Path(__file__).resolve().parents[3] / "data" / "curated_dataset"
+)
+
+_CACHED_MD_SPLIT_RE = re.compile(
+    r"^## Item 1A\. Risk Factors\n(.*?)\n---\n\n"
+    r"## Item 7\. Management's Discussion and Analysis of Financial Condition and Results of Operations\n(.*)$",
+    re.MULTILINE | re.DOTALL,
+)
 
 
 @dataclass(slots=True)
@@ -64,17 +73,65 @@ class DatasetBuildConfig:
     max_upload_workers: int = 8
 
 
+def _is_cached_bundle_healthy(bundle: ExtractedFilingBundle) -> bool:
+    """Validate that a locally staged bundle has clean FY metadata, sections, and financials."""
+    prof = bundle.profile
+
+    # 1. Fiscal year must be consistent with period_of_report
+    expected_fy = resolve_fiscal_year(
+        dei_fiscal_year=prof.fiscal_year,
+        report_date_str=prof.period_of_report,
+    )
+    if expected_fy != prof.fiscal_year:
+        return False
+
+    # 2. Both Item 1A and Item 7 must be present and free of cross-reference stubs / wrong anchors
+    if "item_1a" not in prof.extracted_sections or "item_7" not in prof.extracted_sections:
+        return False
+
+    match = _CACHED_MD_SPLIT_RE.search(bundle.markdown_content)
+    if not match:
+        return False
+    sec_1a = match.group(1).strip()
+    sec_7 = match.group(2).strip()
+    if not is_substantive_section_markdown(sec_1a, item_id="item_1a"):
+        return False
+    if not is_substantive_section_markdown(sec_7, item_id="item_7"):
+        return False
+    # If one section is full-sized SEC text (>=2k chars) and the other is a tiny fragment (<1.5k),
+    # treat as truncated so full-document/exhibit fallback can recover it.
+    if max(len(sec_1a), len(sec_7)) >= MIN_SUBSTANTIVE_SECTION_CHARS and min(
+        len(sec_1a), len(sec_7)
+    ) < 1500:
+        return False
+
+    # 3. Structured financial metrics must be populated and free of dimensional/REIT scale inversions
+    if (
+        prof.revenue is None
+        or prof.revenue <= 0
+        or prof.operating_income is None
+        or prof.net_income is None
+    ):
+        return False
+    if prof.operating_income > 0 and prof.operating_income > 1.5 * prof.revenue:
+        return False
+    if prof.net_income > 0 and prof.net_income > 1.5 * prof.revenue:
+        return False
+
+    return True
+
+
 def _load_existing_company_bundles(
     output_dir: Path,
     ticker: str,
     bucket_name: str,
 ) -> dict[str, ExtractedFilingBundle]:
-    """Load already-staged bundles for `ticker` keyed by accession_number."""
+    """Load validated already-staged bundles for `ticker` keyed by accession_number."""
     struct_dir = output_dir / "structured" / ticker
     if not struct_dir.exists():
         return {}
 
-    by_accession: dict[str, ExtractedFilingBundle] = {}
+    raw_bundles: list[ExtractedFilingBundle] = []
     for json_file in sorted(struct_dir.glob("*_financials.json")):
         try:
             profile = FinancialDataProfile.model_validate_json(
@@ -83,19 +140,46 @@ def _load_existing_company_bundles(
             md_file = output_dir / profile.unstructured_blob_path
             if not md_file.exists():
                 continue
-            # Keep gs:// URIs aligned with the active target bucket
             profile.unstructured_gcs_uri = (
                 f"gs://{bucket_name}/{profile.unstructured_blob_path}"
             )
             profile.structured_gcs_uri = (
                 f"gs://{bucket_name}/{profile.structured_blob_path}"
             )
-            by_accession[profile.accession_number] = ExtractedFilingBundle(
-                profile=profile,
-                markdown_content=md_file.read_text(encoding="utf-8"),
+            raw_bundles.append(
+                ExtractedFilingBundle(
+                    profile=profile,
+                    markdown_content=md_file.read_text(encoding="utf-8"),
+                )
             )
         except Exception as exc:
             logger.warning("Ignoring unreadable cached profile %s: %s", json_file, exc)
+
+    if not raw_bundles:
+        return {}
+
+    # If the cached series has a fiscal-year gap (e.g., mixed Jan-May DEI offsets on CRWD),
+    # force a clean series re-evaluation so no dropped year remains missing.
+    fys = sorted({b.profile.fiscal_year for b in raw_bundles})
+    if len(fys) >= 2 and (fys[-1] - fys[0] + 1) != len(fys):
+        logger.info(
+            "[%s] Cached fiscal years %s contain a gap; re-evaluating series from SEC EDGAR.",
+            ticker,
+            fys,
+        )
+        return {}
+
+    by_accession: dict[str, ExtractedFilingBundle] = {}
+    for bundle in raw_bundles:
+        if _is_cached_bundle_healthy(bundle):
+            by_accession[bundle.profile.accession_number] = bundle
+        else:
+            logger.info(
+                "[%s] Invalidating unhealthy cached FY%d bundle (%s) for re-extraction.",
+                ticker,
+                bundle.profile.fiscal_year,
+                bundle.profile.accession_number,
+            )
 
     return by_accession
 
@@ -113,6 +197,39 @@ def _write_bundle_to_disk(output_dir: Path, bundle: ExtractedFilingBundle) -> No
         json.dumps(bundle.profile.model_dump(mode="json"), indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _prune_stale_company_files(
+    output_dir: Path,
+    ticker: str,
+    *,
+    start_year: int,
+    end_year: int,
+    valid_fiscal_years: set[int],
+) -> None:
+    """Remove any orphaned per-year files in `[start_year, end_year]` after fiscal-year repairs."""
+    struct_dir = output_dir / "structured" / ticker
+    unstruct_dir = output_dir / "unstructured" / ticker
+
+    if struct_dir.exists():
+        for json_file in struct_dir.glob("*_financials.json"):
+            m = re.match(r"^(\d{4})_financials\.json$", json_file.name)
+            if not m:
+                continue
+            fy = int(m.group(1))
+            if start_year <= fy <= end_year and fy not in valid_fiscal_years:
+                logger.info("[%s] Removing stale cached file %s", ticker, json_file)
+                json_file.unlink(missing_ok=True)
+
+    if unstruct_dir.exists():
+        for md_file in unstruct_dir.glob("*_10k.md"):
+            m = re.match(r"^(\d{4})_10k\.md$", md_file.name)
+            if not m:
+                continue
+            fy = int(m.group(1))
+            if start_year <= fy <= end_year and fy not in valid_fiscal_years:
+                logger.info("[%s] Removing stale cached file %s", ticker, md_file)
+                md_file.unlink(missing_ok=True)
 
 
 def _collect_all_staged_profiles(
@@ -241,6 +358,13 @@ def run_dataset_pipeline(
                 all_warnings.extend(comp_warnings)
                 for bundle in bundles:
                     _write_bundle_to_disk(output_dir, bundle)
+                _prune_stale_company_files(
+                    output_dir,
+                    constituent.ticker,
+                    start_year=config.start_year,
+                    end_year=config.end_year,
+                    valid_fiscal_years={b.profile.fiscal_year for b in bundles},
+                )
                 processed_tickers.append(constituent.ticker)
             except Exception as exc:
                 err_msg = str(exc)

@@ -51,6 +51,32 @@ resource "google_vertex_ai_index_endpoint" "sec_10k_chunks_endpoint" {
   depends_on = [google_project_service.required_apis]
 }
 
+# Deploys the index onto the public endpoint so it can serve find_neighbors
+# queries. Deployment typically takes 20-40 minutes. SHARD_SIZE_SMALL indexes
+# can be served on e2-standard-2 machines.
+resource "google_vertex_ai_index_endpoint_deployed_index" "sec_10k_chunks_deployed" {
+  count = var.enable_vertex_vector_search && var.deploy_vertex_vector_index ? 1 : 0
+
+  index_endpoint    = google_vertex_ai_index_endpoint.sec_10k_chunks_endpoint[0].id
+  index             = google_vertex_ai_index.sec_10k_chunks[0].id
+  deployed_index_id = var.vector_search_deployed_index_id
+  display_name      = "sec-edgar-10k-chunks-deployed"
+
+  dedicated_resources {
+    machine_spec {
+      machine_type = var.vector_search_machine_type
+    }
+    min_replica_count = var.vector_search_min_replicas
+    max_replica_count = var.vector_search_max_replicas
+  }
+
+  timeouts {
+    create = "90m"
+    update = "90m"
+    delete = "60m"
+  }
+}
+
 # ------------------------------------------------------------------------------
 # Vertex AI Search (Discovery Engine) Data Store & Hybrid Search Engine
 # ------------------------------------------------------------------------------

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import date
 import logging
 import math
 import re
-from typing import Any
+import time
+from typing import Any, Callable, Literal, TypeVar
+import warnings as py_warnings
 
 import edgar
 from edgar import CompanyNotFoundError
@@ -21,21 +24,43 @@ from edgar_capstone.dataset.models import (
 
 logger = logging.getLogger(__name__)
 
+_T = TypeVar("_T")
+
 DEFAULT_SEC_USER_AGENT = (
     "FDE SEC Edgar Capstone sec-analyst-sa@fde-sec-edgar-sandbox-dev.iam.gserviceaccount.com"
 )
 
-# Ordered US-GAAP fallback concepts when high-level helpers return None
-# (e.g., banking, insurance, energy, or utility single-step income statements).
-REVENUE_FALLBACK_CONCEPTS: tuple[str, ...] = (
+# Consolidated top-line revenue concepts checked first on non-dimensional income statements.
+CONSOLIDATED_TOTAL_REVENUE_CONCEPTS: tuple[str, ...] = (
     "us-gaap_Revenues",
-    "us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax",
-    "us-gaap_RevenueFromContractWithCustomerIncludingAssessedTax",
     "us-gaap_SalesRevenueNet",
     "us-gaap_RevenuesNetOfInterestExpense",
     "us-gaap_TotalRevenuesAndOtherIncome",
+    "us-gaap_RealEstateRevenueNet",
     "us-gaap_RegulatedAndUnregulatedOperatingRevenue",
+)
+
+# Component / standard-specific revenue concepts (ASC 606, ASC 842 REIT leases, healthcare, insurance).
+# When no explicit consolidated total-revenue tag exists (e.g., Equity REITs reporting separate
+# OperatingLeaseLeaseIncome and minor ASC 606 fee lines), we select the largest positive line.
+COMPONENT_REVENUE_CONCEPTS: tuple[str, ...] = (
+    "us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax",
+    "us-gaap_RevenueFromContractWithCustomerIncludingAssessedTax",
+    "us-gaap_OperatingLeaseLeaseIncome",
+    "us-gaap_LeaseIncome",
     "us-gaap_HealthCareOrganizationRevenue",
+    "us-gaap_PremiumsEarnedNet",
+    "us-gaap_InterestAndDividendIncomeOperating",
+)
+
+# Combined tuple preserved for backwards compatibility
+REVENUE_FALLBACK_CONCEPTS: tuple[str, ...] = (
+    *CONSOLIDATED_TOTAL_REVENUE_CONCEPTS,
+    *COMPONENT_REVENUE_CONCEPTS,
+)
+
+OPERATING_INCOME_CONCEPTS: tuple[str, ...] = (
+    "us-gaap_OperatingIncomeLoss",
 )
 
 OPERATING_INCOME_FALLBACK_CONCEPTS: tuple[str, ...] = (
@@ -43,6 +68,7 @@ OPERATING_INCOME_FALLBACK_CONCEPTS: tuple[str, ...] = (
     "us-gaap_IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
     "us-gaap_IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
     "us-gaap_IncomeLossFromContinuingOperationsBeforeIncomeTaxesDomestic",
+    "us-gaap_IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
 )
 
 NET_INCOME_FALLBACK_CONCEPTS: tuple[str, ...] = (
@@ -51,14 +77,137 @@ NET_INCOME_FALLBACK_CONCEPTS: tuple[str, ...] = (
     "us-gaap_NetIncomeLossAvailableToCommonStockholdersBasic",
 )
 
-_TOC_TAG_RE = re.compile(
-    r"(?im)^\s*(?:<u>\s*Table of Contents\s*</u>|\[Table of Contents\]\([^)]*\)|Table of Contents)\s*$"
-)
-_LEADING_ITEM_HEADER_RE = re.compile(
-    r"^\s*(?:#{1,4}\s*|\*\*)?Item\s+(?:1A|7)\b[^\n]*?(?:\*\*)?\s*\n+",
+_TOTAL_REVENUE_LABEL_RE = re.compile(
+    r"^\s*total\s+(?:revenues?|net\s+revenues?|operating\s+revenues?|net\s+sales|sales\s+and\s+revenues?)\s*:?\s*$",
     re.IGNORECASE,
 )
+_OPERATING_INCOME_LABEL_RE = re.compile(
+    r"^\s*(?:operating\s+(?:income|profit|loss|income\s*\(loss\)|loss\s*\(income\))|(?:income|loss)\s+from\s+operations)\s*:?\s*$",
+    re.IGNORECASE,
+)
+_PRETAX_INCOME_LABEL_RE = re.compile(
+    r"^\s*(?:net\s+)?(?:income|earnings|loss|\(loss\)\s*income|income\s*\(loss\)|loss\s*\(income\))\s+"
+    r"(?:from\s+continuing\s+operations\s+)?before\s+"
+    r"(?:provision\s+for\s+|federal\s+and\s+state\s+)?income\s+taxes"
+    r"(?:\s+and\s+[^\n]{1,60})?\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+_TOC_TAG_RE = re.compile(
+    r"(?im)^\s*(?:<u>\s*Table\s+of\s+Contents\s*</u>|\*\*Table\s+of\s+Contents\*\*|\[Table\s+of\s+Contents\]\([^)]*\)|Table\s+of\s+Contents)\s*$"
+)
+_RUNNING_PAGE_HEADER_RE = re.compile(
+    r"(?im)^(?:"
+    r"#{1,4}\s*MANAGEMENT['\u2019]?S\s+DISCUSSION\s+AND\s+ANALYSIS\s+OF\s+FINANCIAL\s+CONDITION\s+AND\s+RESULTS\s+OF\s+OPERATIONS\s*|"
+    r"\|\s*(?:Results\s+of\s+Operations|Risk\s+Factors|Forward-looking\s+Statements|MD&A)\s*\(continued\)\s*\|\s*"
+    r")$"
+)
+_LEADING_ITEM_HEADER_RE = re.compile(
+    r"^\s*(?:\|\s*---[^\n]*\n+\s*)?(?:\|\s*)?(?:#{1,4}\s*|\*\*)?(?:PART\s+I{1,2}[\s.\\—–|-]*)?Item\s+(?:1\\?\.?A|7)\\?\.?\b[^\n]*?(?:\*\*)?(?:\s*\|)?\s*(?:\n\s*\|\s*---[^\n]*)?\n+",
+    re.IGNORECASE,
+)
+_LEADING_TABLE_RULE_RE = re.compile(r"^\s*(?:\|\s*---[^\n]*\|?\s*\n+)+")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
+
+# Minimum lengths for validating extracted 10-K sections
+MIN_ABSOLUTE_SECTION_CHARS = 350
+MIN_SUBSTANTIVE_SECTION_CHARS = 2000
+
+_CROSS_REF_STUB_RE = re.compile(
+    r"(?is)(?:"
+    r"incorporated\s+(?:herein\s+)?by\s+reference|"
+    r"reference\s+is\s+made\s+to\s+(?:the\s+section|page|item|exhibit)|"
+    r"information\s+(?:required|called\s+for)\s+by\s+(?:this\s+)?item(?:\s+(?:1\\?\.?a|7))?\s+(?:is\s+(?:set\s+forth|shown|presented)|appears)|"
+    r"(?:this\s+)?information\s+appears\s+under\s+[“\"']?(?:management|risk\s+factors)|"
+    r"index\s+to\s+management['\u2019]?s\s+discussion\s+and\s+analysis|"
+    r"is\s+shown\s+in\s+.*?exhibit\s+(?:13|99)"
+    r")"
+)
+_WRONG_ITEM_1A_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*|\*\*)?Item\s+1(?:\\?\.)?\s+Business\b",
+    re.IGNORECASE,
+)
+_WRONG_ITEM_7_FOOTNOTE_RE = re.compile(
+    r"^\s*(?:#{1,6}\s*|\*\*)?(?:Note\s+)?7\\?\.[\s\xa0]+(?!Management)",
+    re.IGNORECASE,
+)
+
+# Full-document Markdown fallback regexes (handling `# ITEM 1.A.`, `| ITEM 7. | ... |`, etc.)
+_TOC_PAGE_NUMBER_TAIL_RE = re.compile(r"(?:\|\s*\d{1,3}\s*\|\s*$|\s+\d{1,3}\s*\|\s*$)")
+
+_MD_ITEM_1A_START_RE = re.compile(
+    r"(?im)^(?:\|\s*)?(?:#{1,4}\s*|\*\*)?(?:PART\s+I[\s.|—–-]*)?ITEM\s+1\.?A\.?\b[^\n]{0,120}?risk\s+factors[^\n]*$"
+)
+_MD_ITEM_1A_END_RE = re.compile(
+    r"(?im)^(?:\|\s*)?(?:#{1,4}\s*|\*\*)?(?:PART\s+I{1,2}[\s.|—–-]*)?ITEM\s+(?:1\.?[BC]|2|3)\b[^\n]*$"
+)
+_MD_ITEM_7_START_RE = re.compile(
+    r"(?im)^(?:\|\s*)?(?:#{1,4}\s*|\*\*)?(?:PART\s+II[\s.|—–-]*)?ITEM\s+7(?!\s*\.?A)\b[^\n]{0,140}?management['\u2019]?s\s+discussion[^\n]*$"
+)
+_MD_ITEM_7_END_RE = re.compile(
+    r"(?im)^(?:\|\s*)?(?:#{1,4}\s*|\*\*)?(?:PART\s+(?:II|III)[\s.|—–-]*)?ITEM\s+(?:7\.?A|8|9)\b[^\n]*$"
+)
+
+# Annual Report / Financial Section standalone headings (e.g. XOM, CVX, BK EX-13, CLX EX-99.1)
+_AR_MDA_START_RE = re.compile(
+    r"(?im)^(?:\|\s*|\*\*\s*|#{1,4}\s*)?Management['\u2019]?s\s+Discussion\s+and\s+Analysis"
+    r"(?:\s+of\s+Financial\s+Condition(?:\s+and(?:\s+Results\s+of\s+Operations)?)?)?[\s*:|]*$"
+)
+_AR_MDA_END_RE = re.compile(
+    r"(?im)^(?:\|\s*|\*\*\s*|#{1,4}\s*)(?:"
+    r"Report\s+of\s+Independent\s+Registered\s+Public\s+Accounting\s+Firm|"
+    r"Management['\u2019]?s\s+Report\s+on\s+Internal\s+Control|"
+    r"Report\s+of\s+Management\b|"
+    r"Consolidated\s+Statements?\s+of\s+(?:Income|Operations|Earnings)\b|"
+    r"Statements?\s+of\s+Consolidated\s+(?:Income|Operations|Earnings)\b|"
+    r"Risk\s+Factors\s*(?:\|\s*)?$|"
+    r"Forward-Looking\s+Statements\s*(?:\|\s*)?$"
+    r")[^\n]*$"
+)
+_AR_RISK_START_RE = re.compile(
+    r"(?im)^(?:\|\s*|\*\*\s*|#{1,4}\s*)(?:MD&A\s*[–—-]\s*)?Risk\s+Factors(?:\s*\*\*|\s*\|)?\s*$"
+)
+_AR_RISK_END_RE = re.compile(
+    r"(?im)^(?:\|\s*|\*\*\s*|#{1,4}\s*)(?:"
+    r"Forward-Looking\s+Statements\b|"
+    r"Glossary\b|"
+    r"Report\s+of\s+Independent\s+Registered\s+Public\s+Accounting\s+Firm|"
+    r"Consolidated\s+Statements?\s+of\s+(?:Income|Operations|Earnings)\b|"
+    r"Quantitative\s+and\s+Qualitative\s+Disclosures\s+About\s+Market\s+Risk"
+    r")[^\n]*$"
+)
+
+
+def _retry_sec_call(
+    fn: Callable[[], _T],
+    *,
+    description: str,
+    max_attempts: int = 3,
+    base_delay: float = 1.5,
+) -> _T:
+    """Retry transient SEC EDGAR HTTP / socket operations with exponential backoff."""
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except CompanyNotFoundError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= max_attempts:
+                break
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "Transient error during %s (attempt %d/%d: %s); retrying in %.1fs...",
+                description,
+                attempt,
+                max_attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
 
 
 def configure_sec_identity(user_agent: str = DEFAULT_SEC_USER_AGENT) -> None:
@@ -92,37 +241,249 @@ def resolve_fiscal_year(
 ) -> int:
     """Determine the canonical fiscal year for a 10-K filing.
 
-    Prefers the authoritative XBRL `dei:DocumentFiscalYearFocus` (`entity_info['fiscal_year']`),
-    which handles January/February retail & tech fiscal year conventions accurately
-    (e.g., NVDA Jan 25, 2026 -> FY2026; HD Feb 1, 2026 -> FY2025).
-    Falls back to `report_date` if DEI metadata is unavailable.
+    Validates XBRL `dei:DocumentFiscalYearFocus` (`entity_info['fiscal_year']`) against
+    `report_date_str` to guard against filer DEI copy-paste typos (e.g., a 2022-12-31
+    10-K tagged with DEI fiscal_year=2021):
+      - Period end in June-December (`month >= 6`): fiscal year must equal `report_date.year`.
+      - Period end in January-May (`month <= 5`): fiscal year must be in
+        `{report_date.year - 1, report_date.year}` (accommodating both NVDA Jan 2026 -> FY2026
+        and HD Feb 2026 -> FY2025 conventions).
     """
+    parsed_date = date.fromisoformat(str(report_date_str).strip()[:10])
+    # 52/53-week calendar-year companies whose fiscal year spills a few days into early Jan
+    date_fallback_fy = (
+        parsed_date.year - 1
+        if (parsed_date.month == 1 and parsed_date.day <= 10)
+        else parsed_date.year
+    )
+
     if dei_fiscal_year is not None:
         try:
             fy = int(str(dei_fiscal_year).strip())
             if 1990 <= fy <= 2100:
-                return fy
+                if parsed_date.month >= 6:
+                    if fy == parsed_date.year:
+                        return fy
+                    logger.warning(
+                        "Ignoring implausible DEI fiscal_year=%d for period_of_report=%s; using %d",
+                        fy,
+                        report_date_str,
+                        parsed_date.year,
+                    )
+                    return parsed_date.year
+                if fy in (parsed_date.year - 1, parsed_date.year):
+                    return fy
+                logger.warning(
+                    "Ignoring out-of-range DEI fiscal_year=%d for period_of_report=%s; using %d",
+                    fy,
+                    report_date_str,
+                    date_fallback_fy,
+                )
         except ValueError:
             pass
 
-    parsed_date = date.fromisoformat(str(report_date_str).strip()[:10])
-    # 52/53-week calendar-year companies whose fiscal year spills a few days into Jan
-    if parsed_date.month == 1 and parsed_date.day <= 10:
-        return parsed_date.year - 1
-    return parsed_date.year
+    return date_fallback_fy
+
+
+def reconcile_company_fiscal_years(
+    report_dates_and_fys: list[tuple[str, int]],
+) -> list[int]:
+    """Normalize Jan-May fiscal year offsets across a company's multi-year 10-K series.
+
+    Some Jan-May filers (e.g., CrowdStrike Jan 31) have DEI `DocumentFiscalYearFocus`
+    tagged as `report_year` on most filings (2026-01-31 -> FY2026) but `report_year - 1`
+    on a subset (2025-01-31 -> DEI 2024), creating artificial collisions and year gaps.
+    When all filings share a Jan-May fiscal year-end (`month <= 5`, `day > 10`) and
+    exhibit mixed `{0, -1}` offsets, apply the majority offset (breaking ties with the
+    most recent filing).
+    """
+    if len(report_dates_and_fys) < 2:
+        return [fy for _, fy in report_dates_and_fys]
+
+    parsed = [
+        (date.fromisoformat(rd.strip()[:10]), fy) for rd, fy in report_dates_and_fys
+    ]
+    # Only normalize when the entire series consists of non-spillover Jan-May year-ends
+    if not all(d.month <= 5 and not (d.month == 1 and d.day <= 10) for d, _ in parsed):
+        return [fy for _, fy in report_dates_and_fys]
+
+    months = {d.month for d, _ in parsed}
+    if max(months) - min(months) > 1:
+        # Fiscal year-end month changed materially over time; keep individual resolutions
+        return [fy for _, fy in report_dates_and_fys]
+
+    offsets = [fy - d.year for d, fy in parsed]
+    distinct_offsets = set(offsets)
+    if len(distinct_offsets) <= 1 or not distinct_offsets.issubset({-1, 0}):
+        return [fy for _, fy in report_dates_and_fys]
+
+    counts = Counter(offsets)
+    # Newest filing is first in SEC EDGAR iteration order; sort by date desc to be explicit
+    newest_offset = max(zip(parsed, offsets), key=lambda item: item[0][0])[1]
+    canonical_offset = (
+        0
+        if (counts[0] > counts[-1] or (counts[0] == counts[-1] and newest_offset == 0))
+        else -1
+    )
+    return [d.year + canonical_offset for d, _ in parsed]
 
 
 def clean_markdown_section(raw_text: str) -> str:
     """Normalize extracted 10-K section Markdown for RAG chunking and source viewing."""
     text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
     text = _TOC_TAG_RE.sub("", text)
+    text = _RUNNING_PAGE_HEADER_RE.sub("", text)
     text = "\n".join(line.rstrip() for line in text.split("\n"))
     text = text.strip()
     # Strip redundant leading "Item 1A. Risk Factors" / "Item 7. MD&A" heading if present
     # since we render standardized H2 section headers in the combined document.
     text = _LEADING_ITEM_HEADER_RE.sub("", text, count=1).strip()
+    text = _LEADING_TABLE_RULE_RE.sub("", text).strip()
     text = _MULTI_NEWLINE_RE.sub("\n\n", text)
     return text
+
+
+def is_substantive_section_markdown(
+    cleaned_text: str | None,
+    *,
+    item_id: Literal["item_1a", "item_7"],
+    min_chars: int = MIN_ABSOLUTE_SECTION_CHARS,
+) -> bool:
+    """Return True if `cleaned_text` is genuine Item 1A / Item 7 prose rather than a stub or wrong anchor."""
+    if not cleaned_text or len(cleaned_text) < min_chars:
+        return False
+
+    head = cleaned_text[:300]
+    if item_id == "item_1a" and _WRONG_ITEM_1A_RE.match(head):
+        return False
+    if item_id == "item_7" and _WRONG_ITEM_7_FOOTNOTE_RE.match(head):
+        return False
+
+    if len(cleaned_text) < 2500 and _CROSS_REF_STUB_RE.search(cleaned_text):
+        return False
+
+    return True
+
+
+def _slice_markdown_between(
+    full_md: str,
+    *,
+    start_re: re.Pattern[str],
+    end_re: re.Pattern[str],
+    item_id: Literal["item_1a", "item_7"],
+    min_slice_chars: int = 1500,
+    max_slice_chars: int = 450_000,
+) -> str | None:
+    """Find the best substantive section slice between `start_re` and `end_re` in full Markdown."""
+    best_candidate: str | None = None
+    for m_start in start_re.finditer(full_md):
+        header_line = m_start.group(0)
+        if _TOC_PAGE_NUMBER_TAIL_RE.search(header_line):
+            continue
+
+        body_start = m_start.end()
+        end_pos = min(len(full_md), body_start + max_slice_chars)
+        for m_end in end_re.finditer(full_md, body_start + 400):
+            if _TOC_PAGE_NUMBER_TAIL_RE.search(m_end.group(0)):
+                continue
+            end_pos = m_end.start()
+            break
+
+        if end_pos - body_start < min_slice_chars:
+            continue
+
+        cleaned = clean_markdown_section(full_md[body_start:end_pos])
+        if is_substantive_section_markdown(
+            cleaned, item_id=item_id, min_chars=min_slice_chars
+        ):
+            if best_candidate is None or len(cleaned) > len(best_candidate):
+                best_candidate = cleaned
+
+    return best_candidate
+
+
+def _extract_section_from_full_markdown(
+    full_md: str,
+    *,
+    item_id: Literal["item_1a", "item_7"],
+    include_annual_report_headings: bool = True,
+) -> str | None:
+    """Fallback parser extracting Item 1A or Item 7 directly from full 10-K or Exhibit Markdown."""
+    if not full_md:
+        return None
+
+    if item_id == "item_1a":
+        candidate = _slice_markdown_between(
+            full_md,
+            start_re=_MD_ITEM_1A_START_RE,
+            end_re=_MD_ITEM_1A_END_RE,
+            item_id="item_1a",
+        )
+        if candidate:
+            return candidate
+        if include_annual_report_headings:
+            return _slice_markdown_between(
+                full_md,
+                start_re=_AR_RISK_START_RE,
+                end_re=_AR_RISK_END_RE,
+                item_id="item_1a",
+            )
+        return None
+
+    candidate = _slice_markdown_between(
+        full_md,
+        start_re=_MD_ITEM_7_START_RE,
+        end_re=_MD_ITEM_7_END_RE,
+        item_id="item_7",
+    )
+    if candidate:
+        return candidate
+    if include_annual_report_headings:
+        return _slice_markdown_between(
+            full_md,
+            start_re=_AR_MDA_START_RE,
+            end_re=_AR_MDA_END_RE,
+            item_id="item_7",
+            min_slice_chars=2500,
+        )
+    return None
+
+
+def _load_annual_report_exhibit_markdowns(filing: Any) -> list[str]:
+    """Load Markdown from `EX-13*` or `EX-99.1` Annual Report attachments when referenced."""
+    markdowns: list[str] = []
+    attachments = getattr(filing, "attachments", None)
+    if not attachments:
+        return markdowns
+
+    try:
+        att_iter = list(attachments)
+    except Exception:
+        return markdowns
+
+    for att in att_iter:
+        doc_type = str(
+            getattr(att, "document_type", None)
+            or getattr(att, "form", None)
+            or getattr(att, "type", None)
+            or ""
+        ).strip().upper()
+        if not (doc_type.startswith("EX-13") or doc_type in ("EX-99.1", "EX-99")):
+            continue
+        doc_name = str(getattr(att, "document", "") or "").lower()
+        if doc_name and not doc_name.endswith((".htm", ".html", ".txt")):
+            continue
+        md_fn = getattr(att, "markdown", None)
+        if not callable(md_fn):
+            continue
+        try:
+            att_md = md_fn()
+            if isinstance(att_md, str) and len(att_md) >= 5000:
+                markdowns.append(att_md)
+        except Exception as exc:
+            logger.debug("Unable to render exhibit %s markdown: %s", doc_type, exc)
+
+    return markdowns
 
 
 def _extract_single_section(
@@ -131,8 +492,17 @@ def _extract_single_section(
     section_keys: tuple[str, ...],
     fallback_attr: str,
     item_key: str,
+    item_id: Literal["item_1a", "item_7"] | None = None,
+    filing: Any | None = None,
+    markdown_cache: dict[str, Any] | None = None,
 ) -> str | None:
-    """Extract a 10-K section as Markdown (preserving tables), with plain-text fallbacks."""
+    """Extract a 10-K section as Markdown (preserving tables), with full-filing & exhibit fallbacks."""
+    resolved_item_id: Literal["item_1a", "item_7"] = item_id or (
+        "item_1a" if "1a" in item_key.lower() else "item_7"
+    )
+
+    candidates: list[str] = []
+
     sections = getattr(tenk, "sections", None)
     if sections:
         for key in section_keys:
@@ -143,25 +513,74 @@ def _extract_single_section(
             raw = md_attr() if callable(md_attr) else md_attr
             if isinstance(raw, str):
                 cleaned = clean_markdown_section(raw)
-                if len(cleaned) >= 150:
-                    return cleaned
+                if is_substantive_section_markdown(cleaned, item_id=resolved_item_id):
+                    if len(cleaned) >= MIN_SUBSTANTIVE_SECTION_CHARS:
+                        return cleaned
+                    candidates.append(cleaned)
 
     # Fallback 1: direct TenK property (e.g., tenk.risk_factors / tenk.management_discussion)
     prop_val = getattr(tenk, fallback_attr, None)
     if isinstance(prop_val, str):
         cleaned = clean_markdown_section(prop_val)
-        if len(cleaned) >= 100:
-            return cleaned
+        if is_substantive_section_markdown(cleaned, item_id=resolved_item_id):
+            if len(cleaned) >= MIN_SUBSTANTIVE_SECTION_CHARS:
+                return cleaned
+            candidates.append(cleaned)
 
     # Fallback 2: item indexing (e.g., tenk["Item 1A"])
     try:
-        indexed_val = tenk[item_key]
+        with py_warnings.catch_warnings():
+            py_warnings.simplefilter("ignore", FutureWarning)
+            indexed_val = tenk[item_key]
         if isinstance(indexed_val, str):
             cleaned = clean_markdown_section(indexed_val)
-            if cleaned:
-                return cleaned
+            if is_substantive_section_markdown(cleaned, item_id=resolved_item_id):
+                if len(cleaned) >= MIN_SUBSTANTIVE_SECTION_CHARS:
+                    return cleaned
+                candidates.append(cleaned)
     except Exception:
         pass
+
+    # Fallback 3: Full 10-K Markdown scan (recovers GLW, ATO, CHD, CTSH, CLX Item 1A, XOM, CVX)
+    if filing is not None:
+        cache = markdown_cache if markdown_cache is not None else {}
+        if "filing_md" not in cache:
+            md_fn = getattr(filing, "markdown", None)
+            try:
+                raw_f_md = md_fn() if callable(md_fn) else None
+                cache["filing_md"] = raw_f_md if isinstance(raw_f_md, str) else None
+            except Exception as exc:
+                logger.debug("Unable to render full filing markdown: %s", exc)
+                cache["filing_md"] = None
+
+        filing_md: str | None = cache.get("filing_md")
+        if filing_md and len(filing_md) >= 5000:
+            from_full_md = _extract_section_from_full_markdown(
+                filing_md,
+                item_id=resolved_item_id,
+                include_annual_report_headings=True,
+            )
+            if from_full_md and len(from_full_md) >= MIN_SUBSTANTIVE_SECTION_CHARS:
+                return from_full_md
+            if from_full_md:
+                candidates.append(from_full_md)
+
+        # Fallback 4: EX-13 / EX-99.1 Annual Report exhibit scan (recovers BK/BNY, CLX, CCL, AVY)
+        if "exhibit_mds" not in cache:
+            cache["exhibit_mds"] = _load_annual_report_exhibit_markdowns(filing)
+        for ex_md in cache["exhibit_mds"]:
+            from_ex_md = _extract_section_from_full_markdown(
+                ex_md,
+                item_id=resolved_item_id,
+                include_annual_report_headings=True,
+            )
+            if from_ex_md and len(from_ex_md) >= MIN_SUBSTANTIVE_SECTION_CHARS:
+                return from_ex_md
+            if from_ex_md:
+                candidates.append(from_ex_md)
+
+    if candidates:
+        return max(candidates, key=len)
 
     return None
 
@@ -234,11 +653,12 @@ def format_combined_10k_markdown(
     return "\n".join(parts)
 
 
-def _lookup_concept_from_income_df(
+def _filter_non_dimensional_income_df(
     inc_df: Any,
-    concepts: tuple[str, ...],
-) -> tuple[float | None, str | None]:
-    """Search non-dimensional income statement DataFrame rows for the first matching concept."""
+    *,
+    report_date_str: str | None = None,
+) -> tuple[Any | None, str | None]:
+    """Filter income statement DataFrame to non-dimensional, non-breakdown rows and pick primary FY column."""
     if inc_df is None or getattr(inc_df, "empty", True):
         return None, None
 
@@ -253,14 +673,43 @@ def _lookup_concept_from_income_df(
     if df.empty or "concept" not in df.columns:
         return None, None
 
-    # Identify primary annual value column (e.g., "2025-12-31 (FY)" or first YYYY-MM-DD column)
     fy_cols = [c for c in df.columns if "(FY)" in str(c)]
     if not fy_cols:
         fy_cols = [c for c in df.columns if re.match(r"^\d{4}-\d{2}-\d{2}", str(c))]
     if not fy_cols:
         return None, None
-    primary_col = fy_cols[0]
 
+    primary_col = fy_cols[0]
+    if report_date_str:
+        report_prefix = str(report_date_str).strip()[:7]  # YYYY-MM
+        for col in fy_cols:
+            if str(col).startswith(report_prefix):
+                primary_col = col
+                break
+
+    return df, primary_col
+
+
+def _canonical_xbrl_tag(raw_concept: str) -> str:
+    """Format `us-gaap_Revenues` -> `us-gaap:Revenues`."""
+    return str(raw_concept).replace("_", ":", 1)
+
+
+def _lookup_concept_from_income_df(
+    inc_df: Any,
+    concepts: tuple[str, ...],
+    *,
+    report_date_str: str | None = None,
+    pick_largest_positive: bool = False,
+) -> tuple[float | None, str | None]:
+    """Search non-dimensional income statement rows for matching concepts."""
+    df, primary_col = _filter_non_dimensional_income_df(
+        inc_df, report_date_str=report_date_str
+    )
+    if df is None or primary_col is None:
+        return None, None
+
+    candidates: list[tuple[float, str]] = []
     for target_concept in concepts:
         matched = df[df["concept"] == target_concept]
         if matched.empty:
@@ -268,77 +717,253 @@ def _lookup_concept_from_income_df(
         for raw_val in matched[primary_col].tolist():
             val = _coerce_finite_float(raw_val)
             if val is not None:
-                canonical_tag = target_concept.replace("_", ":", 1)
-                return val, canonical_tag
+                tag = _canonical_xbrl_tag(target_concept)
+                if not pick_largest_positive:
+                    return val, tag
+                candidates.append((val, tag))
+
+    if candidates:
+        # Prefer largest positive component when disambiguating REIT lease vs fee lines
+        pos_candidates = [c for c in candidates if c[0] > 0]
+        if pos_candidates:
+            return max(pos_candidates, key=lambda item: item[0])
+        return candidates[0]
 
     return None, None
 
 
+def _lookup_by_label_or_suffix(
+    inc_df: Any,
+    *,
+    concept_suffixes: tuple[str, ...] = (),
+    label_re: re.Pattern[str] | None = None,
+    report_date_str: str | None = None,
+) -> tuple[float | None, str | None]:
+    """Match company-extension XBRL concepts (e.g., `bk_...`) or standardized line-item labels."""
+    df, primary_col = _filter_non_dimensional_income_df(
+        inc_df, report_date_str=report_date_str
+    )
+    if df is None or primary_col is None:
+        return None, None
+
+    if concept_suffixes:
+        for _, row in df.iterrows():
+            concept_str = str(row.get("concept", "") or "")
+            if any(concept_str.endswith(sfx) or sfx in concept_str for sfx in concept_suffixes):
+                val = _coerce_finite_float(row.get(primary_col))
+                if val is not None:
+                    return val, _canonical_xbrl_tag(concept_str)
+
+    if label_re is not None and "label" in df.columns:
+        for _, row in df.iterrows():
+            label_str = str(row.get("label", "") or "").strip()
+            concept_str = str(row.get("concept", "") or "")
+            if "PerShare" in concept_str or "Shares" in concept_str:
+                continue
+            if label_re.match(label_str):
+                val = _coerce_finite_float(row.get(primary_col))
+                if val is not None:
+                    return val, _canonical_xbrl_tag(concept_str)
+
+    return None, None
+
+
+def _is_exclusively_dimensional_in_df(
+    inc_df: Any,
+    target_val: float,
+    *,
+    report_date_str: str | None = None,
+) -> bool:
+    """Return True if `target_val` appears only on dimensional/breakdown rows of `inc_df`."""
+    if inc_df is None or getattr(inc_df, "empty", True):
+        return False
+
+    non_dim_df, primary_col = _filter_non_dimensional_income_df(
+        inc_df, report_date_str=report_date_str
+    )
+    if primary_col is None or primary_col not in inc_df.columns:
+        return False
+
+    if non_dim_df is not None:
+        for raw_val in non_dim_df[primary_col].tolist():
+            val = _coerce_finite_float(raw_val)
+            if val is not None and math.isclose(val, target_val, rel_tol=1e-6, abs_tol=1.0):
+                return False
+
+    has_dim_col = "dimension" in inc_df.columns
+    has_brk_col = "is_breakdown" in inc_df.columns
+    if not has_dim_col and not has_brk_col:
+        return False
+
+    dim_mask = False
+    if has_dim_col:
+        dim_mask = dim_mask | (inc_df["dimension"] == True)  # noqa: E712
+    if has_brk_col:
+        dim_mask = dim_mask | (inc_df["is_breakdown"] == True)  # noqa: E712
+
+    dim_rows = inc_df[dim_mask]
+    for raw_val in dim_rows[primary_col].tolist():
+        val = _coerce_finite_float(raw_val)
+        if val is not None and math.isclose(val, target_val, rel_tol=1e-6, abs_tol=1.0):
+            return True
+
+    return False
+
+
 def extract_financial_metrics(
     tenk: Any,
+    *,
+    report_date_str: str | None = None,
 ) -> tuple[float | None, float | None, float | None, MetricProvenance]:
-    """Extract Revenue, Operating Income, and Net Income (in USD) with XBRL provenance."""
+    """Extract Revenue, Operating Income, and Net Income (in USD) with XBRL provenance.
+
+    Prioritizes non-dimensional (`dimension=False, is_breakdown=False`) Income Statement
+    DataFrame rows whenever available so dimensional segment rows (e.g., APA's Kinetik
+    breakdown) and minor ASC 606 ancillary lines on Equity REITs (e.g., CPT fee income vs
+    ASC 842 `OperatingLeaseLeaseIncome`) never override consolidated totals.
+    """
     provenance = MetricProvenance()
     fin = getattr(tenk, "financials", None)
     if fin is None:
         provenance.notes.append("No XBRL financials object available on filing.")
         return None, None, None, provenance
 
-    revenue = _coerce_finite_float(fin.get_revenue())
-    if revenue is not None:
-        provenance.revenue = "edgartools:Financials.get_revenue"
+    inc_df = None
+    try:
+        inc_stmt = fin.income_statement()
+        if inc_stmt is not None:
+            inc_df = inc_stmt.to_dataframe()
+    except Exception as exc:
+        logger.debug("Income statement DataFrame unavailable: %s", exc)
 
-    operating_income = _coerce_finite_float(fin.get_operating_income())
-    if operating_income is not None:
-        provenance.operating_income = (
-            "edgartools:Financials.get_operating_income (us-gaap:OperatingIncomeLoss)"
+    # --- 1. Revenue ---
+    revenue: float | None = None
+    if inc_df is not None:
+        # Step 1a: Consolidated total revenue tags (us-gaap_Revenues, SalesRevenueNet, RealEstateRevenueNet, etc.)
+        rev_val, rev_tag = _lookup_concept_from_income_df(
+            inc_df,
+            CONSOLIDATED_TOTAL_REVENUE_CONCEPTS,
+            report_date_str=report_date_str,
         )
+        # Step 1b: Explicit company-extension "Total revenue(s)" line (e.g., BK's bk_TotalRevenues...)
+        if rev_val is None:
+            rev_val, rev_tag = _lookup_by_label_or_suffix(
+                inc_df,
+                concept_suffixes=("_TotalRevenues",),
+                label_re=_TOTAL_REVENUE_LABEL_RE,
+                report_date_str=report_date_str,
+            )
+        # Step 1c: Component revenue tags — pick largest positive (resolves REIT OperatingLeaseLeaseIncome vs minor fees)
+        if rev_val is None:
+            rev_val, rev_tag = _lookup_concept_from_income_df(
+                inc_df,
+                COMPONENT_REVENUE_CONCEPTS,
+                report_date_str=report_date_str,
+                pick_largest_positive=True,
+            )
+        if rev_val is not None:
+            revenue = rev_val
+            provenance.revenue = rev_tag
 
-    net_income = _coerce_finite_float(fin.get_net_income())
-    if net_income is not None:
-        provenance.net_income = (
-            "edgartools:Financials.get_net_income (us-gaap:NetIncomeLoss)"
+    if revenue is None:
+        helper_rev = _coerce_finite_float(fin.get_revenue())
+        if helper_rev is not None and not _is_exclusively_dimensional_in_df(
+            inc_df, helper_rev, report_date_str=report_date_str
+        ):
+            revenue = helper_rev
+            provenance.revenue = "edgartools:Financials.get_revenue"
+
+    # --- 2. Operating Income (with Pre-Tax Continuing Operations fallback) ---
+    operating_income: float | None = None
+    if inc_df is not None:
+        op_val, op_tag = _lookup_concept_from_income_df(
+            inc_df,
+            OPERATING_INCOME_CONCEPTS,
+            report_date_str=report_date_str,
         )
+        if op_val is None:
+            op_val, op_tag = _lookup_by_label_or_suffix(
+                inc_df,
+                concept_suffixes=("_OperatingIncomeLoss",),
+                label_re=_OPERATING_INCOME_LABEL_RE,
+                report_date_str=report_date_str,
+            )
+        if op_val is not None:
+            operating_income = op_val
+            provenance.operating_income = op_tag
 
-    # Fallback inspection of the primary Income Statement DataFrame if any metric is None
-    if revenue is None or operating_income is None or net_income is None:
-        inc_df = None
-        try:
-            inc_stmt = fin.income_statement()
-            if inc_stmt is not None:
-                inc_df = inc_stmt.to_dataframe()
-        except Exception as exc:
-            logger.debug("Income statement DataFrame fallback unavailable: %s", exc)
+    if operating_income is None:
+        helper_op = _coerce_finite_float(fin.get_operating_income())
+        if helper_op is not None and not _is_exclusively_dimensional_in_df(
+            inc_df, helper_op, report_date_str=report_date_str
+        ):
+            operating_income = helper_op
+            provenance.operating_income = (
+                "edgartools:Financials.get_operating_income (us-gaap:OperatingIncomeLoss)"
+            )
 
-        if inc_df is not None:
-            if revenue is None:
-                rev_val, rev_tag = _lookup_concept_from_income_df(
-                    inc_df, REVENUE_FALLBACK_CONCEPTS
+    if operating_income is None and inc_df is not None:
+        pretax_val, pretax_tag = _lookup_concept_from_income_df(
+            inc_df,
+            OPERATING_INCOME_FALLBACK_CONCEPTS[1:],
+            report_date_str=report_date_str,
+        )
+        if pretax_val is None:
+            pretax_val, pretax_tag = _lookup_by_label_or_suffix(
+                inc_df,
+                concept_suffixes=(
+                    "_IncomeLossFromContinuingOperationsBeforeIncomeTaxes",
+                    "BeforeEarningsFromAffiliatesIncomeTaxes",
+                ),
+                label_re=_PRETAX_INCOME_LABEL_RE,
+                report_date_str=report_date_str,
+            )
+        # Tax-exempt single-step Equity REITs (e.g., BXP) report ProfitLoss with no tax line
+        if pretax_val is None:
+            tax_val, _ = _lookup_concept_from_income_df(
+                inc_df,
+                ("us-gaap_IncomeTaxExpenseBenefit", "us-gaap_CurrentIncomeTaxExpenseBenefit"),
+                report_date_str=report_date_str,
+            )
+            if tax_val is None:
+                reit_pl, reit_tag = _lookup_concept_from_income_df(
+                    inc_df,
+                    ("us-gaap_ProfitLoss",),
+                    report_date_str=report_date_str,
                 )
-                if rev_val is not None:
-                    revenue = rev_val
-                    provenance.revenue = rev_tag
+                if reit_pl is not None:
+                    pretax_val, pretax_tag = reit_pl, reit_tag
 
-            if operating_income is None:
-                op_val, op_tag = _lookup_concept_from_income_df(
-                    inc_df, OPERATING_INCOME_FALLBACK_CONCEPTS
+        if pretax_val is not None:
+            operating_income = pretax_val
+            provenance.operating_income = pretax_tag
+            if pretax_tag and "OperatingIncomeLoss" not in pretax_tag:
+                provenance.notes.append(
+                    f"Filer does not report standard GAAP OperatingIncomeLoss; "
+                    f"populated operating_income from {pretax_tag} (pre-tax continuing operations income)."
                 )
-                if op_val is not None:
-                    operating_income = op_val
-                    provenance.operating_income = op_tag
-                    if op_tag and "OperatingIncomeLoss" not in op_tag:
-                        provenance.notes.append(
-                            f"Filer does not report standard GAAP OperatingIncomeLoss; "
-                            f"populated operating_income from {op_tag} (pre-tax continuing operations income)."
-                        )
 
-            if net_income is None:
-                ni_val, ni_tag = _lookup_concept_from_income_df(
-                    inc_df, NET_INCOME_FALLBACK_CONCEPTS
-                )
-                if ni_val is not None:
-                    net_income = ni_val
-                    provenance.net_income = ni_tag
+    # --- 3. Net Income ---
+    net_income: float | None = None
+    if inc_df is not None:
+        ni_val, ni_tag = _lookup_concept_from_income_df(
+            inc_df,
+            NET_INCOME_FALLBACK_CONCEPTS,
+            report_date_str=report_date_str,
+        )
+        if ni_val is not None:
+            net_income = ni_val
+            provenance.net_income = ni_tag
+
+    if net_income is None:
+        helper_ni = _coerce_finite_float(fin.get_net_income())
+        if helper_ni is not None and not _is_exclusively_dimensional_in_df(
+            inc_df, helper_ni, report_date_str=report_date_str
+        ):
+            net_income = helper_ni
+            provenance.net_income = (
+                "edgartools:Financials.get_net_income (us-gaap:NetIncomeLoss)"
+            )
 
     return revenue, operating_income, net_income, provenance
 
@@ -346,13 +971,19 @@ def extract_financial_metrics(
 def _resolve_edgar_company(constituent: CompanyConstituent) -> Any:
     """Resolve an `edgar.Company` by ticker first, falling back to CIK if needed."""
     try:
-        company = edgar.Company(constituent.edgar_ticker)
+        company = _retry_sec_call(
+            lambda: edgar.Company(constituent.edgar_ticker),
+            description=f"resolve ticker {constituent.edgar_ticker}",
+        )
         if getattr(company, "not_found", False):
             raise CompanyNotFoundError(f"Ticker {constituent.edgar_ticker} not found")
         return company
     except Exception:
         if constituent.cik:
-            return edgar.Company(int(constituent.cik))
+            return _retry_sec_call(
+                lambda: edgar.Company(int(constituent.cik)),
+                description=f"resolve CIK {constituent.cik} ({constituent.ticker})",
+            )
         raise
 
 
@@ -375,11 +1006,16 @@ def extract_company_10k_bundles(
         getattr(company, "name", None) or constituent.company_name or constituent.ticker
     )
 
-    filings = company.get_filings(form="10-K", amendments=False).filter(
-        filing_date=f"{start_year}-01-01:"
+    filings = _retry_sec_call(
+        lambda: company.get_filings(form="10-K", amendments=False).filter(
+            filing_date=f"{start_year}-01-01:"
+        ),
+        description=f"fetch 10-K filings index for {constituent.ticker}",
     )
 
-    bundles_by_fy: dict[int, ExtractedFilingBundle] = {}
+    # First pass: collect candidate filings (reusing valid cached bundles or parsing `.obj()`)
+    # so we can reconcile Jan-May multi-year fiscal_year offsets before deduplicating by FY.
+    staged_entries: list[dict[str, Any]] = []
 
     for filing in filings:
         # Skip transition reports like 10-KT
@@ -401,22 +1037,29 @@ def extract_company_10k_bundles(
         if report_date_raw > f"{end_year + 1}-06-30":
             continue
 
-        # Fast resume: reuse locally staged bundle if accession matches
         if existing_accessions and accession_no in existing_accessions:
             cached_bundle = existing_accessions[accession_no]
-            fy_cached = cached_bundle.profile.fiscal_year
-            if start_year <= fy_cached <= end_year and fy_cached not in bundles_by_fy:
-                logger.info(
-                    "[%s] Reusing locally staged FY%d 10-K (%s)",
-                    constituent.ticker,
-                    fy_cached,
-                    accession_no,
-                )
-                bundles_by_fy[fy_cached] = cached_bundle
+            raw_fy = resolve_fiscal_year(
+                dei_fiscal_year=cached_bundle.profile.fiscal_year,
+                report_date_str=report_date_raw,
+            )
+            staged_entries.append(
+                {
+                    "kind": "cached",
+                    "report_date": report_date_raw,
+                    "filing_date": filing_date_raw,
+                    "accession_no": accession_no,
+                    "raw_fy": raw_fy,
+                    "bundle": cached_bundle,
+                }
+            )
             continue
 
         try:
-            tenk = filing.obj()
+            tenk = _retry_sec_call(
+                filing.obj,
+                description=f"parse 10-K {constituent.ticker} {accession_no}",
+            )
         except Exception as exc:
             msg = f"[{constituent.ticker}] Failed to parse 10-K {accession_no}: {exc}"
             logger.warning(msg)
@@ -429,34 +1072,97 @@ def extract_company_10k_bundles(
             getattr(xb, "entity_info", None) or {} if xb is not None else {}
         )
 
-        fiscal_year = resolve_fiscal_year(
+        raw_fy = resolve_fiscal_year(
             dei_fiscal_year=entity_info.get("fiscal_year"),
             report_date_str=report_date_raw,
         )
+        staged_entries.append(
+            {
+                "kind": "parsed",
+                "filing": filing,
+                "tenk": tenk,
+                "report_date": report_date_raw,
+                "filing_date": filing_date_raw,
+                "accession_no": accession_no,
+                "raw_fy": raw_fy,
+            }
+        )
+
+    reconciled_fys = reconcile_company_fiscal_years(
+        [(entry["report_date"], entry["raw_fy"]) for entry in staged_entries]
+    )
+
+    bundles_by_fy: dict[int, ExtractedFilingBundle] = {}
+
+    for entry, fiscal_year in zip(staged_entries, reconciled_fys):
         if fiscal_year < start_year or fiscal_year > end_year:
             continue
-
         # Filings are iterated newest-first; keep the most recent 10-K per fiscal year
         if fiscal_year in bundles_by_fy:
             continue
 
+        accession_no = entry["accession_no"]
+        report_date_raw = entry["report_date"]
+        filing_date_raw = entry["filing_date"]
+
+        if entry["kind"] == "cached":
+            cached_bundle: ExtractedFilingBundle = entry["bundle"]
+            if cached_bundle.profile.fiscal_year != fiscal_year:
+                # Update fiscal year metadata if series reconciliation adjusted it
+                prof = cached_bundle.profile.model_copy(
+                    update={
+                        "profile_id": f"{constituent.ticker}_{fiscal_year}",
+                        "fiscal_year": fiscal_year,
+                        "unstructured_blob_path": f"unstructured/{constituent.ticker}/{fiscal_year}_10k.md",
+                        "structured_blob_path": f"structured/{constituent.ticker}/{fiscal_year}_financials.json",
+                        "unstructured_gcs_uri": f"gs://{bucket_name}/unstructured/{constituent.ticker}/{fiscal_year}_10k.md",
+                        "structured_gcs_uri": f"gs://{bucket_name}/structured/{constituent.ticker}/{fiscal_year}_financials.json",
+                    }
+                )
+                updated_md = re.sub(
+                    r"(?m)^fiscal_year:\s*\d+$",
+                    f"fiscal_year: {fiscal_year}",
+                    cached_bundle.markdown_content,
+                    count=1,
+                )
+                cached_bundle = ExtractedFilingBundle(
+                    profile=prof, markdown_content=updated_md
+                )
+            logger.info(
+                "[%s] Reusing locally staged FY%d 10-K (%s)",
+                constituent.ticker,
+                fiscal_year,
+                accession_no,
+            )
+            bundles_by_fy[fiscal_year] = cached_bundle
+            continue
+
+        filing = entry["filing"]
+        tenk = entry["tenk"]
         sec_url = (
             getattr(filing, "filing_url", None)
             or getattr(filing, "homepage_url", None)
             or f"https://www.sec.gov/Archives/edgar/data/{int(cik_10)}/{accession_no.replace('-', '')}/{accession_no}-index.htm"
         )
 
+        md_cache: dict[str, Any] = {}
         item_1a_md = _extract_single_section(
             tenk,
             section_keys=("part_i_item_1a", "item_1a"),
             fallback_attr="risk_factors",
             item_key="Item 1A",
+            item_id="item_1a",
+            filing=filing,
+            markdown_cache=md_cache,
         )
         item_7_md = _extract_single_section(
             tenk,
             section_keys=("part_ii_item_7", "item_7"),
             fallback_attr="management_discussion",
             item_key="Item 7",
+            item_id="item_7",
+            filing=filing,
+            markdown_cache=md_cache,
         )
 
         extracted_sections: list[str] = []
@@ -474,7 +1180,10 @@ def extract_company_10k_bundles(
             logger.warning(w)
             warnings.append(w)
 
-        revenue, operating_income, net_income, provenance = extract_financial_metrics(tenk)
+        revenue, operating_income, net_income, provenance = extract_financial_metrics(
+            tenk,
+            report_date_str=report_date_raw,
+        )
         missing_metrics = [
             name
             for name, val in (
