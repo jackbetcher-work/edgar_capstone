@@ -39,6 +39,7 @@ _METRIC_LABELS = {
     "revenue": "Revenue",
     "operating_income": "Operating Income",
     "net_income": "Net Income",
+    "research_and_development": "R&D Expense",
 }
 _SECTION_TITLES = {"item_1a": "Item 1A. Risk Factors", "item_7": "Item 7. MD&A"}
 _CHUNK_SECTION_RE = re.compile(r"^(?P<key>.+_\d{4}_(?:item_1a|item_7))_\d+$")
@@ -106,7 +107,12 @@ def _payload_figures(variance_reports: list[dict[str, Any]]) -> list[Figure]:
     """Every figure the deterministic engine produced, for tolerance matching."""
     out: list[Figure] = []
     for rep in variance_reports:
-        for key in ("revenue_variance", "operating_income_variance", "net_income_variance"):
+        for key in (
+            "revenue_variance",
+            "operating_income_variance",
+            "net_income_variance",
+            "research_and_development_variance",
+        ):
             mv = rep.get(key) or {}
             for amount_key in ("start_value", "end_value", "absolute_delta"):
                 if mv.get(amount_key) is not None:
@@ -114,11 +120,15 @@ def _payload_figures(variance_reports: list[dict[str, Any]]) -> list[Figure]:
             for pct_key in ("percentage_delta", "cagr_pct"):
                 if mv.get(pct_key) is not None:
                     out.append(Figure("pct", float(mv[pct_key]), pct_key))
-        for bps_key in ("operating_margin_bps_delta", "net_margin_bps_delta"):
+        for bps_key in (
+            "operating_margin_bps_delta",
+            "net_margin_bps_delta",
+            "rd_intensity_bps_delta",
+        ):
             if rep.get(bps_key) is not None:
                 out.append(Figure("bps", float(rep[bps_key]), bps_key))
         for step in rep.get("annual_series") or []:
-            for metric in ("revenue", "operating_income", "net_income"):
+            for metric in ("revenue", "operating_income", "net_income", "research_and_development"):
                 if step.get(metric) is not None:
                     out.append(Figure("amount", abs(float(step[metric])), metric))
                 if step.get(f"{metric}_yoy_delta") is not None:

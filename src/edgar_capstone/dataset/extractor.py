@@ -76,6 +76,19 @@ NET_INCOME_FALLBACK_CONCEPTS: tuple[str, ...] = (
     "us-gaap_NetIncomeLossAvailableToCommonStockholdersBasic",
 )
 
+# Research & Development expense concepts, in priority order. Issuers that do not report an
+# R&D line (banks, REITs, utilities, most retailers) get `None`, never 0.
+RESEARCH_AND_DEVELOPMENT_CONCEPTS: tuple[str, ...] = (
+    "us-gaap_ResearchAndDevelopmentExpense",
+    "us-gaap_ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
+    "us-gaap_ResearchAndDevelopmentExpenseSoftwareExcludingAcquiredInProcessCost",
+)
+
+_RESEARCH_AND_DEVELOPMENT_LABEL_RE = re.compile(
+    r"^\s*(?:total\s+)?research(?:,)?\s+(?:and|&)\s+development(?:\s+expenses?)?\s*:?\s*$",
+    re.IGNORECASE,
+)
+
 _TOTAL_REVENUE_LABEL_RE = re.compile(
     r"^\s*total\s+(?:revenues?|net\s+revenues?|operating\s+revenues?|net\s+sales|sales\s+and\s+revenues?)\s*:?\s*$",
     re.IGNORECASE,
@@ -1168,6 +1181,46 @@ def extract_financial_metrics(
     return revenue, operating_income, net_income, provenance
 
 
+def extract_research_and_development_expense(
+    tenk: Any,
+    *,
+    report_date_str: str | None = None,
+) -> tuple[float | None, str | None]:
+    """Extract annual Research & Development expense (USD) and its XBRL concept.
+
+    Reads the non-dimensional income statement rows for the reporting-period column, trying
+    `RESEARCH_AND_DEVELOPMENT_CONCEPTS` first and then a company-extension concept / line label
+    ("Research and development"). Returns `(None, None)` when the filer reports no R&D line.
+    """
+    fin = getattr(tenk, "financials", None)
+    if fin is None:
+        return None, None
+    try:
+        inc_stmt = fin.income_statement()
+        inc_df = inc_stmt.to_dataframe() if inc_stmt is not None else None
+    except Exception as exc:
+        logger.debug("Income statement DataFrame unavailable for R&D: %s", exc)
+        return None, None
+    if inc_df is None:
+        return None, None
+
+    rd_val, rd_tag = _lookup_concept_from_income_df(
+        inc_df,
+        RESEARCH_AND_DEVELOPMENT_CONCEPTS,
+        report_date_str=report_date_str,
+    )
+    if rd_val is None:
+        rd_val, rd_tag = _lookup_by_label_or_suffix(
+            inc_df,
+            concept_suffixes=("_ResearchAndDevelopmentExpense",),
+            label_re=_RESEARCH_AND_DEVELOPMENT_LABEL_RE,
+            report_date_str=report_date_str,
+        )
+    if rd_val is None:
+        return None, None
+    return rd_val, rd_tag
+
+
 def _resolve_edgar_company(constituent: CompanyConstituent) -> Any:
     """Resolve an `edgar.Company` by ticker first, falling back to CIK if needed."""
     try:
@@ -1388,6 +1441,11 @@ def extract_company_10k_bundles(
             tenk,
             report_date_str=report_date_raw,
         )
+        research_and_development, rd_tag = extract_research_and_development_expense(
+            tenk,
+            report_date_str=report_date_raw,
+        )
+        provenance.research_and_development = rd_tag
         missing_metrics = [
             name
             for name, val in (
@@ -1450,6 +1508,7 @@ def extract_company_10k_bundles(
             revenue=revenue,
             operating_income=operating_income,
             net_income=net_income,
+            research_and_development=research_and_development,
             metric_provenance=provenance,
             extracted_sections=extracted_sections,
             unstructured_blob_path=unstructured_blob,
@@ -1464,12 +1523,17 @@ def extract_company_10k_bundles(
             markdown_content=markdown_doc,
         )
         logger.info(
-            "[%s] Extracted FY%d 10-K (Rev=%s, OpInc=%s, NetInc=%s, MD=%d chars)",
+            "[%s] Extracted FY%d 10-K (Rev=%s, OpInc=%s, NetInc=%s, R&D=%s, MD=%d chars)",
             constituent.ticker,
             fiscal_year,
             f"${revenue:,.0f}" if revenue is not None else "None",
             f"${operating_income:,.0f}" if operating_income is not None else "None",
             f"${net_income:,.0f}" if net_income is not None else "None",
+            (
+                f"${research_and_development:,.0f}"
+                if research_and_development is not None
+                else "None"
+            ),
             len(markdown_doc),
         )
 

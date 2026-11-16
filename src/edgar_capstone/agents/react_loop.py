@@ -125,6 +125,8 @@ def evaluate_calculated_variances(
         rev_pct = rev.get("percentage_delta")
         op_pct = op.get("percentage_delta")
         ni_pct = ni.get("percentage_delta")
+        rd = rep.get("research_and_development_variance") or {}
+        rd_pct = rd.get("percentage_delta")
         op_bps = rep.get("operating_margin_bps_delta")
         ni_bps = rep.get("net_margin_bps_delta")
 
@@ -157,6 +159,12 @@ def evaluate_calculated_variances(
             findings.append(
                 f"Net Income {ni.get('direction', 'moved')} {_fmt_pct(ni_pct)} "
                 f"to {_fmt_usd(ni.get('end_value'))} (Net Margin {_fmt_bps(ni_bps)})"
+            )
+        if rd_pct is not None:
+            findings.append(
+                f"R&D expense {rd.get('direction', 'moved')} {_fmt_pct(rd_pct)} "
+                f"({_fmt_usd(rd.get('start_value'))} -> {_fmt_usd(rd.get('end_value'))}; "
+                f"R&D intensity {_fmt_bps(rep.get('rd_intensity_bps_delta'))})"
             )
 
         # Detect peak YoY step inflection from annual_series
@@ -232,6 +240,7 @@ def evaluate_calculated_variances(
                 revenue_pct_delta=rev_pct,
                 operating_income_pct_delta=op_pct,
                 net_income_pct_delta=ni_pct,
+                research_and_development_pct_delta=rd_pct,
                 operating_margin_bps_delta=op_bps,
                 net_margin_bps_delta=ni_bps,
                 material_findings=findings,
@@ -430,6 +439,15 @@ def format_react_grounded_output(
                 f"**{_fmt_usd(ni.get('end_value'))}** "
                 f"(Net Margin **{_fmt_bps(rep.get('net_margin_bps_delta'))}**).{primary_cit_tag}"
             )
+            rd = rep.get("research_and_development_variance") or {}
+            if rd.get("start_value") is not None and rd.get("end_value") is not None:
+                lines.append(
+                    f"  - *R&D expense:* **{_fmt_usd(rd.get('start_value'))}** → "
+                    f"**{_fmt_usd(rd.get('end_value'))}** "
+                    f"(**{_fmt_pct(rd.get('percentage_delta'))}**, "
+                    f"Δ **{_fmt_usd(rd.get('absolute_delta'))}**; R&D intensity "
+                    f"**{_fmt_bps(rep.get('rd_intensity_bps_delta'))}**)."
+                )
             ev = eval_by_ticker.get(rep["ticker"])
             if ev and ev.divergences:
                 lines.append(

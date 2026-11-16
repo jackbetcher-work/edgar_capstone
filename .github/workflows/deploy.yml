@@ -11,6 +11,9 @@ on:
     branches:
       - main
       - "**"
+  # Manual redeploy from the Actions tab or `gh workflow run deploy.yml --ref main`.
+  # Build/deploy jobs still require refs/heads/main and DEPLOY_WITH_GITHUB_ACTIONS == 'true'.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -97,7 +100,7 @@ jobs:
   build:
     name: Build Stage - Container Image & Artifact Registry
     needs: test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
     runs-on: ubuntu-latest
     outputs:
       image_digest_uri: ${{ steps.build_image.outputs.image_uri }}
@@ -163,7 +166,7 @@ jobs:
   deploy:
     name: Deploy Stage - Google Cloud Run with Secret Manager
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

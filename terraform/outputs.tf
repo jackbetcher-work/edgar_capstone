@@ -252,3 +252,8 @@ output "cloudbuild_trigger_ids" {
     pull_request_verify = var.enable_cloudbuild_trigger && var.enable_cloudbuild_pr_trigger ? google_cloudbuild_trigger.pull_request_verify[0].trigger_id : null
   }
 }
+
+output "vector_search_psc_address" {
+  description = "Internal IP of the Vector Search Private Service Connect endpoint (null in public mode or before the index is deployed)."
+  value       = local.vector_search_psc_endpoint ? google_compute_address.vector_search_psc[0].address : null
+}

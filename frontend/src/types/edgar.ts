@@ -18,6 +18,7 @@ export interface CompanySummary {
   latest_revenue: number | null
   latest_operating_income: number | null
   latest_net_income: number | null
+  latest_research_and_development?: number | null
   latest_operating_margin_pct: number | null
   latest_net_margin_pct: number | null
   sec_filing_url: string
@@ -34,7 +35,7 @@ export interface CompaniesCatalogResponse {
 }
 
 export interface MetricVariance {
-  metric_name: 'revenue' | 'operating_income' | 'net_income'
+  metric_name: 'revenue' | 'operating_income' | 'net_income' | 'research_and_development'
   start_year: number
   end_year: number
   start_value: number | null
@@ -57,6 +58,9 @@ export interface AnnualStepVariance {
   net_income: number | null
   net_income_yoy_delta: number | null
   net_income_yoy_pct: number | null
+  research_and_development?: number | null
+  research_and_development_yoy_delta?: number | null
+  research_and_development_yoy_pct?: number | null
   sec_filing_url: string | null
 }
 
@@ -72,8 +76,11 @@ export interface CompanyVarianceReport {
   revenue_variance: MetricVariance
   operating_income_variance: MetricVariance
   net_income_variance: MetricVariance
+  /** Absent in older payloads; direction 'unavailable' when the issuer reports no R&D line. */
+  research_and_development_variance?: MetricVariance | null
   operating_margin_bps_delta: number | null
   net_margin_bps_delta: number | null
+  rd_intensity_bps_delta?: number | null
   annual_series: AnnualStepVariance[]
   source_urls: Record<string, string>
 }
@@ -87,6 +94,7 @@ export interface SectorBenchmarkRow {
   avg_company_revenue: number | null
   total_sector_operating_income: number | null
   total_sector_net_income: number | null
+  total_sector_research_and_development?: number | null
 }
 
 export interface GroundedCitation {

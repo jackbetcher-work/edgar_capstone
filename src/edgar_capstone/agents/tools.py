@@ -265,6 +265,9 @@ class GcpToolConfig:
     vvs_endpoint_id: str = ""
     vvs_endpoint_display_name: str = DEFAULT_VERTEX_VECTOR_ENDPOINT_DISPLAY_NAME
     vvs_public_domain: str = ""
+    # Internal IP of the Private Service Connect forwarding rule for the index endpoint.
+    # When set, queries go over gRPC to <ip>:10000 inside the VPC instead of the public domain.
+    vvs_psc_address: str = ""
     vvs_deployed_index_id: str = ""
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS
@@ -293,6 +296,7 @@ class GcpToolConfig:
             or bool(os.environ.get("VERTEX_AI_SEARCH_DATASTORE_ID", "").strip())
             or bool(os.environ.get("VERTEX_VECTOR_SEARCH_ENDPOINT_ID", "").strip())
             or bool(os.environ.get("VERTEX_VECTOR_SEARCH_PUBLIC_DOMAIN", "").strip())
+            or bool(os.environ.get("VERTEX_VECTOR_SEARCH_PSC_ADDRESS", "").strip())
             or exec_mode == "live"
             or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in _TRUTHY_ENV_VALUES
         )
@@ -350,6 +354,7 @@ class GcpToolConfig:
                 or DEFAULT_VERTEX_VECTOR_ENDPOINT_DISPLAY_NAME
             ).strip(),
             vvs_public_domain=os.environ.get("VERTEX_VECTOR_SEARCH_PUBLIC_DOMAIN", "").strip(),
+            vvs_psc_address=os.environ.get("VERTEX_VECTOR_SEARCH_PSC_ADDRESS", "").strip(),
             vvs_deployed_index_id=os.environ.get(
                 "VERTEX_VECTOR_SEARCH_DEPLOYED_INDEX_ID", ""
             ).strip(),
@@ -654,6 +659,7 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
                 "revenue": prov.get("revenue"),
                 "operating_income": prov.get("operating_income"),
                 "net_income": prov.get("net_income"),
+                "research_and_development": prov.get("research_and_development"),
                 "notes": list(prov.get("notes") or []),
             }
 
@@ -674,6 +680,7 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
             "revenue": row.get("revenue"),
             "operating_income": row.get("operating_income"),
             "net_income": row.get("net_income"),
+            "research_and_development": row.get("research_and_development"),
             "metric_provenance": prov,
             "extracted_sections": list(row.get("extracted_sections") or []),
             "unstructured_blob_path": unstructured_blob,
@@ -747,7 +754,9 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
             "profile_id, ticker, company_name, gics_sector, fiscal_year, prev_fiscal_year, "
             "revenue, revenue_yoy_delta, revenue_yoy_pct, "
             "operating_income, operating_income_yoy_delta, operating_income_yoy_pct, "
-            "net_income, net_income_yoy_delta, net_income_yoy_pct, sec_filing_url "
+            "net_income, net_income_yoy_delta, net_income_yoy_pct, "
+            "research_and_development, research_and_development_yoy_delta, "
+            "research_and_development_yoy_pct, sec_filing_url "
             f"FROM {self._table_ref(self.yoy_view)} "
             f"WHERE {' AND '.join(clauses)} "
             "ORDER BY ticker ASC, fiscal_year ASC"
@@ -758,6 +767,7 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
             rev = r.get("revenue")
             op = r.get("operating_income")
             ni = r.get("net_income")
+            rd = r.get("research_and_development")
             op_margin = (
                 round((float(op) / abs(float(rev))) * 100.0, 2) if rev and op is not None else None
             )
@@ -809,8 +819,24 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
                         if r.get("net_income_yoy_pct") is not None
                         else None
                     ),
+                    "research_and_development": rd,
+                    "research_and_development_yoy_delta": (
+                        round(float(r["research_and_development_yoy_delta"]), 2)
+                        if r.get("research_and_development_yoy_delta") is not None
+                        else None
+                    ),
+                    "research_and_development_yoy_pct": (
+                        round(float(r["research_and_development_yoy_pct"]), 2)
+                        if r.get("research_and_development_yoy_pct") is not None
+                        else None
+                    ),
                     "operating_margin_pct": op_margin,
                     "net_margin_pct": net_margin,
+                    "rd_intensity_pct": (
+                        round((float(rd) / abs(float(rev))) * 100.0, 2)
+                        if rev and rd is not None
+                        else None
+                    ),
                     "sec_filing_url": r.get("sec_filing_url") or "",
                 }
             )
@@ -824,7 +850,7 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
         start_year: int,
         end_year: int,
     ) -> list[dict[str, Any]]:
-        """Aggregate sector-level revenue, operating income, and net income benchmarks in BigQuery."""
+        """Aggregate sector-level revenue, operating income, net income, and R&D benchmarks in BigQuery."""
         clauses = ["fiscal_year BETWEEN @start_year AND @end_year"]
         params: list[dict[str, Any]] = [
             _bq_scalar_param("start_year", "INT64", int(start_year)),
@@ -846,7 +872,8 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
             "ROUND(SUM(revenue), 2) AS total_sector_revenue, "
             "ROUND(AVG(revenue), 2) AS avg_company_revenue, "
             "ROUND(SUM(operating_income), 2) AS total_sector_operating_income, "
-            "ROUND(SUM(net_income), 2) AS total_sector_net_income "
+            "ROUND(SUM(net_income), 2) AS total_sector_net_income, "
+            "ROUND(SUM(research_and_development), 2) AS total_sector_research_and_development "
             f"FROM {self._table_ref(self.financial_metrics_table)} "
             f"WHERE {' AND '.join(clauses)} "
             "GROUP BY 1, 2 "
@@ -863,6 +890,9 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
                 "avg_company_revenue": r.get("avg_company_revenue"),
                 "total_sector_operating_income": r.get("total_sector_operating_income"),
                 "total_sector_net_income": r.get("total_sector_net_income"),
+                "total_sector_research_and_development": r.get(
+                    "total_sector_research_and_development"
+                ),
             }
             for r in raw_rows
         ]
@@ -1392,8 +1422,12 @@ class VertexVectorSearchAdapter(_GcpAuthenticatedRestClient):
         self.endpoint_id = config.vvs_endpoint_id
         self.endpoint_display_name = config.vvs_endpoint_display_name
         self.public_domain = config.vvs_public_domain
+        self.psc_address = config.vvs_psc_address
         self.deployed_index_id = config.vvs_deployed_index_id
         self._resolved_target: tuple[str, str, str] | None = None
+        self._psc_endpoint: Any | None = None
+        # Seam for tests: builds an SDK MatchingEngineIndexEndpoint for a resource name.
+        self._psc_endpoint_factory: Any | None = None
 
     def _regional_api_base(self) -> str:
         return f"https://{self.location}-aiplatform.googleapis.com"
@@ -1474,7 +1508,22 @@ class VertexVectorSearchAdapter(_GcpAuthenticatedRestClient):
         end_year: int,
         neighbor_count: int = 10,
     ) -> list[dict[str, Any]]:
-        """Query Vertex AI Vector Search `:findNeighbors` with token & numeric restricts."""
+        """Query Vertex AI Vector Search with token & numeric restricts.
+
+        Public endpoints are queried over REST (`:findNeighbors`). Private Service Connect
+        endpoints are queried over gRPC (`MatchService` on `<psc_address>:10000`) from inside
+        the VPC (Cloud Run Direct VPC egress).
+        """
+        if self.psc_address:
+            return self._find_neighbors_psc(
+                query_embedding,
+                tickers=tickers,
+                gics_sector=gics_sector,
+                section_id=section_id,
+                start_year=start_year,
+                end_year=end_year,
+                neighbor_count=neighbor_count,
+            )
         ep_name, query_base, deployed_id = self.resolve_endpoint_target()
 
         restricts: list[dict[str, Any]] = []
@@ -1560,6 +1609,113 @@ class VertexVectorSearchAdapter(_GcpAuthenticatedRestClient):
                     "distance": dist,
                     "similarity": sim,
                     "source_backend": "vertex_vector_search",
+                }
+            )
+        return parsed
+
+    def _psc_index_endpoint(self) -> Any:
+        """SDK index endpoint bound to the PSC forwarding-rule IP (cached per adapter)."""
+        if self._psc_endpoint is not None:
+            return self._psc_endpoint
+        if not self.endpoint_id:
+            raise GcpEndpointNotReadyError(
+                "VERTEX_VECTOR_SEARCH_ENDPOINT_ID is required to query a Private Service "
+                "Connect index endpoint."
+            )
+        ep_name = self._endpoint_resource_name(self.endpoint_id)
+        if self._psc_endpoint_factory is not None:
+            endpoint = self._psc_endpoint_factory(ep_name)
+        else:
+            from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint import (
+                MatchingEngineIndexEndpoint,
+            )
+
+            endpoint = MatchingEngineIndexEndpoint(
+                index_endpoint_name=ep_name,
+                project=self.project_id,
+                location=self.location,
+                credentials=self._credentials,
+            )
+        endpoint.private_service_connect_ip_address = self.psc_address
+        self._psc_endpoint = endpoint
+        return endpoint
+
+    def _find_neighbors_psc(
+        self,
+        query_embedding: list[float],
+        *,
+        tickers: set[str],
+        gics_sector: str | None,
+        section_id: str | None,
+        start_year: int,
+        end_year: int,
+        neighbor_count: int = 10,
+    ) -> list[dict[str, Any]]:
+        from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint import (
+            Namespace,
+            NumericNamespace,
+        )
+
+        if not self.deployed_index_id:
+            raise GcpEndpointNotReadyError(
+                "VERTEX_VECTOR_SEARCH_DEPLOYED_INDEX_ID is required for Private Service Connect "
+                "queries."
+            )
+        token_filter: list[Any] = []
+        if tickers:
+            token_filter.append(Namespace(name="ticker", allow_tokens=sorted(tickers)))
+        canon_sector = _canonicalize_gics_sector(gics_sector)
+        if canon_sector:
+            token_filter.append(Namespace(name="gics_sector", allow_tokens=[canon_sector]))
+        if section_id in ("item_1a", "item_7"):
+            token_filter.append(Namespace(name="section_id", allow_tokens=[section_id]))
+        numeric_filter = [
+            NumericNamespace(name="fiscal_year", value_int=int(start_year), op="GREATER_EQUAL"),
+            NumericNamespace(name="fiscal_year", value_int=int(end_year), op="LESS_EQUAL"),
+        ]
+        eff_k = max(1, min(int(neighbor_count), 50))
+        try:
+            groups = self._psc_index_endpoint().match(
+                deployed_index_id=self.deployed_index_id,
+                queries=[list(query_embedding)],
+                num_neighbors=eff_k,
+                filter=token_filter,
+                numeric_filter=numeric_filter,
+                per_crowding_attribute_num_neighbors=max(2, eff_k),
+            )
+        except Exception as exc:  # grpc.RpcError and SDK errors
+            code = getattr(exc, "code", None)
+            code_name = getattr(code() if callable(code) else code, "name", "")
+            if code_name in ("UNAVAILABLE", "DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED"):
+                raise UpstreamTimeoutError(
+                    f"Vector Search PSC endpoint {self.psc_address}:10000 {code_name}: {exc}"
+                ) from exc
+            raise
+        neighbors = groups[0] if groups else []
+        parsed: list[dict[str, Any]] = []
+        for nb in neighbors:
+            chunk_id = str(getattr(nb, "id", "") or "").strip()
+            if not chunk_id:
+                continue
+            dist = float(getattr(nb, "distance", 0.0) or 0.0)
+            # Private match() returns IDs and distances only; chunk text and metadata are
+            # hydrated from BigQuery by chunk_id in _execute_live_gcp_hybrid_rag.
+            parsed.append(
+                {
+                    "chunk_id": chunk_id,
+                    "profile_id": None,
+                    "ticker": None,
+                    "company_name": None,
+                    "gics_sector": None,
+                    "fiscal_year": None,
+                    "section_id": None,
+                    "section_title": None,
+                    "chunk_text": None,
+                    "sec_filing_url": None,
+                    "unstructured_gcs_uri": None,
+                    "distance": dist,
+                    "similarity": max(0.0, min(1.0, 1.0 - dist)),
+                    "source_backend": "vertex_vector_search_psc",
                 }
             )
         return parsed
@@ -1763,6 +1919,7 @@ def get_gcp_adapters_status_metadata() -> dict[str, Any]:
             "endpoint_id": cfg.vvs_endpoint_id or None,
             "endpoint_display_name": cfg.vvs_endpoint_display_name,
             "public_domain_configured": bool(cfg.vvs_public_domain),
+            "private_service_connect": bool(cfg.vvs_psc_address),
             "deployed_index_id": cfg.vvs_deployed_index_id or None,
         },
         "gcs_corpus_bucket": cfg.sec_corpus_bucket,
@@ -2029,6 +2186,11 @@ def _profile_to_metric_record(p: FinancialDataProfile) -> MetricRecord:
         if p.revenue and p.net_income is not None
         else None
     )
+    rd_intensity = (
+        round((p.research_and_development / abs(p.revenue)) * 100.0, 2)
+        if p.revenue and p.research_and_development is not None
+        else None
+    )
     return MetricRecord(
         profile_id=p.profile_id,
         ticker=p.ticker,
@@ -2044,8 +2206,10 @@ def _profile_to_metric_record(p: FinancialDataProfile) -> MetricRecord:
         revenue=p.revenue,
         operating_income=p.operating_income,
         net_income=p.net_income,
+        research_and_development=p.research_and_development,
         operating_margin_pct=op_margin,
         net_margin_pct=net_margin,
+        rd_intensity_pct=rd_intensity,
         sec_filing_url=p.sec_filing_url,
         unstructured_gcs_uri=p.unstructured_gcs_uri,
         structured_gcs_uri=p.structured_gcs_uri,
@@ -2141,6 +2305,13 @@ def _build_variance_reports_from_profiles(
         ni_var = _compute_single_metric_variance(
             "net_income", eff_start, eff_end, start_prof.net_income, end_prof.net_income
         )
+        rd_var = _compute_single_metric_variance(
+            "research_and_development",
+            eff_start,
+            eff_end,
+            start_prof.research_and_development,
+            end_prof.research_and_development,
+        )
 
         start_rec = _profile_to_metric_record(start_prof)
         end_rec = _profile_to_metric_record(end_prof)
@@ -2156,6 +2327,11 @@ def _build_variance_reports_from_profiles(
             if start_rec.net_margin_pct is not None and end_rec.net_margin_pct is not None
             else None
         )
+        rd_intensity_bps = (
+            round((end_rec.rd_intensity_pct - start_rec.rd_intensity_pct) * 100.0, 1)
+            if start_rec.rd_intensity_pct is not None and end_rec.rd_intensity_pct is not None
+            else None
+        )
 
         annual_series: list[AnnualStepVariance] = []
         source_urls: dict[int, str] = {}
@@ -2164,6 +2340,7 @@ def _build_variance_reports_from_profiles(
             source_urls[fy] = curr.sec_filing_url
             prev = fy_map.get(fy - 1)
             rev_yoy_d = rev_yoy_p = op_yoy_d = op_yoy_p = ni_yoy_d = ni_yoy_p = None
+            rd_yoy_d = rd_yoy_p = None
             if prev is not None:
                 if curr.revenue is not None and prev.revenue is not None:
                     rev_yoy_d = round(curr.revenue - prev.revenue, 2)
@@ -2177,6 +2354,11 @@ def _build_variance_reports_from_profiles(
                     ni_yoy_d = round(curr.net_income - prev.net_income, 2)
                     if prev.net_income != 0:
                         ni_yoy_p = round((ni_yoy_d / abs(prev.net_income)) * 100.0, 2)
+                curr_rd, prev_rd = curr.research_and_development, prev.research_and_development
+                if curr_rd is not None and prev_rd is not None:
+                    rd_yoy_d = round(curr_rd - prev_rd, 2)
+                    if prev_rd != 0:
+                        rd_yoy_p = round((rd_yoy_d / abs(prev_rd)) * 100.0, 2)
 
             annual_series.append(
                 AnnualStepVariance(
@@ -2191,6 +2373,9 @@ def _build_variance_reports_from_profiles(
                     net_income=curr.net_income,
                     net_income_yoy_delta=ni_yoy_d,
                     net_income_yoy_pct=ni_yoy_p,
+                    research_and_development=curr.research_and_development,
+                    research_and_development_yoy_delta=rd_yoy_d,
+                    research_and_development_yoy_pct=rd_yoy_p,
                     sec_filing_url=curr.sec_filing_url,
                 )
             )
@@ -2207,8 +2392,10 @@ def _build_variance_reports_from_profiles(
             revenue_variance=rev_var,
             operating_income_variance=op_var,
             net_income_variance=ni_var,
+            research_and_development_variance=rd_var,
             operating_margin_bps_delta=op_margin_bps,
             net_margin_bps_delta=net_margin_bps,
+            rd_intensity_bps_delta=rd_intensity_bps,
             annual_series=annual_series,
             source_urls=source_urls,
         )
@@ -2483,7 +2670,7 @@ def fetch_financial_metrics(
     gics_sector: str,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
-    """Retrieves raw structured SEC 10-K financial metrics (Revenue, Operating Income, Net Income, margins, and filing URLs).
+    """Retrieves raw structured SEC 10-K financial metrics (Revenue, Operating Income, Net Income, R&D expense, margins, and filing URLs).
 
     Args:
         tickers: Comma-separated ticker symbols (e.g., 'NVDA,AAPL,MSFT') or 'ALL' for all companies.
@@ -2759,6 +2946,7 @@ def query_looker_financial_explore(
             for prof in t_profiles:
                 if prof.fiscal_year >= start_year and prof.fiscal_year <= end_year:
                     rev_delta = rev_pct = op_delta = op_pct = ni_delta = ni_pct = None
+                    rd_delta = rd_pct = None
                     if prev_prof and prev_prof.fiscal_year == prof.fiscal_year - 1:
                         if prof.revenue is not None and prev_prof.revenue is not None:
                             rev_delta = round(prof.revenue - prev_prof.revenue, 2)
@@ -2778,6 +2966,12 @@ def query_looker_financial_explore(
                             ni_delta = round(prof.net_income - prev_prof.net_income, 2)
                             if prev_prof.net_income != 0:
                                 ni_pct = round((ni_delta / abs(prev_prof.net_income)) * 100.0, 2)
+                        prof_rd = prof.research_and_development
+                        prev_rd = prev_prof.research_and_development
+                        if prof_rd is not None and prev_rd is not None:
+                            rd_delta = round(prof_rd - prev_rd, 2)
+                            if prev_rd != 0:
+                                rd_pct = round((rd_delta / abs(prev_rd)) * 100.0, 2)
 
                     rec = _profile_to_metric_record(prof)
                     rows.append(
@@ -2797,8 +2991,12 @@ def query_looker_financial_explore(
                             "net_income": prof.net_income,
                             "net_income_yoy_delta": ni_delta,
                             "net_income_yoy_pct": ni_pct,
+                            "research_and_development": prof.research_and_development,
+                            "research_and_development_yoy_delta": rd_delta,
+                            "research_and_development_yoy_pct": rd_pct,
                             "operating_margin_pct": rec.operating_margin_pct,
                             "net_margin_pct": rec.net_margin_pct,
+                            "rd_intensity_pct": rec.rd_intensity_pct,
                             "sec_filing_url": prof.sec_filing_url,
                         }
                     )
@@ -2815,6 +3013,9 @@ def query_looker_financial_explore(
             revs = [p.revenue for p in group if p.revenue is not None]
             ops = [p.operating_income for p in group if p.operating_income is not None]
             nis = [p.net_income for p in group if p.net_income is not None]
+            rds = [
+                p.research_and_development for p in group if p.research_and_development is not None
+            ]
             rows.append(
                 {
                     "gics_sector": sector_name,
@@ -2825,6 +3026,7 @@ def query_looker_financial_explore(
                     "avg_company_revenue": round(sum(revs) / len(revs), 2) if revs else None,
                     "total_sector_operating_income": round(sum(ops), 2) if ops else None,
                     "total_sector_net_income": round(sum(nis), 2) if nis else None,
+                    "total_sector_research_and_development": (round(sum(rds), 2) if rds else None),
                 }
             )
 
@@ -2849,7 +3051,7 @@ def calculate_period_variances(
     end_year: int,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
-    """Performs deterministic period-over-period variance calculations for Revenue, Operating Income, and Net Income.
+    """Performs deterministic period-over-period variance calculations for Revenue, Operating Income, Net Income, and R&D expense.
 
     Separates arithmetic calculation from LLM narrative synthesis. Always call this tool first
     before explaining financial changes so narrative claims match deterministic numbers 100%.

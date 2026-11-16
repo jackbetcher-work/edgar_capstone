@@ -91,6 +91,13 @@ view: financial_metrics {
     sql: SAFE_DIVIDE(${TABLE}.net_income, ABS(${TABLE}.revenue)) * 100.0 ;;
   }
 
+  dimension: rd_intensity_pct {
+    type: number
+    label: "R&D Intensity (% of Revenue)"
+    value_format: "0.00\"%\""
+    sql: SAFE_DIVIDE(${TABLE}.research_and_development, ABS(${TABLE}.revenue)) * 100.0 ;;
+  }
+
   measure: company_count {
     type: count_distinct
     label: "Distinct Issuers"
@@ -128,6 +135,21 @@ view: financial_metrics {
     label: "Total Net Income (USD)"
     value_format_name: usd_0
     sql: ${TABLE}.net_income ;;
+  }
+
+  measure: total_research_and_development {
+    type: sum
+    label: "Total R&D Expense (USD)"
+    description: "NULL for issuers that do not report an R&D line, so sums cover R&D reporters only."
+    value_format_name: usd_0
+    sql: ${TABLE}.research_and_development ;;
+  }
+
+  measure: average_rd_intensity_pct {
+    type: average
+    label: "Average R&D Intensity (%)"
+    value_format: "0.00\"%\""
+    sql: ${rd_intensity_pct} ;;
   }
 
   measure: average_operating_margin_pct {

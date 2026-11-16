@@ -181,6 +181,7 @@ def list_curated_companies() -> dict[str, Any]:
                 "latest_revenue": latest.revenue,
                 "latest_operating_income": latest.operating_income,
                 "latest_net_income": latest.net_income,
+                "latest_research_and_development": latest.research_and_development,
                 "latest_operating_margin_pct": latest_rec.operating_margin_pct,
                 "latest_net_margin_pct": latest_rec.net_margin_pct,
                 "sec_filing_url": latest.sec_filing_url,
@@ -496,6 +497,15 @@ def _synthesize_grounded_report(
                 f"**{_format_usd_compact(ni.get('end_value'))}** "
                 f"(Net Margin **{_format_signed_bps(rep.get('net_margin_bps_delta'))}**).{primary_cit_tag}"
             )
+            rd = rep.get("research_and_development_variance") or {}
+            if rd.get("start_value") is not None and rd.get("end_value") is not None:
+                lines.append(
+                    f"  - *R&D expense:* **{_format_usd_compact(rd.get('start_value'))}** → "
+                    f"**{_format_usd_compact(rd.get('end_value'))}** "
+                    f"(**{_format_signed_pct(rd.get('percentage_delta'))}**, "
+                    f"Δ **{_format_usd_compact(rd.get('absolute_delta'))}**; R&D intensity "
+                    f"**{_format_signed_bps(rep.get('rd_intensity_bps_delta'))}**)."
+                )
 
     elif sector_benchmarks:
         lines.append("\n### Sector Quantitative Benchmarks")
@@ -846,7 +856,7 @@ def run_conversational_rag_turn(
                 "status": "completed",
                 "duration_ms": calc_ms,
                 "summary": (
-                    f"Computed deterministic Revenue, Operating Income, Net Income, and margin bps variances "
+                    f"Computed deterministic Revenue, Operating Income, Net Income, R&D, and margin bps variances "
                     f"for {len(variance_reports)} issuer(s) ({scope['tickers_csv']})."
                 ),
             }

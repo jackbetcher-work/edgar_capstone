@@ -43,6 +43,8 @@
         - v_financial_variances_yoy.avg_operating_income_yoy_pct
         - v_financial_variances_yoy.total_net_income
         - v_financial_variances_yoy.avg_net_income_yoy_pct
+        - v_financial_variances_yoy.total_research_and_development
+        - v_financial_variances_yoy.avg_research_and_development_yoy_pct
         - v_financial_variances_yoy.sec_filing_url
       sorts:
         - v_financial_variances_yoy.fiscal_year desc

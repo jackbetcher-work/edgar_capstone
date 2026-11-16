@@ -194,6 +194,19 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       max_instance_count = 10
     }
 
+    # Direct VPC egress so the service can reach the Vector Search PSC endpoint IP.
+    # PRIVATE_RANGES_ONLY keeps Google API traffic on its normal path.
+    dynamic "vpc_access" {
+      for_each = local.vector_search_psc ? [1] : []
+      content {
+        egress = "PRIVATE_RANGES_ONLY"
+        network_interfaces {
+          network    = google_compute_network.sec_edgar[0].id
+          subnetwork = google_compute_subnetwork.sec_edgar_private[0].id
+        }
+      }
+    }
+
     containers {
       # Bootstraps with a lightweight public Cloud Run placeholder image so initial
       # `terraform apply` succeeds in a single stage before CI/CD pushes to GAR.
@@ -355,7 +368,12 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
 
       env {
         name  = "VERTEX_VECTOR_SEARCH_PUBLIC_DOMAIN"
-        value = var.enable_vertex_vector_search ? google_vertex_ai_index_endpoint.sec_10k_chunks_endpoint[0].public_endpoint_domain_name : ""
+        value = var.enable_vertex_vector_search && !local.vector_search_psc ? google_vertex_ai_index_endpoint.sec_10k_chunks_endpoint[0].public_endpoint_domain_name : ""
+      }
+
+      env {
+        name  = "VERTEX_VECTOR_SEARCH_PSC_ADDRESS"
+        value = local.vector_search_psc_endpoint ? google_compute_address.vector_search_psc[0].address : ""
       }
 
       env {

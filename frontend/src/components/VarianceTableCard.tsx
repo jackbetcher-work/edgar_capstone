@@ -61,6 +61,7 @@ export function VarianceTableCard({
               <th className="py-1.5 px-2.5 font-medium text-right">Op Inc Δ</th>
               <th className="py-1.5 px-2.5 font-medium text-right">Op Mgn</th>
               <th className="py-1.5 px-2.5 font-medium text-right">Net Inc Δ</th>
+              <th className="py-1.5 px-2.5 font-medium text-right">R&amp;D Δ</th>
               <th className="py-1.5 px-2.5 font-medium text-right">10-K</th>
             </tr>
           </thead>
@@ -70,6 +71,9 @@ export function VarianceTableCard({
               const rev = rep.revenue_variance
               const op = rep.operating_income_variance
               const ni = rep.net_income_variance
+              const rd = rep.research_and_development_variance
+              const hasRd =
+                rd != null && rd.start_value !== null && rd.end_value !== null
               const latestUrl =
                 rep.source_urls[String(rep.end_year)] ||
                 rep.annual_series[rep.annual_series.length - 1]?.sec_filing_url
@@ -171,6 +175,32 @@ export function VarianceTableCard({
                       </div>
                     </td>
 
+                    <td
+                      className="py-2 px-2.5 text-right whitespace-nowrap"
+                      title={
+                        hasRd
+                          ? `R&D intensity ${formatSignedBps(rep.rd_intensity_bps_delta ?? null)}`
+                          : 'No R&D expense reported in XBRL'
+                      }
+                    >
+                      {hasRd ? (
+                        <>
+                          <div className="text-ink-primary font-medium">
+                            {formatUsdCompact(rd.end_value)}
+                          </div>
+                          <div
+                            className={`text-[10px] font-medium ${deltaTextClass(
+                              rd.percentage_delta
+                            )}`}
+                          >
+                            {formatSignedPercent(rd.percentage_delta)}
+                          </div>
+                        </>
+                      ) : (
+                        <span className="text-ink-muted">—</span>
+                      )}
+                    </td>
+
                     <td className="py-2 px-2.5 text-right whitespace-nowrap">
                       <div className="inline-flex items-center gap-1.5 justify-end">
                         {onInspectFilingSection && (
@@ -245,6 +275,15 @@ export function VarianceTableCard({
                         </td>
                         <td className="py-1 px-2.5 text-right text-ink-primary">
                           NI {formatUsdCompact(step.net_income)}
+                        </td>
+                        <td
+                          className={`py-1 px-2.5 text-right ${deltaTextClass(
+                            step.research_and_development_yoy_pct ?? null
+                          )}`}
+                        >
+                          {step.research_and_development != null
+                            ? `R&D ${formatUsdCompact(step.research_and_development)}`
+                            : '—'}
                         </td>
                         <td className="py-1 px-2.5 text-right">
                           {step.sec_filing_url && (

@@ -366,7 +366,7 @@ def test_cloud_run_direct_iap_internal_sharing_terraform() -> None:
     assert 'startswith(lower(trimspace(p)), "domain:")' in vars_tf
     assert "google_cloud_run_v2_service.sec_edgar_analyst[0].uri" in outputs_tf
 
-    # CI deploys use --set-env-vars (replaces all env vars), so they must keep the IAP role.
+    # CI deploys must keep the IAP role in the env vars they pass explicitly.
     cloudbuild = (REPO_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
     deploy_yml = (REPO_ROOT / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
     assert "IAP_ASSERTION_DEFAULT_ROLE=${_IAP_DEFAULT_ROLE}" in cloudbuild
@@ -546,3 +546,38 @@ def test_ci_checkout_without_gitignored_chunks_or_unstructured_files(
     )
     assert sec_res["status"] == "success"
     assert sec_res["token_estimate"] > 50
+
+
+def test_vector_search_private_service_connect_terraform() -> None:
+    tf_dir = REPO_ROOT / "terraform"
+    network_tf = (tf_dir / "network.tf").read_text(encoding="utf-8")
+    vs_tf = (tf_dir / "vector_search.tf").read_text(encoding="utf-8")
+    run_tf = (tf_dir / "cicd_and_secrets.tf").read_text(encoding="utf-8")
+    vars_tf = (tf_dir / "variables.tf").read_text(encoding="utf-8")
+
+    # PSC is the default; the endpoint has no public domain in that mode
+    access_block = vars_tf.split('variable "vector_search_endpoint_access"', 1)[1].split("}", 1)[0]
+    assert 'default     = "private_service_connect"' in access_block
+    assert "public_endpoint_enabled = !local.vector_search_psc" in vs_tf
+    assert "enable_private_service_connect = true" in vs_tf
+    assert "project_allowlist              = [var.project_id]" in vs_tf
+
+    # Consumer side: private subnet, internal IP, and a PSC forwarding rule to the
+    # deployed index's service attachment
+    assert 'resource "google_compute_network" "sec_edgar"' in network_tf
+    assert "auto_create_subnetworks = false" in network_tf
+    assert "private_ip_google_access = true" in network_tf
+    assert 'address_type = "INTERNAL"' in network_tf
+    assert "private_endpoints[0].service_attachment" in network_tf
+    assert 'load_balancing_scheme = ""' in network_tf
+
+    # Cloud Run reaches the PSC IP through Direct VPC egress and is told the address
+    assert 'egress = "PRIVATE_RANGES_ONLY"' in run_tf
+    assert "network_interfaces {" in run_tf
+    assert '"VERTEX_VECTOR_SEARCH_PSC_ADDRESS"' in run_tf
+    assert "google_compute_address.vector_search_psc[0].address" in run_tf
+
+    # Cloud Build merges env vars so the Terraform-managed PSC address survives deploys
+    cloudbuild = (REPO_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
+    assert "--update-env-vars=" in cloudbuild
+    assert "--set-env-vars=" not in cloudbuild

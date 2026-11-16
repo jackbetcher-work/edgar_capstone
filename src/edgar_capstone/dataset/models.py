@@ -42,6 +42,10 @@ class MetricProvenance(BaseModel):
     net_income: str | None = Field(
         default=None, description="XBRL concept or method used to extract Net Income"
     )
+    research_and_development: str | None = Field(
+        default=None,
+        description="XBRL concept or method used to extract Research & Development expense",
+    )
     notes: list[str] = Field(
         default_factory=list,
         description="Accounting notes (e.g., pre-tax income proxy for banking/energy filers)",
@@ -81,9 +85,16 @@ class FinancialDataProfile(BaseModel):
     net_income: float | None = Field(
         default=None, description="Net Income attributable to parent in USD"
     )
+    research_and_development: float | None = Field(
+        default=None,
+        description=(
+            "Research & Development expense in USD. None (not 0) when the issuer does not "
+            "report an R&D line in its 10-K XBRL."
+        ),
+    )
     metric_provenance: MetricProvenance = Field(
         default_factory=MetricProvenance,
-        description="Provenance details for Revenue, Operating Income, and Net Income",
+        description="Provenance details for Revenue, Operating Income, Net Income, and R&D",
     )
     extracted_sections: list[str] = Field(
         default_factory=list,
@@ -152,6 +163,8 @@ class VertexAISearchManifestRecord(BaseModel):
             struct_data["operating_income"] = profile.operating_income
         if profile.net_income is not None:
             struct_data["net_income"] = profile.net_income
+        if profile.research_and_development is not None:
+            struct_data["research_and_development"] = profile.research_and_development
 
         safe_doc_id = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{profile.profile_id}_10K")
         return cls(

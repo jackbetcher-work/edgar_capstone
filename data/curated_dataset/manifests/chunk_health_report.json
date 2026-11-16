@@ -306,6 +306,6 @@
   },
   "health_score": 99.76,
   "health_status": "HEALTHY",
-  "published_to_cloud_monitoring": false,
-  "published_timeseries_count": 0
+  "published_to_cloud_monitoring": true,
+  "published_timeseries_count": 25
 }

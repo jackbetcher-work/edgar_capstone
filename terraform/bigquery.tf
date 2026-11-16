@@ -56,7 +56,7 @@ resource "google_bigquery_table" "financial_metrics" {
   project             = var.project_id
   dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
   table_id            = "financial_metrics"
-  description         = "Native partitioned and clustered SEC 10-K structured financial profiles (Revenue, Operating Income, Net Income, and metadata)."
+  description         = "Native partitioned and clustered SEC 10-K structured financial profiles (Revenue, Operating Income, Net Income, R&D, and metadata)."
   deletion_protection = var.deletion_protection
   labels              = var.labels
 
@@ -233,7 +233,7 @@ resource "google_bigquery_table" "v_financial_variances_yoy" {
   project             = var.project_id
   dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
   table_id            = "v_financial_variances_yoy"
-  description         = "Deterministic year-over-year variance view (USD delta and %) for Revenue, Operating Income, and Net Income paired with GCS/SEC URIs."
+  description         = "Deterministic year-over-year variance view (USD delta and %) for Revenue, Operating Income, Net Income, and R&D paired with GCS/SEC URIs."
   deletion_protection = var.deletion_protection
   labels              = var.labels
 
@@ -256,10 +256,12 @@ resource "google_bigquery_table" "v_financial_variances_yoy" {
           revenue,
           operating_income,
           net_income,
+          research_and_development,
           LAG(fiscal_year) OVER (PARTITION BY ticker ORDER BY fiscal_year) AS prev_fiscal_year,
           LAG(revenue) OVER (PARTITION BY ticker ORDER BY fiscal_year) AS prev_revenue,
           LAG(operating_income) OVER (PARTITION BY ticker ORDER BY fiscal_year) AS prev_operating_income,
           LAG(net_income) OVER (PARTITION BY ticker ORDER BY fiscal_year) AS prev_net_income,
+          LAG(research_and_development) OVER (PARTITION BY ticker ORDER BY fiscal_year) AS prev_research_and_development,
           unstructured_gcs_uri,
           structured_gcs_uri,
           sec_filing_url
@@ -293,6 +295,12 @@ resource "google_bigquery_table" "v_financial_variances_yoy" {
         IF(prev_fiscal_year = fiscal_year - 1, net_income - prev_net_income, NULL) AS net_income_yoy_delta,
         IF(prev_fiscal_year = fiscal_year - 1 AND prev_net_income != 0,
            SAFE_DIVIDE(net_income - prev_net_income, ABS(prev_net_income)) * 100.0, NULL) AS net_income_yoy_pct,
+        research_and_development,
+        prev_research_and_development,
+        IF(prev_fiscal_year = fiscal_year - 1, research_and_development - prev_research_and_development, NULL) AS research_and_development_yoy_delta,
+        IF(prev_fiscal_year = fiscal_year - 1 AND prev_research_and_development != 0,
+           SAFE_DIVIDE(research_and_development - prev_research_and_development, ABS(prev_research_and_development)) * 100.0, NULL) AS research_and_development_yoy_pct,
+        SAFE_DIVIDE(research_and_development, revenue) * 100.0 AS rd_intensity_pct,
         unstructured_gcs_uri,
         structured_gcs_uri,
         sec_filing_url

@@ -1406,3 +1406,84 @@ def test_http_429_rate_limit_retries_and_strict_vs_auto_fallback() -> None:
     )
     assert auto_res["status"] == "success"
     assert auto_res["record_count"] >= 1
+
+
+def test_vector_search_adapter_queries_private_service_connect_over_grpc() -> None:
+    """With a PSC address, the adapter uses the SDK's private match() (gRPC on <ip>:10000)."""
+    from edgar_capstone.agents.tools import GcpToolConfig, VertexVectorSearchAdapter
+
+    calls: dict[str, Any] = {}
+
+    class _FakePscEndpoint:
+        private_service_connect_ip_address: str | None = None
+
+        def match(self, **kwargs: Any) -> list[list[Any]]:
+            calls["match"] = kwargs
+            calls["ip"] = self.private_service_connect_ip_address
+            return [
+                [
+                    SimpleNamespace(id="NVDA_2026_item_7_0003", distance=0.12),
+                    SimpleNamespace(id="", distance=0.5),
+                ]
+            ]
+
+    def _factory(name: str) -> _FakePscEndpoint:
+        calls["endpoint_name"] = name
+        return _FakePscEndpoint()
+
+    cfg = GcpToolConfig(
+        data_backend="gcp",
+        project_id="iron-radio-514217-q7",
+        location="us-central1",
+        vvs_endpoint_id="555",
+        vvs_deployed_index_id="deployed_sec_10k_chunks_v1",
+        vvs_psc_address="10.20.0.5",
+    )
+    adapter = VertexVectorSearchAdapter(cfg, credentials=_FakeGcpCredentials())
+    adapter._psc_endpoint_factory = _factory
+
+    hits = adapter.find_neighbors(
+        [0.1] * 8,
+        tickers={"NVDA"},
+        gics_sector="information technology",
+        section_id="item_7",
+        start_year=2024,
+        end_year=2026,
+        neighbor_count=5,
+    )
+
+    assert calls["endpoint_name"] == (
+        "projects/iron-radio-514217-q7/locations/us-central1/indexEndpoints/555"
+    )
+    assert calls["ip"] == "10.20.0.5"
+    m = calls["match"]
+    assert m["deployed_index_id"] == "deployed_sec_10k_chunks_v1"
+    assert m["num_neighbors"] == 5
+    assert {(ns.name, tuple(ns.allow_tokens)) for ns in m["filter"]} == {
+        ("ticker", ("NVDA",)),
+        ("gics_sector", ("Information Technology",)),
+        ("section_id", ("item_7",)),
+    }
+    assert [(n.name, n.value_int, n.op) for n in m["numeric_filter"]] == [
+        ("fiscal_year", 2024, "GREATER_EQUAL"),
+        ("fiscal_year", 2026, "LESS_EQUAL"),
+    ]
+    # IDs and distances only; chunk text is hydrated from BigQuery later
+    assert hits == [
+        {
+            "chunk_id": "NVDA_2026_item_7_0003",
+            "profile_id": None,
+            "ticker": None,
+            "company_name": None,
+            "gics_sector": None,
+            "fiscal_year": None,
+            "section_id": None,
+            "section_title": None,
+            "chunk_text": None,
+            "sec_filing_url": None,
+            "unstructured_gcs_uri": None,
+            "distance": 0.12,
+            "similarity": 0.88,
+            "source_backend": "vertex_vector_search_psc",
+        }
+    ]

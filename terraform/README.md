@@ -22,7 +22,7 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `filing_chunks`: Metadata-filtered RAG table partitioned by `fiscal_year` and clustered by `gics_sector, ticker, section_id` with `embedding` (`ARRAY<FLOAT64>`, 768-d) ready for `VECTOR_SEARCH`, automatically seeded from `gs://fde-sec-edgar-sandbox-dev-sec-corpus/manifests/bigquery_filing_chunks.jsonl`.
   - `filing_chunks_ext`: Live GCS external table over `manifests/bigquery_filing_chunks.jsonl`.
   - `unstructured_10k_objects`: BigQuery Object Table indexing `gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/*`.
-  - `v_financial_variances_yoy`: Deterministic YoY variance SQL view (`revenue`, `operating_income`, `net_income` deltas and percentages).
+  - `v_financial_variances_yoy`: Deterministic YoY variance SQL view (`revenue`, `operating_income`, `net_income`, `research_and_development` deltas and percentages, plus `rd_intensity_pct`).
   - `v_filing_chunk_coverage`: Per-filing (`profile_id`, `ticker`, `fiscal_year`) diagnostic view reporting exact `item_1a_chunks`, `item_7_chunks`, `valid_embedding_chunks`, and `filing_chunk_status`.
   - `v_chunk_health_metrics`: Chunk health monitoring SQL view computing ROLLUP health metrics by `(gics_sector, section_id)` including `embedding_coverage_ratio`, `filing_coverage_ratio`, token/character percentiles (`p50`, `p95`), anomaly counts (`missing_embedding`, `dimension_mismatch`, `undersized`, `oversized`, `missing_metadata`), and composite `health_score` (`0–100`) & `health_status` (`HEALTHY`, `DEGRADED`, `UNHEALTHY`).
 - **BigQuery Streaming Telemetry & Audit Sinks + Cloud Logging Sink (`terraform/telemetry.tf`, `terraform/schemas/*.json`):**
@@ -36,8 +36,11 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `google_firestore_database.analyst_feedback_db`: Regional `FIRESTORE_NATIVE` database (`(default)`) persisting analyst thumbs-up/down ratings and audit comments (`analyst_feedback` collection), with `roles/datastore.user` granted to `sec-analyst-sa`.
 - **Vertex AI Vector Search (`terraform/vector_search.tf`):**
   - `sec-edgar-10k-chunks-index` (`google_vertex_ai_index`): 768-dimensional `COSINE_DISTANCE` Tree-AH ANN index backed by `gs://fde-sec-edgar-sandbox-dev-sec-corpus/vector_search/embeddings` with string `restricts` (`ticker`, `cik`, `gics_sector`, `gics_sub_industry`, `section_id`, `form_type`, `profile_id`), `numeric_restricts` (`fiscal_year`), and `crowding_tag` (`ticker`).
-  - `sec-edgar-10k-chunks-endpoint` (`google_vertex_ai_index_endpoint`): Public Index Endpoint for low-latency metadata-filtered vector retrieval. Private Service Connect is still open (README gap 2).
-  - The index only gets data once `seed_vertex_vector_index = true` points it at `vector_search/embeddings` in the bucket. Those embeddings haven't been uploaded yet.
+  - `sec-edgar-10k-chunks-endpoint` (`google_vertex_ai_index_endpoint`):
+    - With `vector_search_endpoint_access = "private_service_connect"` (the default), it's a PSC-only endpoint with no public domain, accepting connections from this project only (`project_allowlist`).
+    - With `vector_search_endpoint_access = "public"`, it's the public REST endpoint instead.
+    - Changing an existing endpoint between the two modes replaces it and redeploys the index.
+  - `seed_vertex_vector_index` (default `true`) points the index at `vector_search/embeddings` in the bucket, where the full-index embeddings (342,945 vectors) are published.
 - **Vertex AI Search / Discovery Engine (`terraform/vector_search.tf`):**
   - `sec-edgar-10k-corpus-ds` (`google_discovery_engine_data_store`) & `sec-edgar-10k-hybrid-search` (`google_discovery_engine_search_engine`): Unstructured 10-K search datastore and Enterprise LLM-enabled search app.
 - **Google Cloud Monitoring Chunk Health View (`terraform/monitoring.tf`):**
@@ -64,6 +67,10 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `cloud_run_access_mode = "iap_direct"` (default): `iap_enabled = true` on the Cloud Run service (google-beta provider). Users open the `app_url` output (`run.app`) and sign in with Google. `google_iap_web_cloud_run_service_iam_member` grants `roles/iap.httpsResourceAccessor` to each `iap_authorized_principals` entry (`group:` or `domain:`). No load balancer is created.
   - `cloud_run_access_mode = "load_balancer"`: ingress `internal-and-cloud-load-balancing` behind the external HTTPS LB, with IAP on the serverless-NEG backend service and a `RESTRICTED` / TLS 1.2+ SSL policy.
   - In both modes only the IAP service agent has `roles/run.invoker`. The IAP JWT audience for the active mode is written to the `sec-edgar-iap-audience` secret.
+- **Private networking for Vector Search (`terraform/network.tf`, PSC mode only):**
+  - `google_compute_network.sec_edgar` (`sec-edgar-analyst-vpc`, custom mode) and `google_compute_subnetwork.sec_edgar_private` (`private_subnet_cidr`, default `10.20.0.0/24`, Private Google Access on).
+  - `google_compute_address.vector_search_psc` (an internal IP) and `google_compute_forwarding_rule.vector_search_psc`. The forwarding rule is a PSC consumer endpoint (`load_balancing_scheme = ""`) targeting the deployed index's `private_endpoints[0].service_attachment`. It's only created once the index is deployed (`deploy_vertex_vector_index`).
+  - The Cloud Run service gets Direct VPC egress into the private subnet (`egress = "PRIVATE_RANGES_ONLY"`) plus `VERTEX_VECTOR_SEARCH_PSC_ADDRESS`. The app queries `<ip>:10000` over gRPC; the IP is also exported as the `vector_search_psc_address` output.
 - **VPC Service Controls (`terraform/vpc_service_controls.tf`):** off by default (`enable_vpc_service_controls`). When on, it creates a regular perimeter around the project that restricts the data and model APIs (`vpc_sc_restricted_services`). Ingress is allowed by identity for operators, CI/CD, runtime/agent SAs, and the log sink writer, and from any identity for Cloud Run invocations (IAP gates those). It's dry-run until `vpc_sc_enforce = true`. It needs an Access Context Manager policy: `vpc_sc_access_policy_id` (scoped policy delegated by an org admin) or `create_vpc_sc_scoped_access_policy = true` (needs org-level permissions).
 - **Custom Application Service Account (`sec-analyst-sa@iron-radio-514217-q7.iam.gserviceaccount.com` / logical project alias `sec-analyst-sa@fde-sec-edgar-sandbox-dev.iam.gserviceaccount.com`):**
   - Enforced via Terraform variable validation and attached directly to `google_cloud_run_v2_service.sec_edgar_analyst` (default Compute Engine SAs are never used).
@@ -120,11 +127,13 @@ terraform apply
 # (Already-built artifacts: publish without re-embedding)
 ../.venv/bin/python ../scripts/build_vector_db.py --upload-only
 
-# 4. Once vector_search/embeddings/ is in the bucket, attach it to the Vector Search index
-terraform apply -var=seed_vertex_vector_index=true
+# 4. Backfill R&D onto older profiles, load native financial_metrics, and import Vertex AI Search
+cd .. && make backfill-rd publish-financials index-vertex-search
 ```
 
-Current data state (2026-11-16): the full-index extraction (501 tickers, 3,022 profiles) and 342,945 Vertex-embedded chunks are built. The chunk and financial manifests are in `gs://fde-sec-edgar-sandbox-dev-sec-corpus/manifests/`. BigQuery isn't loaded yet (`filing_chunks` has 0 rows; `financial_metrics` holds the 114-row sample), and `vector_search/embeddings/` isn't uploaded. The remaining steps are tracked as gap 1 in the root README.
+`seed_vertex_vector_index` defaults to `true`, so the `terraform apply` in step 2 attaches `vector_search/embeddings/` to the Vector Search index. In a fresh project, pass `-var=seed_vertex_vector_index=false` until the embeddings are uploaded.
+
+Current data state (2026-11-16): the full index (501 tickers, 3,022 profiles, 342,945 Vertex-embedded chunks) is published. `filing_chunks` and `financial_metrics` (now with `research_and_development`) are loaded in BigQuery, `sec-edgar-10k-corpus-ds` holds all 3,022 filings, and the Vector Search index reads `vector_search/embeddings/`. The index is deployed to its (Private Service Connect) endpoint by the next full `terraform apply`.
 
 ## Example Metadata-Filtered RAG Query (`VECTOR_SEARCH`)
 

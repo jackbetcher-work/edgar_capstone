@@ -87,9 +87,9 @@ variable "seed_native_filing_chunks" {
 }
 
 variable "seed_vertex_vector_index" {
-  description = "Whether to attach gs://<sec_corpus_bucket>/vector_search/embeddings as contents_delta_uri on the Vertex AI Vector Search index (enable once embeddings exist in GCS)."
+  description = "Whether to attach gs://<sec_corpus_bucket>/vector_search/embeddings as contents_delta_uri on the Vertex AI Vector Search index. The full-index embeddings are published, so this defaults to true; set false only for a fresh project whose bucket has no embeddings yet."
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "embedding_model" {
@@ -512,4 +512,21 @@ variable "vpc_sc_app_ingress_access_levels" {
   description = "Access levels whose callers may reach run.googleapis.com (i.e. invoke the app through IAP). VPC-SC can't match IAM identities on Cloud Run invocations, so the default [\"*\"] admits any source and leaves who-gets-in to IAP. Swap in an IP-based access level to also restrict by network."
   type        = list(string)
   default     = ["*"]
+}
+
+variable "vector_search_endpoint_access" {
+  description = "How the Vector Search index endpoint is reached: private_service_connect (no public domain; Cloud Run queries a PSC forwarding-rule IP over Direct VPC egress) or public (REST findNeighbors on the public endpoint domain)."
+  type        = string
+  default     = "private_service_connect"
+
+  validation {
+    condition     = contains(["private_service_connect", "public"], var.vector_search_endpoint_access)
+    error_message = "vector_search_endpoint_access must be \"private_service_connect\" or \"public\"."
+  }
+}
+
+variable "private_subnet_cidr" {
+  description = "CIDR of the private subnet used for Cloud Run Direct VPC egress and the Vector Search PSC endpoint IP."
+  type        = string
+  default     = "10.20.0.0/24"
 }

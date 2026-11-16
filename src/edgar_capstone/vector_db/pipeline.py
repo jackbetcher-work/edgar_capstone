@@ -5,8 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -14,9 +12,9 @@ from typing import Any, Literal
 import google.auth
 import google.auth.exceptions
 import httpx
-from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
 
+from edgar_capstone.dataset.cloud_publish import run_bigquery_load_job
 from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_BUCKET_NAME,
     DEFAULT_LOCATION,
@@ -262,84 +260,25 @@ def trigger_bigquery_chunks_load_job(
     credentials: Any | None = None,
     poll_timeout_seconds: float = 120.0,
 ) -> str:
-    """Trigger a BigQuery `WRITE_TRUNCATE` load job from `source_gcs_uri` into `filing_chunks`."""
-    if credentials is None:
-        credentials, _ = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-    if not credentials.valid:
-        credentials.refresh(GoogleAuthRequest())
-    token = str(credentials.token)
+    """Trigger a BigQuery `WRITE_TRUNCATE` load job from `source_gcs_uri` into `filing_chunks`.
 
-    job_id = f"load_filing_chunks_{uuid.uuid4().hex[:12]}"
-    insert_url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/jobs"
-    payload = {
-        "jobReference": {
-            "projectId": project_id,
-            "jobId": job_id,
-            "location": location,
-        },
-        "configuration": {
-            "load": {
-                "sourceUris": [source_gcs_uri],
-                "destinationTable": {
-                    "projectId": project_id,
-                    "datasetId": dataset_id,
-                    "tableId": table_id,
-                },
-                "sourceFormat": "NEWLINE_DELIMITED_JSON",
-                "writeDisposition": "WRITE_TRUNCATE",
-                "autodetect": False,
-            }
-        },
-    }
-
-    client = http_client or httpx.Client(timeout=60.0)
-    close_client = http_client is None
-    try:
-        resp = client.post(
-            insert_url,
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-        )
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(
-                f"BigQuery load job submission failed (HTTP {resp.status_code}): {resp.text[:400]}"
-            )
-
-        status_url = (
-            f"https://bigquery.googleapis.com/bigquery/v2/projects/{project_id}/"
-            f"jobs/{job_id}?location={location}"
-        )
-        deadline = time.monotonic() + poll_timeout_seconds
-        while time.monotonic() < deadline:
-            poll_resp = client.get(
-                status_url,
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if poll_resp.status_code == 200:
-                job_data = poll_resp.json()
-                state = job_data.get("status", {}).get("state")
-                if state == "DONE":
-                    err = job_data.get("status", {}).get("errorResult")
-                    if err:
-                        raise RuntimeError(f"BigQuery load job {job_id} failed: {err}")
-                    return job_id
-            time.sleep(1.5 if poll_timeout_seconds <= 120 else 5.0)
-
-        logger.warning(
-            "BigQuery load job %s still running after %.0fs; check `bq show -j %s`.",
-            job_id,
-            poll_timeout_seconds,
-            job_id,
-        )
-        return job_id
-    finally:
-        if close_client:
-            client.close()
+    Thin wrapper over `run_bigquery_load_job`: raises `RuntimeError` on a failed job, and logs a
+    warning (returning the job id) if the job is still running after `poll_timeout_seconds`.
+    """
+    result = run_bigquery_load_job(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        table_id=table_id,
+        source_uris=[source_gcs_uri],
+        location=location,
+        write_disposition="WRITE_TRUNCATE",
+        job_id_prefix="load_filing_chunks",
+        poll_timeout_seconds=poll_timeout_seconds,
+        raise_on_timeout=False,
+        http_client=http_client,
+        credentials=credentials,
+    )
+    return result.job_id
 
 
 def run_vector_db_pipeline(

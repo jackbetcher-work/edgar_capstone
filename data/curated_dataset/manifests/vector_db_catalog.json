@@ -15,9 +15,9 @@
   "bigquery_manifest_path": "/Users/jackbetcher/agy-cli-projects/edgar_capstone/data/curated_dataset/manifests/bigquery_filing_chunks.jsonl",
   "vertex_vector_manifest_path": "/Users/jackbetcher/agy-cli-projects/edgar_capstone/data/curated_dataset/vector_search/embeddings/chunks_embeddings.json",
   "health_report_path": "/Users/jackbetcher/agy-cli-projects/edgar_capstone/data/curated_dataset/manifests/chunk_health_report.json",
-  "uploaded_to_gcs": false,
-  "loaded_to_bigquery": false,
-  "published_monitoring_metrics": false,
+  "uploaded_to_gcs": true,
+  "loaded_to_bigquery": true,
+  "published_monitoring_metrics": true,
   "health_score": 99.76,
   "health_status": "HEALTHY",
   "warnings": [

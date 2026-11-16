@@ -44,15 +44,26 @@ resource "google_vertex_ai_index_endpoint" "sec_10k_chunks_endpoint" {
   project                 = var.project_id
   region                  = var.region
   display_name            = "sec-edgar-10k-chunks-endpoint"
-  description             = "Public endpoint for metadata-filtered ANN retrieval over SEC 10-K Item 1A and Item 7 chunks."
-  public_endpoint_enabled = true
+  description             = local.vector_search_psc ? "Private Service Connect endpoint for metadata-filtered ANN retrieval over SEC 10-K Item 1A and Item 7 chunks." : "Public endpoint for metadata-filtered ANN retrieval over SEC 10-K Item 1A and Item 7 chunks."
+  public_endpoint_enabled = !local.vector_search_psc
   labels                  = var.labels
+
+  # PSC-only endpoint: no public domain, connections accepted from this project only.
+  # Switching an existing public endpoint to PSC replaces the endpoint (and redeploys
+  # the index); see network.tf for the consumer side.
+  dynamic "private_service_connect_config" {
+    for_each = local.vector_search_psc ? [1] : []
+    content {
+      enable_private_service_connect = true
+      project_allowlist              = [var.project_id]
+    }
+  }
 
   depends_on = [google_project_service.required_apis]
 }
 
-# Deploys the index onto the public endpoint so it can serve find_neighbors
-# queries. Deployment typically takes 20-40 minutes. SHARD_SIZE_SMALL indexes
+# Deploys the index onto the endpoint so it can serve queries (gRPC over PSC by
+# default, REST findNeighbors in public mode). Deployment typically takes 20-40 minutes. SHARD_SIZE_SMALL indexes
 # can be served on e2-standard-2 machines.
 resource "google_vertex_ai_index_endpoint_deployed_index" "sec_10k_chunks_deployed" {
   count = var.enable_vertex_vector_search && var.deploy_vertex_vector_index ? 1 : 0

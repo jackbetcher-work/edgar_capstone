@@ -24,11 +24,18 @@ class MetricRecord(BaseModel):
     revenue: float | None = Field(default=None, description="Total Revenue in USD")
     operating_income: float | None = Field(default=None, description="Operating Income in USD")
     net_income: float | None = Field(default=None, description="Net Income in USD")
+    research_and_development: float | None = Field(
+        default=None,
+        description="Research & Development expense in USD (None when the issuer reports no R&D line)",
+    )
     operating_margin_pct: float | None = Field(
         default=None, description="Operating Margin percentage (Operating Income / Revenue * 100)"
     )
     net_margin_pct: float | None = Field(
         default=None, description="Net Margin percentage (Net Income / Revenue * 100)"
+    )
+    rd_intensity_pct: float | None = Field(
+        default=None, description="R&D intensity percentage (R&D expense / Revenue * 100)"
     )
     sec_filing_url: str = Field(..., description="Public SEC EDGAR URL for the 10-K filing")
     unstructured_gcs_uri: str = Field(..., description="GCS URI for unstructured 10-K Markdown")
@@ -41,7 +48,7 @@ class MetricRecord(BaseModel):
 class MetricVariance(BaseModel):
     """Deterministic period-over-period variance for a single financial metric."""
 
-    metric_name: Literal["revenue", "operating_income", "net_income"]
+    metric_name: Literal["revenue", "operating_income", "net_income", "research_and_development"]
     start_year: int
     end_year: int
     start_value: float | None = None
@@ -74,6 +81,9 @@ class AnnualStepVariance(BaseModel):
     net_income: float | None = None
     net_income_yoy_delta: float | None = None
     net_income_yoy_pct: float | None = None
+    research_and_development: float | None = None
+    research_and_development_yoy_delta: float | None = None
+    research_and_development_yoy_pct: float | None = None
     sec_filing_url: str | None = None
 
 
@@ -91,6 +101,12 @@ class CompanyVarianceReport(BaseModel):
     revenue_variance: MetricVariance
     operating_income_variance: MetricVariance
     net_income_variance: MetricVariance
+    research_and_development_variance: MetricVariance | None = Field(
+        default=None,
+        description=(
+            "R&D expense variance; direction 'unavailable' when the issuer reports no R&D line"
+        ),
+    )
     operating_margin_bps_delta: float | None = Field(
         default=None,
         description="Change in Operating Margin in basis points (100 bps = 1.0%)",
@@ -98,6 +114,10 @@ class CompanyVarianceReport(BaseModel):
     net_margin_bps_delta: float | None = Field(
         default=None,
         description="Change in Net Margin in basis points (100 bps = 1.0%)",
+    )
+    rd_intensity_bps_delta: float | None = Field(
+        default=None,
+        description="Change in R&D intensity (R&D / Revenue) in basis points",
     )
     annual_series: list[AnnualStepVariance] = Field(default_factory=list)
     source_urls: dict[int, str] = Field(
@@ -356,6 +376,7 @@ class VarianceEvaluationItem(BaseModel):
     revenue_pct_delta: float | None = None
     operating_income_pct_delta: float | None = None
     net_income_pct_delta: float | None = None
+    research_and_development_pct_delta: float | None = None
     operating_margin_bps_delta: float | None = None
     net_margin_bps_delta: float | None = None
     material_findings: list[str] = Field(default_factory=list)
@@ -445,8 +466,14 @@ class AnalystMetricReference(BaseModel):
     ticker: str = Field(
         ..., description="Ticker of a company in the variance payload, e.g. 'NVDA'."
     )
-    metric: Literal["revenue", "operating_income", "net_income"] = Field(
-        ..., description="Metric to show; its figures come from the deterministic engine."
+    metric: Literal["revenue", "operating_income", "net_income", "research_and_development"] = (
+        Field(
+            ...,
+            description=(
+                "Metric to show; its figures come from the deterministic engine. Use "
+                "'research_and_development' for R&D spend questions."
+            ),
+        )
     )
     note: str = Field(
         default="",

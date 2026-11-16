@@ -269,6 +269,7 @@ def verify_narrative_against_calculations(
             "revenue_variance",
             "operating_income_variance",
             "net_income_variance",
+            "research_and_development_variance",
         ):
             m_obj = rep.get(metric_key) or {}
             pct = m_obj.get("percentage_delta")
@@ -279,6 +280,7 @@ def verify_narrative_against_calculations(
                 "revenue_yoy_pct",
                 "operating_income_yoy_pct",
                 "net_income_yoy_pct",
+                "research_and_development_yoy_pct",
             ):
                 val = step.get(step_key)
                 if val is not None:

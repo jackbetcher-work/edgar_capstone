@@ -96,10 +96,16 @@
     "description": "Annual net income attributable to parent in USD"
   },
   {
+    "name": "research_and_development",
+    "type": "FLOAT",
+    "mode": "NULLABLE",
+    "description": "Annual research & development expense in USD (NULL when the issuer reports no R&D line)"
+  },
+  {
     "name": "metric_provenance",
     "type": "RECORD",
     "mode": "NULLABLE",
-    "description": "XBRL concept provenance for Revenue, Operating Income, and Net Income",
+    "description": "XBRL concept provenance for Revenue, Operating Income, Net Income, and R&D",
     "fields": [
       {
         "name": "revenue",
@@ -118,6 +124,12 @@
         "type": "STRING",
         "mode": "NULLABLE",
         "description": "XBRL concept or extractor source for net_income"
+      },
+      {
+        "name": "research_and_development",
+        "type": "STRING",
+        "mode": "NULLABLE",
+        "description": "XBRL concept or extractor source for research_and_development"
       },
       {
         "name": "notes",

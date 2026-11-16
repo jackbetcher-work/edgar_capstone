@@ -16,11 +16,13 @@ HYDRATION_TICKERS ?=
 ADC_FILE ?= $(HOME)/.config/gcloud/application_default_credentials.json
 CORPUS_PROJECT_ID ?= iron-radio-514217-q7
 SEC_CORPUS_BUCKET ?= fde-sec-edgar-sandbox-dev-sec-corpus
+VERTEX_AI_SEARCH_DATASTORE_ID ?= sec-edgar-10k-corpus-ds
+VERTEX_SEARCH_RECONCILIATION ?= INCREMENTAL
 OFFLINE_ENV := -e EDGAR_EXECUTION_MODE=deterministic -e EDGAR_DATA_BACKEND=local \
 	-e EDGAR_TELEMETRY_BACKEND=local -e EDGAR_FEEDBACK_BACKEND=local \
 	-e EDGAR_PROMPT_STORE_BACKEND=local -e EDGAR_MODEL_ARMOR_MODE=disabled
 
-.PHONY: help install dev start backend frontend build lint format test check clean hydrate-corpus smoke docker-build docker-smoke docker-smoke-hydrated
+.PHONY: help install dev start backend frontend build lint format test check clean hydrate-corpus smoke docker-build docker-smoke docker-smoke-hydrated publish-financials index-vertex-search backfill-rd
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage: make <target>\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 } END {printf "\n"}' $(MAKEFILE_LIST)
@@ -77,6 +79,16 @@ test: ## Run backend (pytest + secret scan) and frontend (lint + vitest) checks
 
 hydrate-corpus: ## Download gitignored chunks manifest + 10-K Markdown from GCS into data/curated_dataset
 	$(PYTHON) scripts/hydrate_corpus.py --bucket $(SEC_CORPUS_BUCKET) --project-id $(CORPUS_PROJECT_ID) --scopes $(HYDRATION_SCOPES) $(if $(HYDRATION_TICKERS),--tickers $(HYDRATION_TICKERS),)
+
+backfill-rd: ## Backfill R&D expense onto staged profiles from SEC XBRL companyfacts, rewrite manifests, upload to GCS
+	$(PYTHON) scripts/backfill_rd_metric.py --project-id $(CORPUS_PROJECT_ID) --bucket $(SEC_CORPUS_BUCKET)
+
+publish-financials: ## Reload BigQuery sec_edgar.financial_metrics from the GCS manifests/bigquery_financials.jsonl
+	$(PYTHON) scripts/publish_corpus.py financial-metrics --project-id $(CORPUS_PROJECT_ID) --bucket $(SEC_CORPUS_BUCKET)
+
+index-vertex-search: ## Import vertex_ai_search_metadata.jsonl into Vertex AI Search (documents:import) + smoke query
+	$(PYTHON) scripts/publish_corpus.py vertex-search --project-id $(CORPUS_PROJECT_ID) --bucket $(SEC_CORPUS_BUCKET) \
+		--data-store-id $(VERTEX_AI_SEARCH_DATASTORE_ID) --reconciliation-mode $(VERTEX_SEARCH_RECONCILIATION)
 
 smoke: ## Run the offline API smoke test in-process against the local checkout (no Docker)
 	EDGAR_EXECUTION_MODE=deterministic EDGAR_DATA_BACKEND=local EDGAR_TELEMETRY_BACKEND=local \

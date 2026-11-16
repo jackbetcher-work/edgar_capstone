@@ -128,4 +128,32 @@ view: v_financial_variances_yoy {
     value_format: "0.00\"%\""
     sql: ${TABLE}.net_income_yoy_pct ;;
   }
+
+  measure: total_research_and_development {
+    type: sum
+    label: "R&D Expense (USD)"
+    value_format_name: usd_0
+    sql: ${TABLE}.research_and_development ;;
+  }
+
+  measure: total_research_and_development_yoy_delta {
+    type: sum
+    label: "R&D Expense YoY Delta (USD)"
+    value_format_name: usd_0
+    sql: ${TABLE}.research_and_development_yoy_delta ;;
+  }
+
+  measure: avg_research_and_development_yoy_pct {
+    type: average
+    label: "R&D Expense YoY Growth (%)"
+    value_format: "0.00\"%\""
+    sql: ${TABLE}.research_and_development_yoy_pct ;;
+  }
+
+  measure: avg_rd_intensity_pct {
+    type: average
+    label: "R&D Intensity (% of Revenue)"
+    value_format: "0.00\"%\""
+    sql: ${TABLE}.rd_intensity_pct ;;
+  }
 }
