@@ -1163,6 +1163,16 @@ def run_conversational_rag_turn(
             answer_markdown,
             caller_agent="FinancialAnalystAgent",
         )
+        raw_report_text = str(react_result.get("raw_structured_report_text") or "")
+        if not resp_decision.blocked and raw_report_text:
+            # Structured-report verification can drop unsupported sentences before rendering;
+            # a projection or MNPI leak in the raw model output must still be blocked & audited.
+            raw_decision = guardrail_svc.inspect_model_response(
+                raw_report_text,
+                caller_agent="FinancialAnalystAgent",
+            )
+            if raw_decision.blocked:
+                resp_decision = raw_decision
     if resp_decision.blocked:
         out_guard_claims = authorize_agent_s2s_hop(
             caller_agent="FinancialAnalystAgent",
@@ -1368,6 +1378,9 @@ def run_conversational_rag_turn(
         },
         "execution_mode": active_execution_mode,
         "adk_runtime": adk_runtime_meta,
+        # Verified structured answer (None for deterministic or legacy free-text synthesis)
+        "structured_report": adk_runtime_meta.get("structured_report"),
+        "report_verification": adk_runtime_meta.get("report_verification"),
         "prompt_store": get_prompt_store_status_metadata(),
         "intent": intent,
         "orchestrator": RootOrchestrator.name,

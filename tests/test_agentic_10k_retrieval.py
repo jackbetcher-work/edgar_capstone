@@ -14,7 +14,6 @@ from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
 
 from edgar_capstone.agents import (
-    calculate_period_variances,
     get_context_latency_tracker,
     get_conversation_memory_manager,
     query_cached_10k_context,
@@ -27,6 +26,7 @@ from edgar_capstone.agents.tools import (
     _load_all_profiles_cached,
     load_cached_10k_section,
 )
+from tests.structured_report_helpers import finding_from_citation, report_json
 
 
 def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() -> None:
@@ -211,15 +211,10 @@ class _RetrievingAnalystLlm(BaseLlm):
 
         payload = tool_responses[-1].response or {}
         cit = payload["citations"][-1]
-        rep = calculate_period_variances(tickers="NVDA", start_year=2024, end_year=2026)[
-            "variance_reports"
-        ][0]
-        final_md = (
-            "### NVIDIA Corp. (NVDA) — Agent-Retrieved 10-K Evidence\n\n"
-            f"- Revenue grew **+{rep['revenue_variance']['percentage_delta']:.2f}%** and operating "
-            f"income **+{rep['operating_income_variance']['percentage_delta']:.2f}%** "
-            f"[NVDA FY{cit['fiscal_year']} | {cit['section_title']} | {cit['chunk_id']}]"
-            f"({cit['sec_filing_url']})."
+        final_md = report_json(
+            headline="NVIDIA Corp. (NVDA) — Agent-Retrieved 10-K Evidence",
+            key_metrics=[("NVDA", "revenue"), ("NVDA", "operating_income")],
+            findings=[finding_from_citation(cit, "Data center demand drove the growth.")],
         )
         yield LlmResponse(
             model_version=self.model,
@@ -291,6 +286,13 @@ def test_chat_turn_agent_retrieves_its_own_evidence_and_citations_resolve() -> N
     turn_chunk_ids = {c["chunk_id"] for c in turn["citations"]}
     assert set(retrieval["cited_chunk_ids"]) <= turn_chunk_ids
 
+    # Structured answer: verified claims are returned as JSON alongside the rendered Markdown
+    assert turn["structured_report"]["headline"].startswith("NVIDIA Corp. (NVDA)")
+    assert turn["report_verification"]["findings_verified"] == 1
+    assert turn["report_verification"]["usable"] is True
+    assert "#### Findings" in turn["answer_markdown"]
+    assert "*Evidence:*" in turn["answer_markdown"]
+
 
 def test_judge_sees_the_passages_the_report_cites() -> None:
     from edgar_capstone.agents.live_runtime import select_citations_for_judge
@@ -360,7 +362,30 @@ def test_unexecuted_text_tool_call_falls_back_instead_of_shipping_a_plan() -> No
         reasoning_llm=_TextActionLlm(),
         judge_llm=_JudgeLlm(),
     )
-    assert turn["adk_runtime"]["grounding_fallback_applied"] is True
-    assert "incomplete" in turn["adk_runtime"]["fallback_reason"]
+    # With structured output, a prose tool call fails AnalystReport validation (or the
+    # incomplete-output guard) and the turn falls back instead of shipping the plan.
+    assert turn["adk_runtime"]["grounding_fallback_applied"] is True or (
+        turn["execution_mode"] == "deterministic_fallback"
+    )
     assert "default_api." not in turn["answer_markdown"]
     assert "/*ACTION*/" not in turn["answer_markdown"]
+
+
+def test_retrieval_budget_short_circuits_tools_after_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from edgar_capstone.agents.callbacks import retrieval_budget_before_tool_callback
+
+    monkeypatch.setenv("EDGAR_ANALYST_RETRIEVAL_BUDGET", "2")
+    ctx = SimpleNamespace(state={})
+    search = SimpleNamespace(name="search_10k_chunks_rag")
+    calc = SimpleNamespace(name="calculate_period_variances")
+    assert retrieval_budget_before_tool_callback(search, {}, ctx) is None
+    assert retrieval_budget_before_tool_callback(search, {}, ctx) is None
+    blocked = retrieval_budget_before_tool_callback(search, {}, ctx)
+    assert blocked is not None and blocked["status"] == "retrieval_budget_exhausted"
+    assert "Write the AnalystReport now" in blocked["message"]
+    # Non-retrieval tools are never budgeted
+    assert retrieval_budget_before_tool_callback(calc, {}, ctx) is None

@@ -31,6 +31,7 @@ from edgar_capstone.agents import (
 from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.security import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
+from tests.structured_report_helpers import evidence_leads, finding_from_citation, report_json
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -57,21 +58,31 @@ class StreamingProAnalystLlm(BaseLlm):
             for p in (c.parts or [])
             if getattr(p, "text", None)
         )
+        leads = evidence_leads(llm_request) or [
+            {
+                "chunk_id": "NVDA_2026_item_7_0000",
+                "ticker": "NVDA",
+                "fiscal_year": 2026,
+                "excerpt": "Data Center compute demand drove revenue growth during the fiscal year.",
+            }
+        ]
         if self.override_markdown is not None:
-            final_md = self.override_markdown
+            # Hallucinated statement: its figure appears in neither the quote nor the payload
+            final_md = report_json(
+                headline="Hallucinated Report",
+                findings=[finding_from_citation(leads[0], self.override_markdown)],
+            )
         else:
-            var_res = calculate_period_variances(tickers="NVDA", start_year=2024, end_year=2026)
-            nvda_rep = var_res["variance_reports"][0]
-            rev_pct = nvda_rep["revenue_variance"]["percentage_delta"]
-            op_pct = nvda_rep["operating_income_variance"]["percentage_delta"]
-            final_md = (
-                f"### NVIDIA Corp. (NVDA) — Live ADK Grounded Variance Synthesis\n\n"
-                f"- **Deterministic Variance Alignment:** Across FY2024–FY2026, NVIDIA revenue expanded "
-                f"**+{rev_pct:.2f}%** while operating income increased **+{op_pct:.2f}%**, driven by "
-                f"Blackwell and Hopper Data Center compute demand "
-                f"[NVDA FY2026 | Item 7 MD&A | NVDA_2026_item_7_0000](https://www.sec.gov/Archives/edgar/data/1045810).\n"
-                f"- **Risk Factor Context:** Export licensing controls and supply chain capacity commitments "
-                f"remain key operational variables cited in Item 1A (`prompt_chars={len(prompt_blob)}`)."
+            final_md = report_json(
+                headline="NVIDIA Corp. (NVDA) — Live ADK Grounded Variance Synthesis",
+                key_metrics=[("NVDA", "revenue"), ("NVDA", "operating_income")],
+                findings=[
+                    finding_from_citation(
+                        leads[0],
+                        "Data Center compute demand drove the revenue expansion.",
+                    )
+                ],
+                notes=f"Grounded in cached 10-K passages (prompt_chars={len(prompt_blob)}).",
             )
 
         await asyncio.sleep(self.ttft_delay_s)
@@ -447,10 +458,7 @@ def test_live_adk_post_generation_grounding_lock_prevents_numeric_hallucination(
     hallucinating_llm = StreamingProAnalystLlm(
         ttft_delay_s=0.005,
         decode_delay_s=0.005,
-        override_markdown=(
-            "### Hallucinated Report\n"
-            "NVIDIA revenue declined -99.99% in FY2026 without any SEC 10-K citation tags."
-        ),
+        override_markdown="NVIDIA revenue declined -99.99% in FY2026.",
     )
     flash_llm = StreamingFlashStructuredLlm(mode="evaluation")
 

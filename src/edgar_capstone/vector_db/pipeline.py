@@ -31,6 +31,7 @@ from edgar_capstone.vector_db.chunker import chunk_filing_document
 from edgar_capstone.vector_db.embedder import (
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_MAX_BATCH_CHARS,
     VertexAIEmbedder,
     populate_chunk_embeddings,
 )
@@ -45,6 +46,19 @@ from edgar_capstone.vector_db.monitoring import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+VECTOR_DB_ARTIFACT_PATHS: tuple[str, ...] = (
+    "manifests/bigquery_filing_chunks.jsonl",
+    "vector_search/embeddings/chunks_embeddings.json",
+    "manifests/chunk_health_report.json",
+    "manifests/vector_db_catalog.json",
+)
+# Small files rewritten after GCS/BigQuery/Monitoring sync so their published flags persist.
+_VECTOR_DB_STATUS_PATHS = [
+    "manifests/chunk_health_report.json",
+    "manifests/vector_db_catalog.json",
+]
 
 
 @dataclass(slots=True)
@@ -65,6 +79,9 @@ class VectorDBBuildConfig:
     embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS
     embedding_backend: Literal["vertex_ai", "deterministic", "auto"] = "auto"
     embedding_batch_size: int = 50
+    embedding_max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS
+    embedding_max_workers: int = 8
+    bigquery_load_timeout_seconds: float = 1800.0
     target_chunk_chars: int = 2200
     max_chunk_chars: int = 3600
     min_chunk_chars: int = 150
@@ -190,8 +207,12 @@ def upload_vector_db_artifacts_to_gcs(
     location: str = DEFAULT_LOCATION,
     create_bucket_if_missing: bool = True,
     storage_client: storage.Client | None = None,
+    rel_paths: list[str] | None = None,
 ) -> int:
-    """Upload the vector database manifests and Vertex AI Vector Search files to GCS."""
+    """Upload the vector database manifests and Vertex AI Vector Search files to GCS.
+
+    `rel_paths` limits the upload to a subset of `VECTOR_DB_ARTIFACT_PATHS`.
+    """
     try:
         client = storage_client or storage.Client(project=project_id)
     except google.auth.exceptions.DefaultCredentialsError as exc:
@@ -206,12 +227,8 @@ def upload_vector_db_artifacts_to_gcs(
         location=location,
         create_if_missing=create_bucket_if_missing,
     )
-    rel_paths = [
-        "manifests/bigquery_filing_chunks.jsonl",
-        "vector_search/embeddings/chunks_embeddings.json",
-        "manifests/chunk_health_report.json",
-        "manifests/vector_db_catalog.json",
-    ]
+    if rel_paths is None:
+        rel_paths = list(VECTOR_DB_ARTIFACT_PATHS)
     uploaded = 0
     for rel in rel_paths:
         local_file = output_dir / rel
@@ -311,8 +328,14 @@ def trigger_bigquery_chunks_load_job(
                     if err:
                         raise RuntimeError(f"BigQuery load job {job_id} failed: {err}")
                     return job_id
-            time.sleep(1.5)
+            time.sleep(1.5 if poll_timeout_seconds <= 120 else 5.0)
 
+        logger.warning(
+            "BigQuery load job %s still running after %.0fs; check `bq show -j %s`.",
+            job_id,
+            poll_timeout_seconds,
+            job_id,
+        )
         return job_id
     finally:
         if close_client:
@@ -384,6 +407,7 @@ def run_vector_db_pipeline(
         _load_cached_embeddings(bq_manifest_path) if config.skip_existing_embeddings else None
     )
 
+    checkpoint_path = output_dir / "vector_search" / ".embedding_checkpoint.jsonl"
     requested_backend: Literal["vertex_ai", "deterministic", "auto"] = (
         "deterministic"
         if (config.local_only and config.embedding_backend == "auto")
@@ -400,7 +424,11 @@ def run_vector_db_pipeline(
         batch_size=config.embedding_batch_size,
         existing_embeddings=cached_embeddings,
         vertex_embedder=vertex_embedder,
+        max_workers=config.embedding_max_workers,
+        max_batch_chars=config.embedding_max_batch_chars,
+        checkpoint_path=checkpoint_path,
     )
+    cached_embeddings = None
 
     health_report = evaluate_chunk_health(
         all_chunks,
@@ -440,6 +468,8 @@ def run_vector_db_pipeline(
     )
 
     _write_vector_db_artifacts(output_dir, all_chunks, health_report, summary)
+    # The manifests now hold every embedding, so the resume checkpoint is no longer needed.
+    checkpoint_path.unlink(missing_ok=True)
 
     if not config.local_only:
         upload_vector_db_artifacts_to_gcs(
@@ -461,6 +491,7 @@ def run_vector_db_pipeline(
                 source_gcs_uri=source_uri,
                 location=config.location,
                 http_client=http_client,
+                poll_timeout_seconds=config.bigquery_load_timeout_seconds,
             )
             summary.loaded_to_bigquery = True
 
@@ -481,6 +512,7 @@ def run_vector_db_pipeline(
             location=config.location,
             create_bucket_if_missing=False,
             storage_client=storage_client,
+            rel_paths=_VECTOR_DB_STATUS_PATHS,
         )
 
     return summary, health_report

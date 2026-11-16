@@ -1659,6 +1659,23 @@ def get_model_armor_status_metadata() -> dict[str, Any]:
 # Official ADK 2.14.0 `BasePlugin` Integration (`ModelArmorSafetyPlugin`)
 # ---------------------------------------------------------------------------
 
+
+def schema_safe_block_text(original_text: str, block_message: str) -> str:
+    """Replacement text for a blocked model response that keeps structured outputs parseable.
+
+    FinancialAnalystAgent answers with constrained `AnalystReport` JSON. Replacing a blocked
+    answer with plain text would fail ADK's output-schema validation, crash the run, and lose
+    the block decision, so structured answers get a minimal AnalystReport carrying the
+    block message instead.
+    """
+    stripped = (original_text or "").strip()
+    if stripped.startswith("{") and '"headline"' in stripped:
+        return json.dumps(
+            {"headline": block_message, "key_metrics": [], "findings": [], "notes": ""}
+        )
+    return block_message
+
+
 _PLUGIN_BLOCK_STATE_KEY = "_model_armor_plugin_pending_block_message"
 _PENDING_STATE_DELTA_KEY = "_model_armor_pending_state_delta"
 _VERIFIED_PROMPT_HASH_KEY = "_model_armor_verified_prompt_sha256"
@@ -1907,7 +1924,11 @@ class ModelArmorSafetyPlugin(BasePlugin):
             return LlmResponse(
                 content=genai_types.Content(
                     role="model",
-                    parts=[genai_types.Part(text=decision.block_message)],
+                    parts=[
+                        genai_types.Part(
+                            text=schema_safe_block_text(combined_text, decision.block_message)
+                        )
+                    ],
                 )
             )
 

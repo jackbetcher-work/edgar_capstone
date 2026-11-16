@@ -50,6 +50,7 @@ from edgar_capstone.agents import (
 from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.security import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
+from tests.structured_report_helpers import report_json, verbatim_quote
 
 
 def _bearer_headers() -> dict[str, str]:
@@ -186,17 +187,20 @@ class _DeterministicReActProLlm(BaseLlm):
         op_pct = nvda_rep["operating_income_variance"]["percentage_delta"]
         chunk_id = (cache_payload.get("matched_chunk_ids") or ["NVDA_2026_item_7_0001"])[0]
         filing_url = cache_payload.get("sec_filing_url") or "https://www.sec.gov/nvda"
-        explanation_snippet = (
-            cache_payload.get("explanations") or ["Data center compute growth."]
-        )[0][:180]
-
-        final_md = (
-            "/*FINAL_ANSWER*/\n"
-            f"### NVIDIA CORP (NVDA) Grounded Variance Report\n"
-            f"- **Evaluated Variances (FY2024→FY2026):** Revenue grew **+{rev_pct:.2f}%** and "
-            f"Operating Income grew **+{op_pct:.2f}%**.\n"
-            f"- **Cached 10-K Explanation:** {explanation_snippet} "
-            f"[NVDA FY2026 | Item 7 MD&A | {chunk_id}]({filing_url})"
+        passage = (cache_payload.get("passages") or [{"text": "Data center compute growth."}])[0]
+        _ = (rev_pct, op_pct, filing_url)
+        final_md = report_json(
+            headline="NVIDIA CORP (NVDA) Grounded Variance Report",
+            key_metrics=[("NVDA", "revenue"), ("NVDA", "operating_income")],
+            findings=[
+                {
+                    "statement": "Data center compute demand explains the revenue variance.",
+                    "ticker": "NVDA",
+                    "fiscal_year": 2026,
+                    "chunk_ids": [chunk_id],
+                    "evidence_quote": verbatim_quote(passage["text"]),
+                }
+            ],
         )
         yield LlmResponse(
             model_version="gemini-2.5-pro",

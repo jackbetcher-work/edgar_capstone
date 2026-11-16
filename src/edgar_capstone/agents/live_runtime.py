@@ -576,8 +576,9 @@ def _retrieval_instructions(
         f"`{scope.get('gics_sector', 'ALL')}`, sections `{scope.get('section_id', 'ALL')}`, "
         f"fiscal years `FY{scope.get('start_year')}`–`FY{scope.get('end_year')}`.",
         "- Write focused queries from the question and the variance movers, keep result sets "
-        "small (`max_passages` <= 4, `top_k` <= 8), skip evidence the leads already cover, and "
-        "stop once every claim is supported.",
+        "small (`max_passages` <= 4, `top_k` <= 8), run independent queries in parallel, skip "
+        "evidence the leads already cover, and stop once every claim is supported (at most 6 "
+        "retrieval calls).",
     ]
     if suggested:
         lines.append(
@@ -652,10 +653,12 @@ def _build_financial_reasoning_prompt(
         )
     sections.append(_retrieval_instructions(scope, variance_evaluations))
     sections.append(
-        "## Synthesis Requirements\n"
-        "Every percentage delta must match the deterministic calculation payload. Every 10-K claim "
-        "must carry an inline `[TICKER FYxxxx | Section Title | chunk_id](sec_filing_url)` citation "
-        "using a `chunk_id` returned by your tools or listed in the evidence leads."
+        "## Answer Format\n"
+        "Answer with a concise `AnalystReport`: a one-sentence `headline`; `key_metrics` as "
+        "references only (the figures come from the payload above); up to 6 `findings`, each with "
+        "`chunk_ids` from your tools or the evidence leads plus a verbatim `evidence_quote` from one "
+        "of those chunks; and short `notes` for anything else. Figures in a finding must appear in "
+        "its quote. Findings that can't be verified are dropped."
     )
     return "\n\n".join(sections)
 
@@ -740,6 +743,9 @@ async def run_live_adk_financial_reasoning_async(
         use_adk_app=True,
         summarizer_llm=flash_llm if isinstance(flash_llm, BaseLlm) else None,
         backend=resolved.backend,
+        # Retrieval is capped at 6 tool calls (retrieval_budget_before_tool_callback); the
+        # remaining calls leave room for parallel tool rounds plus the final AnalystReport.
+        max_llm_calls=10,
     )
 
 

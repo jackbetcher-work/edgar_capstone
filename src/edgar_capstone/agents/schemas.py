@@ -429,3 +429,79 @@ class CodingAssistanceReport(BaseModel):
     context_tokens: int = 0
     context_latency_ms: float = 0.0
     total_latency_ms: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# FinancialAnalystAgent structured output (constrained decoding via ADK output_schema)
+# ---------------------------------------------------------------------------
+# Length limits are stated in field descriptions rather than enforced with max_length:
+# a model that overshoots would fail ADK's schema validation and lose the whole answer.
+# `structured_report.py` trims and verifies after parsing instead.
+
+
+class AnalystMetricReference(BaseModel):
+    """A headline metric to display. Values are filled in from the deterministic engine."""
+
+    ticker: str = Field(
+        ..., description="Ticker of a company in the variance payload, e.g. 'NVDA'."
+    )
+    metric: Literal["revenue", "operating_income", "net_income"] = Field(
+        ..., description="Metric to show; its figures come from the deterministic engine."
+    )
+    note: str = Field(
+        default="",
+        description="Optional label of at most 12 words, e.g. 'fastest growth'. No figures.",
+    )
+
+
+class AnalystFinding(BaseModel):
+    """One 10-K-grounded claim that can be checked against its cited passage."""
+
+    statement: str = Field(
+        ...,
+        description=(
+            "One sentence (at most 40 words) answering part of the question. Any figure it "
+            "contains must appear verbatim in evidence_quote; do not restate variance "
+            "percentages, which are shown from key_metrics."
+        ),
+    )
+    ticker: str = Field(..., description="Company ticker the finding is about.")
+    fiscal_year: int = Field(..., description="Fiscal year of the cited filing.")
+    chunk_ids: list[str] = Field(
+        ...,
+        description=(
+            "1-3 chunk_ids returned by your retrieval tools or listed as evidence leads. "
+            "Never invent IDs."
+        ),
+    )
+    evidence_quote: str = Field(
+        ...,
+        description=(
+            "A short verbatim quote (10-40 words) copied exactly from one of the cited chunks "
+            "that supports the statement."
+        ),
+    )
+
+
+class AnalystReport(BaseModel):
+    """Structured, verifiable answer produced by FinancialAnalystAgent."""
+
+    headline: str = Field(
+        ...,
+        description="One-sentence direct answer to the analyst's question (at most 35 words).",
+    )
+    key_metrics: list[AnalystMetricReference] = Field(
+        default_factory=list,
+        description="Up to 6 metrics to display, most relevant first.",
+    )
+    findings: list[AnalystFinding] = Field(
+        default_factory=list,
+        description="Up to 6 grounded findings, most important first.",
+    )
+    notes: str = Field(
+        default="",
+        description=(
+            "Other details worth sharing in at most 120 words: caveats, data gaps, how "
+            "disclosures changed. Not source-verified, so do not introduce new figures here."
+        ),
+    )

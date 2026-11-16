@@ -363,3 +363,112 @@ def test_cli_parse_args_and_terraform_monitoring_definitions() -> None:
     assert 'resource "google_bigquery_table" "v_filing_chunk_coverage"' in bigquery_tf
     assert 'resource "google_vertex_ai_index" "sec_10k_chunks"' in vector_tf
     assert 'resource "google_discovery_engine_data_store" "sec_10k_corpus"' in vector_tf
+
+
+def _mock_vertex_embedder(
+    requests_seen: list[int],
+    *,
+    reject_over: int | None = None,
+    fail_after: int | None = None,
+    **kwargs: object,
+) -> VertexAIEmbedder:
+    """Build a VertexAIEmbedder backed by an httpx MockTransport."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        n = len(body["instances"])
+        if reject_over is not None and n > reject_over:
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "message": "Unable to submit request because the input token count is 25000 but the model supports up to 20000."
+                    }
+                },
+            )
+        if fail_after is not None and len(requests_seen) >= fail_after:
+            return httpx.Response(403, json={"error": {"message": "quota"}})
+        requests_seen.append(n)
+        preds = [
+            {"embeddings": {"values": [0.123456789] * DEFAULT_EMBEDDING_DIMENSIONS}}
+            for _ in range(n)
+        ]
+        return httpx.Response(200, json={"predictions": preds})
+
+    creds = MagicMock()
+    creds.valid = True
+    creds.token = "fake-oauth-token"
+    return VertexAIEmbedder(
+        project_id="iron-radio-514217-q7",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        credentials=creds,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_vertex_embedder_batches_by_size_splits_oversized_and_runs_concurrently() -> None:
+    texts = [f"text {i} " + "x" * 1000 for i in range(40)]
+
+    seen: list[int] = []
+    embedder = _mock_vertex_embedder(seen, batch_size=50, max_batch_chars=10_000)
+    assert len(embedder.embed_texts(texts)) == 40
+    assert max(seen) <= 9  # ~1,008 chars each -> at most 9 per 10,000-char batch
+    assert sum(seen) == 40
+
+    seen = []
+    embedder = _mock_vertex_embedder(seen, reject_over=4, batch_size=16, max_batch_chars=10**9)
+    assert len(embedder.embed_texts(texts)) == 40
+    assert max(seen) <= 4 and sum(seen) == 40
+
+    seen = []
+    embedder = _mock_vertex_embedder(seen, batch_size=3, max_workers=4)
+    order: list[int] = []
+    vecs = embedder.embed_texts(texts, on_batch_complete=lambda s, e, v: order.append(s))
+    assert len(vecs) == 40 and sum(seen) == 40
+    assert sorted(order) == list(range(0, 40, 3))
+
+
+def test_populate_chunk_embeddings_checkpoints_and_resumes(tmp_path: Path) -> None:
+    prof = _sample_profile()
+    chunks = chunk_filing_document(prof, _sample_markdown(prof))
+    assert len(chunks) >= 2
+    ckpt = tmp_path / "ckpt.jsonl"
+
+    seen: list[int] = []
+    failing = _mock_vertex_embedder(seen, fail_after=1, batch_size=1)
+    try:
+        populate_chunk_embeddings(
+            chunks,
+            project_id="p",
+            backend="vertex_ai",
+            vertex_embedder=failing,
+            checkpoint_path=ckpt,
+        )
+        raise AssertionError("expected the mocked quota failure")
+    except RuntimeError:
+        pass
+    assert len(ckpt.read_text(encoding="utf-8").splitlines()) == 1
+
+    fresh = chunk_filing_document(prof, _sample_markdown(prof))
+    seen = []
+    ok = _mock_vertex_embedder(seen, batch_size=1)
+    populated, backend = populate_chunk_embeddings(
+        fresh,
+        project_id="p",
+        backend="vertex_ai",
+        vertex_embedder=ok,
+        checkpoint_path=ckpt,
+    )
+    assert backend == "vertex_ai"
+    assert sum(seen) == len(fresh) - 1  # the checkpointed chunk was not re-embedded
+    assert all(c.embedding[0] == round(0.123456789, 6) for c in populated)
+
+    again, backend = populate_chunk_embeddings(
+        chunk_filing_document(prof, _sample_markdown(prof)),
+        project_id="p",
+        backend="vertex_ai",
+        vertex_embedder=_mock_vertex_embedder([], fail_after=0),
+        checkpoint_path=ckpt,
+    )
+    assert backend == "vertex_ai"
+    assert all(len(c.embedding) == DEFAULT_EMBEDDING_DIMENSIONS for c in again)

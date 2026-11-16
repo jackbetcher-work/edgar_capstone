@@ -47,6 +47,7 @@ from edgar_capstone.dataset.pipeline import DEFAULT_OUTPUT_DIR  # noqa: E402
 from edgar_capstone.vector_db.embedder import (  # noqa: E402
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_MAX_BATCH_CHARS,
 )
 from edgar_capstone.vector_db.pipeline import (  # noqa: E402
     VectorDBBuildConfig,
@@ -153,6 +154,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=50,
         help="Batch size for Vertex AI embedding requests.",
+    )
+    parser.add_argument(
+        "--embedding-workers",
+        type=int,
+        default=8,
+        help="Number of concurrent Vertex AI embedding requests.",
+    )
+    parser.add_argument(
+        "--max-batch-chars",
+        type=int,
+        default=DEFAULT_MAX_BATCH_CHARS,
+        help="Maximum total characters per Vertex AI embedding request (keeps batches under the token limit).",
     )
     parser.add_argument(
         "--target-chars",
@@ -265,6 +278,8 @@ def main(argv: list[str] | None = None) -> int:
         embedding_dimensions=args.embedding_dimensions,
         embedding_backend=args.embedding_backend,
         embedding_batch_size=args.batch_size,
+        embedding_max_batch_chars=args.max_batch_chars,
+        embedding_max_workers=args.embedding_workers,
         target_chunk_chars=args.target_chars,
         max_chunk_chars=args.max_chars,
         min_chunk_chars=args.min_chars,

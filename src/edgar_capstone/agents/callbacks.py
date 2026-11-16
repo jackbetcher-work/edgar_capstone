@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 import time
 from typing import Any
@@ -27,7 +28,7 @@ from edgar_capstone.security.agent_identity import (
     resolve_agent_identity,
 )
 from edgar_capstone.security.auth import record_security_audit_event
-from edgar_capstone.security.model_armor import get_model_armor_guardrail
+from edgar_capstone.security.model_armor import get_model_armor_guardrail, schema_safe_block_text
 from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,40 @@ def before_agent_telemetry_callback(
                 agent_name,
             )
 
+    return None
+
+
+RETRIEVAL_TOOL_NAMES = frozenset({"search_10k_chunks_rag", "query_cached_10k_context"})
+DEFAULT_ANALYST_RETRIEVAL_BUDGET = 6
+_RETRIEVAL_CALLS_STATE_KEY = "temp:retrieval_calls_used"  # temp: = scoped to one invocation
+
+
+def retrieval_budget_before_tool_callback(
+    tool: BaseTool,
+    args: dict[str, Any],
+    tool_context: Any,
+) -> dict[str, Any] | None:
+    """Cap 10-K retrieval calls per turn so the analyst answers instead of hitting max_llm_calls.
+
+    Once the budget (`EDGAR_ANALYST_RETRIEVAL_BUDGET`, default 6) is spent, retrieval tools
+    return an instruction to write the AnalystReport from the evidence already gathered.
+    """
+    _ = args
+    if getattr(tool, "name", "") not in RETRIEVAL_TOOL_NAMES:
+        return None
+    raw_budget = os.environ.get("EDGAR_ANALYST_RETRIEVAL_BUDGET", "").strip()
+    budget = int(raw_budget) if raw_budget.isdigit() else DEFAULT_ANALYST_RETRIEVAL_BUDGET
+    state = tool_context.state
+    used = int(state.get(_RETRIEVAL_CALLS_STATE_KEY, 0) or 0)
+    if used >= budget:
+        return {
+            "status": "retrieval_budget_exhausted",
+            "message": (
+                f"Retrieval budget of {budget} calls reached for this question. Write the "
+                "AnalystReport now using only the passages already retrieved."
+            ),
+        }
+    state[_RETRIEVAL_CALLS_STATE_KEY] = used + 1
     return None
 
 
@@ -461,10 +496,18 @@ def after_model_fact_check_callback(
                 )
                 state["model_armor_blocked"] = True
                 state["model_armor_findings"] = list(resp_decision.matched_categories)
+                state["model_armor_response_blocked"] = True
+                state["model_armor_response_block_message"] = resp_decision.block_message
                 return LlmResponse(
                     content=genai_types.Content(
                         role="model",
-                        parts=[genai_types.Part(text=resp_decision.block_message)],
+                        parts=[
+                            genai_types.Part(
+                                text=schema_safe_block_text(
+                                    response_text, resp_decision.block_message
+                                )
+                            )
+                        ],
                     )
                 )
             if resp_decision.sdp_redacted:
@@ -483,8 +526,32 @@ def after_model_fact_check_callback(
 
         calc_vars = dict(state.get("calculated_variances", {}))
         citations = list(state.get("retrieved_citations", []))
+        checked_text = response_text
+        # Structured AnalystReport answers (JSON) are verified claim by claim and rendered
+        # first, so the numeric/citation check runs on what the analyst will actually see.
+        from edgar_capstone.agents.structured_report import (
+            parse_analyst_report,
+            render_analyst_report_markdown,
+            verify_analyst_report,
+        )
+
+        structured = (
+            parse_analyst_report(response_text.strip())
+            if response_text.strip().startswith("{")
+            else None
+        )
+        if structured is not None:
+            reports = [v for v in calc_vars.values() if isinstance(v, dict)]
+            verified = verify_analyst_report(
+                structured, variance_reports=reports, citations=citations
+            )
+            checked_text = render_analyst_report_markdown(
+                verified, variance_reports=reports, citations=citations
+            )
+            state["structured_report_markdown"] = checked_text
+            state["structured_report_verification"] = verified.verification.model_dump(mode="json")
         verification = verify_narrative_against_calculations(
-            response_text=response_text,
+            response_text=checked_text,
             calculated_variances=calc_vars,
             retrieved_citations=citations,
             model_latency_ms=latency_rec.total_model_latency_ms,

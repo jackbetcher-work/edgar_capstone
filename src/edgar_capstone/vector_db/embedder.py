@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import math
+import random
 import re
+import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Any, Literal
 
 import google.auth
@@ -20,7 +26,21 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_EMBEDDING_MODEL = "text-embedding-005"
 DEFAULT_EMBEDDING_DIMENSIONS = 768
+# text-embedding-005 accepts at most 20,000 input tokens per request. SEC Markdown
+# averages ~4 characters per token, so 60,000 characters leaves comfortable headroom.
+DEFAULT_MAX_BATCH_CHARS = 60_000
+# Decimal places kept for Vertex AI embeddings in manifests (matches deterministic mode).
+EMBEDDING_ROUND_DECIMALS = 6
 _TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
+
+
+class _BatchTooLargeError(RuntimeError):
+    """Raised when Vertex AI rejects a multi-instance batch for exceeding the token limit."""
+
+
+def _retry_backoff_seconds(attempt: int) -> float:
+    """Exponential backoff with jitter, capped at 30 seconds."""
+    return min(30.0, 1.5 * (2 ** (attempt - 1))) * (0.75 + random.random() * 0.5)
 
 
 def generate_deterministic_embedding(
@@ -66,7 +86,14 @@ def generate_deterministic_embedding(
 
 
 class VertexAIEmbedder:
-    """Client for generating dense embeddings via Vertex AI (`text-embedding-005`)."""
+    """Client for generating dense embeddings via Vertex AI (`text-embedding-005`).
+
+    Requests are packed by both instance count (`batch_size`) and total characters
+    (`max_batch_chars`) so a batch stays under the per-request input-token limit
+    (20,000 tokens for `text-embedding-005`). A batch the API still rejects as too
+    large is split in half and retried. With `max_workers > 1`, batches are sent
+    concurrently and results are returned in input order.
+    """
 
     def __init__(
         self,
@@ -79,6 +106,8 @@ class VertexAIEmbedder:
         max_retries: int = 3,
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
+        max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
+        max_workers: int = 1,
     ) -> None:
         self.project_id = project_id
         self.location = location
@@ -86,18 +115,39 @@ class VertexAIEmbedder:
         self.dimensions = dimensions
         self.batch_size = max(1, min(batch_size, 250))
         self.max_retries = max_retries
+        self.max_batch_chars = max(1, max_batch_chars)
+        self.max_workers = max(1, max_workers)
         self._http_client = http_client
         self._credentials = credentials
+        self._credentials_lock = threading.Lock()
 
     def _get_access_token(self) -> str:
         """Obtain a valid OAuth2 bearer token from Application Default Credentials."""
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-        if not self._credentials.valid:
-            self._credentials.refresh(GoogleAuthRequest())
-        return str(self._credentials.token)
+        with self._credentials_lock:
+            if self._credentials is None:
+                self._credentials, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+            if not self._credentials.valid:
+                self._credentials.refresh(GoogleAuthRequest())
+            return str(self._credentials.token)
+
+    def _plan_batches(self, texts: list[str]) -> list[tuple[int, int]]:
+        """Split `texts` into `(start, end)` ranges bounded by count and total characters."""
+        batches: list[tuple[int, int]] = []
+        start = 0
+        chars = 0
+        for idx, text in enumerate(texts):
+            size = len(text)
+            if idx > start and (
+                idx - start >= self.batch_size or chars + size > self.max_batch_chars
+            ):
+                batches.append((start, idx))
+                start, chars = idx, 0
+            chars += size
+        if start < len(texts):
+            batches.append((start, len(texts)))
+        return batches
 
     def _predict_batch(
         self,
@@ -135,14 +185,28 @@ class VertexAIEmbedder:
         try:
             for attempt in range(1, self.max_retries + 1):
                 token = self._get_access_token()
-                resp = client.post(
-                    url,
-                    json=payload,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                    },
-                )
+                try:
+                    resp = client.post(
+                        url,
+                        json=payload,
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                        },
+                    )
+                except httpx.TransportError as exc:
+                    if attempt < self.max_retries:
+                        backoff = _retry_backoff_seconds(attempt)
+                        logger.warning(
+                            "Vertex AI embedding transport error %s (attempt %d/%d); retrying in %.1fs...",
+                            type(exc).__name__,
+                            attempt,
+                            self.max_retries,
+                            backoff,
+                        )
+                        time.sleep(backoff)
+                        continue
+                    raise
                 if resp.status_code == 200:
                     data = resp.json()
                     predictions = data.get("predictions", [])
@@ -157,8 +221,11 @@ class VertexAIEmbedder:
                         )
                     return vectors
 
+                if resp.status_code == 400 and len(texts) > 1 and "token" in resp.text.lower():
+                    raise _BatchTooLargeError(resp.text[:400])
+
                 if resp.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
-                    backoff = min(16.0, 1.5 * (2 ** (attempt - 1)))
+                    backoff = _retry_backoff_seconds(attempt)
                     logger.warning(
                         "Vertex AI embedding HTTP %d (attempt %d/%d); retrying in %.1fs...",
                         resp.status_code,
@@ -178,25 +245,118 @@ class VertexAIEmbedder:
 
         raise RuntimeError("Exhausted retries calling Vertex AI embedding API")
 
+    def _embed_batch_adaptive(
+        self,
+        texts: list[str],
+        *,
+        task_type: str,
+        titles: list[str] | None,
+    ) -> list[list[float]]:
+        """Embed one batch, halving it recursively if the API rejects it as too many tokens."""
+        try:
+            return self._predict_batch(texts, task_type=task_type, titles=titles)
+        except _BatchTooLargeError:
+            mid = len(texts) // 2
+            logger.info("Embedding batch of %d exceeded the token limit; splitting.", len(texts))
+            left = self._embed_batch_adaptive(
+                texts[:mid], task_type=task_type, titles=titles[:mid] if titles else None
+            )
+            right = self._embed_batch_adaptive(
+                texts[mid:], task_type=task_type, titles=titles[mid:] if titles else None
+            )
+            return left + right
+
     def embed_texts(
         self,
         texts: list[str],
         *,
         task_type: str = "RETRIEVAL_DOCUMENT",
         titles: list[str] | None = None,
+        on_batch_complete: Callable[[int, int, list[list[float]]], None] | None = None,
     ) -> list[list[float]]:
-        """Embed a list of texts in batches."""
-        all_vectors: list[list[float]] = []
-        for start in range(0, len(texts), self.batch_size):
-            batch_texts = texts[start : start + self.batch_size]
-            batch_titles = titles[start : start + self.batch_size] if titles else None
-            batch_vecs = self._predict_batch(
-                batch_texts,
+        """Embed a list of texts in count- and size-bounded batches.
+
+        `on_batch_complete(start, end, vectors)` is called after each batch finishes
+        (from the calling thread), which lets callers checkpoint progress.
+        """
+        batches = self._plan_batches(texts)
+        results: list[list[float] | None] = [None] * len(texts)
+
+        def run(bounds: tuple[int, int]) -> tuple[int, int, list[list[float]]]:
+            start, end = bounds
+            vecs = self._embed_batch_adaptive(
+                texts[start:end],
                 task_type=task_type,
-                titles=batch_titles,
+                titles=titles[start:end] if titles else None,
             )
-            all_vectors.extend(batch_vecs)
-        return all_vectors
+            return start, end, vecs
+
+        def record(start: int, end: int, vecs: list[list[float]]) -> None:
+            results[start:end] = vecs
+            if on_batch_complete is not None:
+                on_batch_complete(start, end, vecs)
+
+        if self.max_workers == 1 or len(batches) <= 1:
+            for bounds in batches:
+                record(*run(bounds))
+        else:
+            owns_client = self._http_client is None
+            if owns_client:
+                self._http_client = httpx.Client(
+                    timeout=60.0,
+                    limits=httpx.Limits(max_connections=self.max_workers * 2),
+                )
+            try:
+                with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                    futures = [pool.submit(run, bounds) for bounds in batches]
+                    try:
+                        for fut in as_completed(futures):
+                            record(*fut.result())
+                    except BaseException:
+                        for f in futures:
+                            f.cancel()
+                        raise
+            finally:
+                if owns_client and self._http_client is not None:
+                    self._http_client.close()
+                    self._http_client = None
+
+        missing = [i for i, vec in enumerate(results) if vec is None]
+        if missing:
+            raise RuntimeError(f"Vertex AI embedding left {len(missing)} inputs without vectors")
+        return [vec for vec in results if vec is not None]
+
+
+def load_embedding_checkpoint(
+    checkpoint_path: Path,
+    *,
+    model_name: str,
+    dimensions: int,
+) -> dict[str, tuple[str, list[float]]]:
+    """Load `chunk_id -> (sha256_text, embedding)` rows from a Vertex AI embedding checkpoint."""
+    if not checkpoint_path.exists():
+        return {}
+    cached: dict[str, tuple[str, list[float]]] = {}
+    with checkpoint_path.open(encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                # A partially written trailing line from an interrupted run.
+                continue
+            emb = row.get("embedding")
+            if (
+                row.get("model") == model_name
+                and isinstance(emb, list)
+                and len(emb) == dimensions
+                and row.get("chunk_id")
+                and row.get("text_sha256")
+            ):
+                cached[str(row["chunk_id"])] = (str(row["text_sha256"]), emb)
+    return cached
 
 
 def populate_chunk_embeddings(
@@ -210,18 +370,46 @@ def populate_chunk_embeddings(
     batch_size: int = 50,
     existing_embeddings: dict[str, tuple[str, list[float]]] | None = None,
     vertex_embedder: VertexAIEmbedder | None = None,
+    max_workers: int = 1,
+    max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
+    checkpoint_path: Path | None = None,
 ) -> tuple[list[FilingChunk], str]:
     """Populate `embedding` on each `FilingChunk` and return `(chunks, resolved_backend)`.
 
     If `existing_embeddings` is provided (mapping `chunk_id -> (sha256_text, embedding)`),
     unchanged chunks with valid dimension embeddings are reused without recomputation.
+
+    If `checkpoint_path` is provided, every Vertex AI batch is appended to that JSONL
+    file as it completes, and rows already in it (same model and dimensions) are
+    reused, so an interrupted run resumes instead of re-embedding everything.
     """
     if not chunks:
         return [], backend if backend != "auto" else "deterministic"
 
+    checkpointed: dict[str, tuple[str, list[float]]] = {}
+    if checkpoint_path is not None and backend in ("vertex_ai", "auto"):
+        checkpointed = load_embedding_checkpoint(
+            checkpoint_path, model_name=model_name, dimensions=dimensions
+        )
+        if checkpointed:
+            logger.info(
+                "Loaded %d Vertex AI embeddings from checkpoint %s",
+                len(checkpointed),
+                checkpoint_path,
+            )
+
+    hashes = [hashlib.sha256(c.chunk_text.encode("utf-8")).hexdigest() for c in chunks]
     to_embed_indices: list[int] = []
+    reused_from_checkpoint = 0
     for idx, chunk in enumerate(chunks):
-        text_hash = hashlib.sha256(chunk.chunk_text.encode("utf-8")).hexdigest()
+        text_hash = hashes[idx]
+        if chunk.chunk_id in checkpointed:
+            cached_hash, cached_vec = checkpointed[chunk.chunk_id]
+            if cached_hash == text_hash:
+                chunk.embedding = cached_vec
+                chunk.embedding_model = model_name
+                reused_from_checkpoint += 1
+                continue
         if existing_embeddings and chunk.chunk_id in existing_embeddings:
             cached_hash, cached_vec = existing_embeddings[chunk.chunk_id]
             if cached_hash == text_hash and len(cached_vec) == dimensions:
@@ -229,10 +417,11 @@ def populate_chunk_embeddings(
                 chunk.embedding_model = model_name
                 continue
         to_embed_indices.append(idx)
+    checkpointed.clear()
 
     if not to_embed_indices:
         logger.info("Reused all %d cached chunk embeddings.", len(chunks))
-        return chunks, "cached"
+        return chunks, "vertex_ai" if reused_from_checkpoint == len(chunks) else "cached"
 
     resolved_backend = backend
     if backend in ("vertex_ai", "auto"):
@@ -242,21 +431,71 @@ def populate_chunk_embeddings(
             model_name=model_name,
             dimensions=dimensions,
             batch_size=batch_size,
+            max_retries=6,
+            max_batch_chars=max_batch_chars,
+            max_workers=max_workers,
         )
+        texts = [chunks[i].chunk_text for i in to_embed_indices]
+        titles = [
+            f"{chunks[i].ticker} FY{chunks[i].fiscal_year} 10-K {chunks[i].section_title}"
+            for i in to_embed_indices
+        ]
+        total = len(texts)
+        progress = {"done": 0, "next_log": 0.0, "started": time.monotonic()}
+        ckpt_fh = None
+        if checkpoint_path is not None:
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            ckpt_fh = checkpoint_path.open("a", encoding="utf-8")
+
+        def on_batch_complete(start: int, end: int, vecs: list[list[float]]) -> None:
+            for offset, vec in enumerate(vecs):
+                i = to_embed_indices[start + offset]
+                rounded = [round(v, EMBEDDING_ROUND_DECIMALS) for v in vec]
+                chunks[i].embedding = rounded
+                chunks[i].embedding_model = model_name
+                if ckpt_fh is not None:
+                    ckpt_fh.write(
+                        json.dumps(
+                            {
+                                "chunk_id": chunks[i].chunk_id,
+                                "text_sha256": hashes[i],
+                                "model": model_name,
+                                "embedding": rounded,
+                            }
+                        )
+                        + "\n"
+                    )
+            if ckpt_fh is not None:
+                ckpt_fh.flush()
+            progress["done"] += end - start
+            now = time.monotonic()
+            if now >= progress["next_log"] or progress["done"] == total:
+                elapsed = max(now - progress["started"], 1e-6)
+                rate = progress["done"] / elapsed
+                eta = (total - progress["done"]) / rate if rate > 0 else float("inf")
+                logger.info(
+                    "Vertex AI embeddings: %d/%d (%.1f%%) | %.0f chunks/s | ETA %.0fs",
+                    progress["done"],
+                    total,
+                    100.0 * progress["done"] / total,
+                    rate,
+                    eta,
+                )
+                progress["next_log"] = now + 30.0
+
         try:
-            texts = [chunks[i].chunk_text for i in to_embed_indices]
-            titles = [
-                f"{chunks[i].ticker} FY{chunks[i].fiscal_year} 10-K {chunks[i].section_title}"
-                for i in to_embed_indices
-            ]
-            vectors = embedder.embed_texts(
+            logger.info(
+                "Embedding %d chunks with Vertex AI %s (%d reused from checkpoint)...",
+                total,
+                model_name,
+                reused_from_checkpoint,
+            )
+            embedder.embed_texts(
                 texts,
                 task_type="RETRIEVAL_DOCUMENT",
                 titles=titles,
+                on_batch_complete=on_batch_complete,
             )
-            for i, vec in zip(to_embed_indices, vectors, strict=True):
-                chunks[i].embedding = vec
-                chunks[i].embedding_model = model_name
             return chunks, "vertex_ai"
         except Exception as exc:
             if backend == "vertex_ai":
@@ -267,6 +506,9 @@ def populate_chunk_embeddings(
                 dimensions,
             )
             resolved_backend = "deterministic"
+        finally:
+            if ckpt_fh is not None:
+                ckpt_fh.close()
 
     for i in to_embed_indices:
         chunks[i].embedding = generate_deterministic_embedding(

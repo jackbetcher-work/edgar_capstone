@@ -57,6 +57,7 @@ from edgar_capstone.security import (
     reset_model_armor_guardrail,
 )
 from edgar_capstone.server import app
+from tests.structured_report_helpers import report_json
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -443,11 +444,13 @@ def test_financial_projection_and_mnpi_filters_block_prompts_and_synthesized_lea
     # 4. Post-generation Model Armor / Projection filter blocks hallucinated LLM target price leak
     get_conversation_memory_manager().reset()
     leaky_llm = _CountingStreamingLlm(
-        response_text=(
-            "### NVDA Analysis\n"
-            "Revenue grew +65.47% [NVDA FY2026 | Item 7 | NVDA_2026_item_7_0001](https://www.sec.gov/nvda). "
-            "Based on momentum, we issue a Strong Buy rating with a 12-month price target of $260 "
-            "and forecast FY2028 revenue of $380B."
+        response_text=report_json(
+            headline="NVDA Analysis",
+            key_metrics=[("NVDA", "revenue")],
+            notes=(
+                "Based on momentum, we issue a Strong Buy rating with a 12-month price target "
+                "of $260 and forecast FY2028 revenue of $380B."
+            ),
         )
     )
     leaked_turn = run_conversational_rag_turn(

@@ -43,6 +43,12 @@ from edgar_capstone.agents.schemas import (
     ReActStep,
     VarianceEvaluationItem,
 )
+from edgar_capstone.agents.structured_report import (
+    ReportVerification,
+    parse_analyst_report,
+    render_analyst_report_markdown,
+    verify_analyst_report,
+)
 from edgar_capstone.agents.tools import query_cached_10k_context
 from edgar_capstone.observability.tracing import traced
 from edgar_capstone.vector_db.chunker import estimate_token_count
@@ -868,6 +874,9 @@ class StructuredReActExecutor:
         fallback_reason: str | None = None
         adk_response_blocked = False
         agent_retrieved_citations: list[dict[str, Any]] = []
+        structured_report_dict: dict[str, Any] | None = None
+        raw_structured_report_text = ""
+        report_verification: ReportVerification | None = None
         adk_response_decision: dict[str, Any] | None = None
         adk_response_block_message = ""
 
@@ -911,6 +920,42 @@ class StructuredReActExecutor:
                         or candidate_md
                     )
                     answer_markdown = candidate_md
+                elif (
+                    structured := parse_analyst_report(
+                        live_stream_result.session_state.get("financial_analyst_report")
+                    )
+                ) is not None:
+                    # Structured answer: verify each claim, then render compact Markdown.
+                    verified = verify_analyst_report(
+                        structured,
+                        variance_reports=variance_reports,
+                        citations=merged_citations,
+                    )
+                    report_verification = verified.verification
+                    structured_report_dict = verified.report.model_dump(mode="json")
+                    # Unverified original, kept so the response guardrail also sees claims
+                    # that verification removed (e.g. a price target in the notes).
+                    raw_structured_report_text = structured.model_dump_json()
+                    if not report_verification.usable:
+                        grounding_fallback_applied = True
+                        fallback_reason = report_verification.unusable_reason
+                    else:
+                        candidate_md = render_analyst_report_markdown(
+                            verified,
+                            variance_reports=variance_reports,
+                            citations=merged_citations,
+                            scope=scope,
+                        )
+                        check = verify_narrative_against_calculations(
+                            response_text=candidate_md,
+                            calculated_variances=calc_map,
+                            retrieved_citations=merged_citations,
+                        )
+                        if check.passed:
+                            answer_markdown = candidate_md
+                        else:
+                            grounding_fallback_applied = True
+                            fallback_reason = "; ".join(check.discrepancies)
                 elif (incomplete_reason := _incomplete_agent_output(candidate_md)) is not None:
                     grounding_fallback_applied = True
                     fallback_reason = incomplete_reason
@@ -1130,6 +1175,10 @@ class StructuredReActExecutor:
             ),
             "grounding_fallback_applied": grounding_fallback_applied,
             "fallback_reason": fallback_reason,
+            "structured_report": structured_report_dict,
+            "report_verification": (
+                report_verification.model_dump(mode="json") if report_verification else None
+            ),
             "agent_retrieval": _summarize_agent_retrieval(
                 live_stream_result,
                 agent_retrieved_citations,
@@ -1151,6 +1200,7 @@ class StructuredReActExecutor:
             "evaluation_model": eval_report.evaluator_model,
             "execution_mode": "live_adk" if live_adk_executed else "deterministic_fallback",
             "adk_runtime": adk_runtime_meta,
+            "raw_structured_report_text": raw_structured_report_text,
             "model_armor_response_blocked": adk_response_blocked,
             "model_armor_response_decision": adk_response_decision,
             "model_armor_response_block_message": adk_response_block_message,

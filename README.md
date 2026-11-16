@@ -24,7 +24,7 @@ make dev
 # 3. Or build the frontend bundle and serve the single-origin app from FastAPI (:8000)
 make start
 
-# 4. Run secret scan, backend pytest suite (139 tests), ESLint, and frontend Vitest suite (6 tests)
+# 4. Run secret scan, backend pytest suite (147 tests), ESLint, and frontend Vitest suite (6 tests)
 make test
 
 # 5. Run the CI lint/format gates (ruff check + format --check, terraform fmt/validate, ESLint),
@@ -133,6 +133,7 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 │   │   ├── context_memory.py        # Pro/Flash model routing, ContextLatencyTracker, session compaction
 │   │   ├── evaluation_and_coding.py # Flash LLM-as-a-Judge evaluator & SQL/Python/LookML coding assist
 │   │   ├── callbacks.py             # Guardrails, first-chunk SSE TTFT capture & grounding callbacks
+│   │   ├── structured_report.py     # Claim-level verification + rendering of the analyst's structured AnalystReport
 │   │   └── tools.py                 # Resilient ADK FunctionTools for metrics, variances, RAG & bounded 10-K section cache
 │   ├── dataset/                     # SEC EDGAR 10-K XBRL + Markdown extraction pipeline (edgartools)
 │   │   ├── paths.py                 # Install-layout-aware data root resolution (source tree, /app/data, cwd)
@@ -143,7 +144,7 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 ├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI
 ├── scripts/                         # CLI entrypoints: dataset build, vector DB build (+ --upload-only), corpus hydration, container smoke test, secret scanner
 ├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP + HTTPS LB, Cloud Build triggers, log-based latency metric
-├── tests/                           # Automated pytest suite (139 tests across agents, live ADK, GCP adapters, telemetry, observability, APIs, IaC, container packaging)
+├── tests/                           # Automated pytest suite (147 tests across agents, live ADK, GCP adapters, telemetry, observability, APIs, IaC, container packaging)
 ├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + Python 3.11 runtime) with baked manifests + build-time corpus check
 ├── .dockerignore                    # Keeps secrets and gitignored heavy corpus artifacts out of the build context
 ├── cloudbuild.yaml                  # Cloud Build: parallel lint/test gates -> build (+ offline smoke test) -> push + deploy (main) / verify-only (PRs)
@@ -177,7 +178,7 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
   - Every row in all three tables carries the request's `trace_id`, so BigQuery telemetry joins back to Cloud Trace and Cloud Logging. The Cloud Logging copies of these sink records are written as top-level `jsonPayload` fields (`component`, `log_sink_target`, `event_payload`), which is what the `google_logging_project_sink` filter matches. Before this change they were plain INFO strings with no configured handler, so they never reached stdout.
   - `ConversationMemoryManager` maintains multi-turn session state for follow-up entity/period recall and compacts older turns above a configurable token threshold.
   - `create_edgar_adk_app` configures an ADK `App` with `ContextCacheConfig` and `EventsCompactionConfig`.
-- **Agent-Driven 10-K Retrieval (`live_runtime.py`, `tools.py`, `prompts/v2/financial_analyst.yaml`):**
+- **Agent-Driven 10-K Retrieval (`live_runtime.py`, `tools.py`, `prompts/v3/financial_analyst.yaml`):**
   - `FinancialAnalystAgent` decides what 10-K evidence each question needs and fetches it. No full sections are forced into its context window.
   - The synthesis request carries:
     - the authoritative variance payload;
@@ -194,7 +195,18 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
   - `query_cached_10k_context` now ranks the complete section rather than the first 50k characters.
   - Section tools report `content_source` (`gcs` | `local_markdown` | `synthesized_fallback`). Placeholder text carries a "do not cite" warning.
   - The analyst uses the model's native thinking (`BuiltInPlanner`) instead of `PlanReActPlanner`. PlanReAct's text `/*ACTION*/` tool snippets made Gemini 3.x write tool calls as prose. As a backstop, a live answer that still contains planning text or an unexecuted call falls back to deterministic synthesis.
-  - The judge now sees the passages the report actually cites, not just the first 8 retrieved.
+  - The judge now sees the full excerpt of every passage the report references, not just the first 8 retrieved.
+  - Retrieval is capped at 6 tool calls per question (`EDGAR_ANALYST_RETRIEVAL_BUDGET`). After that, retrieval tools tell the agent to write its answer instead of running into `max_llm_calls`.
+- **Structured, Verifiable Analyst Output (`schemas.AnalystReport`, `structured_report.py`, `prompts/v3/financial_analyst.yaml`):**
+  - `FinancialAnalystAgent` answers with constrained JSON (ADK `output_schema=AnalystReport`) instead of free-form Markdown. The report has four parts:
+    - a one-sentence `headline`;
+    - `key_metrics` as references (ticker + metric) only, with the figures filled in from the deterministic engine;
+    - up to 6 `findings`, each with `chunk_ids` and a verbatim `evidence_quote`;
+    - free-text `notes` for any other details.
+  - Before rendering, every finding is checked: its chunk IDs must have been retrieved this turn, the quote must appear in a cited passage, and every figure in the statement must appear in the quote or the deterministic payload. Findings that fail are dropped and listed in `report_verification`.
+  - Figures in the headline or notes that can't be traced are removed. If no finding verifies, the turn falls back to deterministic synthesis.
+  - The verified report is rendered as compact Markdown (headline, key metrics, findings with evidence quotes, "Notes (not source-verified)") and also returned as `structured_report` JSON.
+  - The response guardrail inspects the raw, unverified report too, so a price target dropped from the notes is still blocked and audited. Blocked structured answers are replaced with a schema-valid report so ADK validation doesn't hide the block.
   - Caching: ADK's App-level `ContextCacheConfig` caches the static prefix (system instruction and tool declarations) plus the growing conversation, so passages fetched early in a turn are served from cache on later calls in the same turn. The earlier forced full-section `CachedContent` bundle (`tenk_context_cache.py`) was removed.
   - The process-local `_SESSION_10K_CONTEXT_CACHE` is a bounded LRU + TTL map (`EDGAR_10K_SECTION_CACHE_MAX_ENTRIES=256`, `EDGAR_10K_SECTION_CACHE_TTL_SECONDS=3600`).
 
@@ -281,7 +293,12 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
     - The agent made 5–6 targeted retrieval calls covering FY2024, FY2025, and FY2026. Every cited `chunk_id` resolved, and the fact-check passed.
     - Within a turn, up to about 32k context tokens were served from ADK's cache.
     - End-to-end turns take about 65–78 s, because of multiple model calls and long reports.
-  - **Open grounding issue:** the analyst sometimes adds facts from outside the corpus. For example, a "$4.5 billion H20 charge" appears in reports but in no retrieved passage or corpus file. The numeric fact-check only checks percentages, and the judge doesn't reliably catch these.
+  - **Structured output, live on 2026-11-16** (same question, 3 runs after adding the retrieval budget):
+    - All 16 findings verified, and every cited chunk resolved.
+    - Answers were 4.1–4.5k characters, down from 10.6–16k as free-form Markdown.
+    - 4 retrieval calls per run; time to first token about 3.2–3.6 s; turns took 58–63 s.
+    - The judge scored every run 1.0.
+  - **Correction:** an earlier note here called the "$4.5 billion H20 charge" an out-of-corpus hallucination. That was wrong. The FY2026 10-K text stores it Markdown-escaped as `$4\.5 billion`, which a plain-text search missed. The structured run cites it with a verbatim quote from `NVDA_2026_item_7_0002`.
 - **Cloud Build trigger and lint/format gates** *(Sec. 8: CI/CD)*:
   - `terraform/cloudbuild.tf` manages the GitHub connection, the `main` deploy trigger, the PR verify trigger, and the dedicated `sec-edgar-cloudbuild-sa` service account. Set `enable_cloudbuild_trigger = true` after the one-time GitHub App and token setup described in [`terraform/README.md`](terraform/README.md).
   - `cloudbuild.yaml` gates the build on `ruff check` / `ruff format --check`, `terraform fmt` / `validate`, ESLint + Vitest, the secret scan, and pytest.
@@ -377,7 +394,7 @@ These limit who can reach the app and data, but unlike a perimeter they don't st
 **Reference requirement:** A golden dataset of 20+ query–variance–explanation mappings in BigQuery; Gemini 3.5 Flash LLM-as-a-Judge regression checks through `make eval-all` before deployment; >80% pytest coverage; ≥92% grounding recall; 100% numeric agreement and citation coverage; p95 TTFT ≤ 3.0 s; 100% safety compliance.
 
 **Current state:**
-- 139 pytest tests with mocked LLM and Search APIs.
+- 147 pytest tests with mocked LLM and Search APIs.
 - `NarrativeEvaluatorAgent` (4-axis rubric) and `/api/v1/evaluate`.
 - `verify_narrative_against_calculations` enforces numeric and citation locks for each response.
 - No golden dataset or BigQuery eval tables, no `make eval-all` target, and `pytest-cov` is not installed, so coverage is unmeasured.

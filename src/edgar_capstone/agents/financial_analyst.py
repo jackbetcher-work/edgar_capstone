@@ -14,6 +14,7 @@ from edgar_capstone.agents.callbacks import (
     before_agent_telemetry_callback,
     before_model_safety_and_latency_callback,
     before_tool_agent_identity_callback,
+    retrieval_budget_before_tool_callback,
 )
 from edgar_capstone.agents.context_memory import (
     FINANCIAL_REASONING_MODEL,
@@ -23,6 +24,7 @@ from edgar_capstone.agents.prompt_store import (
     load_agent_prompt,
     make_adk_instruction_provider,
 )
+from edgar_capstone.agents.schemas import AnalystReport
 from edgar_capstone.agents.tools import (
     HybridSearchTool,
     LookerQueryTool,
@@ -84,12 +86,18 @@ def create_financial_analyst_agent(
             # Includes thinking tokens on Gemini 3.x; a 4096 cap truncated full reports.
             max_output_tokens=16384,
         ),
+        # Constrained JSON answer (headline, metric references, quote-backed findings, notes),
+        # verified claim by claim in structured_report.py before it is rendered.
+        output_schema=AnalystReport,
         output_key="financial_analyst_report",
         before_agent_callback=before_agent_telemetry_callback,
         after_agent_callback=after_agent_memory_callback,
         before_model_callback=before_model_safety_and_latency_callback,
         after_model_callback=after_model_fact_check_callback,
-        before_tool_callback=before_tool_agent_identity_callback,
+        before_tool_callback=[
+            before_tool_agent_identity_callback,
+            retrieval_budget_before_tool_callback,
+        ],
     )
 
 

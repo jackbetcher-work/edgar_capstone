@@ -38,6 +38,7 @@ from edgar_capstone.agents import (
 from edgar_capstone.agents.tools import _SESSION_10K_CONTEXT_CACHE
 from edgar_capstone.dataset.extractor import format_combined_10k_markdown
 from edgar_capstone.vector_db.embedder import generate_deterministic_embedding
+from tests.structured_report_helpers import finding_from_citation, report_json
 
 
 class _FakeGcpCredentials:
@@ -1095,13 +1096,11 @@ class _LiveToolCallingAnalystLlm(BaseLlm):
             )
             return
 
-        rep = fn_responses["calculate_period_variances"]["variance_reports"][0]
-        rev_pct = rep["revenue_variance"]["percentage_delta"]
         cit = fn_responses["search_10k_chunks_rag"]["citations"][0]
-        final_text = (
-            f"### NVDA Live GCP Grounded Analysis\n"
-            f"NVIDIA FY2024–FY2026 revenue grew **+{rev_pct:.2f}%**, supported by "
-            f"`{cit['chunk_id']}` ({cit['excerpt'][:90]})."
+        final_text = report_json(
+            headline="NVDA Live GCP Grounded Analysis",
+            key_metrics=[("NVDA", "revenue")],
+            findings=[finding_from_citation(cit, "Data Center demand supported revenue growth.")],
         )
         await asyncio.sleep(0.005)
         yield LlmResponse(
@@ -1303,8 +1302,11 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
         backend="vertex_ai",
     )
 
-    assert "+254.45%" in stream_res.final_text
-    assert "NVDA_2026_item_7_0001" in stream_res.final_text
+    report = stream_res.session_state["financial_analyst_report"]
+    assert report["headline"] == "NVDA Live GCP Grounded Analysis"
+    assert report["findings"][0]["chunk_ids"] == ["NVDA_2026_item_7_0001"]
+    # The callback fact-check verifies the structured claims and renders deterministic figures
+    assert "+254.45%" in stream_res.session_state["structured_report_markdown"]
     assert {fc["name"] for fc in stream_res.function_calls} == {
         "calculate_period_variances",
         "search_10k_chunks_rag",
