@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections.abc import Coroutine
@@ -49,11 +50,6 @@ from edgar_capstone.agents.schemas import (
     ModelContextLatencyRecord,
     ModelTaskCategory,
     NarrativeEvaluationReport,
-)
-from edgar_capstone.agents.tenk_context_cache import (
-    TENK_CACHE_SECTION_KEYS_STATE,
-    get_tenk_context_cache_manager,
-    is_cached_content_error,
 )
 from edgar_capstone.observability.tracing import set_span_attributes, traced
 from edgar_capstone.security.model_armor import ModelArmorSafetyPlugin
@@ -508,6 +504,90 @@ def run_adk_agent_stream(**kwargs: Any) -> AdkStreamResult:
     return _run_coro_sync(run_adk_agent_stream_async(**kwargs))
 
 
+# Retrieval budget hints for the agent; FinancialAnalystAgent runs with max_llm_calls=8.
+_EVIDENCE_LEAD_EXCERPT_CHARS = 240
+_MAX_EVIDENCE_LEADS = 8
+
+
+def _compact_evidence_leads(
+    cached_explanations: list[dict[str, Any]],
+    citations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Short, citable pointers to passages the deterministic ReAct pre-pass already found.
+
+    These are leads, not the evidence base. They give the agent chunk_ids and a short
+    excerpt so it can decide what else to retrieve with its tools.
+    """
+    leads: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for c in citations:
+        cid = str(c.get("chunk_id") or "").strip()
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        leads.append(
+            {
+                "chunk_id": cid,
+                "ticker": c.get("ticker"),
+                "fiscal_year": c.get("fiscal_year"),
+                "section_id": c.get("section_id"),
+                "section_title": c.get("section_title"),
+                "sec_filing_url": c.get("sec_filing_url"),
+                "excerpt": " ".join(str(c.get("excerpt") or "").split())[
+                    :_EVIDENCE_LEAD_EXCERPT_CHARS
+                ],
+            }
+        )
+        if len(leads) >= _MAX_EVIDENCE_LEADS:
+            break
+    sections_queried = sorted(
+        {str(e.get("cache_key")) for e in cached_explanations if e.get("cache_key")}
+    )
+    if sections_queried:
+        leads.append({"pre_queried_sections": sections_queried})
+    return leads
+
+
+def _retrieval_instructions(
+    scope: dict[str, Any],
+    variance_evaluations: list[dict[str, Any]],
+) -> str:
+    suggested: list[dict[str, Any]] = []
+    for ev in variance_evaluations:
+        for tq in ev.get("targeted_10k_queries") or []:
+            suggested.append(
+                {
+                    "ticker": tq.get("ticker"),
+                    "fiscal_year": tq.get("fiscal_year"),
+                    "section_id": tq.get("section_id"),
+                    "driver_focus": tq.get("driver_focus"),
+                }
+            )
+    lines = [
+        "## 10-K Retrieval: Query What This Question Needs",
+        "Full 10-K sections are NOT in this request. Retrieve only the evidence the analyst's "
+        "question requires:",
+        "- `query_cached_10k_context(ticker, fiscal_year, section_id, variance_query, max_passages)`: "
+        "ranked passages (with `chunk_id`) from one company-year's `item_7` or `item_1a`, for "
+        "explaining a specific variance driver.",
+        "- `search_10k_chunks_rag(query, tickers, gics_sector, section_id, start_year, end_year, "
+        "top_k)`: hybrid search across filings, for peer comparisons, thematic questions, and "
+        "changes across fiscal years (query each relevant year and compare).",
+        f"- Scope: tickers `{scope.get('tickers_csv', 'ALL')}`, sector "
+        f"`{scope.get('gics_sector', 'ALL')}`, sections `{scope.get('section_id', 'ALL')}`, "
+        f"fiscal years `FY{scope.get('start_year')}`–`FY{scope.get('end_year')}`.",
+        "- Write focused queries from the question and the variance movers, keep result sets "
+        "small (`max_passages` <= 4, `top_k` <= 8), skip evidence the leads already cover, and "
+        "stop once every claim is supported.",
+    ]
+    if suggested:
+        lines.append(
+            "- Suggested retrieval targets from the variance evaluation:\n"
+            f"```json\n{json.dumps(suggested[:8], indent=2, default=str)}\n```"
+        )
+    return "\n".join(lines)
+
+
 def _build_financial_reasoning_prompt(
     *,
     query: str,
@@ -521,20 +601,12 @@ def _build_financial_reasoning_prompt(
     chunk_health: dict[str, Any] | None,
     memory_summary_text: str = "",
 ) -> str:
-    """Assemble grounded structured metrics and cached 10-K passages for `FinancialAnalystAgent`."""
-    compact_citations = [
-        {
-            "chunk_id": c.get("chunk_id"),
-            "ticker": c.get("ticker"),
-            "company_name": c.get("company_name"),
-            "fiscal_year": c.get("fiscal_year"),
-            "section_id": c.get("section_id"),
-            "section_title": c.get("section_title"),
-            "sec_filing_url": c.get("sec_filing_url"),
-            "excerpt": str(c.get("excerpt") or "")[:480],
-        }
-        for c in citations[:10]
-    ]
+    """Assemble the deterministic facts and retrieval brief for `FinancialAnalystAgent`.
+
+    The request carries the authoritative numbers (variances, benchmarks) plus short
+    evidence leads. 10-K text is retrieved by the agent itself through targeted tools,
+    so only the passages relevant to the question enter the context window.
+    """
     sections: list[str] = [
         f"## Analyst Query\n{query.strip()}",
         (
@@ -555,9 +627,13 @@ def _build_financial_reasoning_prompt(
             f"```json\n{json.dumps(variance_reports, indent=2, default=str)}\n```"
         )
     if variance_evaluations:
+        compact_evals = [
+            {k: v for k, v in ev.items() if k != "targeted_10k_queries"}
+            for ev in variance_evaluations
+        ]
         sections.append(
             "## Pre-Evaluated ReAct Variance Movers & Operating Leverage Diagnostics\n"
-            f"```json\n{json.dumps(variance_evaluations, indent=2, default=str)}\n```"
+            f"```json\n{json.dumps(compact_evals, indent=2, default=str)}\n```"
         )
     if sector_benchmarks:
         sections.append(
@@ -569,23 +645,18 @@ def _build_financial_reasoning_prompt(
             "## Vector Corpus & Chunk Health Diagnostics\n"
             f"```json\n{json.dumps(chunk_health, indent=2, default=str)}\n```"
         )
-    if cached_explanations:
+    leads = _compact_evidence_leads(cached_explanations, citations)
+    if leads:
         sections.append(
-            "## Resident Cached 10-K Section Explanations (Item 7 MD&A & Item 1A Risk Factors)\n"
-            f"```json\n{json.dumps(cached_explanations, indent=2, default=str)}\n```"
+            "## 10-K Evidence Leads (partial pre-retrieval — verify or extend with tools)\n"
+            f"```json\n{json.dumps(leads, indent=2, default=str)}\n```"
         )
-    if compact_citations:
-        sections.append(
-            "## Retrieved 10-K Hybrid RAG Grounding Citations\n"
-            "Cite claims inline using `[TICKER FYxxxx | Section Title | chunk_id](sec_filing_url)`.\n"
-            f"```json\n{json.dumps(compact_citations, indent=2, default=str)}\n```"
-        )
+    sections.append(_retrieval_instructions(scope, variance_evaluations))
     sections.append(
         "## Synthesis Requirements\n"
-        "The authoritative variance calculations, cached 10-K explanations, and hybrid RAG citations "
-        "are already provided above — synthesize the final institutional Markdown report directly "
-        "without redundant tool calls unless critical data is missing. Every percentage delta must match "
-        "the deterministic calculation payload and every 10-K claim must include its inline citation tag."
+        "Every percentage delta must match the deterministic calculation payload. Every 10-K claim "
+        "must carry an inline `[TICKER FYxxxx | Section Title | chunk_id](sec_filing_url)` citation "
+        "using a `chunk_id` returned by your tools or listed in the evidence leads."
     )
     return "\n\n".join(sections)
 
@@ -636,12 +707,6 @@ async def run_live_adk_financial_reasoning_async(
     cached_tokens = sum(
         int(c.get("token_estimate") or 0) for c in cached_explanations if c.get("cache_hit")
     )
-    # Full 10-K sections queried by the ReAct loop, in priority order, for remote context caching
-    tenk_section_keys: list[str] = []
-    for c in cached_explanations:
-        key = str(c.get("cache_key") or "").strip()
-        if key and key not in tenk_section_keys:
-            tenk_section_keys.append(key)
     state_seed: dict[str, Any] = {
         "calculated_variances": calc_map,
         "retrieved_citations": list(citations),
@@ -651,7 +716,6 @@ async def run_live_adk_financial_reasoning_async(
             "misses": cache_misses,
             "cached_tokens_saved": cached_tokens,
         },
-        TENK_CACHE_SECTION_KEYS_STATE: tenk_section_keys,
     }
 
     prompt_text = _build_financial_reasoning_prompt(
@@ -667,32 +731,55 @@ async def run_live_adk_financial_reasoning_async(
         memory_summary_text=str((memory_context or {}).get("memory_summary_text") or ""),
     )
 
-    stream_kwargs: dict[str, Any] = {
-        "agent": analyst_agent,
-        "prompt_text": prompt_text,
-        "user_id": user_id,
-        "session_id": session_id,
-        "app_name": "edgar_chat_app",
-        "state_delta": state_seed,
-        "use_adk_app": True,
-        "summarizer_llm": flash_llm if isinstance(flash_llm, BaseLlm) else None,
-        "backend": resolved.backend,
-    }
-    try:
-        return await run_adk_agent_stream_async(**stream_kwargs)
-    except Exception as exc:
-        if not tenk_section_keys or not is_cached_content_error(exc):
-            raise
-        # The remote CachedContent expired or was deleted between lookup and use: drop
-        # local handles and retry once, which rediscovers or recreates the cache.
-        logger.warning("10-K CachedContent rejected at generate time (%s); retrying once.", exc)
-        get_tenk_context_cache_manager().invalidate()
-        return await run_adk_agent_stream_async(**stream_kwargs)
+    return await run_adk_agent_stream_async(
+        agent=analyst_agent,
+        prompt_text=prompt_text,
+        user_id=user_id,
+        session_id=session_id,
+        app_name="edgar_chat_app",
+        state_delta=state_seed,
+        use_adk_app=True,
+        summarizer_llm=flash_llm if isinstance(flash_llm, BaseLlm) else None,
+        backend=resolved.backend,
+    )
 
 
 def run_live_adk_financial_reasoning(**kwargs: Any) -> AdkStreamResult:
     """Synchronous wrapper around `run_live_adk_financial_reasoning_async`."""
     return _run_coro_sync(run_live_adk_financial_reasoning_async(**kwargs))
+
+
+_JUDGE_MAX_CITATIONS = 16
+_JUDGE_EXCERPT_CHARS = 900
+_CITED_CHUNK_ID_IN_REPORT_RE = re.compile(r"\[[^\]|]+\|[^\]|]+\|\s*([^\]|]+?)\s*\]\(")
+
+
+def select_citations_for_judge(
+    response_markdown: str,
+    citations: list[dict[str, Any]],
+    *,
+    max_citations: int = _JUDGE_MAX_CITATIONS,
+) -> list[dict[str, Any]]:
+    """Give the judge the passages the report actually cites, then other retrieved evidence.
+
+    With agent-driven retrieval, the passages the analyst cites are usually ones it fetched
+    itself, which sit at the end of the turn's citation list. Taking the first N citations
+    hid them from the judge and made valid citations look hallucinated.
+    """
+    cited = list(
+        dict.fromkeys(m.strip() for m in _CITED_CHUNK_ID_IN_REPORT_RE.findall(response_markdown))
+    )
+    by_id: dict[str, dict[str, Any]] = {}
+    for c in citations:
+        by_id.setdefault(str(c.get("chunk_id") or ""), c)
+    ordered = [by_id[cid] for cid in cited if cid in by_id]
+    ordered += [c for c in citations if str(c.get("chunk_id") or "") not in set(cited)]
+    selected: list[dict[str, Any]] = []
+    for c in ordered[:max_citations]:
+        trimmed = dict(c)
+        trimmed["excerpt"] = str(c.get("excerpt") or "")[:_JUDGE_EXCERPT_CHARS]
+        selected.append(trimmed)
+    return selected
 
 
 async def run_live_adk_narrative_evaluation_async(
@@ -723,6 +810,7 @@ async def run_live_adk_narrative_evaluation_async(
         f"{r.get('ticker', 'UNK')}_{r.get('start_year', 0)}_{r.get('end_year', 0)}": r
         for r in variance_reports
     }
+    judge_citations = select_citations_for_judge(response_markdown, citations)
     eval_prompt = (
         f"Evaluate the following synthesized SEC 10-K variance report against the deterministic "
         f"calculation outputs and retrieved citations.\n\n"
@@ -730,7 +818,7 @@ async def run_live_adk_narrative_evaluation_async(
         f"### Deterministic Variance Calculations\n"
         f"```json\n{json.dumps(variance_reports, default=str)}\n```\n\n"
         f"### Retrieved 10-K Citations (cached_explanations_count={cached_explanations_count})\n"
-        f"```json\n{json.dumps(citations[:8], default=str)}\n```\n\n"
+        f"```json\n{json.dumps(judge_citations, default=str)}\n```\n\n"
         f"### Synthesized Narrative Report Under Evaluation\n{response_markdown}\n"
     )
 
@@ -742,7 +830,7 @@ async def run_live_adk_narrative_evaluation_async(
         app_name="edgar_eval_app",
         state_delta={
             "calculated_variances": calc_map,
-            "retrieved_citations": list(citations[:8]),
+            "retrieved_citations": judge_citations,
         },
         use_adk_app=False,
         backend=resolved.backend,

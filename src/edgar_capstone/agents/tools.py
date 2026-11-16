@@ -1852,9 +1852,6 @@ def get_context_cache_runtime_stats() -> dict[str, Any]:
     total = hits + misses
     hit_ms = float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_hit_latency_ms", 0.0))
     miss_ms = float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_miss_latency_ms", 0.0))
-    # Lazy import: tenk_context_cache imports this module for section hydration.
-    from edgar_capstone.agents.tenk_context_cache import get_tenk_context_cache_manager
-
     resident = dict(_SESSION_10K_CONTEXT_CACHE.items())
     return {
         "cached_sections_count": len(resident),
@@ -1865,7 +1862,6 @@ def get_context_cache_runtime_stats() -> dict[str, Any]:
         "section_cache_max_entries": _SESSION_10K_CONTEXT_CACHE.max_entries,
         "section_cache_ttl_seconds": _SESSION_10K_CONTEXT_CACHE.ttl_seconds,
         "section_cache_evictions": _SESSION_10K_CONTEXT_CACHE.evictions,
-        "vertex_context_cache": get_tenk_context_cache_manager().stats(),
         "hits": hits,
         "misses": misses,
         "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
@@ -3129,6 +3125,7 @@ def load_cached_10k_section(
     if entry is None:
         matched_prof: FinancialDataProfile | None = None
         md_content: str | None = None
+        content_source = "gcs"
         adapters, strict_gcp = _resolve_gcp_dispatch()
 
         if adapters is not None:
@@ -3184,8 +3181,10 @@ def load_cached_10k_section(
             md_path = dataset_dir / matched_prof.unstructured_blob_path
             if md_path.exists():
                 md_content = md_path.read_text(encoding="utf-8")
+                content_source = "local_markdown"
             else:
                 md_content = _synthesize_fallback_10k_markdown(matched_prof)
+                content_source = "synthesized_fallback"
 
         sections = extract_sections_from_combined_markdown(md_content)
         sec_text = sections.get(sec_key, "")
@@ -3200,6 +3199,8 @@ def load_cached_10k_section(
             "unstructured_gcs_uri": matched_prof.unstructured_gcs_uri,
             "token_estimate": token_est,
             "full_text": sec_text,
+            # gcs | local_markdown | synthesized_fallback (placeholder text, not a filing)
+            "content_source": content_source,
         }
         _SESSION_10K_CONTEXT_CACHE[cache_id] = entry
 
@@ -3259,6 +3260,7 @@ def load_cached_10k_section(
         "lookup_latency_ms": lookup_latency_ms,
         "sec_filing_url": entry["sec_filing_url"],
         "unstructured_gcs_uri": entry["unstructured_gcs_uri"],
+        "content_source": entry.get("content_source", "unknown"),
         "content": excerpt,
         "truncated": len(str(entry["full_text"])) > effective_max,
     }
@@ -3306,20 +3308,24 @@ def query_cached_10k_context(
     max_passages: int,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
-    """Queries a company's cached 10-K section (Item 7 MD&A or Item 1A Risk Factors) for variance explanations.
+    """Returns the passages of one company-year 10-K section most relevant to a specific question.
 
-    Warms the 10-K section in the Context Cache Manager on first access (or hits resident cache),
-    ranks paragraphs against the evaluated financial variance drivers, and links matching chunk IDs.
+    Use this for targeted evidence instead of reading whole sections: it ranks every paragraph of
+    the company's Item 7 (MD&A) or Item 1A (Risk Factors) against `variance_query` and returns only
+    the top `max_passages`, each with the `chunk_id` to cite.
 
     Args:
         ticker: Company ticker symbol (e.g., 'NVDA', 'AAPL').
         fiscal_year: Reporting fiscal year (e.g., 2026).
         section_id: 10-K section to query: 'item_7' (MD&A) or 'item_1a' (Risk Factors).
-        variance_query: Variance explanation query (e.g., 'revenue growth operating margin expansion Blackwell').
-        max_passages: Maximum number of grounded explanation passages to return (1 to 10).
+        variance_query: Focused question or driver to explain (e.g., 'data center revenue growth Blackwell demand').
+        max_passages: Number of passages to return (1 to 10; 2-4 is usually enough).
 
     Returns:
-        Dictionary with 'status', 'cache_hit', 'token_estimate', 'lookup_latency_ms', 'explanations', and 'matched_chunk_ids'.
+        Dictionary with 'status', 'passages' (each with 'text', 'chunk_id', 'chunk_match'),
+        'section_title', 'sec_filing_url', 'content_source' (gcs | local_markdown |
+        synthesized_fallback; never cite synthesized_fallback text as filing evidence), and
+        'matched_citations'.
     """
     t0 = time.perf_counter()
     cached_res = load_cached_10k_section(
@@ -3332,7 +3338,10 @@ def query_cached_10k_context(
     if cached_res.get("status") != "success":
         return cached_res
 
-    full_text = str(cached_res.get("content") or "")
+    # Rank over the complete section, not the 50k-char excerpt returned to callers.
+    full_entry = get_full_10k_section(str(cached_res["cache_key"]))
+    full_text = str((full_entry or {}).get("full_text") or cached_res.get("content") or "")
+    content_source = str(cached_res.get("content_source") or "unknown")
     raw_blocks = [
         blk.strip()
         for blk in re.split(r"\n\s*\n+", full_text)
@@ -3428,16 +3437,27 @@ def query_cached_10k_context(
 
     matched_chunk_ids: list[str] = []
     matched_citations: list[dict[str, Any]] = []
+    passages: list[dict[str, Any]] = []
     for passage in top_passages:
         snippet_probe = passage[:90].lower()
-        best_chunk = next(
+        exact_chunk = next(
             (
                 r
                 for r in section_chunks
                 if snippet_probe[:48] in str(r.get("chunk_text", "")).lower()
                 or str(r.get("chunk_text", ""))[:48].lower() in passage.lower()
             ),
-            section_chunks[0] if section_chunks else None,
+            None,
+        )
+        best_chunk = exact_chunk or (section_chunks[0] if section_chunks else None)
+        passages.append(
+            {
+                "text": passage,
+                "chunk_id": str(best_chunk["chunk_id"]) if best_chunk is not None else None,
+                # "section" means the passage was not located in a specific chunk; the
+                # chunk_id then points at the section's first chunk.
+                "chunk_match": "exact" if exact_chunk is not None else "section",
+            }
         )
         if best_chunk is not None:
             cid = str(best_chunk["chunk_id"])
@@ -3490,6 +3510,16 @@ def query_cached_10k_context(
         "token_estimate": cached_res["token_estimate"],
         "lookup_latency_ms": total_lookup_ms,
         "sec_filing_url": cached_res["sec_filing_url"],
+        "content_source": content_source,
+        **(
+            {
+                "warning": "Section text is a synthesized placeholder (filing Markdown unavailable); "
+                "do not cite it as 10-K evidence."
+            }
+            if content_source == "synthesized_fallback"
+            else {}
+        ),
+        "passages": passages,
         "explanations": top_passages,
         "matched_chunk_ids": matched_chunk_ids,
         "matched_citations": matched_citations,

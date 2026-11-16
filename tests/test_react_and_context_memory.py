@@ -13,7 +13,7 @@ from google.adk.memory import InMemoryMemoryService
 from google.adk.models.base_llm import BaseLlm, LlmCapabilities
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
-from google.adk.planners import PlanReActPlanner
+from google.adk.planners import BuiltInPlanner, PlanReActPlanner
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
@@ -90,8 +90,13 @@ class _DeterministicReActProLlm(BaseLlm):
             {
                 "turn": len(self.call_log) + 1,
                 "seen_tools": sorted(seen_tools),
-                "has_plan_react_instruction": "/*PLANNING*/"
-                in str(getattr(llm_request.config, "system_instruction", "")),
+                "native_thinking_requested": bool(
+                    getattr(
+                        getattr(llm_request.config, "thinking_config", None),
+                        "include_thoughts",
+                        False,
+                    )
+                ),
             }
         )
 
@@ -242,7 +247,10 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     assert RootOrchestrator.model == "gemini-3.8-flash"
     assert FinancialAnalystAgent.model == "gemini-3.8-flash"
     assert isinstance(RootOrchestrator.planner, PlanReActPlanner)
-    assert isinstance(FinancialAnalystAgent.planner, PlanReActPlanner)
+    # Native thinking for the analyst: PlanReActPlanner's text "/*ACTION*/" tool snippets made
+    # Gemini 3.x write tool calls as prose instead of issuing function calls.
+    assert isinstance(FinancialAnalystAgent.planner, BuiltInPlanner)
+    assert FinancialAnalystAgent.planner.thinking_config.include_thoughts is True
 
     assert NarrativeEvaluatorAgent.model == "gemini-3.5-flash"
     assert CodingAssistantAgent.model == "gemini-3.5-flash"
@@ -328,9 +336,9 @@ def test_adk_runner_executes_structured_react_loop_with_context_latency_tracking
 
     final_answer, session = asyncio.run(_run_turn())
 
-    # 1. Verify PlanReActPlanner injected structured planning instructions & executed 3 model turns
+    # 1. Verify the analyst requested native thinking (BuiltInPlanner) & executed 3 model turns
     assert len(mock_llm.call_log) == 3
-    assert mock_llm.call_log[0]["has_plan_react_instruction"] is True
+    assert mock_llm.call_log[0]["native_thinking_requested"] is True
     assert "NVIDIA CORP (NVDA)" in final_answer
     assert "NVDA_2026_item_7_" in final_answer
 

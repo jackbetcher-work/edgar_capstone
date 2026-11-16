@@ -6,7 +6,7 @@ import os
 
 from google.adk.agents import Agent
 from google.adk.models.base_llm import BaseLlm
-from google.adk.planners import PlanReActPlanner
+from google.adk.planners import BuiltInPlanner
 from google.genai import types as genai_types
 
 from edgar_capstone.agents.callbacks import (
@@ -23,9 +23,7 @@ from edgar_capstone.agents.prompt_store import (
     load_agent_prompt,
     make_adk_instruction_provider,
 )
-from edgar_capstone.agents.tenk_context_cache import tenk_context_cache_before_model_callback
 from edgar_capstone.agents.tools import (
-    ContextCacheTool,
     HybridSearchTool,
     LookerQueryTool,
     MetricFetchTool,
@@ -35,7 +33,13 @@ from edgar_capstone.agents.tools import (
 
 DEFAULT_ANALYST_MODEL = os.environ.get("EDGAR_ANALYST_MODEL", FINANCIAL_REASONING_MODEL)
 
-FINANCIAL_ANALYST_INSTRUCTION: str = load_agent_prompt("financial_analyst")
+# The analyst follows the registry's `latest` prompt (v2: targeted 10-K retrieval) rather than
+# the store-wide default version used by the other agents.
+DEFAULT_ANALYST_PROMPT_VERSION = "latest"
+
+FINANCIAL_ANALYST_INSTRUCTION: str = load_agent_prompt(
+    "financial_analyst", version=DEFAULT_ANALYST_PROMPT_VERSION
+)
 
 
 def create_financial_analyst_agent(
@@ -44,23 +48,35 @@ def create_financial_analyst_agent(
     model: str | BaseLlm = DEFAULT_ANALYST_MODEL,
     prompt_version: str | None = None,
 ) -> Agent:
-    """Create the specialized `FinancialAnalystAgent` ADK `LlmAgent` with `PlanReActPlanner`."""
+    """Create the specialized `FinancialAnalystAgent` ADK `LlmAgent`.
+
+    Uses the model's native thinking (`BuiltInPlanner`) rather than `PlanReActPlanner`.
+    PlanReActPlanner asks the model to write tool calls as text under `/*ACTION*/`, and
+    Gemini 3.x sometimes did exactly that ("default_api.query_cached_10k_context(...)")
+    instead of issuing a real function call, so retrieval never ran. The ReAct structure
+    lives in the system prompt and the deterministic pre-pass instead.
+    """
     return Agent(
         name=name,
         model=model,
-        planner=PlanReActPlanner(),
+        planner=BuiltInPlanner(thinking_config=genai_types.ThinkingConfig(include_thoughts=True)),
         description=(
             "Gemini SEC 10-K financial reasoning agent employing a structured ReAct "
-            "loop to evaluate deterministic period-over-period variances, query cached 10-K "
-            "context (Item 1A Risk Factors & Item 7 MD&A), and format strictly cited reports."
+            "loop to evaluate deterministic period-over-period variances, retrieve only the 10-K "
+            "evidence each question needs (Item 1A Risk Factors & Item 7 MD&A passages), and "
+            "format strictly cited reports."
         ),
-        instruction=make_adk_instruction_provider("financial_analyst", version=prompt_version),
+        instruction=make_adk_instruction_provider(
+            "financial_analyst", version=prompt_version or DEFAULT_ANALYST_PROMPT_VERSION
+        ),
         tools=[
             VarianceCalculationTool,
             MetricFetchTool,
             LookerQueryTool,
+            # Targeted retrieval only: ranked passages and hybrid search, each returning
+            # chunk_ids. Whole-section loading (`load_cached_10k_section`) stays with
+            # ContextCacheAgent and the source-viewer API, not the synthesis agent.
             HybridSearchTool,
-            ContextCacheTool,
             QueryCached10KTool,
         ],
         generate_content_config=genai_types.GenerateContentConfig(
@@ -71,12 +87,7 @@ def create_financial_analyst_agent(
         output_key="financial_analyst_report",
         before_agent_callback=before_agent_telemetry_callback,
         after_agent_callback=after_agent_memory_callback,
-        # Guardrails run first (a blocked prompt never creates a cache), then the full
-        # 10-K sections in scope are attached as a remote Vertex AI CachedContent.
-        before_model_callback=[
-            before_model_safety_and_latency_callback,
-            tenk_context_cache_before_model_callback,
-        ],
+        before_model_callback=before_model_safety_and_latency_callback,
         after_model_callback=after_model_fact_check_callback,
         before_tool_callback=before_tool_agent_identity_callback,
     )

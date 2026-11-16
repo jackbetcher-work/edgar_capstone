@@ -69,7 +69,9 @@ def test_adk_agent_hierarchy_and_tool_registration() -> None:
     assert "fetch_financial_metrics" in tool_names
     assert "query_looker_financial_explore" in tool_names
     assert "search_10k_chunks_rag" in tool_names
-    assert "load_cached_10k_section" in tool_names
+    assert "query_cached_10k_context" in tool_names
+    # Targeted retrieval only: the synthesis agent cannot pull whole 10-K sections
+    assert "load_cached_10k_section" not in tool_names
 
 
 def test_intent_routing_classification() -> None:

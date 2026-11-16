@@ -531,6 +531,71 @@ def format_react_grounded_output(
     return "\n".join(lines)
 
 
+_RETRIEVAL_TOOL_NAMES = frozenset({"search_10k_chunks_rag", "query_cached_10k_context"})
+_UNEXECUTED_ACTION_MARKERS = ("/*ACTION*/", "default_api.", "/*PLANNING*/")
+
+
+def _incomplete_agent_output(text: str) -> str | None:
+    """Return a reason when the live answer is planning text or a tool call written as prose."""
+    if not text.strip():
+        return "Empty live agent output"
+    if "/*FINAL_ANSWER*/" in text:
+        return None
+    for marker in _UNEXECUTED_ACTION_MARKERS:
+        if marker in text:
+            return (
+                f"Live agent output was incomplete (contains '{marker}': planning text or an "
+                "unexecuted tool call instead of a final answer)"
+            )
+    return None
+
+
+_CITED_CHUNK_ID_RE = re.compile(r"\[[^\]|]+\|[^\]|]+\|\s*([^\]|]+?)\s*\]\(")
+
+
+def _merge_agent_retrieved_citations(
+    merged_citations: list[dict[str, Any]],
+    session_citations: Any,
+) -> list[dict[str, Any]]:
+    """Append citations the agent retrieved via tools (in place) and return only the new ones."""
+    existing = {str(c.get("chunk_id")) for c in merged_citations}
+    added: list[dict[str, Any]] = []
+    for cit in session_citations or []:
+        if not isinstance(cit, dict):
+            continue
+        cid = str(cit.get("chunk_id") or "")
+        if cid and cid not in existing:
+            existing.add(cid)
+            merged_citations.append(cit)
+            added.append(cit)
+    return added
+
+
+def _summarize_agent_retrieval(
+    live_stream_result: AdkStreamResult | None,
+    agent_retrieved_citations: list[dict[str, Any]],
+    merged_citations: list[dict[str, Any]],
+    answer_markdown: str,
+) -> dict[str, Any] | None:
+    """Report which 10-K evidence the agent pulled itself and whether its citations resolve."""
+    if live_stream_result is None:
+        return None
+    retrieval_calls = [
+        {"name": fc.get("name"), "args": fc.get("args")}
+        for fc in live_stream_result.function_calls
+        if fc.get("name") in _RETRIEVAL_TOOL_NAMES
+    ]
+    known_ids = {str(c.get("chunk_id")) for c in merged_citations}
+    cited_ids = list(dict.fromkeys(m.strip() for m in _CITED_CHUNK_ID_RE.findall(answer_markdown)))
+    return {
+        "retrieval_tool_calls": retrieval_calls,
+        "retrieval_tool_calls_count": len(retrieval_calls),
+        "agent_retrieved_chunk_ids": [str(c.get("chunk_id")) for c in agent_retrieved_citations],
+        "cited_chunk_ids": cited_ids,
+        "unresolved_cited_chunk_ids": [cid for cid in cited_ids if cid not in known_ids],
+    }
+
+
 class StructuredReActExecutor:
     """Executes the structured ReAct loop (`evaluate_variances -> query_cached_10k_context -> format_grounded_output`)."""
 
@@ -802,6 +867,7 @@ class StructuredReActExecutor:
         grounding_fallback_applied = False
         fallback_reason: str | None = None
         adk_response_blocked = False
+        agent_retrieved_citations: list[dict[str, Any]] = []
         adk_response_decision: dict[str, Any] | None = None
         adk_response_block_message = ""
 
@@ -826,6 +892,13 @@ class StructuredReActExecutor:
                 )
                 live_adk_executed = True
                 candidate_md = live_stream_result.final_text
+                # Passages the agent retrieved itself with search_10k_chunks_rag /
+                # query_cached_10k_context become part of the turn's citation set (source
+                # viewer, fact-check, and evaluator).
+                agent_retrieved_citations = _merge_agent_retrieved_citations(
+                    merged_citations,
+                    live_stream_result.session_state.get("retrieved_citations"),
+                )
                 if live_stream_result.session_state.get("model_armor_response_blocked") is True:
                     adk_response_blocked = True
                     raw_dec = live_stream_result.session_state.get(
@@ -838,6 +911,9 @@ class StructuredReActExecutor:
                         or candidate_md
                     )
                     answer_markdown = candidate_md
+                elif (incomplete_reason := _incomplete_agent_output(candidate_md)) is not None:
+                    grounding_fallback_applied = True
+                    fallback_reason = incomplete_reason
                 else:
                     check = verify_narrative_against_calculations(
                         response_text=candidate_md,
@@ -1054,10 +1130,11 @@ class StructuredReActExecutor:
             ),
             "grounding_fallback_applied": grounding_fallback_applied,
             "fallback_reason": fallback_reason,
-            "vertex_context_cache": (
-                live_stream_result.session_state.get("tenk_context_cache")
-                if live_stream_result is not None
-                else None
+            "agent_retrieval": _summarize_agent_retrieval(
+                live_stream_result,
+                agent_retrieved_citations,
+                merged_citations,
+                answer_markdown if live_adk_executed else "",
             ),
         }
 

@@ -133,7 +133,6 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 │   │   ├── context_memory.py        # Pro/Flash model routing, ContextLatencyTracker, session compaction
 │   │   ├── evaluation_and_coding.py # Flash LLM-as-a-Judge evaluator & SQL/Python/LookML coding assist
 │   │   ├── callbacks.py             # Guardrails, first-chunk SSE TTFT capture & grounding callbacks
-│   │   ├── tenk_context_cache.py    # Full 10-K sections as shared Vertex AI CachedContent (L1 -> discovery -> create)
 │   │   └── tools.py                 # Resilient ADK FunctionTools for metrics, variances, RAG & bounded 10-K section cache
 │   ├── dataset/                     # SEC EDGAR 10-K XBRL + Markdown extraction pipeline (edgartools)
 │   │   ├── paths.py                 # Install-layout-aware data root resolution (source tree, /app/data, cwd)
@@ -178,25 +177,26 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
   - Every row in all three tables carries the request's `trace_id`, so BigQuery telemetry joins back to Cloud Trace and Cloud Logging. The Cloud Logging copies of these sink records are written as top-level `jsonPayload` fields (`component`, `log_sink_target`, `event_payload`), which is what the `google_logging_project_sink` filter matches. Before this change they were plain INFO strings with no configured handler, so they never reached stdout.
   - `ConversationMemoryManager` maintains multi-turn session state for follow-up entity/period recall and compacts older turns above a configurable token threshold.
   - `create_edgar_adk_app` configures an ADK `App` with `ContextCacheConfig` and `EventsCompactionConfig`.
-- **Vertex AI Context Caching for 10-K Sections (`tenk_context_cache.py`):**
-  - The full Item 1A / Item 7 sections that the ReAct loop queried are registered as one remote Gemini `CachedContent` per synthesis (`google.genai.Client.caches`). The resource also holds `FinancialAnalystAgent`'s resolved system instruction and tool declarations, because Gemini rejects requests that set `cached_content` together with `system_instruction` or `tools`.
-  - A `before_model_callback` runs after the Model Armor guardrail. It attaches the cache with `config.cached_content` and skips ADK's own prefix cache for that call.
-  - Lookup order: an in-process handle, then cross-instance discovery by a deterministic `display_name` (`caches.list()`, built from a SHA-256 of the model, instruction, tools, and section content), then `caches.create`. TTLs are extended with `caches.update` once less than half remains.
-  - Fallbacks: bundles below the model's minimum cacheable size are sent inline. Cache API errors and timeouts fall back to passages-only grounding and trip a circuit breaker. If a cache expires between lookup and use, the synthesis is retried once.
-  - Decisions appear in `adk_runtime.vertex_context_cache` on chat responses. Counters appear under `context_cache_runtime.vertex_context_cache` in `/api/v1/telemetry/context-latency`. Real cached-token savings flow through `cached_content_token_count` into the cost telemetry.
-  - The process-local `_SESSION_10K_CONTEXT_CACHE` is now a bounded LRU + TTL map (`EDGAR_10K_SECTION_CACHE_MAX_ENTRIES=256`, `EDGAR_10K_SECTION_CACHE_TTL_SECONDS=3600`).
-  - Configuration:
-
-    | Variable | Default | Purpose |
-    | :--- | :--- | :--- |
-    | `EDGAR_10K_CONTEXT_CACHE` | `auto` | `off` disables remote caching |
-    | `EDGAR_10K_CONTEXT_CACHE_TTL_SECONDS` | `1800` | Cache TTL |
-    | `EDGAR_10K_CONTEXT_CACHE_MAX_TOKENS` | `200000` | Token budget per bundle |
-    | `EDGAR_10K_CONTEXT_CACHE_MIN_TOKENS` | per model | Minimum cacheable size: 2,048 for Gemini 2.5, 4,096 for Gemini 3 |
-    | `EDGAR_10K_CONTEXT_CACHE_DISCOVERY` | `true` | Cross-instance lookup |
-    | `EDGAR_10K_CONTEXT_CACHE_CREATE_TIMEOUT_SECONDS` | `20` | Create timeout |
-    | `EDGAR_10K_CONTEXT_CACHE_DISCOVERY_TIMEOUT_SECONDS` | `5` | Discovery timeout |
-    | `EDGAR_10K_CONTEXT_CACHE_FAILURE_COOLDOWN_SECONDS` | `600` | Circuit-breaker cooldown |
+- **Agent-Driven 10-K Retrieval (`live_runtime.py`, `tools.py`, `prompts/v2/financial_analyst.yaml`):**
+  - `FinancialAnalystAgent` decides what 10-K evidence each question needs and fetches it. No full sections are forced into its context window.
+  - The synthesis request carries:
+    - the authoritative variance payload;
+    - the variance movers;
+    - up to 8 short evidence leads (`chunk_id` plus a 240-character excerpt from the deterministic pre-pass);
+    - suggested retrieval targets;
+    - a retrieval brief explaining how to call the tools.
+  - The agent's 10-K tools are `query_cached_10k_context` (ranked passages from one company-year section, each with its `chunk_id`) and `search_10k_chunks_rag` (metadata-filtered hybrid search across companies and fiscal years). `load_cached_10k_section`, which loads a whole section, stays with `ContextCacheAgent` and the source-viewer API.
+  - Passages the agent retrieves are merged into the turn's citations, which feed the source viewer, the fact-check, and the judge. `adk_runtime.agent_retrieval` reports:
+    - the retrieval calls made;
+    - the chunks the agent pulled;
+    - the cited chunk IDs;
+    - any cited IDs that don't resolve.
+  - `query_cached_10k_context` now ranks the complete section rather than the first 50k characters.
+  - Section tools report `content_source` (`gcs` | `local_markdown` | `synthesized_fallback`). Placeholder text carries a "do not cite" warning.
+  - The analyst uses the model's native thinking (`BuiltInPlanner`) instead of `PlanReActPlanner`. PlanReAct's text `/*ACTION*/` tool snippets made Gemini 3.x write tool calls as prose. As a backstop, a live answer that still contains planning text or an unexecuted call falls back to deterministic synthesis.
+  - The judge now sees the passages the report actually cites, not just the first 8 retrieved.
+  - Caching: ADK's App-level `ContextCacheConfig` caches the static prefix (system instruction and tool declarations) plus the growing conversation, so passages fetched early in a turn are served from cache on later calls in the same turn. The earlier forced full-section `CachedContent` bundle (`tenk_context_cache.py`) was removed.
+  - The process-local `_SESSION_10K_CONTEXT_CACHE` is a bounded LRU + TTL map (`EDGAR_10K_SECTION_CACHE_MAX_ENTRIES=256`, `EDGAR_10K_SECTION_CACHE_TTL_SECONDS=3600`).
 
 ### 3. FastAPI Backend, Persistent Feedback, LookML Semantic Layer & Split-Pane Frontend (`server.py`, `looker/`, `frontend/`)
 - **Backend API & Firestore Feedback Persistence:** Exposes `/health`, `/api/v1/chat`, `/api/v1/variances`, `/api/v1/search`, `/api/v1/metrics`, `/api/v1/explore/{explore_name}`, `/api/v1/looker/catalog`, `/api/v1/section`, `/api/v1/companies`, `/api/v1/evaluate`, `/api/v1/coding-assist`, `/api/v1/telemetry/context-latency`, `/api/v1/telemetry/sessions`, `/api/v1/feedback`, `/api/v1/secrets/status`, and `/api/v1/auth/*`. `FirestoreFeedbackStore` persists analyst thumbs-up/down ratings and audit comments to Google Cloud Firestore Native (`analyst_feedback` collection via REST v1 `documents` & `:runQuery`, controlled by `EDGAR_FEEDBACK_BACKEND`). Serves the compiled React bundle from `/` in production.
