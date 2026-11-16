@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import AsyncGenerator
 
+import pytest
 from fastapi.testclient import TestClient
 from google.adk.models import Gemini
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
-import pytest
 
 from edgar_capstone.agents import (
     build_adk_llm_for_task,

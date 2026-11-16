@@ -4,16 +4,16 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 import time
+from pathlib import Path
 from typing import Any
 
-from cryptography.hazmat.primitives.asymmetric import ec
-from fastapi.testclient import TestClient
-from google.auth.exceptions import DefaultCredentialsError
 import httpx
 import pytest
 import yaml
+from cryptography.hazmat.primitives.asymmetric import ec
+from fastapi.testclient import TestClient
+from google.auth.exceptions import DefaultCredentialsError
 
 from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.agents.context_memory import (
@@ -95,9 +95,7 @@ def _isolated_telemetry_state():
 def auth_client_env():
     """Isolated IAP ES256 verifier supporting Admin, Analyst, Viewer, and Agent S2S principals."""
     ec_signing_key = ec.generate_private_key(ec.SECP256R1())
-    jwks_payload = {
-        "keys": [ec_public_key_to_jwk(ec_signing_key.public_key(), kid="iap-telem-k1")]
-    }
+    jwks_payload = {"keys": [ec_public_key_to_jwk(ec_signing_key.public_key(), kid="iap-telem-k1")]}
 
     def _jwks_transport(request: httpx.Request) -> httpx.Response:
         if str(request.url) == GOOGLE_IAP_JWKS_URI:
@@ -421,9 +419,17 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     assert audit_row["tickers"] == ["NVDA"]
 
     # Verify Cloud Logging JSON sink records were also emitted
-    sink_logs = [json.loads(r.message) for r in caplog.records if r.name == "edgar_capstone.cloud_logging_sink"]
+    sink_logs = [
+        json.loads(r.message)
+        for r in caplog.records
+        if r.name == "edgar_capstone.cloud_logging_sink"
+    ]
     logged_targets = {item["log_sink_target"] for item in sink_logs}
-    assert {"llm_telemetry_events", "session_telemetry_events", "security_audit_logs"} <= logged_targets
+    assert {
+        "llm_telemetry_events",
+        "session_telemetry_events",
+        "security_audit_logs",
+    } <= logged_targets
 
     # Verify BigQuery parameterized SQL readback for security audit logs
     queried_audits = sink.query_security_audit_logs(limit=10, event_type="filing_10k_section_read")

@@ -56,6 +56,23 @@ Provisions the BigQuery data & vector search foundation, Vertex AI Vector Search
   - `google_artifact_registry_repository.sec_edgar_repo`: Docker container repository (`us-central1-docker.pkg.dev/iron-radio-514217-q7/sec-edgar-repo`).
   - `google_iam_workload_identity_pool.github_pool` & `google_iam_workload_identity_pool_provider.github_provider`: Keyless OIDC authentication for GitHub Actions push pipelines (`sec-edgar-cicd-sa@iron-radio-514217-q7.iam.gserviceaccount.com`).
   - `google_cloud_run_v2_service.sec_edgar_analyst`: Cloud Run service running `sec-analyst-sa` with secrets mounted directly from Secret Manager (`value_source.secret_key_ref`). Bootstraps cleanly in a single-stage `terraform apply` via `var.cloud_run_initial_image` (`us-docker.pkg.dev/cloudrun/container/hello`) while preserving CI/CD container deployments via `lifecycle.ignore_changes`.
+- **Cloud Build Triggers (`terraform/cloudbuild.tf`, opt-in with `enable_cloudbuild_trigger = true`):**
+  - `google_cloudbuildv2_connection.github` and `google_cloudbuildv2_repository.edgar_capstone`: a 2nd-gen GitHub connection in `var.region` that links `var.github_repository`. To reuse a connection created in the console instead, set `create_cloudbuild_github_connection = false`.
+  - `google_cloudbuild_trigger.main_deploy`: on pushes or merges matching `cloudbuild_trigger_branch_regex` (default `^main$`), runs `cloudbuild.yaml` with `_PIPELINE_MODE=deploy`. That covers the lint and test gates, container build and smoke test, push to Artifact Registry, and Cloud Run deploy.
+  - `google_cloudbuild_trigger.pull_request_verify`: on pull requests into `main`, runs the same file with `_PIPELINE_MODE=verify`, which skips the push and deploy. PRs from external contributors need a `/gcbrun` comment first.
+  - `google_service_account.cloudbuild_runner` (`sec-edgar-cloudbuild-sa`) is a dedicated least-privilege identity. Its roles are `roles/logging.logWriter`, `roles/run.developer`, Artifact Registry writer on the app repository only, `roles/iam.serviceAccountUser` on `sec-analyst-sa`, and Secret Accessor on the three managed secrets.
+  - Triggers pass `_REGION`, `_GAR_REPOSITORY`, `_SERVICE_NAME`, `_RUNTIME_SA`, `_BIGQUERY_DATASET`, and `_SEC_CORPUS_BUCKET` from Terraform, so the pipeline always matches the deployed config. Changes to Markdown and `docs/**` are ignored.
+  - One-time setup, done outside Terraform so the GitHub token never enters state:
+    ```bash
+    # a. Install the "Google Cloud Build" GitHub App on the repo; note the installation ID
+    # b. Store a GitHub PAT (repo, read:user, read:org) in Secret Manager
+    printf '%s' "$GITHUB_PAT" | gcloud secrets create sec-edgar-github-oauth-token \
+      --project=iron-radio-514217-q7 --replication-policy=automatic --data-file=-
+    # c. terraform.tfvars
+    #    enable_cloudbuild_trigger             = true
+    #    cloudbuild_github_app_installation_id = <installation-id>
+    terraform apply
+    ```
 
 ## Usage
 

@@ -364,3 +364,60 @@ variable "vector_search_max_replicas" {
   type        = number
   default     = 1
 }
+
+# ------------------------------------------------------------------------------
+# Cloud Build CI/CD triggers (cloudbuild.tf)
+# ------------------------------------------------------------------------------
+variable "enable_cloudbuild_trigger" {
+  description = "Whether to manage the Cloud Build GitHub connection, repository link, service account, and main/PR triggers. Requires the one-time GitHub App install and OAuth token secret described in cloudbuild.tf."
+  type        = bool
+  default     = false
+}
+
+variable "enable_cloudbuild_pr_trigger" {
+  description = "Whether to also create the pull-request trigger that runs cloudbuild.yaml in verify mode (lint, test, build, smoke test; no push or deploy)."
+  type        = bool
+  default     = true
+}
+
+variable "create_cloudbuild_github_connection" {
+  description = "Create the Cloud Build 2nd-gen GitHub connection in Terraform. Set false to reuse an existing connection named cloudbuild_github_connection_name (e.g. one created in the console)."
+  type        = bool
+  default     = true
+}
+
+variable "cloudbuild_github_connection_name" {
+  description = "Name of the Cloud Build 2nd-gen GitHub connection in var.region."
+  type        = string
+  default     = "sec-edgar-github"
+}
+
+variable "cloudbuild_github_app_installation_id" {
+  description = "Installation ID of the Google Cloud Build GitHub App on the repository owner (github.com/settings/installations/<ID>). Required when create_cloudbuild_github_connection is true."
+  type        = number
+  default     = 0
+}
+
+variable "cloudbuild_github_oauth_token_secret_id" {
+  description = "Secret Manager secret ID holding the GitHub OAuth token / PAT used by the Cloud Build connection. Created out of band so the token never enters Terraform state."
+  type        = string
+  default     = "sec-edgar-github-oauth-token"
+}
+
+variable "cloudbuild_github_oauth_token_secret_version" {
+  description = "Version of the GitHub OAuth token secret referenced by the Cloud Build connection."
+  type        = string
+  default     = "1"
+}
+
+variable "cloudbuild_trigger_branch_regex" {
+  description = "RE2 branch regex: pushes to matching branches deploy, and pull requests targeting them are verified."
+  type        = string
+  default     = "^main$"
+}
+
+variable "cloudbuild_service_account_id" {
+  description = "Account ID for the dedicated Cloud Build trigger service account."
+  type        = string
+  default     = "sec-edgar-cloudbuild-sa"
+}

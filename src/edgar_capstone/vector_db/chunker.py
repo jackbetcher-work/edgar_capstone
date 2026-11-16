@@ -112,7 +112,11 @@ def _split_oversized_block(block: str, max_chars: int) -> list[str]:
         current_len = sum(len(x) + 1 for x in current_lines)
 
         for line in content_lines:
-            if current_lines and current_len + len(line) + 1 > max_chars and len(current_lines) > len(table_header):
+            if (
+                current_lines
+                and current_len + len(line) + 1 > max_chars
+                and len(current_lines) > len(table_header)
+            ):
                 pieces.append("\n".join(current_lines).strip())
                 current_lines = list(table_header)
                 current_len = sum(len(x) + 1 for x in current_lines)
@@ -175,9 +179,7 @@ def split_section_into_passages(
             tagged_blocks.append((full_title, block, True))
         else:
             full_title = (
-                f"{base_title} — {current_subheading}"
-                if current_subheading
-                else base_title
+                f"{base_title} — {current_subheading}" if current_subheading else base_title
             )
             for sub_block in _split_oversized_block(block, max_chars=max_chars):
                 tagged_blocks.append((full_title, sub_block, False))
@@ -192,7 +194,9 @@ def split_section_into_passages(
         # Flush buffer if adding this block exceeds target_chars and we already have substantive text
         if (
             buf_blocks
-            and (buf_len + block_len + 2 > target_chars or (is_heading and buf_len >= min_chars * 3))
+            and (
+                buf_len + block_len + 2 > target_chars or (is_heading and buf_len >= min_chars * 3)
+            )
             and buf_len >= min_chars
         ):
             chunk_body = "\n\n".join(buf_blocks).strip()

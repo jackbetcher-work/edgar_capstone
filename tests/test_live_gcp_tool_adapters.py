@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-from types import SimpleNamespace
-from typing import Any, AsyncGenerator
 import urllib.parse
+from collections.abc import AsyncGenerator
+from types import SimpleNamespace
+from typing import Any
 
-from google.auth.exceptions import DefaultCredentialsError
+import httpx
+import pytest
 from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
+from google.auth.exceptions import DefaultCredentialsError
 from google.genai import types as genai_types
-import httpx
-import pytest
 
 from edgar_capstone.agents import (
     GcpToolAdapters,
@@ -143,7 +144,9 @@ def _encode_bq_profile_row(
             {"v": f"unstructured/{ticker}/{fy}_10k.md"},
             {"v": f"structured/{ticker}/{fy}_financials.json"},
             {"v": f"gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/{ticker}/{fy}_10k.md"},
-            {"v": f"gs://fde-sec-edgar-sandbox-dev-sec-corpus/structured/{ticker}/{fy}_financials.json"},
+            {
+                "v": f"gs://fde-sec-edgar-sandbox-dev-sec-corpus/structured/{ticker}/{fy}_financials.json"
+            },
             {"v": f"https://www.sec.gov/Archives/edgar/data/1045810/{ticker}_{fy}_10k.htm"},
         ]
     }
@@ -404,7 +407,9 @@ def test_bigquery_adapter_all_looker_explores() -> None:
                                 {"v": "120067000000.0"},
                                 {"v": "47187000000.0"},
                                 {"v": "64.7462"},
-                                {"v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026.htm"},
+                                {
+                                    "v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026.htm"
+                                },
                             ]
                         }
                     ],
@@ -786,7 +791,9 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
                     200,
                     json={
                         "jobComplete": True,
-                        "schema": {"fields": [*chunk_fields, {"name": "distance", "type": "FLOAT"}]},
+                        "schema": {
+                            "fields": [*chunk_fields, {"name": "distance", "type": "FLOAT"}]
+                        },
                         "rows": [
                             {
                                 "f": [
@@ -806,8 +813,12 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
                                             "and resulted in excess inventory charges in FY2026."
                                         )
                                     },
-                                    {"v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026.htm"},
-                                    {"v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"},
+                                    {
+                                        "v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026.htm"
+                                    },
+                                    {
+                                        "v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"
+                                    },
                                     {"v": "0.10"},
                                 ]
                             }
@@ -839,8 +850,12 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
                                             "Data Center GPU shipments to China and D:5 regions."
                                         )
                                     },
-                                    {"v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2025.htm"},
-                                    {"v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2025_10k.md"},
+                                    {
+                                        "v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2025.htm"
+                                    },
+                                    {
+                                        "v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2025_10k.md"
+                                    },
                                 ]
                             }
                         ],
@@ -967,8 +982,12 @@ def test_context_cache_miss_loads_from_bigquery_and_gcs_and_queries_cached_secti
                                             "by hyperscale cloud deployment of Blackwell GB200 NVL72 clusters."
                                         )
                                     },
-                                    {"v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026_10k.htm"},
-                                    {"v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"},
+                                    {
+                                        "v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026_10k.htm"
+                                    },
+                                    {
+                                        "v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"
+                                    },
                                 ]
                             }
                         ],
@@ -1095,9 +1114,7 @@ class _LiveToolCallingAnalystLlm(BaseLlm):
         yield LlmResponse(
             model_version=self.model,
             partial=False,
-            content=genai_types.Content(
-                role="model", parts=[genai_types.Part(text=final_text)]
-            ),
+            content=genai_types.Content(role="model", parts=[genai_types.Part(text=final_text)]),
             usage_metadata=genai_types.GenerateContentResponseUsageMetadata(
                 prompt_token_count=1800,
                 candidates_token_count=75,
@@ -1180,9 +1197,15 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
                                     {"v": "item_7"},
                                     {"v": "Item 7. MD&A"},
                                     {"v": "1"},
-                                    {"v": "Blackwell architecture ramped across cloud hyperscalers in FY2026."},
-                                    {"v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026.htm"},
-                                    {"v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"},
+                                    {
+                                        "v": "Blackwell architecture ramped across cloud hyperscalers in FY2026."
+                                    },
+                                    {
+                                        "v": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026.htm"
+                                    },
+                                    {
+                                        "v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"
+                                    },
                                     {"v": "0.08"},
                                 ]
                             }
@@ -1192,9 +1215,7 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
 
         if ":predict" in url and "text-embedding-005" in url:
             gcp_services_contacted.add("vertex_ai_embeddings")
-            return httpx.Response(
-                200, json={"predictions": [{"embeddings": {"values": q_vec}}]}
-            )
+            return httpx.Response(200, json={"predictions": [{"embeddings": {"values": q_vec}}]})
 
         if ":findNeighbors" in url:
             gcp_services_contacted.add("vertex_vector_search")

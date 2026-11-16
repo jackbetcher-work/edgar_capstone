@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from collections import Counter
-from datetime import date
 import logging
 import math
 import re
 import time
-from typing import Any, Callable, Literal, TypeVar
 import warnings as py_warnings
+from collections import Counter
+from collections.abc import Callable
+from datetime import date
+from typing import Any, Literal, TypeVar
 
 import edgar
 from edgar import CompanyNotFoundError
@@ -59,9 +60,7 @@ REVENUE_FALLBACK_CONCEPTS: tuple[str, ...] = (
     *COMPONENT_REVENUE_CONCEPTS,
 )
 
-OPERATING_INCOME_CONCEPTS: tuple[str, ...] = (
-    "us-gaap_OperatingIncomeLoss",
-)
+OPERATING_INCOME_CONCEPTS: tuple[str, ...] = ("us-gaap_OperatingIncomeLoss",)
 
 OPERATING_INCOME_FALLBACK_CONCEPTS: tuple[str, ...] = (
     "us-gaap_OperatingIncomeLoss",
@@ -300,9 +299,7 @@ def reconcile_company_fiscal_years(
     if len(report_dates_and_fys) < 2:
         return [fy for _, fy in report_dates_and_fys]
 
-    parsed = [
-        (date.fromisoformat(rd.strip()[:10]), fy) for rd, fy in report_dates_and_fys
-    ]
+    parsed = [(date.fromisoformat(rd.strip()[:10]), fy) for rd, fy in report_dates_and_fys]
     # Only normalize when the entire series consists of non-spillover Jan-May year-ends
     if not all(d.month <= 5 and not (d.month == 1 and d.day <= 10) for d, _ in parsed):
         return [fy for _, fy in report_dates_and_fys]
@@ -319,11 +316,9 @@ def reconcile_company_fiscal_years(
 
     counts = Counter(offsets)
     # Newest filing is first in SEC EDGAR iteration order; sort by date desc to be explicit
-    newest_offset = max(zip(parsed, offsets), key=lambda item: item[0][0])[1]
+    newest_offset = max(zip(parsed, offsets, strict=False), key=lambda item: item[0][0])[1]
     canonical_offset = (
-        0
-        if (counts[0] > counts[-1] or (counts[0] == counts[-1] and newest_offset == 0))
-        else -1
+        0 if (counts[0] > counts[-1] or (counts[0] == counts[-1] and newest_offset == 0)) else -1
     )
     return [d.year + canonical_offset for d, _ in parsed]
 
@@ -393,9 +388,7 @@ def _slice_markdown_between(
             continue
 
         cleaned = clean_markdown_section(full_md[body_start:end_pos])
-        if is_substantive_section_markdown(
-            cleaned, item_id=item_id, min_chars=min_slice_chars
-        ):
+        if is_substantive_section_markdown(cleaned, item_id=item_id, min_chars=min_slice_chars):
             if best_candidate is None or len(cleaned) > len(best_candidate):
                 best_candidate = cleaned
 
@@ -462,12 +455,16 @@ def _load_annual_report_exhibit_markdowns(filing: Any) -> list[str]:
         return markdowns
 
     for att in att_iter:
-        doc_type = str(
-            getattr(att, "document_type", None)
-            or getattr(att, "form", None)
-            or getattr(att, "type", None)
-            or ""
-        ).strip().upper()
+        doc_type = (
+            str(
+                getattr(att, "document_type", None)
+                or getattr(att, "form", None)
+                or getattr(att, "type", None)
+                or ""
+            )
+            .strip()
+            .upper()
+        )
         if not (doc_type.startswith("EX-13") or doc_type in ("EX-99.1", "EX-99")):
             continue
         doc_name = str(getattr(att, "document", "") or "").lower()
@@ -703,9 +700,7 @@ def _lookup_concept_from_income_df(
     pick_largest_positive: bool = False,
 ) -> tuple[float | None, str | None]:
     """Search non-dimensional income statement rows for matching concepts."""
-    df, primary_col = _filter_non_dimensional_income_df(
-        inc_df, report_date_str=report_date_str
-    )
+    df, primary_col = _filter_non_dimensional_income_df(inc_df, report_date_str=report_date_str)
     if df is None or primary_col is None:
         return None, None
 
@@ -740,9 +735,7 @@ def _lookup_by_label_or_suffix(
     report_date_str: str | None = None,
 ) -> tuple[float | None, str | None]:
     """Match company-extension XBRL concepts (e.g., `bk_...`) or standardized line-item labels."""
-    df, primary_col = _filter_non_dimensional_income_df(
-        inc_df, report_date_str=report_date_str
-    )
+    df, primary_col = _filter_non_dimensional_income_df(inc_df, report_date_str=report_date_str)
     if df is None or primary_col is None:
         return None, None
 
@@ -961,9 +954,7 @@ def extract_financial_metrics(
             inc_df, helper_ni, report_date_str=report_date_str
         ):
             net_income = helper_ni
-            provenance.net_income = (
-                "edgartools:Financials.get_net_income (us-gaap:NetIncomeLoss)"
-            )
+            provenance.net_income = "edgartools:Financials.get_net_income (us-gaap:NetIncomeLoss)"
 
     return revenue, operating_income, net_income, provenance
 
@@ -1002,9 +993,7 @@ def extract_company_10k_bundles(
     warnings: list[str] = []
     company = _resolve_edgar_company(constituent)
     cik_10 = format_cik(getattr(company, "cik", None) or constituent.cik) or "0000000000"
-    official_name = (
-        getattr(company, "name", None) or constituent.company_name or constituent.ticker
-    )
+    official_name = getattr(company, "name", None) or constituent.company_name or constituent.ticker
 
     filings = _retry_sec_call(
         lambda: company.get_filings(form="10-K", amendments=False).filter(
@@ -1094,7 +1083,7 @@ def extract_company_10k_bundles(
 
     bundles_by_fy: dict[int, ExtractedFilingBundle] = {}
 
-    for entry, fiscal_year in zip(staged_entries, reconciled_fys):
+    for entry, fiscal_year in zip(staged_entries, reconciled_fys, strict=False):
         if fiscal_year < start_year or fiscal_year > end_year:
             continue
         # Filings are iterated newest-first; keep the most recent 10-K per fiscal year
@@ -1125,9 +1114,7 @@ def extract_company_10k_bundles(
                     cached_bundle.markdown_content,
                     count=1,
                 )
-                cached_bundle = ExtractedFilingBundle(
-                    profile=prof, markdown_content=updated_md
-                )
+                cached_bundle = ExtractedFilingBundle(profile=prof, markdown_content=updated_md)
             logger.info(
                 "[%s] Reusing locally staged FY%d 10-K (%s)",
                 constituent.ticker,
@@ -1202,9 +1189,7 @@ def extract_company_10k_bundles(
             warnings.append(w)
 
         unstructured_blob = f"unstructured/{constituent.ticker}/{fiscal_year}_10k.md"
-        structured_blob = (
-            f"structured/{constituent.ticker}/{fiscal_year}_financials.json"
-        )
+        structured_blob = f"structured/{constituent.ticker}/{fiscal_year}_financials.json"
 
         markdown_doc = format_combined_10k_markdown(
             ticker=constituent.ticker,

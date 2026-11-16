@@ -7,10 +7,10 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from fastapi.testclient import TestClient
 import httpx
 import pytest
 import yaml
+from fastapi.testclient import TestClient
 
 from edgar_capstone.security import (
     MANAGED_SECRETS,
@@ -55,6 +55,9 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert "verify_no_secrets.py" in test_steps_str
     assert "pytest" in test_steps_str
     assert "terraform fmt -check" in test_steps_str
+    assert "terraform validate" in test_steps_str
+    assert "ruff check" in test_steps_str
+    assert "ruff format --check" in test_steps_str
     assert "npm --prefix frontend ci" in test_steps_str
     assert "npm --prefix frontend run lint" in test_steps_str
     assert "npm --prefix frontend test" in test_steps_str
@@ -64,6 +67,10 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     # Stage 2: build (depends on test, uses keyless WIF + Secret Manager + frontend container check)
     build_job = jobs["build"]
     assert build_job.get("needs") == "test"
+    # Cloud Build is the primary deploy path; GitHub Actions deploys only when opted in
+    for gated_job in (jobs["build"], jobs["deploy"]):
+        assert "refs/heads/main" in gated_job["if"]
+        assert "vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'" in gated_job["if"]
     build_uses = [step.get("uses", "") for step in build_job["steps"]]
     assert any("google-github-actions/auth@" in u for u in build_uses)
     assert any("google-github-actions/get-secretmanager-secrets@" in u for u in build_uses)
@@ -101,16 +108,41 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     cb = yaml.safe_load(cb_path.read_text(encoding="utf-8"))
     steps = cb.get("steps", [])
     step_ids = [s.get("id") for s in steps]
-    assert step_ids == ["test", "build", "deploy"]
+    gate_ids = ["lint-python", "lint-terraform", "frontend", "test"]
+    assert step_ids == [*gate_ids, "build", "deploy"]
 
-    build_step = next(s for s in steps if s["id"] == "build")
-    assert build_step["waitFor"] == ["test"]
+    # Quality gates start immediately and run in parallel
+    steps_by_id = {s["id"]: s for s in steps}
+    for gate_id in gate_ids:
+        assert steps_by_id[gate_id]["waitFor"] == ["-"]
+
+    lint_py_cmd = " ".join(steps_by_id["lint-python"]["args"])
+    assert "ruff check" in lint_py_cmd
+    assert "ruff format --check" in lint_py_cmd
+    lint_tf_cmd = " ".join(steps_by_id["lint-terraform"]["args"])
+    assert "terraform fmt -check -recursive" in lint_tf_cmd
+    assert "terraform init -backend=false" in lint_tf_cmd
+    assert "terraform validate" in lint_tf_cmd
+    frontend_cmd = " ".join(steps_by_id["frontend"]["args"])
+    assert "npm --prefix frontend run lint" in frontend_cmd
+    assert "npm --prefix frontend test" in frontend_cmd
+    test_cmd = " ".join(steps_by_id["test"]["args"])
+    assert "verify_no_secrets.py" in test_cmd
+    assert "pytest" in test_cmd
+
+    # Pinned ruff version in CI matches the dev dependency pin
+    pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert f'"ruff=={cb["substitutions"]["_RUFF_VERSION"]}"' in pyproject_text
+
+    build_step = steps_by_id["build"]
+    assert build_step["waitFor"] == gate_ids
     assert "SEC_EDGAR_USER_AGENT" in build_step["secretEnv"]
     build_cmd = " ".join(build_step["args"])
     assert "DOCKER_BUILDKIT=1" in build_cmd
     assert "/app/frontend/dist/index.html" in build_cmd
+    assert "container_smoke_test.py" in build_cmd
 
-    deploy_step = next(s for s in steps if s["id"] == "deploy")
+    deploy_step = steps_by_id["deploy"]
     assert deploy_step["waitFor"] == ["build"]
     assert set(deploy_step["secretEnv"]) == {
         "SEC_EDGAR_USER_AGENT",
@@ -120,6 +152,14 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     deploy_cmd = " ".join(deploy_step["args"])
     assert "--set-secrets=" in deploy_cmd
 
+    # PR (verify) builds must never push images or deploy
+    assert cb["substitutions"]["_PIPELINE_MODE"] == "deploy"
+    assert "images" not in cb, "top-level images: would push even in verify mode"
+    assert build_cmd.index('"${_PIPELINE_MODE}" != "deploy"') < build_cmd.index("docker push")
+    assert deploy_cmd.index('"${_PIPELINE_MODE}" != "deploy"') < deploy_cmd.index(
+        "gcloud run deploy"
+    )
+
     secret_mgr_entries = cb.get("availableSecrets", {}).get("secretManager", [])
     envs_bound = {entry["env"] for entry in secret_mgr_entries}
     assert envs_bound == {
@@ -127,6 +167,57 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
         "GEMINI_API_KEY",
         "INTERNAL_IAP_AUDIENCE",
     }
+
+
+def test_cloudbuild_triggers_managed_in_terraform() -> None:
+    cb_tf = (REPO_ROOT / "terraform" / "cloudbuild.tf").read_text(encoding="utf-8")
+    assert 'resource "google_cloudbuildv2_connection" "github"' in cb_tf
+    assert 'resource "google_cloudbuildv2_repository" "edgar_capstone"' in cb_tf
+    assert 'resource "google_cloudbuild_trigger" "main_deploy"' in cb_tf
+    assert 'resource "google_cloudbuild_trigger" "pull_request_verify"' in cb_tf
+    assert 'filename        = "cloudbuild.yaml"' in cb_tf
+    assert '_PIPELINE_MODE = "deploy"' in cb_tf
+    assert '_PIPELINE_MODE = "verify"' in cb_tf
+    assert "COMMENTS_ENABLED_FOR_EXTERNAL_CONTRIBUTORS_ONLY" in cb_tf
+
+    # Dedicated least-privilege build identity (no project-wide owner/editor/admin roles)
+    assert 'resource "google_service_account" "cloudbuild_runner"' in cb_tf
+    assert "service_account = google_service_account.cloudbuild_runner[0].id" in cb_tf
+    assert "roles/run.developer" in cb_tf
+    assert "roles/run.admin" not in cb_tf
+    assert "roles/editor" not in cb_tf
+    assert "roles/owner" not in cb_tf
+    assert 'resource "google_artifact_registry_repository_iam_member" "cloudbuild_repo_writer"' in (
+        cb_tf
+    )
+
+    # GitHub token is referenced by Secret Manager version name only, never read into state
+    assert 'data "google_secret_manager_secret_version"' not in cb_tf
+    assert "oauth_token_secret_version = local.cloudbuild_oauth_token_secret_version" in cb_tf
+
+    variables_tf = (REPO_ROOT / "terraform" / "variables.tf").read_text(encoding="utf-8")
+    for var_name in (
+        "enable_cloudbuild_trigger",
+        "enable_cloudbuild_pr_trigger",
+        "create_cloudbuild_github_connection",
+        "cloudbuild_github_app_installation_id",
+        "cloudbuild_github_oauth_token_secret_id",
+        "cloudbuild_trigger_branch_regex",
+        "cloudbuild_service_account_id",
+    ):
+        assert f'variable "{var_name}"' in variables_tf
+
+
+def test_ruff_lint_and_format_gate_configured() -> None:
+    pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "[tool.ruff]" in pyproject_text
+    assert "[tool.ruff.lint]" in pyproject_text
+    assert "[tool.ruff.format]" in pyproject_text
+
+    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "\nlint:" in makefile_text
+    assert "\nformat:" in makefile_text
+    assert "ruff format --check" in makefile_text
 
 
 def test_no_secrets_or_keys_exposed_in_repository() -> None:
@@ -251,9 +342,7 @@ def test_frontend_lockfile_uses_public_npm_registry() -> None:
     assert packages[""].get("devDependencies") == pkg_json.get("devDependencies")
 
     resolved_urls = [
-        meta["resolved"]
-        for key, meta in packages.items()
-        if key != "" and "resolved" in meta
+        meta["resolved"] for key, meta in packages.items() if key != "" and "resolved" in meta
     ]
     assert len(resolved_urls) > 0
     bad_urls = [u for u in resolved_urls if not u.startswith("https://registry.npmjs.org/")]

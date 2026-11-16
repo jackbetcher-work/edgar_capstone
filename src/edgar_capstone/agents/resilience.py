@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from datetime import datetime, timezone
 import functools
 import inspect
 import logging
 import time
+from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any, TypeVar
 
 import httpx
@@ -75,7 +75,7 @@ def _record_tool_telemetry(
             "status": status,
             "duration_ms": round(duration_ms, 2),
             "attempts": attempts,
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
         if error_message:
             entry["error"] = error_message

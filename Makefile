@@ -20,7 +20,7 @@ OFFLINE_ENV := -e EDGAR_EXECUTION_MODE=deterministic -e EDGAR_DATA_BACKEND=local
 	-e EDGAR_TELEMETRY_BACKEND=local -e EDGAR_FEEDBACK_BACKEND=local \
 	-e EDGAR_PROMPT_STORE_BACKEND=local -e EDGAR_MODEL_ARMOR_MODE=disabled
 
-.PHONY: help install dev start backend frontend build test clean hydrate-corpus smoke docker-build docker-smoke docker-smoke-hydrated
+.PHONY: help install dev start backend frontend build lint format test check clean hydrate-corpus smoke docker-build docker-smoke docker-smoke-hydrated
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage: make <target>\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 } END {printf "\n"}' $(MAKEFILE_LIST)
@@ -50,6 +50,25 @@ frontend: ## Run Vite React dev server only
 build: ## Build production frontend bundle and validate backend
 	$(PYTHON) -m compileall -q src
 	cd frontend && npm run build
+
+lint: ## Run the CI lint/format gates: ruff check + format --check, terraform fmt/validate, ESLint
+	$(PYTHON) -m ruff check .
+	$(PYTHON) -m ruff format --check .
+	@if command -v terraform >/dev/null 2>&1; then \
+		terraform fmt -check -recursive terraform/ && \
+		terraform -chdir=terraform init -backend=false -input=false >/dev/null && \
+		terraform -chdir=terraform validate -no-color; \
+	else \
+		echo "terraform not installed; skipping terraform fmt/validate (still enforced in CI)"; \
+	fi
+	cd frontend && npm run lint
+
+format: ## Auto-fix Python lint issues and apply ruff formatting + terraform fmt
+	$(PYTHON) -m ruff check --fix .
+	$(PYTHON) -m ruff format .
+	@if command -v terraform >/dev/null 2>&1; then terraform fmt -recursive terraform/; fi
+
+check: lint test ## Run every CI gate locally (lint + format checks, secret scan, pytest, vitest)
 
 test: ## Run backend (pytest + secret scan) and frontend (lint + vitest) checks
 	$(PYTHON) scripts/verify_no_secrets.py --repo-root .
@@ -93,5 +112,5 @@ docker-smoke-hydrated: docker-build ## Run the image with GCS corpus hydration (
 	$(DOCKER) rm -f $(SMOKE_CONTAINER) >/dev/null; exit $$status
 
 clean: ## Remove build artifacts and caches
-	rm -rf frontend/dist .pytest_cache
+	rm -rf frontend/dist .pytest_cache .ruff_cache
 	find src tests scripts -type d -name "__pycache__" -exec rm -rf {} +

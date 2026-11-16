@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 def utc_now_iso() -> str:
     """Return current UTC timestamp in ISO-8601 format."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class VertexVectorRestrict(BaseModel):
@@ -36,9 +36,7 @@ class FilingChunk(BaseModel):
     and serializes to Vertex AI Vector Search batch/stream JSONL format.
     """
 
-    chunk_id: str = Field(
-        ..., description="Unique chunk identifier (e.g., NVDA_2026_item_1a_0000)"
-    )
+    chunk_id: str = Field(..., description="Unique chunk identifier (e.g., NVDA_2026_item_1a_0000)")
     profile_id: str = Field(
         ..., description="Foreign key to financial_metrics.profile_id ({TICKER}_{FY})"
     )
@@ -76,9 +74,7 @@ class FilingChunk(BaseModel):
         ..., description="Markdown passage text for RAG synthesis and grounding"
     )
     char_count: int = Field(..., ge=0, description="Character length of chunk_text")
-    token_estimate: int = Field(
-        ..., ge=0, description="Approximate token count of chunk_text"
-    )
+    token_estimate: int = Field(..., ge=0, description="Approximate token count of chunk_text")
     embedding: list[float] = Field(
         default_factory=list,
         description="Dense vector embedding (ARRAY<FLOAT64>) for vector search",

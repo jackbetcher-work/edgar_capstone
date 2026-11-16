@@ -221,9 +221,7 @@ def test_hybrid_search_and_context_cache_tools() -> None:
 def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
     attempts = {"count": 0}
 
-    @with_tool_resilience(
-        tool_name="flaky_429_tool", max_retries=3, base_delay_seconds=0.01
-    )
+    @with_tool_resilience(tool_name="flaky_429_tool", max_retries=3, base_delay_seconds=0.01)
     def flaky_tool(tool_context: SimpleNamespace | None = None) -> dict[str, str]:
         attempts["count"] += 1
         if attempts["count"] < 3:
@@ -267,9 +265,7 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
             "annual_series": [],
         }
     }
-    cb_ctx.state["retrieved_citations"] = [
-        {"chunk_id": "NVDA_2026_item_7_0001"}
-    ]
+    cb_ctx.state["retrieved_citations"] = [{"chunk_id": "NVDA_2026_item_7_0001"}]
     valid_llm_resp = LlmResponse(
         content=genai_types.Content(
             role="model",

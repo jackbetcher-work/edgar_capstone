@@ -2,20 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
 import logging
-from pathlib import Path
 import time
-from typing import Any, Literal
 import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
 
 import google.auth
 import google.auth.exceptions
+import httpx
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.cloud import storage
-import httpx
 
 from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_BUCKET_NAME,
@@ -99,9 +99,7 @@ def _load_filtered_profiles(
 
     profiles: list[FinancialDataProfile] = []
     for json_path in sorted(struct_root.rglob("*_financials.json")):
-        profile = FinancialDataProfile.model_validate_json(
-            json_path.read_text(encoding="utf-8")
-        )
+        profile = FinancialDataProfile.model_validate_json(json_path.read_text(encoding="utf-8"))
         profile.unstructured_gcs_uri = f"gs://{bucket_name}/{profile.unstructured_blob_path}"
         profile.structured_gcs_uri = f"gs://{bucket_name}/{profile.structured_blob_path}"
 
@@ -140,7 +138,9 @@ def _load_cached_embeddings(
                 text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
                 cached[str(cid)] = (text_hash, [float(v) for v in emb])
     except Exception as exc:
-        logger.warning("Ignoring unreadable cached chunk manifest %s: %s", bq_chunks_jsonl_path, exc)
+        logger.warning(
+            "Ignoring unreadable cached chunk manifest %s: %s", bq_chunks_jsonl_path, exc
+        )
 
     return cached
 
@@ -162,9 +162,10 @@ def _write_vector_db_artifacts(
     health_path = manifests_dir / "chunk_health_report.json"
     catalog_path = manifests_dir / "vector_db_catalog.json"
 
-    with bq_chunks_path.open("w", encoding="utf-8") as bq_f, vertex_chunks_path.open(
-        "w", encoding="utf-8"
-    ) as vx_f:
+    with (
+        bq_chunks_path.open("w", encoding="utf-8") as bq_f,
+        vertex_chunks_path.open("w", encoding="utf-8") as vx_f,
+    ):
         for chunk in chunks:
             bq_f.write(json.dumps(chunk.to_bigquery_record()) + "\n")
             vx_f.write(json.dumps(chunk.to_vertex_vector_search_record()) + "\n")
@@ -380,9 +381,7 @@ def run_vector_db_pipeline(
 
     bq_manifest_path = output_dir / "manifests" / "bigquery_filing_chunks.jsonl"
     cached_embeddings = (
-        _load_cached_embeddings(bq_manifest_path)
-        if config.skip_existing_embeddings
-        else None
+        _load_cached_embeddings(bq_manifest_path) if config.skip_existing_embeddings else None
     )
 
     requested_backend: Literal["vertex_ai", "deterministic", "auto"] = (

@@ -26,6 +26,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "ruff==0.17.4",
 ]
 
 [project.scripts]
@@ -42,3 +43,33 @@ include = ["edgar_capstone*", "scripts*"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]
+
+# ------------------------------------------------------------------------------
+# Ruff lint + format gate (`make lint`, Cloud Build `lint-python`, GitHub Actions)
+# ------------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "."]
+extend-exclude = ["build", "frontend", "terraform", "data", "looker", "prompts"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line length is enforced by `ruff format`; long literals/URLs are allowed
+    "B008",  # FastAPI `Depends(...)` / `Query(...)` defaults are idiomatic
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["edgar_capstone", "scripts"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

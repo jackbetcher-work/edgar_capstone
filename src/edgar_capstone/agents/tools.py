@@ -8,24 +8,24 @@ environments while preserving zero-dependency deterministic execution in offline
 
 from __future__ import annotations
 
-from collections import OrderedDict, defaultdict
-from dataclasses import dataclass
 import functools
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import time
-from typing import Any, Literal
 import urllib.parse
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
 
 import google.auth
-from google.auth.exceptions import DefaultCredentialsError, RefreshError
-from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.adk.tools import FunctionTool, ToolContext
 import httpx
 import numpy as np
+from google.adk.tools import FunctionTool, ToolContext
+from google.auth.exceptions import DefaultCredentialsError, RefreshError
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from edgar_capstone.agents.resilience import (
     RateLimitExceededError,
@@ -49,6 +49,7 @@ from edgar_capstone.dataset.gcs_storage import (
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.dataset.paths import resolve_curated_dataset_dir
 from edgar_capstone.dataset.pipeline import DEFAULT_OUTPUT_DIR
+from edgar_capstone.telemetry import get_telemetry_sink
 from edgar_capstone.vector_db.chunker import (
     chunk_filing_document,
     estimate_token_count,
@@ -60,7 +61,6 @@ from edgar_capstone.vector_db.embedder import (
     VertexAIEmbedder,
     generate_deterministic_embedding,
 )
-from edgar_capstone.telemetry import get_telemetry_sink
 
 logger = logging.getLogger(__name__)
 
@@ -117,9 +117,7 @@ class GcpAdapterHttpError(ToolExecutionError):
     """Raised when a GCP REST API returns a non-retryable HTTP 4xx response."""
 
     def __init__(self, *, status_code: int, url: str, response_text: str) -> None:
-        super().__init__(
-            f"GCP REST request failed (HTTP {status_code}) for {url}: {response_text}"
-        )
+        super().__init__(f"GCP REST request failed (HTTP {status_code}) for {url}: {response_text}")
         self.status_code = status_code
         self.url = url
         self.response_text = response_text
@@ -196,8 +194,7 @@ class GcpToolConfig:
             or bool(os.environ.get("VERTEX_VECTOR_SEARCH_ENDPOINT_ID", "").strip())
             or bool(os.environ.get("VERTEX_VECTOR_SEARCH_PUBLIC_DOMAIN", "").strip())
             or exec_mode == "live"
-            or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower()
-            in _TRUTHY_ENV_VALUES
+            or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in _TRUTHY_ENV_VALUES
         )
 
         project_id = (
@@ -226,27 +223,20 @@ class GcpToolConfig:
                 or DEFAULT_BQ_FINANCIAL_METRICS_TABLE
             ).strip(),
             bq_filing_chunks_table=(
-                os.environ.get("BIGQUERY_FILING_CHUNKS_TABLE")
-                or DEFAULT_BQ_FILING_CHUNKS_TABLE
+                os.environ.get("BIGQUERY_FILING_CHUNKS_TABLE") or DEFAULT_BQ_FILING_CHUNKS_TABLE
             ).strip(),
             bq_yoy_view=(
-                os.environ.get("BIGQUERY_YOY_VARIANCE_VIEW")
-                or DEFAULT_BQ_YOY_VARIANCES_VIEW
+                os.environ.get("BIGQUERY_YOY_VARIANCE_VIEW") or DEFAULT_BQ_YOY_VARIANCES_VIEW
             ).strip(),
             bq_chunk_health_view=(
-                os.environ.get("BIGQUERY_CHUNK_HEALTH_VIEW")
-                or DEFAULT_BQ_CHUNK_HEALTH_VIEW
+                os.environ.get("BIGQUERY_CHUNK_HEALTH_VIEW") or DEFAULT_BQ_CHUNK_HEALTH_VIEW
             ).strip(),
-            sec_corpus_bucket=(
-                os.environ.get("SEC_CORPUS_BUCKET") or DEFAULT_BUCKET_NAME
-            ).strip(),
+            sec_corpus_bucket=(os.environ.get("SEC_CORPUS_BUCKET") or DEFAULT_BUCKET_NAME).strip(),
             vais_location=(
-                os.environ.get("VERTEX_AI_SEARCH_LOCATION")
-                or DEFAULT_VERTEX_AI_SEARCH_LOCATION
+                os.environ.get("VERTEX_AI_SEARCH_LOCATION") or DEFAULT_VERTEX_AI_SEARCH_LOCATION
             ).strip(),
             vais_collection_id=(
-                os.environ.get("VERTEX_AI_SEARCH_COLLECTION")
-                or DEFAULT_VERTEX_AI_SEARCH_COLLECTION
+                os.environ.get("VERTEX_AI_SEARCH_COLLECTION") or DEFAULT_VERTEX_AI_SEARCH_COLLECTION
             ).strip(),
             vais_engine_id=os.environ.get(
                 "VERTEX_AI_SEARCH_ENGINE_ID", DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID
@@ -259,9 +249,7 @@ class GcpToolConfig:
                 os.environ.get("VERTEX_VECTOR_SEARCH_ENDPOINT_DISPLAY_NAME")
                 or DEFAULT_VERTEX_VECTOR_ENDPOINT_DISPLAY_NAME
             ).strip(),
-            vvs_public_domain=os.environ.get(
-                "VERTEX_VECTOR_SEARCH_PUBLIC_DOMAIN", ""
-            ).strip(),
+            vvs_public_domain=os.environ.get("VERTEX_VECTOR_SEARCH_PUBLIC_DOMAIN", "").strip(),
             vvs_deployed_index_id=os.environ.get(
                 "VERTEX_VECTOR_SEARCH_DEPLOYED_INDEX_ID", ""
             ).strip(),
@@ -339,9 +327,7 @@ class _GcpAuthenticatedRestClient:
                 headers=headers,
             )
         except httpx.TimeoutException as exc:
-            raise UpstreamTimeoutError(
-                f"Timed out calling GCP endpoint {url}: {exc}"
-            ) from exc
+            raise UpstreamTimeoutError(f"Timed out calling GCP endpoint {url}: {exc}") from exc
         finally:
             if close_client:
                 client.close()
@@ -409,9 +395,7 @@ def _bq_array_param(name: str, elem_type: str, values: list[Any]) -> dict[str, A
             "arrayType": {"type": elem_type},
         },
         "parameterValue": {
-            "arrayValues": [
-                {"value": None if v is None else str(v)} for v in values
-            ]
+            "arrayValues": [{"value": None if v is None else str(v)} for v in values]
         },
     }
 
@@ -454,9 +438,7 @@ def _decode_bq_cell(raw_val: Any, field_schema: dict[str, Any]) -> Any:
     return str(raw_val)
 
 
-def _decode_bq_row(
-    row_obj: dict[str, Any], schema_fields: list[dict[str, Any]]
-) -> dict[str, Any]:
+def _decode_bq_row(row_obj: dict[str, Any], schema_fields: list[dict[str, Any]]) -> dict[str, Any]:
     """Decode a single BigQuery `{"f": [{"v": ...}, ...]}` row using `schema.fields`."""
     cells = row_obj.get("f")
     if not isinstance(cells, list):
@@ -507,9 +489,7 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
         query_parameters: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Execute a parameterized Standard SQL query on BigQuery and return decoded rows."""
-        base_url = (
-            f"https://bigquery.googleapis.com/bigquery/v2/projects/{self.project_id}/queries"
-        )
+        base_url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{self.project_id}/queries"
         payload: dict[str, Any] = {
             "query": sql,
             "useLegacySql": False,
@@ -603,8 +583,7 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
                 or f"gs://{self.sec_corpus_bucket}/{unstructured_blob}"
             ),
             "structured_gcs_uri": str(
-                row.get("structured_gcs_uri")
-                or f"gs://{self.sec_corpus_bucket}/{structured_blob}"
+                row.get("structured_gcs_uri") or f"gs://{self.sec_corpus_bucket}/{structured_blob}"
             ),
             "sec_filing_url": str(row.get("sec_filing_url") or ""),
         }
@@ -680,14 +659,10 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
             op = r.get("operating_income")
             ni = r.get("net_income")
             op_margin = (
-                round((float(op) / abs(float(rev))) * 100.0, 2)
-                if rev and op is not None
-                else None
+                round((float(op) / abs(float(rev))) * 100.0, 2) if rev and op is not None else None
             )
             net_margin = (
-                round((float(ni) / abs(float(rev))) * 100.0, 2)
-                if rev and ni is not None
-                else None
+                round((float(ni) / abs(float(rev))) * 100.0, 2) if rev and ni is not None else None
             )
             formatted.append(
                 {
@@ -855,12 +830,8 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
                 by_section[sec_id] = {
                     "group_key": sec_id,
                     "total_chunks": tot_chunks,
-                    "distinct_profiles": sum(
-                        int(c.get("distinct_profiles") or 0) for c in cells
-                    ),
-                    "distinct_tickers": sum(
-                        int(c.get("distinct_tickers") or 0) for c in cells
-                    ),
+                    "distinct_profiles": sum(int(c.get("distinct_profiles") or 0) for c in cells),
+                    "distinct_tickers": sum(int(c.get("distinct_tickers") or 0) for c in cells),
                     "valid_embedding_count": valid_embs,
                     "embedding_coverage_ratio": (
                         round(valid_embs / tot_chunks, 4) if tot_chunks > 0 else 0.0
@@ -986,9 +957,7 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
             f"FROM {self._table_ref(self.filing_chunks_table)} "
             "WHERE chunk_id IN UNNEST(@chunk_ids)"
         )
-        rows = self.run_query(
-            sql, [_bq_array_param("chunk_ids", "STRING", unique_ids)]
-        )
+        rows = self.run_query(sql, [_bq_array_param("chunk_ids", "STRING", unique_ids)])
         return {str(r["chunk_id"]): r for r in rows if r.get("chunk_id")}
 
     def fetch_section_chunks(
@@ -1086,9 +1055,7 @@ class VertexAISearchAdapter(_GcpAuthenticatedRestClient):
         )
         urls: list[str] = []
         if self.engine_id:
-            urls.append(
-                f"{prefix}/engines/{self.engine_id}/servingConfigs/default_search:search"
-            )
+            urls.append(f"{prefix}/engines/{self.engine_id}/servingConfigs/default_search:search")
         if self.datastore_id:
             urls.append(
                 f"{prefix}/dataStores/{self.datastore_id}/servingConfigs/default_search:search"
@@ -1110,9 +1077,7 @@ class VertexAISearchAdapter(_GcpAuthenticatedRestClient):
             f"fiscal_year <= {int(end_year)}",
         ]
         if tickers:
-            quoted_tickers = ", ".join(
-                f'"{t.replace(chr(34), "")}"' for t in sorted(tickers)
-            )
+            quoted_tickers = ", ".join(f'"{t.replace(chr(34), "")}"' for t in sorted(tickers))
             clauses.append(f"ticker: ANY({quoted_tickers})")
         canon_sector = _canonicalize_gics_sector(gics_sector)
         if canon_sector:
@@ -1283,8 +1248,7 @@ class VertexAISearchAdapter(_GcpAuthenticatedRestClient):
                 if section_id in ("item_1a", "item_7") and resolved_sec != section_id:
                     continue
                 chunk_id = str(
-                    struct_data.get("chunk_id")
-                    or f"{profile_id}_{resolved_sec}_vais_{seg_idx:04d}"
+                    struct_data.get("chunk_id") or f"{profile_id}_{resolved_sec}_vais_{seg_idx:04d}"
                 )
                 passages.append(
                     {
@@ -1295,9 +1259,7 @@ class VertexAISearchAdapter(_GcpAuthenticatedRestClient):
                         "gics_sector": doc_sector,
                         "fiscal_year": fy,
                         "section_id": resolved_sec,
-                        "section_title": str(
-                            raw_title or _default_section_title(resolved_sec)
-                        ),
+                        "section_title": str(raw_title or _default_section_title(resolved_sec)),
                         "chunk_text": seg_text,
                         "sec_filing_url": sec_url,
                         "unstructured_gcs_uri": gcs_uri,
@@ -1340,8 +1302,7 @@ class VertexVectorSearchAdapter(_GcpAuthenticatedRestClient):
         if raw_endpoint_id.startswith("projects/"):
             return raw_endpoint_id
         return (
-            f"projects/{self.project_id}/locations/{self.location}/"
-            f"indexEndpoints/{raw_endpoint_id}"
+            f"projects/{self.project_id}/locations/{self.location}/indexEndpoints/{raw_endpoint_id}"
         )
 
     def resolve_endpoint_target(self) -> tuple[str, str, str]:
@@ -1352,9 +1313,7 @@ class VertexVectorSearchAdapter(_GcpAuthenticatedRestClient):
         if self.endpoint_id and self.deployed_index_id:
             ep_name = self._endpoint_resource_name(self.endpoint_id)
             base_url = (
-                f"https://{self.public_domain}"
-                if self.public_domain
-                else self._regional_api_base()
+                f"https://{self.public_domain}" if self.public_domain else self._regional_api_base()
             )
             self._resolved_target = (ep_name, base_url, self.deployed_index_id)
             return self._resolved_target
@@ -1491,9 +1450,7 @@ class VertexVectorSearchAdapter(_GcpAuthenticatedRestClient):
                     "company_name": meta.get("company_name"),
                     "gics_sector": meta.get("gics_sector") or dp_restrict_map.get("gics_sector"),
                     "fiscal_year": (
-                        int(meta["fiscal_year"])
-                        if meta.get("fiscal_year") is not None
-                        else None
+                        int(meta["fiscal_year"]) if meta.get("fiscal_year") is not None else None
                     ),
                     "section_id": meta.get("section_id") or dp_restrict_map.get("section_id"),
                     "section_title": meta.get("section_title"),
@@ -1590,9 +1547,7 @@ class GcpToolAdapters:
             http_client=http_client,
             credentials=credentials,
         )
-        self._query_embedding_cache: OrderedDict[tuple[str, str], list[float]] = (
-            OrderedDict()
-        )
+        self._query_embedding_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
 
     def embed_texts(
         self,
@@ -1613,9 +1568,7 @@ class GcpToolAdapters:
         try:
             vectors = self.embedder.embed_texts(texts, task_type=task_type)
         except httpx.TimeoutException as exc:
-            raise UpstreamTimeoutError(
-                f"Timed out generating Vertex AI embeddings: {exc}"
-            ) from exc
+            raise UpstreamTimeoutError(f"Timed out generating Vertex AI embeddings: {exc}") from exc
         except RuntimeError as exc:
             msg = str(exc)
             if "HTTP 429" in msg:
@@ -1808,9 +1761,7 @@ def get_context_cache_runtime_stats() -> dict[str, Any]:
         "hits": hits,
         "misses": misses,
         "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
-        "cached_tokens_saved": int(
-            _CONTEXT_CACHE_RUNTIME_COUNTERS.get("cached_tokens_saved", 0)
-        ),
+        "cached_tokens_saved": int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("cached_tokens_saved", 0)),
         "mean_hit_lookup_latency_ms": round(hit_ms / hits, 3) if hits > 0 else 0.0,
         "mean_miss_load_latency_ms": round(miss_ms / misses, 3) if misses > 0 else 0.0,
     }
@@ -1824,11 +1775,7 @@ def _get_dataset_dir() -> Path:
 def _synthesize_fallback_10k_markdown(profile: FinancialDataProfile) -> str:
     """Generate grounded Item 1A and Item 7 Markdown for a profile when unstructured files are gitignored in CI."""
     rev_str = f"${profile.revenue:,.0f}" if profile.revenue is not None else "N/A"
-    op_str = (
-        f"${profile.operating_income:,.0f}"
-        if profile.operating_income is not None
-        else "N/A"
-    )
+    op_str = f"${profile.operating_income:,.0f}" if profile.operating_income is not None else "N/A"
     ni_str = f"${profile.net_income:,.0f}" if profile.net_income is not None else "N/A"
 
     item_1a = (
@@ -1902,9 +1849,7 @@ def _load_all_profiles_cached(dataset_dir_str: str) -> list[FinancialDataProfile
         if struct_root.exists():
             for json_file in sorted(struct_root.rglob("*_financials.json")):
                 profiles.append(
-                    FinancialDataProfile.model_validate_json(
-                        json_file.read_text(encoding="utf-8")
-                    )
+                    FinancialDataProfile.model_validate_json(json_file.read_text(encoding="utf-8"))
                 )
 
     profiles.sort(key=lambda p: (p.ticker, p.fiscal_year))
@@ -2024,9 +1969,7 @@ def _compute_single_metric_variance(
 
     abs_delta = round(end_val - start_val, 2)
     pct_delta = (
-        round(((end_val - start_val) / abs(start_val)) * 100.0, 2)
-        if start_val != 0
-        else None
+        round(((end_val - start_val) / abs(start_val)) * 100.0, 2) if start_val != 0 else None
     )
     years_span = max(0, end_year - start_year)
     cagr_pct: float | None = None
@@ -2310,9 +2253,7 @@ def _execute_live_gcp_hybrid_rag(
             return
         if ticker_filter and ticker.upper().replace(".", "-") not in ticker_filter:
             return
-        sector_val = str(
-            hit.get("gics_sector") or hydrated_row.get("gics_sector") or "Unknown"
-        )
+        sector_val = str(hit.get("gics_sector") or hydrated_row.get("gics_sector") or "Unknown")
         if sector_norm and sector_val.lower() != sector_norm:
             return
         resolved_sec = _normalize_section_id(
@@ -2334,9 +2275,7 @@ def _execute_live_gcp_hybrid_rag(
         fused[cid] = {
             "chunk_id": cid,
             "profile_id": str(
-                hit.get("profile_id")
-                or hydrated_row.get("profile_id")
-                or f"{ticker}_{fy}"
+                hit.get("profile_id") or hydrated_row.get("profile_id") or f"{ticker}_{fy}"
             ),
             "ticker": ticker,
             "company_name": str(
@@ -2355,9 +2294,7 @@ def _execute_live_gcp_hybrid_rag(
                 hit.get("sec_filing_url") or hydrated_row.get("sec_filing_url") or ""
             ),
             "unstructured_gcs_uri": str(
-                hit.get("unstructured_gcs_uri")
-                or hydrated_row.get("unstructured_gcs_uri")
-                or ""
+                hit.get("unstructured_gcs_uri") or hydrated_row.get("unstructured_gcs_uri") or ""
             ),
             "rrf_score": rrf_inc,
             "max_similarity": sim,
@@ -2402,9 +2339,7 @@ def _execute_live_gcp_hybrid_rag(
             matched_terms = sum(1 for term in query_terms if term in text_lower)
             lexical_boost = 0.35 * (matched_terms / len(query_terms))
         rrf_norm = min(1.0, cand["rrf_score"] * 30.0)
-        hybrid_score = (
-            0.55 * float(cand["max_similarity"]) + 0.30 * rrf_norm + lexical_boost
-        )
+        hybrid_score = 0.55 * float(cand["max_similarity"]) + 0.30 * rrf_norm + lexical_boost
         scored_candidates.append((hybrid_score, cand))
 
     scored_candidates.sort(key=lambda item: item[0], reverse=True)
@@ -2472,10 +2407,7 @@ def fetch_financial_metrics(
                 end_year=end_year,
                 gics_sector=sector_norm,
             )
-            records = [
-                _profile_to_metric_record(p).model_dump(mode="json")
-                for p in bq_profiles
-            ]
+            records = [_profile_to_metric_record(p).model_dump(mode="json") for p in bq_profiles]
             _record_gcp_backend_invocation(
                 tool_context,
                 tool_name="fetch_financial_metrics",
@@ -2717,7 +2649,7 @@ def query_looker_financial_explore(
     rows: list[dict[str, Any]] = []
 
     if explore_key in ("yoy_variances", "peer_comparison"):
-        for ticker, t_profiles in sorted(by_ticker.items()):
+        for _ticker, t_profiles in sorted(by_ticker.items()):
             t_profiles.sort(key=lambda x: x.fiscal_year)
             prev_prof: FinancialDataProfile | None = None
             for prof in t_profiles:
@@ -2727,16 +2659,12 @@ def query_looker_financial_explore(
                         if prof.revenue is not None and prev_prof.revenue is not None:
                             rev_delta = round(prof.revenue - prev_prof.revenue, 2)
                             if prev_prof.revenue != 0:
-                                rev_pct = round(
-                                    (rev_delta / abs(prev_prof.revenue)) * 100.0, 2
-                                )
+                                rev_pct = round((rev_delta / abs(prev_prof.revenue)) * 100.0, 2)
                         if (
                             prof.operating_income is not None
                             and prev_prof.operating_income is not None
                         ):
-                            op_delta = round(
-                                prof.operating_income - prev_prof.operating_income, 2
-                            )
+                            op_delta = round(prof.operating_income - prev_prof.operating_income, 2)
                             if prev_prof.operating_income != 0:
                                 op_pct = round(
                                     (op_delta / abs(prev_prof.operating_income)) * 100.0,
@@ -2745,9 +2673,7 @@ def query_looker_financial_explore(
                         if prof.net_income is not None and prev_prof.net_income is not None:
                             ni_delta = round(prof.net_income - prev_prof.net_income, 2)
                             if prev_prof.net_income != 0:
-                                ni_pct = round(
-                                    (ni_delta / abs(prev_prof.net_income)) * 100.0, 2
-                                )
+                                ni_pct = round((ni_delta / abs(prev_prof.net_income)) * 100.0, 2)
 
                     rec = _profile_to_metric_record(prof)
                     rows.append(
@@ -2984,7 +2910,10 @@ def search_10k_chunks_rag(
 
     candidate_indices: list[int] = []
     for idx, row in enumerate(rows):
-        if ticker_filter and str(row.get("ticker", "")).upper().replace(".", "-") not in ticker_filter:
+        if (
+            ticker_filter
+            and str(row.get("ticker", "")).upper().replace(".", "-") not in ticker_filter
+        ):
             continue
         if sector_norm and str(row.get("gics_sector", "")).lower() != sector_norm:
             continue
@@ -3108,8 +3037,7 @@ def load_cached_10k_section(
                     }
                 if matched_prof is not None:
                     gcs_target = (
-                        matched_prof.unstructured_gcs_uri
-                        or matched_prof.unstructured_blob_path
+                        matched_prof.unstructured_gcs_uri or matched_prof.unstructured_blob_path
                     )
                     md_content = adapters.gcs_corpus.fetch_markdown(gcs_target)
                     _record_gcp_backend_invocation(
@@ -3176,8 +3104,7 @@ def load_cached_10k_section(
             int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("hits", 0)) + 1
         )
         _CONTEXT_CACHE_RUNTIME_COUNTERS["cached_tokens_saved"] = (
-            int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("cached_tokens_saved", 0))
-            + saved_tokens_delta
+            int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("cached_tokens_saved", 0)) + saved_tokens_delta
         )
         _CONTEXT_CACHE_RUNTIME_COUNTERS["total_hit_latency_ms"] = (
             float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_hit_latency_ms", 0.0))
@@ -3325,14 +3252,9 @@ def query_cached_10k_context(
         )
 
     if dense_sims is None:
-        q_vec = np.asarray(
-            generate_deterministic_embedding(variance_query), dtype=np.float32
-        )
+        q_vec = np.asarray(generate_deterministic_embedding(variance_query), dtype=np.float32)
         dense_sims = [
-            float(
-                np.asarray(generate_deterministic_embedding(blk[:600]), dtype=np.float32)
-                @ q_vec
-            )
+            float(np.asarray(generate_deterministic_embedding(blk[:600]), dtype=np.float32) @ q_vec)
             for blk in raw_blocks
         ]
 

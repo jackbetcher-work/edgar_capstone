@@ -1,5 +1,11 @@
 name: SEC EDGAR Analyst CI/CD Pipeline
 
+# Cloud Build (terraform/cloudbuild.tf + cloudbuild.yaml) is the primary deploy
+# path. This workflow always runs the lint/test gates on every push. The build
+# and deploy jobs run only on pushes to main, and only when the repository
+# variable DEPLOY_WITH_GITHUB_ACTIONS is 'true'. That way a merge never deploys
+# twice.
+
 on:
   push:
     branches:
@@ -50,14 +56,21 @@ jobs:
         run: |
           python scripts/verify_no_secrets.py
 
+      - name: Lint and format-check Python (ruff)
+        run: |
+          ruff check --output-format=github .
+          ruff format --check --diff .
+
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: "1.9.0"
+          terraform_version: "1.9.8"
 
-      - name: Check Terraform formatting
+      - name: Check Terraform formatting and validate configuration
         run: |
-          terraform fmt -check -recursive terraform/
+          terraform fmt -check -recursive -diff terraform/
+          terraform -chdir=terraform init -backend=false -input=false -no-color
+          terraform -chdir=terraform validate -no-color
 
       - name: Run automated pytest suite
         run: |
@@ -84,6 +97,7 @@ jobs:
   build:
     name: Build Stage - Container Image & Artifact Registry
     needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
     runs-on: ubuntu-latest
     outputs:
       image_digest_uri: ${{ steps.build_image.outputs.image_uri }}
@@ -149,6 +163,7 @@ jobs:
   deploy:
     name: Deploy Stage - Google Cloud Run with Secret Manager
     needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

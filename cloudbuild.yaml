@@ -1,6 +1,11 @@
 # ==============================================================================
-# Google Cloud Build CI/CD Pipeline — Triggered on each push to GitHub
-# Composed of explicit `test`, `build`, and `deploy` stages.
+# Google Cloud Build CI/CD Pipeline
+# Started by the Terraform-managed triggers in terraform/cloudbuild.tf:
+#   - push / merge to main  -> _PIPELINE_MODE=deploy (lint, test, build, push, deploy)
+#   - pull request into main -> _PIPELINE_MODE=verify (lint, test, build + smoke test)
+# Manual `gcloud builds submit` runs default to deploy mode.
+# Stages: parallel `lint-python`, `lint-terraform`, `frontend`, `test` gates
+#         -> `build` -> `deploy`.
 # Zero secrets or keys are exposed in this pipeline; all sensitive values are
 # retrieved dynamically from Google Cloud Secret Manager (`availableSecrets`).
 # ==============================================================================
@@ -17,6 +22,11 @@ substitutions:
   _VIEWER_GROUPS: sec-edgar-viewers@fde-workspace.corp
   _BIGQUERY_DATASET: sec_edgar
   _SEC_CORPUS_BUCKET: fde-sec-edgar-sandbox-dev-sec-corpus
+  _PIPELINE_MODE: deploy
+  _RUFF_VERSION: 0.17.4
+  _TERRAFORM_VERSION: 1.9.8
+
+timeout: 1800s
 
 options:
   logging: CLOUD_LOGGING_ONLY
@@ -24,26 +34,69 @@ options:
 
 steps:
   # ----------------------------------------------------------------------------
-  # Stage 1: Test — Secret-leak scan and automated pytest verification
+  # Stage 1: Quality gates (all four run in parallel; any failure stops the build)
   # ----------------------------------------------------------------------------
-  - id: test
+  - id: lint-python
     name: python:3.11-slim
+    waitFor: ["-"]
     entrypoint: bash
     args:
       - -c
       - |
         set -euo pipefail
-        python -m pip install --upgrade pip
-        pip install -e ".[dev]"
+        python -m pip install --quiet --upgrade pip
+        pip install --quiet "ruff==${_RUFF_VERSION}"
+        ruff check --output-format=full .
+        ruff format --check --diff .
+
+  - id: lint-terraform
+    name: hashicorp/terraform:${_TERRAFORM_VERSION}
+    waitFor: ["-"]
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -eu
+        terraform fmt -check -recursive -diff terraform/
+        cd terraform
+        terraform init -backend=false -input=false -no-color
+        terraform validate -no-color
+
+  - id: frontend
+    name: node:22-slim
+    waitFor: ["-"]
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        npm --prefix frontend ci --no-audit --no-fund
+        npm --prefix frontend run lint
+        npm --prefix frontend test
+
+  - id: test
+    name: python:3.11-slim
+    waitFor: ["-"]
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        python -m pip install --quiet --upgrade pip
+        pip install --quiet -e ".[dev]"
         python scripts/verify_no_secrets.py
         pytest -v --tb=short
 
   # ----------------------------------------------------------------------------
-  # Stage 2: Build — Build frontend + backend container image & push to GAR
+  # Stage 2: Build — Build frontend + backend container image, smoke test, and
+  # push to GAR (push skipped in verify mode)
   # ----------------------------------------------------------------------------
   - id: build
     name: gcr.io/cloud-builders/docker
     waitFor:
+      - lint-python
+      - lint-terraform
+      - frontend
       - test
     secretEnv:
       - SEC_EDGAR_USER_AGENT
@@ -72,6 +125,10 @@ steps:
           --entrypoint python \
           "$${IMAGE_URI}:${COMMIT_SHA}" \
           scripts/container_smoke_test.py --in-process --expect-corpus baked
+        if [ "${_PIPELINE_MODE}" != "deploy" ]; then
+          echo "_PIPELINE_MODE=${_PIPELINE_MODE}: image built and smoke-tested; skipping push."
+          exit 0
+        fi
         docker push "$${IMAGE_URI}:${COMMIT_SHA}"
         docker push "$${IMAGE_URI}:latest"
 
@@ -91,6 +148,10 @@ steps:
       - -c
       - |
         set -euo pipefail
+        if [ "${_PIPELINE_MODE}" != "deploy" ]; then
+          echo "_PIPELINE_MODE=${_PIPELINE_MODE}: skipping Cloud Run deploy."
+          exit 0
+        fi
         test -n "$${SEC_EDGAR_USER_AGENT}"
         test -n "$${GEMINI_API_KEY}"
         IMAGE_URI="${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_GAR_REPOSITORY}/${_SERVICE_NAME}:${COMMIT_SHA}"
@@ -109,9 +170,8 @@ steps:
           --set-env-vars="GCP_PROJECT_ID=${PROJECT_ID},GOOGLE_CLOUD_PROJECT=${PROJECT_ID},GCP_PROJECT_NAME=${_PROJECT_NAME},GCP_REGION=${_REGION},GOOGLE_CLOUD_LOCATION=${_REGION},GOOGLE_GENAI_USE_VERTEXAI=true,EDGAR_EXECUTION_MODE=auto,EDGAR_ANALYST_MODEL=gemini-2.5-pro,EDGAR_FLASH_MODEL=gemini-3.5-flash,EDGAR_MODEL_ARMOR_MODE=gcp,MODEL_ARMOR_TEMPLATE_ID=sec-edgar-analyst-armor,EDGAR_PROMPT_STORE_BACKEND=auto,EDGAR_TELEMETRY_BACKEND=gcp,EDGAR_FEEDBACK_BACKEND=gcp,FIRESTORE_DATABASE_ID=(default),FIRESTORE_FEEDBACK_COLLECTION=analyst_feedback,RUNTIME_SERVICE_ACCOUNT=${_RUNTIME_SA},CLOUD_IDENTITY_DOMAIN=${_CLOUD_IDENTITY_DOMAIN},ADMIN_CLOUD_IDENTITY_GROUPS=${_ADMIN_GROUPS},ANALYST_CLOUD_IDENTITY_GROUPS=${_ANALYST_GROUPS},VIEWER_CLOUD_IDENTITY_GROUPS=${_VIEWER_GROUPS},BIGQUERY_DATASET_ID=${_BIGQUERY_DATASET},SEC_CORPUS_BUCKET=${_SEC_CORPUS_BUCKET}" \
           --set-secrets="SEC_EDGAR_USER_AGENT=sec-edgar-user-agent:latest,GEMINI_API_KEY=sec-edgar-gemini-api-key:latest,INTERNAL_IAP_AUDIENCE=sec-edgar-iap-audience:latest"
 
-images:
-  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_GAR_REPOSITORY}/${_SERVICE_NAME}:${COMMIT_SHA}
-  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_GAR_REPOSITORY}/${_SERVICE_NAME}:latest
+# No top-level `images:` block: Cloud Build would push those tags even in verify
+# mode. The build step pushes explicitly when _PIPELINE_MODE=deploy.
 
 availableSecrets:
   secretManager:

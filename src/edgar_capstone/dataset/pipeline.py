@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date
 import json
 import logging
-from pathlib import Path
 import re
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
 
 from google.cloud import storage
 
@@ -39,9 +39,7 @@ from edgar_capstone.dataset.models import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OUTPUT_DIR = (
-    Path(__file__).resolve().parents[3] / "data" / "curated_dataset"
-)
+DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[3] / "data" / "curated_dataset"
 
 _CACHED_MD_SPLIT_RE = re.compile(
     r"^## Item 1A\. Risk Factors\n(.*?)\n---\n\n"
@@ -100,9 +98,10 @@ def _is_cached_bundle_healthy(bundle: ExtractedFilingBundle) -> bool:
         return False
     # If one section is full-sized SEC text (>=2k chars) and the other is a tiny fragment (<1.5k),
     # treat as truncated so full-document/exhibit fallback can recover it.
-    if max(len(sec_1a), len(sec_7)) >= MIN_SUBSTANTIVE_SECTION_CHARS and min(
-        len(sec_1a), len(sec_7)
-    ) < 1500:
+    if (
+        max(len(sec_1a), len(sec_7)) >= MIN_SUBSTANTIVE_SECTION_CHARS
+        and min(len(sec_1a), len(sec_7)) < 1500
+    ):
         return False
 
     # 3. Structured financial metrics must be populated and free of dimensional/REIT scale inversions
@@ -140,12 +139,8 @@ def _load_existing_company_bundles(
             md_file = output_dir / profile.unstructured_blob_path
             if not md_file.exists():
                 continue
-            profile.unstructured_gcs_uri = (
-                f"gs://{bucket_name}/{profile.unstructured_blob_path}"
-            )
-            profile.structured_gcs_uri = (
-                f"gs://{bucket_name}/{profile.structured_blob_path}"
-            )
+            profile.unstructured_gcs_uri = f"gs://{bucket_name}/{profile.unstructured_blob_path}"
+            profile.structured_gcs_uri = f"gs://{bucket_name}/{profile.structured_blob_path}"
             raw_bundles.append(
                 ExtractedFilingBundle(
                     profile=profile,
@@ -243,12 +238,8 @@ def _collect_all_staged_profiles(
 
     profiles: list[FinancialDataProfile] = []
     for json_path in sorted(struct_root.rglob("*_financials.json")):
-        profile = FinancialDataProfile.model_validate_json(
-            json_path.read_text(encoding="utf-8")
-        )
-        expected_unstructured_uri = (
-            f"gs://{bucket_name}/{profile.unstructured_blob_path}"
-        )
+        profile = FinancialDataProfile.model_validate_json(json_path.read_text(encoding="utf-8"))
+        expected_unstructured_uri = f"gs://{bucket_name}/{profile.unstructured_blob_path}"
         expected_structured_uri = f"gs://{bucket_name}/{profile.structured_blob_path}"
         if (
             profile.unstructured_gcs_uri != expected_unstructured_uri

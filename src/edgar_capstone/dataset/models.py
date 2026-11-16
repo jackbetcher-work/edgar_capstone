@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import re
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 def utc_now_iso() -> str:
     """Return current UTC timestamp in ISO-8601 format."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class CompanyConstituent(BaseModel):
@@ -20,13 +20,9 @@ class CompanyConstituent(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     ticker: str = Field(..., description="Canonical ticker symbol (e.g., NVDA, BRK.B)")
-    edgar_ticker: str = Field(
-        ..., description="SEC EDGAR lookup ticker symbol (e.g., NVDA, BRK-B)"
-    )
+    edgar_ticker: str = Field(..., description="SEC EDGAR lookup ticker symbol (e.g., NVDA, BRK-B)")
     company_name: str = Field(..., description="Company display or SEC legal name")
-    cik: str | None = Field(
-        default=None, description="10-digit zero-padded SEC Central Index Key"
-    )
+    cik: str | None = Field(default=None, description="10-digit zero-padded SEC Central Index Key")
     gics_sector: str = Field(default="Unknown", description="GICS Sector classification")
     gics_sub_industry: str = Field(
         default="Unknown", description="GICS Sub-Industry classification"
@@ -69,9 +65,7 @@ class FinancialDataProfile(BaseModel):
     form_type: str = Field(default="10-K", description="SEC form type")
     fiscal_year: int = Field(..., description="Reporting fiscal year (e.g., 2026)")
     fiscal_period: str = Field(default="FY", description="Fiscal period focus")
-    period_of_report: str = Field(
-        ..., description="Fiscal period end date (YYYY-MM-DD)"
-    )
+    period_of_report: str = Field(..., description="Fiscal period end date (YYYY-MM-DD)")
     filing_date: str = Field(..., description="SEC EDGAR filing date (YYYY-MM-DD)")
     accession_number: str = Field(
         ..., description="SEC accession number (e.g., 0001045810-26-000021)"
@@ -107,9 +101,7 @@ class FinancialDataProfile(BaseModel):
     structured_gcs_uri: str = Field(
         ..., description="Full gs:// URI for structured financials JSON"
     )
-    sec_filing_url: str = Field(
-        ..., description="Public SEC EDGAR URL for the source filing"
-    )
+    sec_filing_url: str = Field(..., description="Public SEC EDGAR URL for the source filing")
     ingested_at: str = Field(
         default_factory=utc_now_iso, description="UTC ingestion timestamp (ISO-8601)"
     )

@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 
 import httpx
 import numpy as np
-import pytest
 
 from edgar_capstone.dataset.extractor import format_combined_10k_markdown
 from edgar_capstone.dataset.models import FinancialDataProfile
@@ -17,7 +16,6 @@ from edgar_capstone.vector_db.chunker import (
     chunk_filing_document,
     estimate_token_count,
     extract_sections_from_combined_markdown,
-    split_section_into_passages,
 )
 from edgar_capstone.vector_db.embedder import (
     DEFAULT_EMBEDDING_DIMENSIONS,
@@ -25,7 +23,6 @@ from edgar_capstone.vector_db.embedder import (
     generate_deterministic_embedding,
     populate_chunk_embeddings,
 )
-from edgar_capstone.vector_db.models import FilingChunk
 from edgar_capstone.vector_db.monitoring import (
     CloudMonitoringHealthPublisher,
     build_cloud_monitoring_timeseries,
@@ -137,14 +134,13 @@ def test_section_extraction_and_heading_breadcrumbs() -> None:
     # Check subsection heading breadcrumbs on chunks
     titles = [c.section_title for c in chunks]
     assert any("Risks Related to Our Industry and Markets" in t for t in titles)
-    assert any("Fiscal Year 2026 Overview" in t or "Results of Operations Table" in t for t in titles)
+    assert any(
+        "Fiscal Year 2026 Overview" in t or "Results of Operations Table" in t for t in titles
+    )
 
     # Check metadata & schema alignment with terraform/schemas/filing_chunks.json
     schema_path = (
-        Path(__file__).resolve().parents[1]
-        / "terraform"
-        / "schemas"
-        / "filing_chunks.json"
+        Path(__file__).resolve().parents[1] / "terraform" / "schemas" / "filing_chunks.json"
     )
     bq_schema = json.loads(schema_path.read_text(encoding="utf-8"))
     expected_cols = {col["name"] for col in bq_schema}
@@ -204,10 +200,7 @@ def test_deterministic_and_vertex_ai_embeddings() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8"))
         n = len(body["instances"])
-        preds = [
-            {"embeddings": {"values": [0.1] * DEFAULT_EMBEDDING_DIMENSIONS}}
-            for _ in range(n)
-        ]
+        preds = [{"embeddings": {"values": [0.1] * DEFAULT_EMBEDDING_DIMENSIONS}} for _ in range(n)]
         return httpx.Response(200, json={"predictions": preds})
 
     mock_creds = MagicMock()

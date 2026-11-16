@@ -13,7 +13,8 @@ import json
 import logging
 import re
 import time
-from typing import Any, Callable, Literal
+from collections.abc import Callable
+from typing import Any, Literal
 
 from google.adk.agents import Agent
 from google.adk.models.base_llm import BaseLlm
@@ -155,14 +156,28 @@ def evaluate_variance_explanation(
                     resolution=runtime_res,
                     custom_llm=llm,
                 )
-                num_score = max(0.0, min(1.0, float(raw_live_eval.get("numeric_fidelity_score", 1.0 if fc.passed else 0.45))))
+                num_score = max(
+                    0.0,
+                    min(
+                        1.0,
+                        float(
+                            raw_live_eval.get("numeric_fidelity_score", 1.0 if fc.passed else 0.45)
+                        ),
+                    ),
+                )
                 if not fc.passed:
                     num_score = min(num_score, 0.45)
-                cit_score = max(0.0, min(1.0, float(raw_live_eval.get("citation_grounding_score", 1.0))))
+                cit_score = max(
+                    0.0, min(1.0, float(raw_live_eval.get("citation_grounding_score", 1.0)))
+                )
                 if citations and not fc.has_required_citations:
                     cit_score = min(cit_score, 0.25)
-                exp_score = max(0.0, min(1.0, float(raw_live_eval.get("explanation_quality_score", 1.0))))
-                thm_score = max(0.0, min(1.0, float(raw_live_eval.get("thematic_consistency_score", 1.0))))
+                exp_score = max(
+                    0.0, min(1.0, float(raw_live_eval.get("explanation_quality_score", 1.0)))
+                )
+                thm_score = max(
+                    0.0, min(1.0, float(raw_live_eval.get("thematic_consistency_score", 1.0)))
+                )
                 rationale = str(
                     raw_live_eval.get("rationale")
                     or f"Evaluated via live ADK NarrativeEvaluatorAgent ({eval_model})."
@@ -225,18 +240,27 @@ def evaluate_variance_explanation(
     else:
         num_score = 1.0 if fc.passed else 0.45
         if citations:
-            cit_score = min(1.0, max(0.3, fc.matched_citations_count / max(1, min(len(citations), 3))))
+            cit_score = min(
+                1.0, max(0.3, fc.matched_citations_count / max(1, min(len(citations), 3)))
+            )
             if not fc.has_required_citations:
                 cit_score = 0.2
         else:
             cit_score = 1.0 if len(response_markdown.strip()) <= 240 else 0.75
 
         has_variance_section = bool(
-            re.search(r"variance|revenue|operating\s+income|benchmark|diagnostic", response_markdown, re.IGNORECASE)
+            re.search(
+                r"variance|revenue|operating\s+income|benchmark|diagnostic",
+                response_markdown,
+                re.IGNORECASE,
+            )
         )
-        has_explanation_section = (
-            cached_explanations_count > 0
-            or bool(re.search(r"item\s*7|md&a|item\s*1a|risk\s+factor|disclosure", response_markdown, re.IGNORECASE))
+        has_explanation_section = cached_explanations_count > 0 or bool(
+            re.search(
+                r"item\s*7|md&a|item\s*1a|risk\s+factor|disclosure",
+                response_markdown,
+                re.IGNORECASE,
+            )
         )
         exp_score = (
             1.0
@@ -339,9 +363,7 @@ def generate_financial_coding_assistance(
                 )
                 live_code_str = str(raw_live_code.get("code") or "").strip()
                 if not live_code_str:
-                    raise ValueError(
-                        "CodingAssistantAgent returned an empty code payload."
-                    )
+                    raise ValueError("CodingAssistantAgent returned an empty code payload.")
                 live_title = str(
                     raw_live_code.get("artifact_title")
                     or f"Gemini 3.5 Flash {language.upper()} Analysis ({', '.join(parsed_tickers)})"
@@ -417,13 +439,13 @@ def generate_financial_coding_assistance(
     elif language == "lookml":
         title = f"LookML Semantic Explore: SEC 10-K YoY Variances ({dataset_id})"
         code = (
-            f"include: \"/views/v_financial_variances_yoy.view.lkml\"\n\n"
+            f'include: "/views/v_financial_variances_yoy.view.lkml"\n\n'
             f"explore: yoy_variances {{\n"
             f"  view_name: v_financial_variances_yoy\n"
-            f"  label: \"SEC 10-K YoY Financial Variances\"\n"
+            f'  label: "SEC 10-K YoY Financial Variances"\n'
             f"  sql_always_where: ${{fiscal_year}} BETWEEN {start_year} AND {end_year} ;;\n"
             f"  always_filter: {{\n"
-            f"    filters: [v_financial_variances_yoy.ticker: \"{','.join(parsed_tickers)}\"]\n"
+            f'    filters: [v_financial_variances_yoy.ticker: "{",".join(parsed_tickers)}"]\n'
             f"  }}\n"
             f"}}\n"
         )

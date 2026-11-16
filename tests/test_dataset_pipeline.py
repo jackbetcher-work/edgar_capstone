@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -20,7 +20,6 @@ from edgar_capstone.dataset.constituents import (
 from edgar_capstone.dataset.extractor import (
     _extract_single_section,
     clean_markdown_section,
-    extract_company_10k_bundles,
     extract_financial_metrics,
     format_combined_10k_markdown,
     is_substantive_section_markdown,
@@ -32,7 +31,6 @@ from edgar_capstone.dataset.gcs_storage import (
     ensure_gcs_bucket,
     normalize_bucket_name,
 )
-from edgar_capstone.dataset.models import CompanyConstituent
 from edgar_capstone.dataset.pipeline import DatasetBuildConfig, run_dataset_pipeline
 from scripts.build_sec_dataset import parse_args
 
@@ -269,9 +267,7 @@ def test_end_to_end_pipeline_local_and_mock_gcs(tmp_path: Path) -> None:
     mock_client.lookup_bucket.return_value = None  # Simulate missing bucket -> triggers creation
 
     mock_bucket = MagicMock()
-    mock_bucket.iam_configuration = SimpleNamespace(
-        uniform_bucket_level_access_enabled=False
-    )
+    mock_bucket.iam_configuration = SimpleNamespace(uniform_bucket_level_access_enabled=False)
     uploaded_blobs: dict[str, MagicMock] = {}
 
     def _get_blob(blob_name: str) -> MagicMock:
@@ -671,5 +667,3 @@ def test_unhealthy_cache_invalidation_and_stale_pruning(tmp_path: Path) -> None:
     assert not (unstruct_dir / "2021_10k.md").exists()
     assert (struct_dir / "2022_financials.json").exists()
     assert (unstruct_dir / "2022_10k.md").exists()
-
-

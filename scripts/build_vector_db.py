@@ -29,8 +29,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -293,8 +293,10 @@ def main(argv: list[str] | None = None) -> int:
         f"Embedding Config  : {summary.embedding_model} ({summary.embedding_dimensions}-d, "
         f"backend={summary.embedding_backend})"
     )
-    print(f"Filings Indexed   : {health.total_profiles_indexed}/{health.total_profiles_expected} "
-          f"({health.full_section_coverage_ratio * 100:.1f}% full Item 1A + Item 7 coverage)")
+    print(
+        f"Filings Indexed   : {health.total_profiles_indexed}/{health.total_profiles_expected} "
+        f"({health.full_section_coverage_ratio * 100:.1f}% full Item 1A + Item 7 coverage)"
+    )
     print(
         f"Total Chunks      : {summary.total_chunks_generated:,} "
         f"(Item 1A: {summary.item_1a_chunks:,} | Item 7: {summary.item_7_chunks:,})"

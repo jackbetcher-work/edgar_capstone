@@ -26,11 +26,11 @@ Examples:
 from __future__ import annotations
 
 import argparse
-from datetime import date
 import logging
 import os
-from pathlib import Path
 import sys
+from datetime import date
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -130,9 +130,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(
-            os.environ.get("EDGAR_DATASET_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR))
-        ),
+        default=Path(os.environ.get("EDGAR_DATASET_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR))),
         help="Local staging directory mirroring the GCS object layout.",
     )
     mode_group = parser.add_mutually_exclusive_group()

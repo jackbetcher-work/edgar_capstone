@@ -15,24 +15,24 @@ Implements:
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import json
 import logging
 import os
-from pathlib import Path
 import re
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Literal
 import urllib.parse
 import uuid
+from collections import Counter, defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal
 
 import google.auth
+import httpx
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
 from google.auth.transport.requests import Request as GoogleAuthRequest
-import httpx
 
 from edgar_capstone.dataset.gcs_storage import DEFAULT_LOCATION, DEFAULT_PROJECT_ID
 
@@ -130,8 +130,7 @@ class TelemetryConfig:
             or bool(os.environ.get("FIRESTORE_DATABASE_ID", "").strip())
             or bool(os.environ.get("FIRESTORE_FEEDBACK_COLLECTION", "").strip())
             or exec_mode == "live"
-            or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower()
-            in _TRUTHY_ENV_VALUES
+            or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in _TRUTHY_ENV_VALUES
         )
 
         project_id = (
@@ -154,8 +153,7 @@ class TelemetryConfig:
                 os.environ.get("BIGQUERY_DATASET_ID") or DEFAULT_BIGQUERY_DATASET_ID
             ).strip(),
             bq_llm_telemetry_table=(
-                os.environ.get("BIGQUERY_LLM_TELEMETRY_TABLE")
-                or DEFAULT_BQ_LLM_TELEMETRY_TABLE
+                os.environ.get("BIGQUERY_LLM_TELEMETRY_TABLE") or DEFAULT_BQ_LLM_TELEMETRY_TABLE
             ).strip(),
             bq_session_telemetry_table=(
                 os.environ.get("BIGQUERY_SESSION_TELEMETRY_TABLE")
@@ -165,8 +163,7 @@ class TelemetryConfig:
                 os.environ.get("BIGQUERY_AUDIT_LOGS_TABLE") or DEFAULT_BQ_AUDIT_LOGS_TABLE
             ).strip(),
             bq_telemetry_cost_view=(
-                os.environ.get("BIGQUERY_TELEMETRY_COST_VIEW")
-                or DEFAULT_BQ_TELEMETRY_COST_VIEW
+                os.environ.get("BIGQUERY_TELEMETRY_COST_VIEW") or DEFAULT_BQ_TELEMETRY_COST_VIEW
             ).strip(),
             firestore_database_id=(
                 os.environ.get("FIRESTORE_DATABASE_ID") or DEFAULT_FIRESTORE_DATABASE_ID
@@ -374,9 +371,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         self.config = config or TelemetryConfig.from_env()
         self.project_id = _validate_bq_id(self.config.project_id, "project_id")
         self.dataset_id = _validate_bq_id(self.config.bq_dataset_id, "dataset_id")
-        self.llm_table = _validate_bq_id(
-            self.config.bq_llm_telemetry_table, "llm_telemetry_table"
-        )
+        self.llm_table = _validate_bq_id(self.config.bq_llm_telemetry_table, "llm_telemetry_table")
         self.session_table = _validate_bq_id(
             self.config.bq_session_telemetry_table, "session_telemetry_table"
         )
@@ -425,10 +420,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             "kind": "bigquery#tableDataInsertAllRequest",
             "skipInvalidRows": False,
             "ignoreUnknownValues": True,
-            "rows": [
-                {"insertId": insert_id, "json": row_data}
-                for insert_id, row_data in rows
-            ],
+            "rows": [{"insertId": insert_id, "json": row_data} for insert_id, row_data in rows],
         }
         resp_data = self._request_json("POST", url, json_body=payload)
         insert_errors = resp_data.get("insertErrors") if isinstance(resp_data, dict) else None
@@ -437,7 +429,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
                 f"BigQuery insertAll rejected rows for {self.dataset_id}.{safe_table}: "
                 f"{json.dumps(insert_errors)[:400]}"
             )
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         with self._lock:
             self._streamed_counts[safe_table] += len(rows)
             self._last_streamed_at = now_iso
@@ -578,7 +570,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
     ) -> dict[str, Any]:
         """Record conversational session, company scope, report generation, tool usage & cost telemetry."""
         now_epoch = time.time()
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         eff_session_id = (session_id or "").strip() or f"ephemeral-{uuid.uuid4().hex[:10]}"
         norm_tickers = sorted({str(t).strip().upper() for t in tickers_analyzed if str(t).strip()})
 
@@ -606,17 +598,13 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             cum_reports = tracker.reports_generated
             elapsed_sec = round(max(0.0, now_epoch - tracker.started_at_epoch), 3)
 
-        tot_ctx_tokens = sum(
-            r.context_breakdown.total_context_tokens for r in turn_latency_records
-        )
+        tot_ctx_tokens = sum(r.context_breakdown.total_context_tokens for r in turn_latency_records)
         cached_ctx_tokens = sum(
             r.context_breakdown.cached_context_tokens for r in turn_latency_records
         )
         out_tokens = sum(r.output_tokens + r.thoughts_tokens for r in turn_latency_records)
         tot_cost_usd = round(sum(r.total_cost_usd for r in turn_latency_records), 8)
-        saved_cost_usd = round(
-            sum(r.cached_token_savings_usd for r in turn_latency_records), 8
-        )
+        saved_cost_usd = round(sum(r.cached_token_savings_usd for r in turn_latency_records), 8)
         ttft_ms = (
             round(turn_latency_records[0].ttft_ms, 3)
             if turn_latency_records
@@ -672,9 +660,9 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
     def record_security_audit_log(self, entry: dict[str, Any]) -> dict[str, Any]:
         """Stream a structured authentication or 10-K access audit log to `security_audit_logs`."""
         epoch = float(entry.get("recorded_at_epoch") or time.time())
-        recorded_at = entry.get("recorded_at") or datetime.fromtimestamp(
-            epoch, tz=timezone.utc
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        recorded_at = entry.get("recorded_at") or datetime.fromtimestamp(epoch, tz=UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
         event_id = str(entry.get("event_id") or f"aud-{uuid.uuid4().hex[:12]}")
         row: dict[str, Any] = {
             "event_id": event_id,
@@ -689,9 +677,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             "hosted_domain": entry.get("hosted_domain"),
             "identity_provider": entry.get("identity_provider"),
             "roles": [str(r) for r in (entry.get("roles") or [])],
-            "cloud_identity_groups": [
-                str(g) for g in (entry.get("cloud_identity_groups") or [])
-            ],
+            "cloud_identity_groups": [str(g) for g in (entry.get("cloud_identity_groups") or [])],
             "agent_identity": entry.get("agent_identity"),
             "spiffe_id": entry.get("spiffe_id"),
             "iap_assertion_verified": bool(entry.get("iap_assertion_verified", False)),
@@ -720,9 +706,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
                 params = [_bq_scalar_param("limit", "INT64", bounded)]
                 if session_id and session_id.strip():
                     clauses.append("session_id = @session_id")
-                    params.append(
-                        _bq_scalar_param("session_id", "STRING", session_id.strip())
-                    )
+                    params.append(_bq_scalar_param("session_id", "STRING", session_id.strip()))
                 where_sql = f"WHERE {' AND '.join(clauses)} " if clauses else ""
                 sql = (
                     "SELECT turn_id, CAST(recorded_at AS STRING) AS recorded_at, session_id, "
@@ -789,9 +773,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
 
         latencies.sort()
         avg_turns_per_session = (
-            round(
-                sum(v[0] for v in sessions_snap.values()) / len(sessions_snap), 2
-            )
+            round(sum(v[0] for v in sessions_snap.values()) / len(sessions_snap), 2)
             if sessions_snap
             else 0.0
         )
@@ -827,9 +809,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
                 params = [_bq_scalar_param("limit", "INT64", bounded)]
                 if event_type and event_type.strip():
                     clauses.append("event_type = @event_type")
-                    params.append(
-                        _bq_scalar_param("event_type", "STRING", event_type.strip())
-                    )
+                    params.append(_bq_scalar_param("event_type", "STRING", event_type.strip()))
                 where_sql = f"WHERE {' AND '.join(clauses)} " if clauses else ""
                 sql = (
                     "SELECT event_id, CAST(recorded_at AS STRING) AS recorded_at, "
@@ -889,9 +869,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
 
         grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
         for ev in events:
-            day = str(ev.get("recorded_at") or "")[:10] or datetime.now(timezone.utc).strftime(
-                "%Y-%m-%d"
-            )
+            day = str(ev.get("recorded_at") or "")[:10] or datetime.now(UTC).strftime("%Y-%m-%d")
             key = (
                 day,
                 str(ev.get("model_name") or "unknown"),
@@ -901,9 +879,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             grouped[key].append(ev)
 
         rows: list[dict[str, Any]] = []
-        for (day, model_name, agent_name, task_cat), recs in sorted(
-            grouped.items(), reverse=True
-        ):
+        for (day, model_name, agent_name, task_cat), recs in sorted(grouped.items(), reverse=True):
             tot_lats = sorted(float(r.get("total_model_latency_ms") or 0.0) for r in recs)
             ttfts = sorted(float(r.get("ttft_ms") or 0.0) for r in recs)
             hits = sum(1 for r in recs if r.get("cache_hit"))
@@ -1013,17 +989,12 @@ def encode_firestore_value(value: Any, *, field_name: str = "") -> dict[str, Any
             return {"timestampValue": value}
         return {"stringValue": value}
     if isinstance(value, (list, tuple)):
-        return {
-            "arrayValue": {
-                "values": [encode_firestore_value(v) for v in value]
-            }
-        }
+        return {"arrayValue": {"values": [encode_firestore_value(v) for v in value]}}
     if isinstance(value, dict):
         return {
             "mapValue": {
                 "fields": {
-                    str(k): encode_firestore_value(v, field_name=str(k))
-                    for k, v in value.items()
+                    str(k): encode_firestore_value(v, field_name=str(k)) for k, v in value.items()
                 }
             }
         }
@@ -1031,10 +1002,7 @@ def encode_firestore_value(value: Any, *, field_name: str = "") -> dict[str, Any
 
 
 def encode_firestore_fields(record: dict[str, Any]) -> dict[str, Any]:
-    return {
-        str(k): encode_firestore_value(v, field_name=str(k))
-        for k, v in record.items()
-    }
+    return {str(k): encode_firestore_value(v, field_name=str(k)) for k, v in record.items()}
 
 
 def decode_firestore_value(val_obj: dict[str, Any]) -> Any:
@@ -1056,10 +1024,7 @@ def decode_firestore_value(val_obj: dict[str, Any]) -> Any:
         return [decode_firestore_value(item) for item in (arr.get("values") or [])]
     if "mapValue" in val_obj:
         mp = val_obj["mapValue"] or {}
-        return {
-            str(k): decode_firestore_value(v)
-            for k, v in (mp.get("fields") or {}).items()
-        }
+        return {str(k): decode_firestore_value(v) for k, v in (mp.get("fields") or {}).items()}
     return None
 
 
@@ -1122,11 +1087,9 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
     ) -> dict[str, Any]:
         """Persist an analyst feedback entry to Firestore (with local fallback in offline/auto mode)."""
         now_epoch = round(time.time(), 3)
-        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         feedback_id = f"fbk-{uuid.uuid4().hex[:12]}"
-        norm_tickers = [
-            str(t).strip().upper() for t in (tickers or []) if str(t).strip()
-        ]
+        norm_tickers = [str(t).strip().upper() for t in (tickers or []) if str(t).strip()]
 
         entry: dict[str, Any] = {
             "feedback_id": feedback_id,
@@ -1153,10 +1116,7 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
         attempt_gcp, strict_gcp = self._should_attempt_gcp()
 
         if attempt_gcp:
-            url = (
-                f"{self._documents_base_url()}/"
-                f"{urllib.parse.quote(self.collection_id, safe='')}"
-            )
+            url = f"{self._documents_base_url()}/{urllib.parse.quote(self.collection_id, safe='')}"
             doc_body = {"fields": encode_firestore_fields(entry)}
             try:
                 created_doc = self._request_json(
@@ -1406,7 +1366,9 @@ def load_lookml_project_catalog(looker_dir: Path | None = None) -> dict[str, Any
 
     manifest_path = root / "manifest.lkml"
     models: list[dict[str, Any]] = []
-    for model_file in sorted((root / "models").glob("*.model.lkml")) if (root / "models").is_dir() else []:
+    for model_file in (
+        sorted((root / "models").glob("*.model.lkml")) if (root / "models").is_dir() else []
+    ):
         content = model_file.read_text(encoding="utf-8")
         conn_match = _LOOKML_CONNECTION_RE.search(content)
         explores = _LOOKML_EXPLORE_RE.findall(content)
@@ -1421,7 +1383,9 @@ def load_lookml_project_catalog(looker_dir: Path | None = None) -> dict[str, Any
         )
 
     views: list[dict[str, Any]] = []
-    for view_file in sorted((root / "views").glob("*.view.lkml")) if (root / "views").is_dir() else []:
+    for view_file in (
+        sorted((root / "views").glob("*.view.lkml")) if (root / "views").is_dir() else []
+    ):
         content = view_file.read_text(encoding="utf-8")
         view_names = _LOOKML_VIEW_RE.findall(content)
         sql_table_match = _LOOKML_SQL_TABLE_RE.search(content)
@@ -1431,9 +1395,7 @@ def load_lookml_project_catalog(looker_dir: Path | None = None) -> dict[str, Any
             {
                 "view_name": view_names[0] if view_names else view_file.stem.replace(".view", ""),
                 "file": f"looker/views/{view_file.name}",
-                "sql_table_name": (
-                    sql_table_match.group(1).strip() if sql_table_match else None
-                ),
+                "sql_table_name": (sql_table_match.group(1).strip() if sql_table_match else None),
                 "dimensions": dims,
                 "measures": measures,
                 "dimension_count": len(dims),

@@ -22,9 +22,7 @@ class MetricRecord(BaseModel):
     accession_number: str = Field(..., description="SEC accession number")
     currency: str = Field(default="USD", description="Reporting currency")
     revenue: float | None = Field(default=None, description="Total Revenue in USD")
-    operating_income: float | None = Field(
-        default=None, description="Operating Income in USD"
-    )
+    operating_income: float | None = Field(default=None, description="Operating Income in USD")
     net_income: float | None = Field(default=None, description="Net Income in USD")
     operating_margin_pct: float | None = Field(
         default=None, description="Operating Margin percentage (Operating Income / Revenue * 100)"
@@ -122,12 +120,8 @@ class LookerExploreQuery(BaseModel):
         ...,
         description="Target Looker semantic explore view to query",
     )
-    tickers: list[str] = Field(
-        default_factory=list, description="Optional ticker symbols filter"
-    )
-    gics_sector: str | None = Field(
-        default=None, description="Optional GICS Sector filter"
-    )
+    tickers: list[str] = Field(default_factory=list, description="Optional ticker symbols filter")
+    gics_sector: str | None = Field(default=None, description="Optional GICS Sector filter")
     start_year: int = Field(default=2020, description="Start fiscal year (inclusive)")
     end_year: int = Field(default=2026, description="End fiscal year (inclusive)")
     limit: int = Field(default=25, ge=1, le=200, description="Max rows to return")
@@ -142,12 +136,8 @@ class GroundedCitation(BaseModel):
     company_name: str = Field(..., description="Official company name")
     gics_sector: str = Field(..., description="GICS Sector")
     fiscal_year: int = Field(..., description="Reporting fiscal year")
-    section_id: Literal["item_1a", "item_7"] = Field(
-        ..., description="10-K section identifier"
-    )
-    section_title: str = Field(
-        ..., description="Human-readable section & subsection breadcrumb"
-    )
+    section_id: Literal["item_1a", "item_7"] = Field(..., description="10-K section identifier")
+    section_title: str = Field(..., description="Human-readable section & subsection breadcrumb")
     excerpt: str = Field(..., description="Grounded 10-K Markdown passage text")
     sec_filing_url: str = Field(
         ..., description="Direct SEC EDGAR archive URL for split-pane source viewing"
@@ -200,10 +190,14 @@ class ContextBreakdown(BaseModel):
         default=0, ge=0, description="Tokens in system instructions and ReAct protocol headers"
     )
     memory_and_history_tokens: int = Field(
-        default=0, ge=0, description="Tokens from conversational session history and recalled memory"
+        default=0,
+        ge=0,
+        description="Tokens from conversational session history and recalled memory",
     )
     variance_payload_tokens: int = Field(
-        default=0, ge=0, description="Tokens representing deterministic variance calculation payloads"
+        default=0,
+        ge=0,
+        description="Tokens representing deterministic variance calculation payloads",
     )
     cached_10k_tokens: int = Field(
         default=0, ge=0, description="Tokens served from cached 10-K filing sections"

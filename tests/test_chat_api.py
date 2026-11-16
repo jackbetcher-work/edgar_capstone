@@ -130,4 +130,3 @@ def test_single_origin_terminal_ui_bundle_serving(tmp_path, monkeypatch) -> None
 
     unknown_api_resp = client.get("/api/v1/nonexistent")
     assert unknown_api_resp.status_code == 404
-

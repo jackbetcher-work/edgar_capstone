@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 import logging
 import os
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
-import time
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
@@ -54,7 +53,6 @@ from edgar_capstone.security.agent_identity import (
     PER_AGENT_IDENTITIES,
     S2S_AGENT_ASSERTION_HEADER,
 )
-from edgar_capstone.security.model_armor import get_model_armor_status_metadata
 from edgar_capstone.security.auth import (
     GOOGLE_IAP_ISSUER,
     AuthenticatedUser,
@@ -69,6 +67,7 @@ from edgar_capstone.security.auth import (
     require_permissions,
     revoke_bearer_token,
 )
+from edgar_capstone.security.model_armor import get_model_armor_status_metadata
 from edgar_capstone.security.rbac import (
     Permission,
     RuntimeServiceAccountConfig,
@@ -257,8 +256,7 @@ def auth_discovery_config(
         "rbac": settings.rbac_policy().to_public_dict(),
         "service_account": runtime_sa.to_public_dict(),
         "agent_identities": [
-            spec.to_public_dict(runtime_sa.project_id)
-            for spec in PER_AGENT_IDENTITIES.values()
+            spec.to_public_dict(runtime_sa.project_id) for spec in PER_AGENT_IDENTITIES.values()
         ],
     }
 
@@ -441,8 +439,7 @@ def inspect_rbac_and_agent_identities(
         "rbac_policy": verifier.settings.rbac_policy().to_public_dict(),
         "runtime_service_account": runtime_sa.to_public_dict(),
         "agent_identities": [
-            spec.to_public_dict(runtime_sa.project_id)
-            for spec in PER_AGENT_IDENTITIES.values()
+            spec.to_public_dict(runtime_sa.project_id) for spec in PER_AGENT_IDENTITIES.values()
         ],
     }
 
@@ -1103,4 +1100,3 @@ def serve_terminal_ui(full_path: str = "") -> FileResponse:
             return FileResponse(asset_path)
 
     return FileResponse(dist_dir / "index.html")
-

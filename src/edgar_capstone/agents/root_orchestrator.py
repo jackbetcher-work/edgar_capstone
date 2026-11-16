@@ -38,9 +38,7 @@ from edgar_capstone.agents.tools import (
     VarianceCalculationTool,
 )
 
-DEFAULT_ORCHESTRATOR_MODEL = os.environ.get(
-    "EDGAR_ORCHESTRATOR_MODEL", DEFAULT_ANALYST_MODEL
-)
+DEFAULT_ORCHESTRATOR_MODEL = os.environ.get("EDGAR_ORCHESTRATOR_MODEL", DEFAULT_ANALYST_MODEL)
 
 QueryIntentType = Literal[
     "longitudinal_single_company",

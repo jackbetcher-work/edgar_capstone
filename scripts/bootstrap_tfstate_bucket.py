@@ -15,9 +15,9 @@ import os
 import time
 
 import google.auth
+import httpx
 from google.auth.transport.requests import Request
 from google.cloud import storage
-import httpx
 
 DEFAULT_PROJECT_ID = "iron-radio-514217-q7"
 DEFAULT_TFSTATE_BUCKET = "iron-radio-514217-q7-tfstate"
@@ -26,9 +26,7 @@ DEFAULT_LOCATION = "us-central1"
 
 def ensure_bootstrap_apis(project_id: str = DEFAULT_PROJECT_ID) -> None:
     """Enable Cloud Resource Manager & Service Usage APIs required by Terraform."""
-    creds, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
+    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
     creds.refresh(Request())
     headers = {"Authorization": f"Bearer {creds.token}"}
     url = f"https://serviceusage.googleapis.com/v1/projects/{project_id}/services:batchEnable"

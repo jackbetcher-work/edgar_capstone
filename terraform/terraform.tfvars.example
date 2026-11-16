@@ -38,3 +38,14 @@ cloud_identity_rbac_groups = {
   analysts = ["sec-edgar-analysts@fde-workspace.corp"]
   viewers  = ["sec-edgar-viewers@fde-workspace.corp"]
 }
+
+# Cloud Build triggers (see cloudbuild.tf for the one-time GitHub App + token setup)
+enable_cloudbuild_trigger                    = false
+enable_cloudbuild_pr_trigger                 = true
+create_cloudbuild_github_connection          = true
+cloudbuild_github_connection_name            = "sec-edgar-github"
+cloudbuild_github_app_installation_id        = 0
+cloudbuild_github_oauth_token_secret_id      = "sec-edgar-github-oauth-token"
+cloudbuild_github_oauth_token_secret_version = "1"
+cloudbuild_trigger_branch_regex              = "^main$"
+cloudbuild_service_account_id                = "sec-edgar-cloudbuild-sa"

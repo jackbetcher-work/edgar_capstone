@@ -14,13 +14,15 @@ boundary, and short-lived audience-bound S2S token attestation.
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
 import json
 import os
 import time
-from typing import Any
 import uuid
+from dataclasses import dataclass
+from typing import Any
 
+import google.auth
+import httpx
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
@@ -28,9 +30,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
     decode_dss_signature,
     encode_dss_signature,
 )
-import google.auth
 from google.auth.transport.requests import Request as GoogleAuthRequest
-import httpx
 
 from edgar_capstone.security.rbac import (
     CUSTOM_RUNTIME_SA_ACCOUNT_ID,
@@ -257,9 +257,7 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
             "roles/aiplatform.user",
             "roles/logging.logWriter",
         ),
-        oauth_scopes=(
-            "https://www.googleapis.com/auth/devstorage.read_only",
-        ),
+        oauth_scopes=("https://www.googleapis.com/auth/devstorage.read_only",),
     ),
     "ModelArmorGuardrail": AgentIdentitySpec(
         agent_name="ModelArmorGuardrail",
@@ -280,9 +278,7 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
             "roles/aiplatform.user",
             "roles/logging.logWriter",
         ),
-        oauth_scopes=(
-            "https://www.googleapis.com/auth/cloud-platform",
-        ),
+        oauth_scopes=("https://www.googleapis.com/auth/cloud-platform",),
     ),
 }
 

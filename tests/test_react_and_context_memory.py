@@ -180,7 +180,9 @@ class _DeterministicReActProLlm(BaseLlm):
         op_pct = nvda_rep["operating_income_variance"]["percentage_delta"]
         chunk_id = (cache_payload.get("matched_chunk_ids") or ["NVDA_2026_item_7_0001"])[0]
         filing_url = cache_payload.get("sec_filing_url") or "https://www.sec.gov/nvda"
-        explanation_snippet = (cache_payload.get("explanations") or ["Data center compute growth."])[0][:180]
+        explanation_snippet = (
+            cache_payload.get("explanations") or ["Data center compute growth."]
+        )[0][:180]
 
         final_md = (
             "/*FINAL_ANSWER*/\n"
@@ -313,7 +315,9 @@ def test_adk_runner_executes_structured_react_loop_with_context_latency_tracking
             ),
         ):
             if event.is_final_response() and event.content and event.content.parts:
-                final_text = "".join(p.text or "" for p in event.content.parts if not getattr(p, "thought", False))
+                final_text = "".join(
+                    p.text or "" for p in event.content.parts if not getattr(p, "thought", False)
+                )
         sess = await session_service.get_session(
             app_name="sec_edgar_react_test",
             user_id="lead-analyst",
@@ -423,7 +427,9 @@ def test_context_induced_latency_attribution_and_cache_speedup_math() -> None:
     assert rec_large_uncached.context_latency_ratio > rec_small.context_latency_ratio
 
     # Caching 9,700 10-K tokens reduces prefill share and records positive KV-cache latency savings
-    assert rec_large_cached.context_prefill_latency_ms < rec_large_uncached.context_prefill_latency_ms
+    assert (
+        rec_large_cached.context_prefill_latency_ms < rec_large_uncached.context_prefill_latency_ms
+    )
     assert rec_large_cached.estimated_cache_latency_saved_ms > 1000.0
 
     # Explicit observed TTFT above 3000ms SLO marks within_ttft_slo=False
@@ -474,7 +480,9 @@ def test_context_induced_latency_attribution_and_cache_speedup_math() -> None:
     assert est_bd.system_instruction_tokens > 0
     assert est_bd.user_prompt_tokens > 0
     resp_with_usage = LlmResponse(
-        content=genai_types.Content(role="model", parts=[genai_types.Part(text="Grounded output.")]),
+        content=genai_types.Content(
+            role="model", parts=[genai_types.Part(text="Grounded output.")]
+        ),
         usage_metadata=genai_types.GenerateContentResponseUsageMetadata(
             prompt_token_count=4096,
             cached_content_token_count=3072,
@@ -658,13 +666,8 @@ def test_fastapi_react_telemetry_evaluation_and_coding_endpoints() -> None:
     assert c_body["react_execution"]["iterations"] >= 4
     assert len(c_body["react_execution"]["cached_10k_explanations"]) >= 1
     assert c_body["evaluation"]["evaluator_model"] == "gemini-3.5-flash"
-    assert (
-        c_body["context_and_memory"]["models"]["financial_reasoning_model"]
-        == "gemini-2.5-pro"
-    )
-    assert (
-        c_body["context_and_memory"]["turn_context_latency"]["total_calls"] >= 3
-    )
+    assert c_body["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-2.5-pro"
+    assert c_body["context_and_memory"]["turn_context_latency"]["total_calls"] >= 3
 
     # Context-induced latency telemetry endpoint
     tel_resp = client.get(
@@ -689,9 +692,7 @@ def test_fastapi_react_telemetry_evaluation_and_coding_endpoints() -> None:
             "response_markdown": c_body["answer_markdown"],
             "variance_reports": c_body["variance_reports"],
             "citations": c_body["citations"],
-            "cached_explanations_count": len(
-                c_body["react_execution"]["cached_10k_explanations"]
-            ),
+            "cached_explanations_count": len(c_body["react_execution"]["cached_10k_explanations"]),
         },
     )
     assert eval_resp.status_code == 200

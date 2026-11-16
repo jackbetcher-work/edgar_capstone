@@ -7,15 +7,16 @@ import json
 import time
 from typing import Any
 
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
-from fastapi.testclient import TestClient
 import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from fastapi.testclient import TestClient
 
 from edgar_capstone.security import (
     GOOGLE_IAP_ISSUER,
     GOOGLE_IAP_JWKS_URI,
     GOOGLE_WORKSPACE_JWKS_URI,
+    AuthenticationError,
     AuthSettings,
     IAPJwtVerifier,
     JwksKeyStore,
@@ -117,7 +118,11 @@ def test_all_internal_apis_require_jwt_bearer_authentication() -> None:
         ("GET", "/api/v1/companies", None),
         ("POST", "/api/v1/chat", {"query": "NVDA FY2026 revenue drivers"}),
         ("GET", "/api/v1/section?ticker=NVDA&fiscal_year=2026&section_id=item_7", None),
-        ("POST", "/api/v1/section", {"ticker": "NVDA", "fiscal_year": 2026, "section_id": "item_7"}),
+        (
+            "POST",
+            "/api/v1/section",
+            {"ticker": "NVDA", "fiscal_year": 2026, "section_id": "item_7"},
+        ),
         ("POST", "/api/v1/feedback", {"message_id": "m1", "rating": "up"}),
     ]
 
@@ -275,7 +280,7 @@ def test_cryptographic_attacks_temporal_bounds_and_key_rotation(idp_keyring) -> 
             }
         ).encode("utf-8")
     )
-    with pytest.raises( Exception ):
+    with pytest.raises(AuthenticationError):
         verifier.verify_jwt(f"{h_b64}.{tampered_payload}.{s_b64}")
 
     # 2. Algorithm confusion: alg="none" and alg="HS256"

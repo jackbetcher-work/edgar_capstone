@@ -215,3 +215,16 @@ output "vertex_vector_search_deployed_index_id" {
   description = "Deployed index ID on the Vector Search endpoint (VERTEX_VECTOR_SEARCH_DEPLOYED_INDEX_ID)."
   value       = length(google_vertex_ai_index_endpoint_deployed_index.sec_10k_chunks_deployed) > 0 ? google_vertex_ai_index_endpoint_deployed_index.sec_10k_chunks_deployed[0].deployed_index_id : null
 }
+
+output "cloudbuild_service_account_email" {
+  description = "Email of the dedicated Cloud Build trigger service account (null when enable_cloudbuild_trigger = false)."
+  value       = var.enable_cloudbuild_trigger ? google_service_account.cloudbuild_runner[0].email : null
+}
+
+output "cloudbuild_trigger_ids" {
+  description = "IDs of the Terraform-managed Cloud Build triggers."
+  value = {
+    main_deploy         = var.enable_cloudbuild_trigger ? google_cloudbuild_trigger.main_deploy[0].trigger_id : null
+    pull_request_verify = var.enable_cloudbuild_trigger && var.enable_cloudbuild_pr_trigger ? google_cloudbuild_trigger.pull_request_verify[0].trigger_id : null
+  }
+}

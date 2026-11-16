@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
 import logging
 import os
-from pathlib import Path
 import re
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import google.auth
-from google.auth.transport.requests import Request as GoogleAuthRequest
 import httpx
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +219,9 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "github_pat_token",
-        re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b"),
+        re.compile(
+            r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{36,}\b|\bgithub_pat_[A-Za-z0-9_]{22,}\b"
+        ),
     ),
     (
         "aws_access_key_id",

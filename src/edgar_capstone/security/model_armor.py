@@ -19,8 +19,6 @@ Replaces legacy regex prompt-injection filters with:
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, field
 import functools
 import hashlib
 import json
@@ -29,8 +27,12 @@ import os
 import string
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar
 
+import google.auth
+import httpx
 from google.adk.agents.callback_context import CallbackContext
 from google.adk.agents.invocation_context import InvocationContext
 from google.adk.events.event import Event
@@ -39,10 +41,8 @@ from google.adk.models.llm_response import LlmResponse
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.tools.base_tool import BaseTool
 from google.adk.tools.tool_context import ToolContext
-import google.auth
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.genai import types as genai_types
-import httpx
 
 from edgar_capstone.security.agent_identity import (
     GcpAgentIamCredentialsClient,
@@ -221,7 +221,12 @@ def _detect_sensitive_spans(text: str) -> list[tuple[int, int, str]]:
             and seg[7:].isdigit()
         ):
             area, grp, ser = seg[:3], seg[4:6], seg[7:]
-            if area not in ("000", "666") and not area.startswith("9") and grp != "00" and ser != "0000":
+            if (
+                area not in ("000", "666")
+                and not area.startswith("9")
+                and grp != "00"
+                and ser != "0000"
+            ):
                 spans.append((i, i + 11, "US_SOCIAL_SECURITY_NUMBER"))
 
     # 2. Credit Card Numbers (13-19 digits with spaces/hyphens passing Luhn & major IIN prefix)
@@ -320,7 +325,11 @@ def _detect_sensitive_spans(text: str) -> list[tuple[int, int, str]]:
                 spans.append((t_idx, t_end, "AUTH_TOKEN"))
             elif tok.startswith(("ghp_", "gho_", "ghs_", "github_pat_")) and len(tok) >= 28:
                 spans.append((t_idx, t_end, "AUTH_TOKEN"))
-            elif (tok.startswith("AKIA") or tok.startswith("ASIA")) and len(tok) == 20 and tok.isalnum():
+            elif (
+                (tok.startswith("AKIA") or tok.startswith("ASIA"))
+                and len(tok) == 20
+                and tok.isalnum()
+            ):
                 spans.append((t_idx, t_end, "AUTH_TOKEN"))
             t_idx = t_end
         else:
@@ -384,7 +393,9 @@ class FinancialProjectionFilter:
                 return after.strip()
         return text
 
-    def evaluate(self, text: str, *, stage: Literal["prompt", "response"] = "prompt") -> ProjectionFilterResult:
+    def evaluate(
+        self, text: str, *, stage: Literal["prompt", "response"] = "prompt"
+    ) -> ProjectionFilterResult:
         if not text or not text.strip():
             return ProjectionFilterResult(matched=False)
 
@@ -409,9 +420,7 @@ class FinancialProjectionFilter:
             )
 
         target_text = (
-            self._extract_query_segment_if_structured_prompt(text)
-            if stage == "prompt"
-            else text
+            self._extract_query_segment_if_structured_prompt(text) if stage == "prompt" else text
         )
         lowered = " ".join(target_text.lower().split())
         words = _normalize_words(target_text)
@@ -476,13 +485,19 @@ class LocalModelArmorEmulatorTransport(httpx.BaseTransport):
 
         if ":sanitizeUserPrompt" in url_str:
             text = str((payload.get("userPromptData") or {}).get("text") or "")
-            return httpx.Response(200, json=self._build_sanitization_response(text, is_user_prompt=True))
+            return httpx.Response(
+                200, json=self._build_sanitization_response(text, is_user_prompt=True)
+            )
 
         if ":sanitizeModelResponse" in url_str:
             text = str((payload.get("modelResponseData") or {}).get("text") or "")
-            return httpx.Response(200, json=self._build_sanitization_response(text, is_user_prompt=False))
+            return httpx.Response(
+                200, json=self._build_sanitization_response(text, is_user_prompt=False)
+            )
 
-        return httpx.Response(404, json={"error": {"code": 404, "message": f"Unknown endpoint: {url_str}"}})
+        return httpx.Response(
+            404, json={"error": {"code": 404, "message": f"Unknown endpoint: {url_str}"}}
+        )
 
     def _handle_dlp_request(self, url_str: str, payload: dict[str, Any]) -> httpx.Response:
         text = str((payload.get("item") or {}).get("value") or "")
@@ -496,7 +511,9 @@ class LocalModelArmorEmulatorTransport(httpx.BaseTransport):
                 }
                 for start, end, info_type in spans
             ]
-            return httpx.Response(200, json={"result": {"findings": findings, "findingsTruncated": False}})
+            return httpx.Response(
+                200, json={"result": {"findings": findings, "findingsTruncated": False}}
+            )
 
         if url_str.endswith(":deidentify"):
             redacted = _redact_spans(text, spans)
@@ -511,7 +528,9 @@ class LocalModelArmorEmulatorTransport(httpx.BaseTransport):
                     "overview": {"transformationSummaries": summaries},
                 },
             )
-        return httpx.Response(404, json={"error": {"code": 404, "message": "Unsupported DLP operation"}})
+        return httpx.Response(
+            404, json={"error": {"code": 404, "message": "Unsupported DLP operation"}}
+        )
 
     def _build_sanitization_response(self, text: str, *, is_user_prompt: bool) -> dict[str, Any]:
         policy = _load_guardrail_policy_dict()
@@ -538,8 +557,7 @@ class LocalModelArmorEmulatorTransport(httpx.BaseTransport):
         sdp_matched = len(spans) > 0
         redacted_text = _redact_spans(text, spans) if sdp_matched else text
         sdp_findings = [
-            {"infoType": info_type, "likelihood": "VERY_LIKELY"}
-            for _, _, info_type in spans
+            {"infoType": info_type, "likelihood": "VERY_LIKELY"} for _, _, info_type in spans
         ]
 
         overall_match = pi_matched or malicious_uri_matched or sdp_matched
@@ -558,7 +576,9 @@ class LocalModelArmorEmulatorTransport(httpx.BaseTransport):
                     "malicious_uris": {
                         "maliciousUriFilterResult": {
                             "executionState": "EXECUTION_SUCCESS",
-                            "matchState": "MATCH_FOUND" if malicious_uri_matched else "NO_MATCH_FOUND",
+                            "matchState": "MATCH_FOUND"
+                            if malicious_uri_matched
+                            else "NO_MATCH_FOUND",
                         }
                     },
                     "rai": {
@@ -642,13 +662,17 @@ class ModelArmorConfig:
         )
         location = _normalize_location(raw_loc)
         raw_template = (
-            os.environ.get("MODEL_ARMOR_TEMPLATE_ID", "").strip()
-            or DEFAULT_MODEL_ARMOR_TEMPLATE_ID
+            os.environ.get("MODEL_ARMOR_TEMPLATE_ID", "").strip() or DEFAULT_MODEL_ARMOR_TEMPLATE_ID
         )
         # Allow passing full resource path `projects/{p}/locations/{l}/templates/{t}`
         if raw_template.startswith("projects/"):
             segs = raw_template.split("/")
-            if len(segs) >= 6 and segs[0] == "projects" and segs[2] == "locations" and segs[4] == "templates":
+            if (
+                len(segs) >= 6
+                and segs[0] == "projects"
+                and segs[2] == "locations"
+                and segs[4] == "templates"
+            ):
                 project_id = segs[1]
                 location = _normalize_location(segs[3])
                 raw_template = segs[5]
@@ -662,7 +686,8 @@ class ModelArmorConfig:
             location=location,
             template_id=raw_template,
             sdp_inspect_template_id=os.environ.get("SDP_INSPECT_TEMPLATE_ID", "").strip() or None,
-            sdp_deidentify_template_id=os.environ.get("SDP_DEIDENTIFY_TEMPLATE_ID", "").strip() or None,
+            sdp_deidentify_template_id=os.environ.get("SDP_DEIDENTIFY_TEMPLATE_ID", "").strip()
+            or None,
             sdp_action=sdp_action,
             enable_cloud_dlp_api=_truthy_env("MODEL_ARMOR_ENABLE_DLP_API", True),
             projection_filter_enabled=_truthy_env("MODEL_ARMOR_PROJECTION_FILTER_ENABLED", True),
@@ -706,9 +731,7 @@ def parse_model_armor_response(
     match_state = str(
         sr.get("filterMatchState") or sr.get("filter_match_state") or "NO_MATCH_FOUND"
     ).upper()
-    inv_result = str(
-        sr.get("invocationResult") or sr.get("invocation_result") or "SUCCESS"
-    ).upper()
+    inv_result = str(sr.get("invocationResult") or sr.get("invocation_result") or "SUCCESS").upper()
     filter_results = sr.get("filterResults") or sr.get("filter_results") or {}
     if not isinstance(filter_results, dict):
         filter_results = {}
@@ -731,18 +754,20 @@ def parse_model_armor_response(
         or pi_entry.get("pi_and_jailbreak_filter_result")
         or pi_entry
     )
-    if isinstance(pi_res, dict) and _is_matched(pi_res.get("matchState") or pi_res.get("match_state")):
+    if isinstance(pi_res, dict) and _is_matched(
+        pi_res.get("matchState") or pi_res.get("match_state")
+    ):
         conf = pi_res.get("confidenceLevel") or pi_res.get("confidence_level") or "HIGH"
         blocking.append(f"pi_and_jailbreak:{conf}")
 
     # 2. Responsible AI (RAI)
     rai_entry = filter_results.get("rai") or {}
     rai_res = rai_entry.get("raiFilterResult") or rai_entry.get("rai_filter_result") or rai_entry
-    if isinstance(rai_res, dict) and _is_matched(rai_res.get("matchState") or rai_res.get("match_state")):
+    if isinstance(rai_res, dict) and _is_matched(
+        rai_res.get("matchState") or rai_res.get("match_state")
+    ):
         type_map = (
-            rai_res.get("raiFilterTypeResults")
-            or rai_res.get("rai_filter_type_results")
-            or {}
+            rai_res.get("raiFilterTypeResults") or rai_res.get("rai_filter_type_results") or {}
         )
         matched_rai_subtypes: list[str] = []
         if isinstance(type_map, dict):
@@ -764,7 +789,9 @@ def parse_model_armor_response(
         or uri_entry.get("malicious_uri_filter_result")
         or uri_entry
     )
-    if isinstance(uri_res, dict) and _is_matched(uri_res.get("matchState") or uri_res.get("match_state")):
+    if isinstance(uri_res, dict) and _is_matched(
+        uri_res.get("matchState") or uri_res.get("match_state")
+    ):
         blocking.append("malicious_uris")
 
     # 4. CSAM
@@ -785,7 +812,9 @@ def parse_model_armor_response(
     if isinstance(sdp_res, dict):
         insp = sdp_res.get("inspectResult") or sdp_res.get("inspect_result") or {}
         deid = sdp_res.get("deidentifyResult") or sdp_res.get("deidentify_result") or {}
-        if isinstance(insp, dict) and _is_matched(insp.get("matchState") or insp.get("match_state")):
+        if isinstance(insp, dict) and _is_matched(
+            insp.get("matchState") or insp.get("match_state")
+        ):
             sdp_matched = True
             for f_item in insp.get("findings") or []:
                 if isinstance(f_item, dict):
@@ -793,7 +822,9 @@ def parse_model_armor_response(
                     it_name = it_raw.get("name") if isinstance(it_raw, dict) else it_raw
                     if it_name:
                         sdp_info_types.append(str(it_name))
-        if isinstance(deid, dict) and _is_matched(deid.get("matchState") or deid.get("match_state")):
+        if isinstance(deid, dict) and _is_matched(
+            deid.get("matchState") or deid.get("match_state")
+        ):
             sdp_matched = True
             data_obj = deid.get("data") or {}
             if isinstance(data_obj, dict) and isinstance(data_obj.get("text"), str):
@@ -865,7 +896,9 @@ def _raise_for_security_http_status(resp: httpx.Response, service_label: str) ->
     snippet = resp.text[:300]
     if resp.status_code == 429:
         retry_hdr = resp.headers.get("Retry-After")
-        retry_s = float(retry_hdr) if retry_hdr and retry_hdr.replace(".", "", 1).isdigit() else None
+        retry_s = (
+            float(retry_hdr) if retry_hdr and retry_hdr.replace(".", "", 1).isdigit() else None
+        )
         raise RateLimitExceededError(
             f"{service_label} HTTP 429 rate limited: {snippet}",
             retry_after_seconds=retry_s,
@@ -966,7 +999,11 @@ class ModelArmorClient:
         except (RateLimitExceededError, UpstreamTimeoutError):
             raise
         except Exception as exc:
-            if self.config.mode == "auto" and self._http_client is None and self._credentials is None:
+            if (
+                self.config.mode == "auto"
+                and self._http_client is None
+                and self._credentials is None
+            ):
                 logger.warning(
                     "%s live GCP call unavailable in auto mode (%s); routing via Model Armor wire emulator.",
                     service_label,
@@ -1072,11 +1109,7 @@ class ModelArmorClient:
                 "minLikelihood": "POSSIBLE",
             },
             "deidentifyConfig": {
-                "infoTypeTransformations": {
-                    "transformations": [
-                        {"replaceWithInfoTypeConfig": {}}
-                    ]
-                }
+                "infoTypeTransformations": {"transformations": [{"replaceWithInfoTypeConfig": {}}]}
             },
         }
         if self.config.sdp_inspect_template_id:
@@ -1168,7 +1201,8 @@ class ModelArmorGuardrailService:
     def _attest_guardrail_s2s(self, caller_agent: str) -> tuple[str, str]:
         eff_caller = (
             caller_agent
-            if caller_agent in ("RootOrchestrator", "FinancialAnalystAgent", CUSTOM_RUNTIME_SA_ACCOUNT_ID)
+            if caller_agent
+            in ("RootOrchestrator", "FinancialAnalystAgent", CUSTOM_RUNTIME_SA_ACCOUNT_ID)
             else CUSTOM_RUNTIME_SA_ACCOUNT_ID
         )
         claims = authorize_agent_s2s_hop(
@@ -1298,7 +1332,9 @@ class ModelArmorGuardrailService:
 
         if self.config.enable_cloud_dlp_api and not sdp_triggered:
             try:
-                dlp_matched, dlp_types, dlp_text = self.client.inspect_and_deidentify_sdp(working_text)
+                dlp_matched, dlp_types, dlp_text = self.client.inspect_and_deidentify_sdp(
+                    working_text
+                )
                 if dlp_matched:
                     sdp_triggered = True
                     sdp_types.update(dlp_types)
@@ -1323,7 +1359,11 @@ class ModelArmorGuardrailService:
 
         if sdp_triggered:
             sorted_types = tuple(sorted(sdp_types))
-            if self.config.sdp_action == "block" or "GCP_API_KEY" in sdp_types or "AUTH_TOKEN" in sdp_types:
+            if (
+                self.config.sdp_action == "block"
+                or "GCP_API_KEY" in sdp_types
+                or "AUTH_TOKEN" in sdp_types
+            ):
                 record_security_audit_event(
                     event_type="sdp_sensitive_prompt_blocked",
                     user=None,
@@ -1759,7 +1799,9 @@ class ModelArmorSafetyPlugin(BasePlugin):
 
         decision = self.guardrail.inspect_user_prompt(
             latest_user_text,
-            caller_agent=str(getattr(callback_context, "agent_name", "") or CUSTOM_RUNTIME_SA_ACCOUNT_ID),
+            caller_agent=str(
+                getattr(callback_context, "agent_name", "") or CUSTOM_RUNTIME_SA_ACCOUNT_ID
+            ),
         )
         state["model_armor_last_decision"] = decision.to_audit_dict()
         if decision.blocked:
@@ -1799,7 +1841,9 @@ class ModelArmorSafetyPlugin(BasePlugin):
         serialized = json.dumps(result, default=str)
         decision = self.guardrail.inspect_user_prompt(
             serialized,
-            caller_agent=str(getattr(tool_context, "agent_name", "") or CUSTOM_RUNTIME_SA_ACCOUNT_ID),
+            caller_agent=str(
+                getattr(tool_context, "agent_name", "") or CUSTOM_RUNTIME_SA_ACCOUNT_ID
+            ),
         )
         if decision.blocked:
             tool_context.state["model_armor_blocked"] = True
@@ -1846,7 +1890,9 @@ class ModelArmorSafetyPlugin(BasePlugin):
 
         decision = self.guardrail.inspect_model_response(
             combined_text,
-            caller_agent=str(getattr(callback_context, "agent_name", "") or "FinancialAnalystAgent"),
+            caller_agent=str(
+                getattr(callback_context, "agent_name", "") or "FinancialAnalystAgent"
+            ),
         )
         state["model_armor_last_response_decision"] = decision.to_audit_dict()
 

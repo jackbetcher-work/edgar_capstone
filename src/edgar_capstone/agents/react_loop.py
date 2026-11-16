@@ -14,12 +14,13 @@ Implements the structured ReAct loop (`Thought -> Action -> Observation -> ... -
 
 from __future__ import annotations
 
-from collections import defaultdict
 import json
 import logging
 import re
 import time
-from typing import Any, Callable
+from collections import defaultdict
+from collections.abc import Callable
+from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
 
@@ -87,9 +88,7 @@ def _clean_passage(text: str, max_len: int = 320) -> str:
 def _inline_citation_tag(cit: dict[str, Any]) -> str:
     ticker = cit["ticker"]
     fy = cit["fiscal_year"]
-    sec_label = (
-        "Item 1A Risk Factors" if cit["section_id"] == "item_1a" else "Item 7 MD&A"
-    )
+    sec_label = "Item 1A Risk Factors" if cit["section_id"] == "item_1a" else "Item 7 MD&A"
     chunk_id = cit["chunk_id"]
     url = cit.get("sec_filing_url") or "#source-viewer"
     return f"[{ticker} FY{fy} | {sec_label} | {chunk_id}]({url})"
@@ -154,14 +153,10 @@ def evaluate_calculated_variances(
 
         # Detect peak YoY step inflection from annual_series
         annual_steps = [
-            s
-            for s in (rep.get("annual_series") or [])
-            if s.get("revenue_yoy_pct") is not None
+            s for s in (rep.get("annual_series") or []) if s.get("revenue_yoy_pct") is not None
         ]
         if annual_steps:
-            peak_step = max(
-                annual_steps, key=lambda s: abs(float(s["revenue_yoy_pct"]))
-            )
+            peak_step = max(annual_steps, key=lambda s: abs(float(s["revenue_yoy_pct"])))
             findings.append(
                 f"Peak YoY revenue inflection in FY{peak_step['fiscal_year']} "
                 f"({_fmt_pct(peak_step['revenue_yoy_pct'])} vs FY{peak_step.get('prev_fiscal_year')})"
@@ -264,9 +259,7 @@ def query_cached_10k_for_explanations(
     if not planned_requests and citations:
         sec_norm = (section_filter or "ALL").strip().lower()
         for cit in citations[:4]:
-            sec_id = (
-                sec_norm if sec_norm in ("item_1a", "item_7") else str(cit["section_id"])
-            )
+            sec_id = sec_norm if sec_norm in ("item_1a", "item_7") else str(cit["section_id"])
             key = (str(cit["ticker"]), int(cit["fiscal_year"]), sec_id)
             if key not in seen_keys:
                 seen_keys.add(key)
@@ -362,9 +355,7 @@ def format_react_grounded_output(
 
     # 1. Executive Synthesis Header
     if intent == "multi_company_peer_comparison" and len(variance_reports) >= 2:
-        names = ", ".join(
-            f"**{r['company_name']} ({r['ticker']})**" for r in variance_reports
-        )
+        names = ", ".join(f"**{r['company_name']} ({r['ticker']})**" for r in variance_reports)
         lines.append("### Multi-Company Variance & Filing Synthesis")
         lines.append(
             f"Structured ReAct multi-period analysis comparing {names} across "
@@ -391,7 +382,7 @@ def format_react_grounded_output(
         )
         lines.append(
             f"Cross-filing ReAct retrieval combining cached 10-K context and 768-d hybrid search "
-            f"for query: *\"{query.strip()}\"*."
+            f'for query: *"{query.strip()}"*.'
         )
 
     # 2. Deterministic Quantitative Findings + Evaluated Variance Insights
@@ -457,11 +448,15 @@ def format_react_grounded_output(
                 sec_title = cit.get("section_title") or cit["section_id"].upper()
                 lines.append(
                     f"- **{cit['company_name']} ({cit['ticker']}) — {sec_title}:** "
-                    f"\"{_clean_passage(cit['excerpt'], 290)}\" {_inline_citation_tag(cit)}"
+                    f'"{_clean_passage(cit["excerpt"], 290)}" {_inline_citation_tag(cit)}'
                 )
     elif cached_explanations or citations:
-        mda_cached = [e for e in cached_explanations if e.section_id == "item_7" and e.extracted_explanations]
-        risk_cached = [e for e in cached_explanations if e.section_id == "item_1a" and e.extracted_explanations]
+        mda_cached = [
+            e for e in cached_explanations if e.section_id == "item_7" and e.extracted_explanations
+        ]
+        risk_cached = [
+            e for e in cached_explanations if e.section_id == "item_1a" and e.extracted_explanations
+        ]
         item7_cits = [c for c in citations if c["section_id"] == "item_7"]
         item1a_cits = [c for c in citations if c["section_id"] == "item_1a"]
 
@@ -475,7 +470,8 @@ def format_react_grounded_output(
                         (
                             c
                             for c in item7_cits
-                            if c["ticker"] == exp.ticker and int(c["fiscal_year"]) == exp.fiscal_year
+                            if c["ticker"] == exp.ticker
+                            and int(c["fiscal_year"]) == exp.fiscal_year
                         ),
                         item7_cits[0] if item7_cits else None,
                     ),
@@ -483,14 +479,14 @@ def format_react_grounded_output(
                 cit_tag = f" {_inline_citation_tag(linked_cit)}" if linked_cit else ""
                 lines.append(
                     f"- **{exp.ticker} FY{exp.fiscal_year} ({exp.variance_driver_focus}):** "
-                    f"\"{_clean_passage(exp.extracted_explanations[0], 300)}\"{cit_tag}"
+                    f'"{_clean_passage(exp.extracted_explanations[0], 300)}"{cit_tag}'
                 )
                 rendered_mda += 1
             for cit in item7_cits[: max(0, 4 - rendered_mda)]:
                 sec_title = cit.get("section_title") or "Item 7. MD&A"
                 lines.append(
                     f"- **{cit['ticker']} FY{cit['fiscal_year']} ({sec_title}):** "
-                    f"\"{_clean_passage(cit['excerpt'], 300)}\" {_inline_citation_tag(cit)}"
+                    f'"{_clean_passage(cit["excerpt"], 300)}" {_inline_citation_tag(cit)}'
                 )
 
         if risk_cached or item1a_cits:
@@ -503,7 +499,8 @@ def format_react_grounded_output(
                         (
                             c
                             for c in item1a_cits
-                            if c["ticker"] == exp.ticker and int(c["fiscal_year"]) == exp.fiscal_year
+                            if c["ticker"] == exp.ticker
+                            and int(c["fiscal_year"]) == exp.fiscal_year
                         ),
                         item1a_cits[0] if item1a_cits else None,
                     ),
@@ -511,14 +508,14 @@ def format_react_grounded_output(
                 cit_tag = f" {_inline_citation_tag(linked_cit)}" if linked_cit else ""
                 lines.append(
                     f"- **{exp.ticker} FY{exp.fiscal_year} ({exp.variance_driver_focus}):** "
-                    f"\"{_clean_passage(exp.extracted_explanations[0], 300)}\"{cit_tag}"
+                    f'"{_clean_passage(exp.extracted_explanations[0], 300)}"{cit_tag}'
                 )
                 rendered_risk += 1
             for cit in item1a_cits[: max(0, 4 - rendered_risk)]:
                 sec_title = cit.get("section_title") or "Item 1A. Risk Factors"
                 lines.append(
                     f"- **{cit['ticker']} FY{cit['fiscal_year']} ({sec_title}):** "
-                    f"\"{_clean_passage(cit['excerpt'], 300)}\" {_inline_citation_tag(cit)}"
+                    f'"{_clean_passage(cit["excerpt"], 300)}" {_inline_citation_tag(cit)}'
                 )
     else:
         lines.append(
@@ -572,11 +569,6 @@ class StructuredReActExecutor:
             self.reasoning_llm.model
             if self.reasoning_llm is not None
             else resolve_model_for_task("financial_reasoning")
-        )
-        eval_model = (
-            self.judge_llm.model
-            if self.judge_llm is not None
-            else resolve_model_for_task("evaluation")
         )
         tracker = get_context_latency_tracker()
         runtime_res = resolve_live_adk_runtime(
@@ -702,9 +694,7 @@ class StructuredReActExecutor:
 
         cached_hits = sum(1 for e in cached_explanations if e.cache_hit)
         cached_toks_hit = sum(e.token_estimate for e in cached_explanations if e.cache_hit)
-        uncached_toks_miss = sum(
-            e.token_estimate for e in cached_explanations if not e.cache_hit
-        )
+        uncached_toks_miss = sum(e.token_estimate for e in cached_explanations if not e.cache_hit)
 
         react_steps.append(
             ReActStep(
@@ -736,9 +726,7 @@ class StructuredReActExecutor:
         # Adaptive ReAct check: if multi-company comparison has a ticker missing cached explanation, run follow-up pass
         covered_tickers = {e.ticker for e in cached_explanations}
         missing_eval_tickers = [
-            ev.ticker
-            for ev in variance_evaluations
-            if ev.ticker not in covered_tickers
+            ev.ticker for ev in variance_evaluations if ev.ticker not in covered_tickers
         ]
         if (
             missing_eval_tickers
@@ -765,9 +753,7 @@ class StructuredReActExecutor:
                     existing_cids.add(mc["chunk_id"])
             add_cached_toks = sum(e.token_estimate for e in more_exps if e.cache_hit)
             cached_toks_hit += add_cached_toks
-            uncached_toks_miss += sum(
-                e.token_estimate for e in more_exps if not e.cache_hit
-            )
+            uncached_toks_miss += sum(e.token_estimate for e in more_exps if not e.cache_hit)
             react_steps.append(
                 ReActStep(
                     iteration=len(react_steps) + 1,
@@ -804,10 +790,7 @@ class StructuredReActExecutor:
             chunk_health=chunk_health,
         )
 
-        calc_map = {
-            f"{r['ticker']}_{r['start_year']}_{r['end_year']}": r
-            for r in variance_reports
-        }
+        calc_map = {f"{r['ticker']}_{r['start_year']}_{r['end_year']}": r for r in variance_reports}
         answer_markdown = deterministic_markdown
         live_stream_result: AdkStreamResult | None = None
         live_adk_executed = False
@@ -824,12 +807,8 @@ class StructuredReActExecutor:
                     intent=intent,
                     scope=scope,
                     variance_reports=variance_reports,
-                    variance_evaluations=[
-                        v.model_dump(mode="json") for v in variance_evaluations
-                    ],
-                    cached_explanations=[
-                        c.model_dump(mode="json") for c in cached_explanations
-                    ],
+                    variance_evaluations=[v.model_dump(mode="json") for v in variance_evaluations],
+                    cached_explanations=[c.model_dump(mode="json") for c in cached_explanations],
                     citations=merged_citations,
                     sector_benchmarks=sector_benchmarks,
                     chunk_health=chunk_health,
@@ -850,9 +829,7 @@ class StructuredReActExecutor:
                     if isinstance(raw_dec, dict):
                         adk_response_decision = raw_dec
                     adk_response_block_message = str(
-                        live_stream_result.session_state.get(
-                            "model_armor_response_block_message"
-                        )
+                        live_stream_result.session_state.get("model_armor_response_block_message")
                         or candidate_md
                     )
                     answer_markdown = candidate_md
@@ -889,9 +866,7 @@ class StructuredReActExecutor:
                     "variance_evaluations": [
                         v.model_dump(mode="json") for v in variance_evaluations
                     ],
-                    "cached_explanations": [
-                        c.model_dump(mode="json") for c in cached_explanations
-                    ],
+                    "cached_explanations": [c.model_dump(mode="json") for c in cached_explanations],
                     "citations": merged_citations,
                 },
             )
@@ -908,7 +883,11 @@ class StructuredReActExecutor:
         synth_ms = (time.perf_counter() - t_synth) * 1000.0
         synth_out_tokens = estimate_token_count(answer_markdown)
 
-        if live_adk_executed and live_stream_result is not None and live_stream_result.latency_records:
+        if (
+            live_adk_executed
+            and live_stream_result is not None
+            and live_stream_result.latency_records
+        ):
             turn_latency_records.extend(live_stream_result.latency_records)
             rec_synth = live_stream_result.latency_records[-1]
             synth_thought = (

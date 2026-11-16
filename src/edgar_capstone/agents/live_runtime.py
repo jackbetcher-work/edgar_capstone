@@ -18,14 +18,15 @@ Execution Modes (`EDGAR_EXECUTION_MODE`):
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 import json
 import logging
 import os
 import time
-from typing import Any, Coroutine, Literal, TypeVar
 import uuid
+from collections.abc import Coroutine
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Any, Literal, TypeVar
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.run_config import RunConfig, StreamingMode

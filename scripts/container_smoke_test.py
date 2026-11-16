@@ -26,11 +26,11 @@ Examples:
 from __future__ import annotations
 
 import argparse
-from contextlib import AbstractContextManager, nullcontext
 import json
-from pathlib import Path
 import sys
 import time
+from contextlib import AbstractContextManager, nullcontext
+from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -139,14 +139,19 @@ def run_smoke_checks(
 
     companies = _json(client.get("/api/v1/companies", headers=headers), "GET /api/v1/companies")
     company_list = companies.get("companies") or []
-    _require(companies.get("company_count", 0) > 0 and company_list, "No curated companies resolved")
+    _require(
+        companies.get("company_count", 0) > 0 and company_list, "No curated companies resolved"
+    )
     target = next((c for c in company_list if c.get("ticker") == "NVDA"), company_list[0])
     ticker = str(target["ticker"])
     years = sorted(int(y) for y in target.get("fiscal_years") or [])
     _require(bool(years), f"{ticker} has no fiscal years")
     end_year = years[-1]
     start_year = years[-2] if len(years) > 1 else end_year
-    report["checks"]["companies"] = {"company_count": companies.get("company_count"), "probe_ticker": ticker}
+    report["checks"]["companies"] = {
+        "company_count": companies.get("company_count"),
+        "probe_ticker": ticker,
+    }
 
     variances = _json(
         client.post(
@@ -180,7 +185,12 @@ def run_smoke_checks(
     section = _json(
         client.get(
             "/api/v1/section",
-            params={"ticker": ticker, "fiscal_year": end_year, "section_id": "item_7", "max_chars": 2000},
+            params={
+                "ticker": ticker,
+                "fiscal_year": end_year,
+                "section_id": "item_7",
+                "max_chars": 2000,
+            },
             headers=headers,
         ),
         "GET /api/v1/section",
@@ -221,8 +231,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "the real chunks manifest and 10-K Markdown; 'any' skips corpus assertions."
         ),
     )
-    parser.add_argument("--wait-seconds", type=float, default=0.0, help="Seconds to wait for /health.")
-    parser.add_argument("--timeout", type=float, default=60.0, help="Per-request timeout (seconds).")
+    parser.add_argument(
+        "--wait-seconds", type=float, default=0.0, help="Seconds to wait for /health."
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=60.0, help="Per-request timeout (seconds)."
+    )
     return parser.parse_args(argv)
 
 

@@ -6,9 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi.testclient import TestClient
 import pytest
 import yaml
+from fastapi.testclient import TestClient
 
 from edgar_capstone.dataset import corpus_hydration as ch
 from edgar_capstone.dataset import paths as corpus_paths
@@ -227,7 +227,9 @@ def test_hydrate_downloads_missing_artifacts_and_skips_existing(tmp_path: Path) 
     assert result.ok
     assert result.downloaded_objects == 2  # chunks manifest + NVDA markdown
     assert result.skipped_existing == 1
-    assert (dataset_dir / CHUNKS_MANIFEST_REL).read_bytes() == _corpus_objects()[CHUNKS_MANIFEST_REL]
+    assert (dataset_dir / CHUNKS_MANIFEST_REL).read_bytes() == _corpus_objects()[
+        CHUNKS_MANIFEST_REL
+    ]
     assert (dataset_dir / "unstructured" / "NVDA" / "2025_10k.md").is_file()
     assert existing.read_text(encoding="utf-8") == "LOCAL COPY"
     # Scopes not requested are not touched.
@@ -298,7 +300,9 @@ def test_startup_hydration_modes(tmp_path: Path) -> None:
     assert disabled.status == "disabled"
     assert client.list_calls == []
 
-    best_effort = run_startup_corpus_hydration(_config(tmp_path, mode="auto"), storage_client=client)
+    best_effort = run_startup_corpus_hydration(
+        _config(tmp_path, mode="auto"), storage_client=client
+    )
     assert best_effort.status == "failed"
     assert ch.get_last_corpus_hydration_result() is best_effort
 
@@ -388,7 +392,9 @@ def test_dockerfile_dockerignore_and_makefile_package_corpus() -> None:
     assert 'EDGAR_CORPUS_HYDRATION="off"' in dockerfile
     assert "chown -R appuser:appgroup /app/data" in dockerfile
     assert "describe_local_corpus" in dockerfile
-    assert dockerfile.index("chown -R appuser:appgroup /app/data") < dockerfile.index("USER appuser")
+    assert dockerfile.index("chown -R appuser:appgroup /app/data") < dockerfile.index(
+        "USER appuser"
+    )
 
     dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
     for pattern in (

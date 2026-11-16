@@ -14,15 +14,15 @@ Implements:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import json
 import logging
 import os
 import threading
 import time
-from typing import Any
 import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Any
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.callback_context import CallbackContext
@@ -73,7 +73,9 @@ class ModelPerformanceProfile:
     tier: str
     primary_use_cases: tuple[str, ...]
     uncached_prefill_ms_per_token: float
-    cached_prefill_discount_factor: float  # Fraction of uncached prefill cost when cached (e.g. 0.20 = 5x faster)
+    cached_prefill_discount_factor: (
+        float  # Fraction of uncached prefill cost when cached (e.g. 0.20 = 5x faster)
+    )
     decode_ms_per_token: float
     uncached_input_usd_per_1m: float = 1.25
     cached_input_usd_per_1m: float = 0.3125
@@ -304,7 +306,9 @@ def extract_llm_request_context_breakdown(
 
     cache_stats = state_dict.get("context_cache_stats") if state_dict else None
     cache_hit = cached_total > 0 or (
-        isinstance(cache_stats, dict) and int(cache_stats.get("hits", 0) or 0) > 0 and cached_10k_tokens > 0
+        isinstance(cache_stats, dict)
+        and int(cache_stats.get("hits", 0) or 0) > 0
+        and cached_10k_tokens > 0
     )
     uncached_total = max(0, total_tokens - cached_total)
 
@@ -411,9 +415,7 @@ def attribute_context_latency(
     # Calibrated prefill vs decode work units
     uncached_prefill_work = uncached_toks * profile.uncached_prefill_ms_per_token
     cached_prefill_work = (
-        cached_toks
-        * profile.uncached_prefill_ms_per_token
-        * profile.cached_prefill_discount_factor
+        cached_toks * profile.uncached_prefill_ms_per_token * profile.cached_prefill_discount_factor
     )
     total_prefill_work = uncached_prefill_work + cached_prefill_work
     decode_work = max(1, gen_toks) * profile.decode_ms_per_token if gen_toks > 0 else 0.0
@@ -437,16 +439,14 @@ def attribute_context_latency(
         else ctx_latency_ms
     )
 
-    ctx_ratio = (ctx_latency_ms / total_ms) if total_ms > 0.0 else (
-        (total_prefill_work / combined_work) if combined_work > 0.0 else 0.0
+    ctx_ratio = (
+        (ctx_latency_ms / total_ms)
+        if total_ms > 0.0
+        else ((total_prefill_work / combined_work) if combined_work > 0.0 else 0.0)
     )
     ctx_ratio = max(0.0, min(1.0, ctx_ratio))
 
-    per_1k_ms = (
-        (ctx_latency_ms / (total_ctx_toks / 1000.0))
-        if total_ctx_toks > 0
-        else 0.0
-    )
+    per_1k_ms = (ctx_latency_ms / (total_ctx_toks / 1000.0)) if total_ctx_toks > 0 else 0.0
 
     # Prefill latency saved because cached_toks avoided full uncached prefill
     cache_saved_ms = (
@@ -456,10 +456,9 @@ def attribute_context_latency(
     )
 
     # USD token cost & cached-token discount savings
-    input_cost_usd = (
-        (uncached_toks / 1_000_000.0) * profile.uncached_input_usd_per_1m
-        + (cached_toks / 1_000_000.0) * profile.cached_input_usd_per_1m
-    )
+    input_cost_usd = (uncached_toks / 1_000_000.0) * profile.uncached_input_usd_per_1m + (
+        cached_toks / 1_000_000.0
+    ) * profile.cached_input_usd_per_1m
     uncached_input_baseline_usd = (
         (uncached_toks + cached_toks) / 1_000_000.0
     ) * profile.uncached_input_usd_per_1m
@@ -470,7 +469,7 @@ def attribute_context_latency(
 
     return ModelContextLatencyRecord(
         call_id=f"llm-ctx-{uuid.uuid4().hex[:12]}",
-        timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        timestamp=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         agent_name=agent_name,
         model_name=model_name,
         task_category=task_category,
@@ -645,9 +644,7 @@ class ContextLatencyTracker:
 
         return ContextLatencySummary(
             total_calls=len(items),
-            total_context_tokens=sum(
-                r.context_breakdown.total_context_tokens for r in items
-            ),
+            total_context_tokens=sum(r.context_breakdown.total_context_tokens for r in items),
             total_cached_context_tokens=sum(
                 r.context_breakdown.cached_context_tokens for r in items
             ),
@@ -659,9 +656,7 @@ class ContextLatencyTracker:
             mean_context_latency_ms=round(sum(ctx_latencies) / len(ctx_latencies), 3),
             p50_context_latency_ms=round(_percentile(ctx_latencies, 50.0), 3),
             p95_context_latency_ms=round(_percentile(ctx_latencies, 95.0), 3),
-            mean_total_model_latency_ms=round(
-                sum(total_latencies) / len(total_latencies), 3
-            ),
+            mean_total_model_latency_ms=round(sum(total_latencies) / len(total_latencies), 3),
             p95_ttft_ms=round(_percentile(ttfts, 95.0), 3),
             ttft_slo_target_ms=TTFT_SLO_TARGET_MS,
             ttft_slo_compliance_ratio=round(within_slo / len(items), 4),
@@ -795,16 +790,16 @@ class ConversationMemoryManager:
                     "compaction_count": 0,
                     "memory_summary_text": "",
                     "memory_tokens": 0,
-                    "memory_lookup_latency_ms": round(
-                        (time.perf_counter() - t0) * 1000.0, 3
-                    ),
+                    "memory_lookup_latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
                 }
 
             lines: list[str] = []
             if sess.compacted_summary:
                 lines.append(f"[Compacted Prior Context]: {sess.compacted_summary}")
             for t in sess.turns[-self.retention_turns :]:
-                highlights = "; ".join(t.variance_highlights[:2]) if t.variance_highlights else "N/A"
+                highlights = (
+                    "; ".join(t.variance_highlights[:2]) if t.variance_highlights else "N/A"
+                )
                 lines.append(
                     f"[Turn {t.turn_index} | {','.join(t.tickers) or t.gics_sector} FY{t.start_year}-FY{t.end_year}]: "
                     f"Query='{t.query}' -> {highlights}"
@@ -858,7 +853,7 @@ class ConversationMemoryManager:
             turn_text = f"{query}\n{answer_markdown}"
             entry = TurnMemoryEntry(
                 turn_index=len(sess.turns) + 1,
-                timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                timestamp=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 query=query,
                 intent=intent,
                 tickers=list(tickers),
@@ -881,10 +876,7 @@ class ConversationMemoryManager:
             total_mem_tokens = sum(t.token_estimate for t in sess.turns) + estimate_token_count(
                 sess.compacted_summary
             )
-            if (
-                total_mem_tokens >= self.token_threshold
-                and len(sess.turns) > self.retention_turns
-            ):
+            if total_mem_tokens >= self.token_threshold and len(sess.turns) > self.retention_turns:
                 compaction_triggered = True
                 compacted_tokens_before = total_mem_tokens
                 older_turns = sess.turns[: -self.retention_turns]
@@ -894,7 +886,11 @@ class ConversationMemoryManager:
                     digest_parts.append(sess.compacted_summary)
                 for old in older_turns:
                     tk_str = ",".join(old.tickers) if old.tickers else old.gics_sector
-                    hl_str = "; ".join(old.variance_highlights[:1]) if old.variance_highlights else old.intent
+                    hl_str = (
+                        "; ".join(old.variance_highlights[:1])
+                        if old.variance_highlights
+                        else old.intent
+                    )
                     digest_parts.append(
                         f"T{old.turn_index}({tk_str} FY{old.start_year}-{old.end_year}): {hl_str}"
                     )

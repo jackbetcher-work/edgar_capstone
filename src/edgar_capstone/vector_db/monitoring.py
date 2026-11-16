@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-from datetime import datetime, timezone
 import json
 import logging
-import math
+from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Any
 
 import google.auth
-from google.auth.transport.requests import Request as GoogleAuthRequest
 import httpx
 import numpy as np
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.vector_db.models import (
@@ -143,14 +142,11 @@ def evaluate_chunk_health(
         if expected_profile_ids
         else indexed_profile_ids
     )
-    missing_profile_ids = [
-        pid for pid in expected_profile_ids if pid not in chunks_by_profile
-    ]
+    missing_profile_ids = [pid for pid in expected_profile_ids if pid not in chunks_by_profile]
     incomplete_section_profile_ids = [
         pid
         for pid in expected_profile_ids
-        if pid in chunks_by_profile
-        and not {"item_1a", "item_7"}.issubset(chunks_by_profile[pid])
+        if pid in chunks_by_profile and not {"item_1a", "item_7"}.issubset(chunks_by_profile[pid])
     ]
     profiles_with_both_sections = sum(
         1
@@ -181,9 +177,7 @@ def evaluate_chunk_health(
         by_section_chunks[c.section_id].append(c)
         by_sector_chunks[c.gics_sector or "Unknown"].append(c)
 
-        has_emb, dim_ok, finite_ok = _is_valid_finite_embedding(
-            c.embedding, expected_embedding_dim
-        )
+        has_emb, dim_ok, finite_ok = _is_valid_finite_embedding(c.embedding, expected_embedding_dim)
         if not has_emb:
             anomalies.missing_embedding += 1
         elif not dim_ok:
@@ -295,7 +289,7 @@ def build_cloud_monitoring_timeseries(
     Aligns 1:1 with the custom metric descriptors and dashboard widgets provisioned
     in `terraform/monitoring.tf`.
     """
-    end_time = timestamp_rfc3339 or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_time = timestamp_rfc3339 or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     resource = {
         "type": "global",
         "labels": {"project_id": report.project_id},
@@ -363,7 +357,6 @@ def build_cloud_monitoring_timeseries(
     )
 
     # 4. Total chunks broken down by GICS sector & section
-    sector_section_counts: dict[tuple[str, str], int] = defaultdict(int)
     for sec_id, sec_breakdown in report.by_section.items():
         _add_gauge(
             "token_count_mean",

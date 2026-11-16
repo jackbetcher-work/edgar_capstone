@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 import re
 import time
+from collections import defaultdict
 from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
@@ -107,12 +107,8 @@ _SECTOR_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 _YEAR_MENTION_RE = re.compile(r"\b(?:FY\s*)?(202[0-6])\b", re.IGNORECASE)
-_ITEM_1A_ONLY_RE = re.compile(
-    r"\b(?:item\s*1a|risk\s+factors?)\b", re.IGNORECASE
-)
-_ITEM_7_ONLY_RE = re.compile(
-    r"\b(?:item\s*7|md&a|management'?s\s+discussion)\b", re.IGNORECASE
-)
+_ITEM_1A_ONLY_RE = re.compile(r"\b(?:item\s*1a|risk\s+factors?)\b", re.IGNORECASE)
+_ITEM_7_ONLY_RE = re.compile(r"\b(?:item\s*7|md&a|management'?s\s+discussion)\b", re.IGNORECASE)
 
 
 def _format_usd_compact(value: float | None) -> str:
@@ -462,7 +458,7 @@ def _synthesize_grounded_report(
         )
         lines.append(
             f"Cross-filing hybrid retrieval combining 768-d semantic similarity and lexical keyword matching "
-            f"for query: *\"{query.strip()}\"*."
+            f'for query: *"{query.strip()}"*.'
         )
 
     # 2. Deterministic Quantitative Findings (100% agreement with calculation engine)
@@ -522,7 +518,7 @@ def _synthesize_grounded_report(
                     sec_title = cit.get("section_title") or cit["section_id"].upper()
                     lines.append(
                         f"- **{cit['company_name']} ({cit['ticker']}) — {sec_title}:** "
-                        f"\"{_clean_10k_excerpt(cit['excerpt'], 290)}\" {_format_inline_citation(cit)}"
+                        f'"{_clean_10k_excerpt(cit["excerpt"], 290)}" {_format_inline_citation(cit)}'
                     )
         else:
             item7_cits = [c for c in citations if c["section_id"] == "item_7"]
@@ -534,7 +530,7 @@ def _synthesize_grounded_report(
                     sec_title = cit.get("section_title") or "Item 7. MD&A"
                     lines.append(
                         f"- **{cit['ticker']} FY{cit['fiscal_year']} ({sec_title}):** "
-                        f"\"{_clean_10k_excerpt(cit['excerpt'], 300)}\" {_format_inline_citation(cit)}"
+                        f'"{_clean_10k_excerpt(cit["excerpt"], 300)}" {_format_inline_citation(cit)}'
                     )
 
             if item1a_cits:
@@ -543,7 +539,7 @@ def _synthesize_grounded_report(
                     sec_title = cit.get("section_title") or "Item 1A. Risk Factors"
                     lines.append(
                         f"- **{cit['ticker']} FY{cit['fiscal_year']} ({sec_title}):** "
-                        f"\"{_clean_10k_excerpt(cit['excerpt'], 300)}\" {_format_inline_citation(cit)}"
+                        f'"{_clean_10k_excerpt(cit["excerpt"], 300)}" {_format_inline_citation(cit)}'
                     )
     else:
         lines.append(
@@ -911,9 +907,14 @@ def run_conversational_rag_turn(
     )
 
     # If user ran a broad query without naming specific tickers, compute variances for top cited issuers
-    if not variance_reports and citations and intent in (
-        "longitudinal_single_company",
-        "multi_company_peer_comparison",
+    if (
+        not variance_reports
+        and citations
+        and intent
+        in (
+            "longitudinal_single_company",
+            "multi_company_peer_comparison",
+        )
     ):
         inferred_tickers = []
         for cit in citations:
@@ -1129,7 +1130,9 @@ def run_conversational_rag_turn(
             projection_blocked=bool(raw_plugin_dec.get("projection_blocked", False)),
             original_text="",
             sanitized_text="",
-            matched_categories=tuple(raw_plugin_dec.get("matched_categories") or ("policy_violation",)),
+            matched_categories=tuple(
+                raw_plugin_dec.get("matched_categories") or ("policy_violation",)
+            ),
             sdp_info_types=tuple(raw_plugin_dec.get("sdp_info_types") or ()),
             block_message=str(
                 react_result.get("model_armor_response_block_message") or answer_markdown
@@ -1226,12 +1229,8 @@ def run_conversational_rag_turn(
                 "execution_mode": active_execution_mode,
                 "iterations": len(react_steps),
                 "steps": [s.model_dump(mode="json") for s in react_steps],
-                "variance_evaluations": [
-                    v.model_dump(mode="json") for v in variance_evaluations
-                ],
-                "cached_10k_explanations": [
-                    e.model_dump(mode="json") for e in cached_explanations
-                ],
+                "variance_evaluations": [v.model_dump(mode="json") for v in variance_evaluations],
+                "cached_10k_explanations": [e.model_dump(mode="json") for e in cached_explanations],
             },
             "context_and_memory": {
                 "models": get_model_strategy_metadata(),
@@ -1299,9 +1298,7 @@ def run_conversational_rag_turn(
 
     # Persist turn into ConversationMemoryManager (with automatic Gemini 3.5 Flash compaction if over threshold)
     variance_highlights = [
-        ev.material_findings[0]
-        for ev in variance_evaluations
-        if ev.material_findings
+        ev.material_findings[0] for ev in variance_evaluations if ev.material_findings
     ]
     memory_persist = memory_mgr.record_turn(
         session_id=session_id,
@@ -1373,12 +1370,8 @@ def run_conversational_rag_turn(
             "observed_ttft_ms": adk_runtime_meta.get("observed_ttft_ms"),
             "iterations": len(react_steps),
             "steps": [s.model_dump(mode="json") for s in react_steps],
-            "variance_evaluations": [
-                v.model_dump(mode="json") for v in variance_evaluations
-            ],
-            "cached_10k_explanations": [
-                e.model_dump(mode="json") for e in cached_explanations
-            ],
+            "variance_evaluations": [v.model_dump(mode="json") for v in variance_evaluations],
+            "cached_10k_explanations": [e.model_dump(mode="json") for e in cached_explanations],
         },
         "context_and_memory": {
             "models": get_model_strategy_metadata(),
@@ -1387,9 +1380,7 @@ def run_conversational_rag_turn(
                 "persistence": memory_persist,
             },
             "turn_context_latency": turn_latency_summary.model_dump(mode="json"),
-            "model_call_records": [
-                r.model_dump(mode="json") for r in turn_latency_records
-            ],
+            "model_call_records": [r.model_dump(mode="json") for r in turn_latency_records],
             "global_context_latency": (
                 get_context_latency_tracker().summarize().model_dump(mode="json")
             ),

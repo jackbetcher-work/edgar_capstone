@@ -8,9 +8,8 @@ from pathlib import Path
 
 import httpx
 
-from edgar_capstone.dataset.paths import resolve_sp500_constituents_csv
-
 from edgar_capstone.dataset.models import CompanyConstituent
+from edgar_capstone.dataset.paths import resolve_sp500_constituents_csv
 
 logger = logging.getLogger(__name__)
 
@@ -162,8 +161,6 @@ def load_constituents(
 
     if sector_filter:
         needle = sector_filter.strip().lower()
-        resolved = [
-            comp for comp in resolved if comp.gics_sector.strip().lower() == needle
-        ]
+        resolved = [comp for comp in resolved if comp.gics_sector.strip().lower() == needle]
 
     return resolved

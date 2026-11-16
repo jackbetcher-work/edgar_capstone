@@ -11,10 +11,10 @@ Implements:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import StrEnum
 import os
 import re
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID
@@ -148,7 +148,9 @@ class CloudIdentityRoleDefinition:
     gcp_iam_roles: tuple[str, ...]
     permissions: frozenset[str]
 
-    def to_public_dict(self, *, default_domain: str = DEFAULT_CLOUD_IDENTITY_DOMAIN) -> dict[str, Any]:
+    def to_public_dict(
+        self, *, default_domain: str = DEFAULT_CLOUD_IDENTITY_DOMAIN
+    ) -> dict[str, Any]:
         return {
             "role": self.role,
             "display_name": self.display_name,
@@ -384,13 +386,9 @@ class RuntimeServiceAccountConfig:
             or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
             or DEFAULT_PROJECT_ID
         )
-        project_name = (
-            os.environ.get("GCP_PROJECT_NAME", "").strip()
-            or DEFAULT_PROJECT_NAME
-        )
+        project_name = os.environ.get("GCP_PROJECT_NAME", "").strip() or DEFAULT_PROJECT_NAME
         account_id = (
-            os.environ.get("RUNTIME_SERVICE_ACCOUNT_ID", "").strip()
-            or CUSTOM_RUNTIME_SA_ACCOUNT_ID
+            os.environ.get("RUNTIME_SERVICE_ACCOUNT_ID", "").strip() or CUSTOM_RUNTIME_SA_ACCOUNT_ID
         )
         explicit_sa = os.environ.get("RUNTIME_SERVICE_ACCOUNT", "").strip()
         if explicit_sa:
@@ -414,7 +412,13 @@ class RuntimeServiceAccountConfig:
     def allowed_projects(self) -> tuple[str, ...]:
         extra = _split_csv(os.environ.get("ALLOWED_SERVICE_ACCOUNT_PROJECTS"))
         ordered: list[str] = []
-        for candidate in (self.project_id, self.project_name, DEFAULT_PROJECT_ID, DEFAULT_PROJECT_NAME, *extra):
+        for candidate in (
+            self.project_id,
+            self.project_name,
+            DEFAULT_PROJECT_ID,
+            DEFAULT_PROJECT_NAME,
+            *extra,
+        ):
             norm = candidate.strip().lower()
             if norm and norm not in ordered:
                 ordered.append(norm)

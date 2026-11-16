@@ -12,21 +12,22 @@ code in a version-controlled, integrity-hashed prompt store supporting three bac
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
 import json
 import logging
 import os
-from pathlib import Path
 import threading
 import time
-from typing import Any, Callable, Literal
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import quote
 
 import google.auth
-from google.auth.transport.requests import Request as GoogleAuthRequest
 import httpx
 import yaml
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from edgar_capstone.agents.resilience import (
     RateLimitExceededError,
@@ -216,11 +217,7 @@ def _parse_prompt_document(
     )
     release_tag = str(parsed.get("release_tag") or requested_version)
     agent_name = str(parsed.get("agent_name") or parsed.get("displayName") or prompt_id)
-    model_name = str(
-        parsed.get("model")
-        or (parsed.get("promptData") or {}).get("model")
-        or ""
-    )
+    model_name = str(parsed.get("model") or (parsed.get("promptData") or {}).get("model") or "")
     description = str(parsed.get("description") or "").strip()
     safety_policy = dict(parsed.get("safety_policy") or {})
     extra_meta: dict[str, Any] = {}
@@ -252,9 +249,7 @@ def _raise_for_prompt_http_status(resp: httpx.Response, service_label: str) -> N
     if resp.status_code == 429:
         raise RateLimitExceededError(f"{service_label} HTTP 429 rate limited: {snippet}")
     if resp.status_code in (408, 502, 503, 504):
-        raise UpstreamTimeoutError(
-            f"{service_label} transient HTTP {resp.status_code}: {snippet}"
-        )
+        raise UpstreamTimeoutError(f"{service_label} transient HTTP {resp.status_code}: {snippet}")
     raise ToolExecutionError(f"{service_label} HTTP {resp.status_code}: {snippet}")
 
 
@@ -445,8 +440,7 @@ class VertexPromptStoreBackend:
             resource_path = resource_ref
         else:
             resource_path = (
-                f"projects/{self.project_id}/locations/{self.location}"
-                f"/datasets/{resource_ref}"
+                f"projects/{self.project_id}/locations/{self.location}/datasets/{resource_ref}"
             )
         url = f"https://{self.location}-aiplatform.googleapis.com/v1beta1/{resource_path}"
         if eff_version and "datasetVersions" not in resource_path:
@@ -488,9 +482,7 @@ class VersionedPromptStore:
         storage_client: Any | None = None,
     ) -> None:
         raw_mode = (
-            (backend_mode or os.environ.get("EDGAR_PROMPT_STORE_BACKEND", "auto"))
-            .strip()
-            .lower()
+            (backend_mode or os.environ.get("EDGAR_PROMPT_STORE_BACKEND", "auto")).strip().lower()
         )
         if raw_mode not in ("auto", "local", "gcs", "vertex"):
             raise ValueError(
@@ -499,10 +491,8 @@ class VersionedPromptStore:
             )
         self.backend_mode: PromptBackendMode = raw_mode  # type: ignore[assignment]
         self.default_version = (
-            (default_version or os.environ.get("EDGAR_PROMPT_VERSION", DEFAULT_PROMPT_VERSION))
-            .strip()
-            or DEFAULT_PROMPT_VERSION
-        )
+            default_version or os.environ.get("EDGAR_PROMPT_VERSION", DEFAULT_PROMPT_VERSION)
+        ).strip() or DEFAULT_PROMPT_VERSION
         self.cache_ttl_seconds = cache_ttl_seconds
         self._lock = threading.Lock()
         self._cache: dict[str, tuple[float, PromptArtifact]] = {}
@@ -686,7 +676,9 @@ def get_prompt_store() -> VersionedPromptStore:
         return _GLOBAL_PROMPT_STORE
 
 
-def configure_prompt_store(store: VersionedPromptStore | None = None, **kwargs: Any) -> VersionedPromptStore:
+def configure_prompt_store(
+    store: VersionedPromptStore | None = None, **kwargs: Any
+) -> VersionedPromptStore:
     """Configure or replace the process-wide `VersionedPromptStore` instance."""
     global _GLOBAL_PROMPT_STORE
     with _PROMPT_STORE_LOCK:

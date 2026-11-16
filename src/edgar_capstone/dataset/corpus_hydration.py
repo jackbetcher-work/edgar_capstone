@@ -28,17 +28,17 @@ Runtime controls (all optional):
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 import logging
 import os
-from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Literal
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Literal
 
 from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_BUCKET_NAME,
@@ -50,9 +50,7 @@ from edgar_capstone.dataset.paths import resolve_curated_dataset_dir
 logger = logging.getLogger(__name__)
 
 HydrationMode = Literal["off", "auto", "required"]
-HydrationStatus = Literal[
-    "disabled", "hydrated", "up_to_date", "dry_run", "partial", "failed"
-]
+HydrationStatus = Literal["disabled", "hydrated", "up_to_date", "dry_run", "partial", "failed"]
 
 FINANCIALS_MANIFEST_REL = "manifests/bigquery_financials.jsonl"
 CHUNKS_MANIFEST_REL = "manifests/bigquery_filing_chunks.jsonl"
@@ -258,11 +256,9 @@ def _build_storage_client(project_id: str) -> Any:
     return storage.Client(project=project_id)
 
 
-def _finalize(
-    result: CorpusHydrationResult, started: float
-) -> CorpusHydrationResult:
+def _finalize(result: CorpusHydrationResult, started: float) -> CorpusHydrationResult:
     result.duration_ms = round((time.perf_counter() - started) * 1000.0, 3)
-    result.completed_at = datetime.now(timezone.utc).isoformat()
+    result.completed_at = datetime.now(UTC).isoformat()
     return result
 
 
@@ -292,7 +288,9 @@ def hydrate_local_corpus(
         bucket = client.bucket(config.bucket_name)
     except Exception as exc:  # DefaultCredentialsError, invalid project, etc.
         result.status = "failed"
-        result.errors.append(f"Unable to initialize GCS client for gs://{config.bucket_name}: {exc}")
+        result.errors.append(
+            f"Unable to initialize GCS client for gs://{config.bucket_name}: {exc}"
+        )
         return _finalize(result, started)
 
     planned: dict[str, _PlannedDownload] = {}
@@ -424,7 +422,7 @@ def run_startup_corpus_hydration(
             dataset_dir=str(cfg.dataset_dir),
             scopes=list(cfg.scopes),
             tickers=sorted(cfg.tickers),
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
         )
         _LAST_HYDRATION_RESULT = result
         return result
@@ -440,7 +438,7 @@ def run_startup_corpus_hydration(
             scopes=list(cfg.scopes),
             tickers=sorted(cfg.tickers),
             errors=[f"Unexpected corpus hydration error: {exc}"],
-            completed_at=datetime.now(timezone.utc).isoformat(),
+            completed_at=datetime.now(UTC).isoformat(),
         )
 
     _LAST_HYDRATION_RESULT = result
@@ -483,14 +481,15 @@ def describe_local_corpus(dataset_dir: Path | None = None) -> dict[str, Any]:
     root = Path(dataset_dir or resolve_curated_dataset_dir()).resolve()
     financials_manifest = (root / FINANCIALS_MANIFEST_REL).is_file()
     structured_dir = root / "structured"
-    structured_present = structured_dir.is_dir() and next(
-        structured_dir.rglob("*_financials.json"), None
-    ) is not None
+    structured_present = (
+        structured_dir.is_dir()
+        and next(structured_dir.rglob("*_financials.json"), None) is not None
+    )
     chunks_manifest = (root / CHUNKS_MANIFEST_REL).is_file()
     unstructured_dir = root / "unstructured"
-    markdown_present = unstructured_dir.is_dir() and next(
-        unstructured_dir.rglob("*.md"), None
-    ) is not None
+    markdown_present = (
+        unstructured_dir.is_dir() and next(unstructured_dir.rglob("*.md"), None) is not None
+    )
 
     if financials_manifest:
         profile_source = "financials_manifest"

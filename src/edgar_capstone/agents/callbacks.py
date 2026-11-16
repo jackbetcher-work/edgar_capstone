@@ -182,8 +182,8 @@ def before_model_safety_and_latency_callback(
 
     # Managed Google Cloud Model Armor + SDP + Financial Projection guardrail check
     if latest_user_text.strip():
-        already_verified = (
-            state.get("_model_armor_verified_prompt_sha256") == _hash_text(latest_user_text)
+        already_verified = state.get("_model_armor_verified_prompt_sha256") == _hash_text(
+            latest_user_text
         )
         if not already_verified:
             decision = get_model_armor_guardrail().inspect_user_prompt(
@@ -259,8 +259,7 @@ def verify_narrative_against_calculations(
     mentioned_pcts = [float(m) for m in _PERCENT_NUMBER_RE.findall(response_text)]
     if expected_pcts and mentioned_pcts:
         matched_any = any(
-            any(abs(abs(m) - abs(exp)) <= 0.6 for m in mentioned_pcts)
-            for exp in expected_pcts
+            any(abs(abs(m) - abs(exp)) <= 0.6 for m in mentioned_pcts) for exp in expected_pcts
         )
         if not matched_any:
             discrepancies.append(
@@ -307,9 +306,7 @@ def after_model_fact_check_callback(
     )
     raw_observed_ttft = state.get("_observed_ttft_ms")
     state["_observed_ttft_ms"] = None
-    observed_ttft_ms = (
-        float(raw_observed_ttft) if raw_observed_ttft is not None else None
-    )
+    observed_ttft_ms = float(raw_observed_ttft) if raw_observed_ttft is not None else None
     prep_ms = float(state.get("_context_prep_latency_ms", 0.0) or 0.0)
 
     agent_name = str(getattr(callback_context, "agent_name", "") or "UnknownAgent")
@@ -329,8 +326,8 @@ def after_model_fact_check_callback(
             uncached_context_tokens=fallback_toks,
         )
 
-    reconciled_breakdown, output_tokens, thoughts_tokens = (
-        reconcile_breakdown_with_usage_metadata(base_breakdown, llm_response)
+    reconciled_breakdown, output_tokens, thoughts_tokens = reconcile_breakdown_with_usage_metadata(
+        base_breakdown, llm_response
     )
 
     response_text = ""
@@ -352,7 +349,12 @@ def after_model_fact_check_callback(
     # Infer ReAct phase from tool calls or final answer synthesis
     if has_function_call:
         if any(
-            t in ("calculate_period_variances", "fetch_financial_metrics", "query_looker_financial_explore")
+            t
+            in (
+                "calculate_period_variances",
+                "fetch_financial_metrics",
+                "query_looker_financial_explore",
+            )
             for t in called_tools
         ):
             react_phase = "evaluate_variances"
@@ -368,10 +370,7 @@ def after_model_fact_check_callback(
 
     inv_ctx = getattr(callback_context, "_invocation_context", None)
     adk_session = getattr(inv_ctx, "session", None)
-    cb_session_id = (
-        getattr(adk_session, "id", None)
-        or state.get("session_id")
-    )
+    cb_session_id = getattr(adk_session, "id", None) or state.get("session_id")
     cb_user_id = (
         getattr(inv_ctx, "user_id", None)
         or getattr(adk_session, "user_id", None)
@@ -431,7 +430,8 @@ def after_model_fact_check_callback(
             "phase": react_phase,
             "agent": agent_name,
             "model_used": model_name,
-            "thought": thought_text.strip() or (
+            "thought": thought_text.strip()
+            or (
                 f"Selected tool(s): {', '.join(called_tools)}"
                 if called_tools
                 else "Synthesized final grounded response."

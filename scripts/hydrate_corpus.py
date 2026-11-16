@@ -23,8 +23,8 @@ import argparse
 import json
 import logging
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -81,8 +81,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Restrict unstructured/structured downloads to these tickers (e.g. NVDA AAPL).",
     )
-    parser.add_argument("--overwrite", action="store_true", help="Re-download files that already exist.")
-    parser.add_argument("--dry-run", action="store_true", help="List planned downloads without writing files.")
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Re-download files that already exist."
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="List planned downloads without writing files."
+    )
     parser.add_argument("--max-workers", type=int, default=8, help="Parallel download workers.")
     parser.add_argument("--json", action="store_true", help="Emit the hydration result as JSON.")
     return parser.parse_args(argv)
@@ -122,7 +126,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Tickers           : {', '.join(result.tickers)}")
         print(f"Status            : {result.status.upper()}")
         print(f"Objects considered: {result.objects_considered}")
-        print(f"Downloaded        : {result.downloaded_objects} ({result.bytes_downloaded:,} bytes)")
+        print(
+            f"Downloaded        : {result.downloaded_objects} ({result.bytes_downloaded:,} bytes)"
+        )
         print(f"Skipped (present) : {result.skipped_existing}")
         if result.planned_objects:
             print("Planned (sample)  :")

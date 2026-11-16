@@ -10,9 +10,9 @@ import time
 from typing import Any, Literal
 
 import google.auth
-from google.auth.transport.requests import Request as GoogleAuthRequest
 import httpx
 import numpy as np
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from edgar_capstone.vector_db.models import FilingChunk
 

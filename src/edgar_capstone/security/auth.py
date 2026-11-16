@@ -9,18 +9,19 @@ audit logging.
 from __future__ import annotations
 
 import base64
-from collections import deque
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import logging
 import os
 import threading
 import time
-from typing import Any
 import uuid
+from collections import deque
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
 
+import httpx
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
@@ -29,11 +30,10 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
     encode_dss_signature,
 )
 from fastapi import Depends, HTTPException, Request, status
-import httpx
 
 from edgar_capstone.security.agent_identity import (
-    AgentAuthorizationError,
     S2S_AGENT_ASSERTION_HEADER,
+    AgentAuthorizationError,
     get_agent_s2s_broker,
     resolve_agent_by_service_account_id,
     resolve_agent_identity,
@@ -309,11 +309,9 @@ class AuthSettings:
         strict_mode = is_production_iap_mode()
         raw_iap_aud = os.environ.get("INTERNAL_IAP_AUDIENCE", "").strip()
 
-        if (
-            not raw_iap_aud
-            and os.environ.get("IAP_RESOLVE_AUDIENCE_FROM_SECRET_MANAGER", "").lower()
-            in {"1", "true", "yes"}
-        ):
+        if not raw_iap_aud and os.environ.get(
+            "IAP_RESOLVE_AUDIENCE_FROM_SECRET_MANAGER", ""
+        ).lower() in {"1", "true", "yes"}:
             try:
                 client = secret_client or SecretManagerClient()
                 secret = client.get_secret(
@@ -322,7 +320,9 @@ class AuthSettings:
                 )
                 raw_iap_aud = secret.get_secret_value().strip()
             except Exception as exc:
-                logger.warning("Unable to resolve IAP audience from Secret Manager: %s", type(exc).__name__)
+                logger.warning(
+                    "Unable to resolve IAP audience from Secret Manager: %s", type(exc).__name__
+                )
 
         okta_client_id = os.environ.get("OKTA_CLIENT_ID", "").strip() or None
         google_client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip() or None
@@ -377,9 +377,8 @@ class AuthSettings:
                 or ("sec-edgar-viewers", "sec-edgar-auditors", "compliance-auditors")
             )
         )
-        cloud_identity_domain = (
-            os.environ.get("CLOUD_IDENTITY_DOMAIN", "").strip().lower()
-            or (allowed_domains[0] if allowed_domains else DEFAULT_CLOUD_IDENTITY_DOMAIN)
+        cloud_identity_domain = os.environ.get("CLOUD_IDENTITY_DOMAIN", "").strip().lower() or (
+            allowed_domains[0] if allowed_domains else DEFAULT_CLOUD_IDENTITY_DOMAIN
         )
         runtime_sa_cfg = RuntimeServiceAccountConfig.from_env()
         allowed_custom_sas = tuple(
@@ -580,9 +579,7 @@ def record_security_audit_event(
         ticker_list = []
 
     now_epoch = round(time.time(), 3)
-    now_iso = datetime.fromtimestamp(now_epoch, tz=timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    now_iso = datetime.fromtimestamp(now_epoch, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     entry = {
         "event_id": f"aud-{uuid.uuid4().hex[:12]}",
         "recorded_at": now_iso,
@@ -708,7 +705,9 @@ class JwksKeyStore:
             if jwk is not None:
                 return jwk_to_public_key(jwk)
             # Unknown kid: refresh if minimum interval elapsed (key rotation handling)
-            if (now - cached[0]) < self.min_refresh_interval_seconds and jwks_uri not in self._static_jwks:
+            if (
+                now - cached[0]
+            ) < self.min_refresh_interval_seconds and jwks_uri not in self._static_jwks:
                 raise AuthenticationError(f"Signing key kid={kid!r} not found in cached JWKS.")
 
         fresh_map = self._fetch_jwks(jwks_uri)
@@ -717,7 +716,9 @@ class JwksKeyStore:
 
         jwk = fresh_map.get(kid)
         if jwk is None:
-            raise AuthenticationError(f"Signing key kid={kid!r} not found in identity provider JWKS.")
+            raise AuthenticationError(
+                f"Signing key kid={kid!r} not found in identity provider JWKS."
+            )
         return jwk_to_public_key(jwk)
 
 
@@ -819,9 +820,7 @@ class IAPJwtVerifier:
 
     def _validate_audience(self, claims: dict[str, Any]) -> str:
         if not self.settings.audiences:
-            raise AuthenticationError(
-                "IAP OAuth2 / JWT audience is not configured on the server."
-            )
+            raise AuthenticationError("IAP OAuth2 / JWT audience is not configured on the server.")
 
         aud_claim = claims.get("aud")
         if isinstance(aud_claim, str):
@@ -942,7 +941,9 @@ class IAPJwtVerifier:
             hosted_domain: str | None = hd_claim.strip().lower()
         elif not is_gcp_sa and "@" in email:
             email_domain = email.rsplit("@", 1)[1].lower()
-            hosted_domain = None if email_domain in {"gmail.com", "googlemail.com"} else email_domain
+            hosted_domain = (
+                None if email_domain in {"gmail.com", "googlemail.com"} else email_domain
+            )
         else:
             hosted_domain = None
 
@@ -1013,7 +1014,9 @@ class IAPJwtVerifier:
         if not isinstance(issuer, str) or not issuer.strip():
             raise AuthenticationError("JWT payload is missing 'iss' claim.")
         if require_iap_issuer and issuer != GOOGLE_IAP_ISSUER:
-            raise AuthenticationError("IAP assertion header must be issued by https://cloud.google.com/iap.")
+            raise AuthenticationError(
+                "IAP assertion header must be issued by https://cloud.google.com/iap."
+            )
 
         jwks_uri, idp = self._resolve_issuer_target(issuer)
         if idp == "google_iap" and alg != "ES256":
@@ -1061,9 +1064,7 @@ class IAPJwtVerifier:
         sso_federation = "google_workspace_okta_sso"
         if email.endswith(".gserviceaccount.com"):
             sso_federation = (
-                "gcp_agent_workload_identity"
-                if agent_identity
-                else "gcp_iam_service_account"
+                "gcp_agent_workload_identity" if agent_identity else "gcp_iam_service_account"
             )
 
         return AuthenticatedUser(
