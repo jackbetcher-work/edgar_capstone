@@ -1,6 +1,16 @@
-# Terraform — SEC EDGAR Hybrid RAG Vector Database, BigQuery & Chunk Health Monitoring
+# Terraform — SEC EDGAR Natural Language Analyst Infrastructure
 
-Provisions the BigQuery data & vector search foundation, Vertex AI Vector Search (Matching Engine), Vertex AI Search (Discovery Engine), and the Google Cloud Monitoring chunk health dashboard in project `iron-radio-514217-q7` (`us-central1`) with remote Terraform state stored in `gs://iron-radio-514217-q7-tfstate`.
+Provisions the whole stack in project `iron-radio-514217-q7` (`us-central1`), with remote state in `gs://iron-radio-514217-q7-tfstate`:
+
+- the GCS corpus bucket and the BigQuery data, vector, and telemetry foundation;
+- Vertex AI Vector Search and Vertex AI Search;
+- Firestore feedback, Model Armor, and Sensitive Data Protection;
+- IAM and per-agent identities, Secret Manager, Cloud Run, and IAP (directly on the service, or behind an HTTPS load balancer);
+- an optional VPC Service Controls perimeter;
+- Cloud Build triggers;
+- Cloud Monitoring dashboards and the request-latency metric.
+
+Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
 
 ## Provisioned Resources
 
@@ -16,7 +26,7 @@ Provisions the BigQuery data & vector search foundation, Vertex AI Vector Search
   - `v_filing_chunk_coverage`: Per-filing (`profile_id`, `ticker`, `fiscal_year`) diagnostic view reporting exact `item_1a_chunks`, `item_7_chunks`, `valid_embedding_chunks`, and `filing_chunk_status`.
   - `v_chunk_health_metrics`: Chunk health monitoring SQL view computing ROLLUP health metrics by `(gics_sector, section_id)` including `embedding_coverage_ratio`, `filing_coverage_ratio`, token/character percentiles (`p50`, `p95`), anomaly counts (`missing_embedding`, `dimension_mismatch`, `undersized`, `oversized`, `missing_metadata`), and composite `health_score` (`0–100`) & `health_status` (`HEALTHY`, `DEGRADED`, `UNHEALTHY`).
 - **BigQuery Streaming Telemetry & Audit Sinks + Cloud Logging Sink (`terraform/telemetry.tf`, `terraform/schemas/*.json`):**
-  - `llm_telemetry_events`: Day-partitioned (`recorded_at`), clustered (`model_name, agent_name, task_category`) sink table capturing per-call cached/uncached input tokens, output/thoughts tokens, USD token cost, 75% cached-token discount savings, and prefill/decode/TTFT latency.
+  - `llm_telemetry_events`: Day-partitioned (`recorded_at`), clustered (`model_name, agent_name, task_category`) sink table capturing per-call cached/uncached input tokens, output/thoughts tokens, USD token cost, cached-token discount savings, prefill/decode/TTFT latency, and the request `trace_id`.
   - `session_telemetry_events`: Day-partitioned (`recorded_at`), clustered (`intent, execution_mode, user_id`) sink table capturing conversational session length, cumulative companies analyzed, report generation counts, ADK tool invocations, and turn latency/cost.
   - `security_audit_logs`: Day-partitioned (`recorded_at`), clustered (`event_type, status, user_email`) sink table capturing IAP/Workspace/Okta SSO authentication and 10-K filing access audit trails.
   - `v_telemetry_cost_and_latency`: Analytical SQL view aggregating daily model/agent token volume, USD cost, cached-token savings, cache hit rate, p95 latency, and TTFT SLO compliance for Looker BI.
@@ -26,7 +36,8 @@ Provisions the BigQuery data & vector search foundation, Vertex AI Vector Search
   - `google_firestore_database.analyst_feedback_db`: Regional `FIRESTORE_NATIVE` database (`(default)`) persisting analyst thumbs-up/down ratings and audit comments (`analyst_feedback` collection), with `roles/datastore.user` granted to `sec-analyst-sa`.
 - **Vertex AI Vector Search (`terraform/vector_search.tf`):**
   - `sec-edgar-10k-chunks-index` (`google_vertex_ai_index`): 768-dimensional `COSINE_DISTANCE` Tree-AH ANN index backed by `gs://fde-sec-edgar-sandbox-dev-sec-corpus/vector_search/embeddings` with string `restricts` (`ticker`, `cik`, `gics_sector`, `gics_sub_industry`, `section_id`, `form_type`, `profile_id`), `numeric_restricts` (`fiscal_year`), and `crowding_tag` (`ticker`).
-  - `sec-edgar-10k-chunks-endpoint` (`google_vertex_ai_index_endpoint`): Public Index Endpoint for low-latency metadata-filtered vector retrieval.
+  - `sec-edgar-10k-chunks-endpoint` (`google_vertex_ai_index_endpoint`): Public Index Endpoint for low-latency metadata-filtered vector retrieval. Private Service Connect is still open (README gap 2).
+  - The index only gets data once `seed_vertex_vector_index = true` points it at `vector_search/embeddings` in the bucket. Those embeddings haven't been uploaded yet.
 - **Vertex AI Search / Discovery Engine (`terraform/vector_search.tf`):**
   - `sec-edgar-10k-corpus-ds` (`google_discovery_engine_data_store`) & `sec-edgar-10k-hybrid-search` (`google_discovery_engine_search_engine`): Unstructured 10-K search datastore and Enterprise LLM-enabled search app.
 - **Google Cloud Monitoring Chunk Health View (`terraform/monitoring.tf`):**
@@ -39,6 +50,13 @@ Provisions the BigQuery data & vector search foundation, Vertex AI Vector Search
     - `anomaly_chunk_count` (anomaly counts labeled by `anomaly_type`)
   - `chunk_health_dashboard` (`google_monitoring_dashboard`): 12-column Cloud Monitoring dashboard with KPI scorecards, GICS sector/section chunk distribution charts, anomaly breakdown bars, token length trends, BigQuery query execution telemetry, and a structured logs panel (`jsonPayload.event_type="sec_edgar_chunk_health_evaluation"`).
 - **BigQuery Cloud Resource Connection (`vertex-ai-rag-conn`):** Granted `roles/aiplatform.user` and `roles/storage.objectViewer` on the SEC corpus bucket.
+- **Gemini models & APIs (`terraform/variables.tf`, `terraform/apis.tf`):**
+  - `financial_reasoning_model` (default `gemini-3.8-flash`), `coding_and_evaluation_model` (`gemini-3.5-flash`), and `gemini_location` (`global`) become Cloud Run's `EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`, and `EDGAR_GEMINI_LOCATION`. The Cloud Build triggers pass the same values.
+  - The project can't reach `gemini-2.5-pro`, and both Flash models are served only from the `global` endpoint. BigQuery, GCS, Model Armor, and embeddings stay in `var.region`.
+  - `serviceconsumermanagement.googleapis.com` is enabled because Vertex AI context caching needs it to provision its tenant project.
+- **Observability (`terraform/observability.tf`):**
+  - `google_logging_metric.api_request_latencies` is a log-based distribution metric (`logging.googleapis.com/user/sec_edgar/api_request_latencies`). It is built from the app's `http_request_completed` access logs, labeled by route, method, and status, with trace exemplars.
+  - The three telemetry tables carry a nullable `trace_id` column. See [`docs/observability.md`](../docs/observability.md).
 - **Role-Based Access Control via Cloud Identity Groups (`terraform/iam.tf`, `terraform/iap_and_sso.tf`):**
   - `google_cloud_identity_group.rbac_groups`: Optional provisioning of Google Cloud Identity security groups (`sec-edgar-admins`, `sec-edgar-analysts`, `sec-edgar-viewers`), plus variable validation strictly prohibiting individual `user:` bindings.
   - Group-scoped IAM bindings (`group:<group-id>@<domain>`) across IAP (`roles/iap.httpsResourceAccessor`), BigQuery (`roles/bigquery.dataViewer` / `roles/bigquery.metadataViewer`), Discovery Engine (`roles/discoveryengine.viewer`), and Cloud Run/Logging/Monitoring observability for Admins.
@@ -66,7 +84,7 @@ Provisions the BigQuery data & vector search foundation, Vertex AI Vector Search
   - `google_cloudbuild_trigger.main_deploy`: on pushes or merges matching `cloudbuild_trigger_branch_regex` (default `^main$`), runs `cloudbuild.yaml` with `_PIPELINE_MODE=deploy`. That covers the lint and test gates, container build and smoke test, push to Artifact Registry, and Cloud Run deploy.
   - `google_cloudbuild_trigger.pull_request_verify`: on pull requests into `main`, runs the same file with `_PIPELINE_MODE=verify`, which skips the push and deploy. PRs from external contributors need a `/gcbrun` comment first.
   - `google_service_account.cloudbuild_runner` (`sec-edgar-cloudbuild-sa`) is a dedicated least-privilege identity. Its roles are `roles/logging.logWriter`, `roles/run.developer`, Artifact Registry writer on the app repository only, `roles/iam.serviceAccountUser` on `sec-analyst-sa`, and Secret Accessor on the three managed secrets.
-  - Triggers pass `_REGION`, `_GAR_REPOSITORY`, `_SERVICE_NAME`, `_RUNTIME_SA`, `_BIGQUERY_DATASET`, and `_SEC_CORPUS_BUCKET` from Terraform, so the pipeline always matches the deployed config. Changes to Markdown and `docs/**` are ignored.
+  - Triggers pass `_REGION`, `_GAR_REPOSITORY`, `_SERVICE_NAME`, `_RUNTIME_SA`, `_BIGQUERY_DATASET`, `_SEC_CORPUS_BUCKET`, `_ANALYST_MODEL`, `_FLASH_MODEL`, and `_GEMINI_LOCATION` from Terraform, so the pipeline always matches the deployed config. Changes to Markdown and `docs/**` are ignored.
   - One-time setup, done outside Terraform so the GitHub token never enters state:
     ```bash
     # a. Install the "Google Cloud Build" GitHub App on the repo; note the installation ID
@@ -78,6 +96,7 @@ Provisions the BigQuery data & vector search foundation, Vertex AI Vector Search
     #    cloudbuild_github_app_installation_id = <installation-id>
     terraform apply
     ```
+  - Not enabled in the project yet: no triggers exist, so deploys currently go through manual `gcloud builds submit` (or GitHub Actions with `DEPLOY_WITH_GITHUB_ACTIONS=true`).
 
 ## Usage
 
@@ -98,7 +117,14 @@ terraform apply
 # 3. Populate curated SEC 10-K filings & vector DB manifests into the Terraform-managed bucket and BigQuery
 ../.venv/bin/python ../scripts/build_sec_dataset.py --sp500 --no-create-bucket
 ../.venv/bin/python ../scripts/build_vector_db.py --embedding-backend vertex_ai
+# (Already-built artifacts: publish without re-embedding)
+../.venv/bin/python ../scripts/build_vector_db.py --upload-only
+
+# 4. Once vector_search/embeddings/ is in the bucket, attach it to the Vector Search index
+terraform apply -var=seed_vertex_vector_index=true
 ```
+
+Current data state (2026-11-16): the full-index extraction (501 tickers, 3,022 profiles) and 342,945 Vertex-embedded chunks are built. The chunk and financial manifests are in `gs://fde-sec-edgar-sandbox-dev-sec-corpus/manifests/`. BigQuery isn't loaded yet (`filing_chunks` has 0 rows; `financial_metrics` holds the 114-row sample), and `vector_search/embeddings/` isn't uploaded. The remaining steps are tracked as gap 1 in the root README.
 
 ## Example Metadata-Filtered RAG Query (`VECTOR_SEARCH`)
 

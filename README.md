@@ -11,7 +11,7 @@ This document summarizes what is implemented in the repository today, how to run
 ### Prerequisites
 - Python 3.11+
 - Node.js 22+ and `npm`
-- Optional for infrastructure operations: Terraform `>= 1.5` and `gcloud`
+- Optional for infrastructure operations: Terraform `>= 1.7` and `gcloud`
 
 ### Install, Run, and Test
 ```bash
@@ -24,7 +24,7 @@ make dev
 # 3. Or build the frontend bundle and serve the single-origin app from FastAPI (:8000)
 make start
 
-# 4. Run secret scan, backend pytest suite (147 tests), ESLint, and frontend Vitest suite (6 tests)
+# 4. Run secret scan, backend pytest suite (147 tests), ESLint, and frontend Vitest suite (7 tests)
 make test
 
 # 5. Run the CI lint/format gates (ruff check + format --check, terraform fmt/validate, ESLint),
@@ -83,7 +83,7 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 `GET /health` now includes a `corpus` block. It shows the resolved dataset directory, where profiles, chunks, and 10-K sections are coming from (`*_manifest` / `markdown_files` vs. `synthesized_from_profiles`), and the result of the last hydration run.
 
 > [!IMPORTANT]
-> `gs://fde-sec-edgar-sandbox-dev-sec-corpus/` currently has no `manifests/bigquery_filing_chunks.jsonl`. The vector DB artifacts were never uploaded because of an upload bug that is now fixed. Publish the locally staged artifacts once with `.venv/bin/python scripts/build_vector_db.py --upload-only`. Until then, use `HYDRATION_SCOPES=unstructured`. The local tools will chunk the hydrated 10-K Markdown on the fly, using deterministic embeddings.
+> `gs://fde-sec-edgar-sandbox-dev-sec-corpus/manifests/` now holds the full-index manifests, including `bigquery_filing_chunks.jsonl` (342,945 chunks), so `make docker-smoke-hydrated` can hydrate with the default `chunks,unstructured` scopes. The Vector Search embeddings (`vector_search/embeddings/`, about 6 GB locally) are still not in the bucket, and BigQuery hasn't been loaded (see gap 1).
 
 ### Observability: Latency Tracing & Structured Logs
 Each API request is one OpenTelemetry trace, exported to **Cloud Trace**. Every log line is structured JSON carrying the same trace ID and goes to **Cloud Logging**. On Cloud Run (`K_SERVICE` set) both turn on automatically, so Cloud Build and GitHub Actions don't need extra env vars. Locally, spans stay in-process unless you choose an exporter, and logs are readable text that still includes `[trace=… span=…]`. Full details are in [`docs/observability.md`](docs/observability.md).
@@ -120,6 +120,7 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 ```text
 ├── docs/project_reference.md        # Target architecture and product specification
 ├── docs/observability.md            # Tracing, structured logging, correlation surfaces & GCP lookup guide
+├── prompts/                         # Versioned agent prompts: registry.yaml + v1/ (all agents), v2/ & v3/ (FinancialAnalystAgent)
 ├── src/edgar_capstone/
 │   ├── server.py                    # FastAPI gateway, auth/RBAC routes, RAG & telemetry APIs
 │   ├── telemetry.py                 # Streaming BigQuery telemetry/audit sinks, Firestore feedback & LookML catalog
@@ -129,7 +130,10 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 │   │   └── middleware.py            # Per-request log context, X-Trace-Id / Server-Timing headers, latency access log
 │   ├── agents/                      # Google ADK agents, live Runner SSE engine, ReAct & context tracking
 │   │   ├── live_runtime.py          # ADK Runner (StreamingMode.SSE), Vertex/Gemini config & retry backoff
-│   │   ├── react_loop.py            # Structured ReAct loop + post-generation numeric/citation lock
+│   │   ├── chat_engine.py           # /api/v1/chat turn: scope, guardrails, retrieval, ReAct, judge, telemetry
+│   │   ├── react_loop.py            # Structured ReAct loop, agent-retrieval merge, structured-report verification
+│   │   ├── financial_analyst.py     # FinancialAnalystAgent (BuiltInPlanner, output_schema=AnalystReport, retrieval budget)
+│   │   ├── prompt_store.py          # Versioned prompt loader (local / GCS / Vertex AI) + runtime model variables
 │   │   ├── context_memory.py        # Pro/Flash model routing, ContextLatencyTracker, session compaction
 │   │   ├── evaluation_and_coding.py # Flash LLM-as-a-Judge evaluator & SQL/Python/LookML coding assist
 │   │   ├── callbacks.py             # Guardrails, first-chunk SSE TTFT capture & grounding callbacks
@@ -138,12 +142,12 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 │   ├── dataset/                     # SEC EDGAR 10-K XBRL + Markdown extraction pipeline (edgartools)
 │   │   ├── paths.py                 # Install-layout-aware data root resolution (source tree, /app/data, cwd)
 │   │   └── corpus_hydration.py      # GCS -> local corpus hydration (startup + CLI) and /health corpus status
-│   ├── vector_db/                   # Section-aware 10-K chunker, 768-d embedder, chunk-health monitor
+│   ├── vector_db/                   # Section-aware 10-K chunker, batched Vertex AI / deterministic 768-d embedder, chunk-health monitor
 │   └── security/                    # IAP/OIDC JWT verification, Cloud Identity RBAC, SPIFFE S2S auth
 ├── looker/                          # LookML semantic layer (manifest, model, 6 views, 2 LookML dashboards)
-├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI
+├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI (see frontend/README.md)
 ├── scripts/                         # CLI entrypoints: dataset build, vector DB build (+ --upload-only), corpus hydration, container smoke test, secret scanner
-├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP + HTTPS LB, Cloud Build triggers, log-based latency metric
+├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP (direct or via HTTPS LB), VPC-SC (off by default), Cloud Build triggers, log-based latency metric
 ├── tests/                           # Automated pytest suite (147 tests across agents, live ADK, GCP adapters, telemetry, observability, APIs, IaC, container packaging)
 ├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + Python 3.11 runtime) with baked manifests + build-time corpus check
 ├── .dockerignore                    # Keeps secrets and gitignored heavy corpus artifacts out of the build context
@@ -157,21 +161,32 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 
 ### 1. Curated SEC 10-K Dataset & Vector Pipeline (`dataset/`, `vector_db/`, `scripts/`)
 - **10-K Extraction (`build-sec-dataset`):** Extracts XBRL financial statements (`Revenue`, `Operating Income`, `Net Income`) and cleans Item 1A / Item 7 Markdown via `edgartools`, writing local manifests and uploading to GCS (`gs://fde-sec-edgar-sandbox-dev-sec-corpus`).
-- **Materialized Corpus (`data/curated_dataset/`):** Currently generated in `sample` mode covering **18 S&P 500 companies** across 8 GICS sectors from **FY2020–FY2026** (**114 company-year profiles**). `data/sp500_constituents.csv` and `build-sec-dataset --sp500` are included for full-index runs.
-- **Chunking, Embeddings & Health Monitoring (`build-vector-db`):** Splits filings by section headings into **12,180 metadata-tagged chunks** (`5,556` Item 1A + `6,624` Item 7) with 768-dimensional embeddings (`vertex` mode via `text-embedding-005` or `deterministic` local hash mode) and evaluates chunk/embedding health metrics (`chunk_health_report.json`). `--upload-only` publishes already-staged vector DB artifacts to GCS without re-chunking or re-embedding.
+- **Materialized Corpus (`data/curated_dataset/`):** The full S&P 500 index (`build-sec-dataset --sp500`): **501 tickers** from `data/sp500_constituents.csv` and **3,022 company-year profiles** for **FY2020–FY2026**, with structured financials and Item 1A / Item 7 Markdown for each. The structured JSON and Markdown are uploaded to GCS (`dataset_catalog.json`: `uploaded_to_gcs: true`, no failed tickers).
+- **Chunking, Embeddings & Health Monitoring (`build-vector-db`):**
+  - Splits filings by section headings into **342,945 metadata-tagged chunks** (154,383 Item 1A + 188,562 Item 7).
+  - Embeds them as 768-dimensional `text-embedding-005` vectors (`--embedding-backend auto | vertex_ai | deterministic`; this build used `vertex_ai`). The Vertex AI embedder batches by count and total characters (`--max-batch-chars`, default 60,000), halves a batch the API rejects for token limits, retries with jittered backoff, and runs requests in parallel (`--embedding-workers`).
+  - Writes `chunk_health_report.json`: health score 99.76 (`HEALTHY`), 100% embedding coverage, and 2,975 of 3,022 filings with both sections.
+  - `--upload-only` publishes already-staged vector DB artifacts to GCS without re-chunking or re-embedding.
 - **Container Corpus Packaging & Hydration (`dataset/paths.py`, `dataset/corpus_hydration.py`, `hydrate-sec-corpus`):** Data paths are now resolved the same way in a source checkout, an editable install, and the container's non-editable `/opt/venv` install. Before this fix, the image looked for its corpus under `site-packages` and never found the baked `/app/data` manifests. Gitignored chunks and 10-K Markdown can be downloaded from GCS at FastAPI startup (`EDGAR_CORPUS_HYDRATION`) or with the CLI. Downloads are atomic, existing files are skipped, ticker filters are supported, and paths that would escape the dataset directory are rejected.
 
 ### 2. ADK Agents, Live Runner Execution & Model/Context Strategy (`agents/`)
 - **Agent Hierarchy & Dual-Model Routing:**
-  - **`gemini-3.8-flash`** handles financial reasoning and orchestration in `RootOrchestrator` and `FinancialAnalystAgent` (both configured with ADK `PlanReActPlanner`). This departs from the reference spec, which names Gemini 2.5 Pro: that model returns HTTP 404 in this project. Override it with `EDGAR_ANALYST_MODEL`. The prompts render whichever model is configured at runtime, and `gemini-3.8-flash` has its own cost profile ($0.75 input / $0.075 cached / $3.75 output per 1M tokens, introductory Vertex pricing until 2027-01-01).
+  - **`gemini-3.8-flash`** handles financial reasoning and orchestration in `RootOrchestrator` (ADK `PlanReActPlanner`) and `FinancialAnalystAgent` (native thinking via `BuiltInPlanner`; see below). Both are served from the `global` Vertex endpoint (`EDGAR_GEMINI_LOCATION`). This departs from the reference spec, which names Gemini 2.5 Pro: that model returns HTTP 404 in this project. Override it with `EDGAR_ANALYST_MODEL`. The prompts render whichever model is configured at runtime, and `gemini-3.8-flash` has its own cost profile ($0.75 input / $0.075 cached / $3.75 output per 1M tokens, introductory Vertex pricing until 2027-01-01).
   - **`gemini-3.5-flash`** is assigned to `NarrativeEvaluatorAgent` (4-axis rubric evaluation), `CodingAssistantAgent` (BigQuery SQL, Python audit scripts, LookML snippets), `ContextCacheAgent` (10-K section cache warmup), and ADK `LlmEventSummarizer` context compaction.
 - **Versioned Prompt Store & Dynamic Loader (`prompts/`, `agents/prompt_store.py`):**
   - Agent instructions and guardrail policy templates (`root_orchestrator`, `financial_analyst`, `context_cache_agent`, `narrative_evaluator`, `coding_assistant`, `model_armor_policy`) are stored in a versioned catalog (`prompts/registry.yaml` + `prompts/v1/*.yaml`) with SHA-256 integrity hashing and dynamic ADK `InstructionProvider` resolution across `local` (`prompts/`), Google Cloud Storage (`gs://...`), and Vertex AI Prompt Management backends (`EDGAR_PROMPT_STORE_BACKEND`).
+  - Most agents load `v1` (`EDGAR_PROMPT_VERSION`). `FinancialAnalystAgent` follows the registry's `latest` for its prompt, currently `v3` (structured output); `v2` added targeted retrieval. Older versions stay loadable by number.
+  - The instruction provider renders the configured model names (`EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`) at runtime, overriding the defaults recorded in each prompt file.
 - **Live ADK `Runner` Streaming & Grounding Fallback (`live_runtime.py`):**
   - Executes ADK `Agent`s inside `create_edgar_adk_app` (`ModelArmorSafetyPlugin`, `ContextCacheConfig`, and `EventsCompactionConfig`) via `google.adk.runners.Runner` (`StreamingMode.SSE`, `InMemorySessionService`, `InMemoryMemoryService`) with `HttpRetryOptions` backoff (`429`, `500`, `502`, `503`, `504`) against Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`) or Gemini API (`GEMINI_API_KEY` / `GOOGLE_API_KEY`).
   - Captures real wall-clock streaming Time-to-First-Thought / Time-to-First-Token (`observed_ttft_ms`) on the first partial SSE chunk (`llm_response.partial == True`) in `after_model_fact_check_callback`, reconciles Gemini `usage_metadata` token counts on the final chunk, enforces post-generation `verify_narrative_against_calculations` grounding locks, and falls back deterministically when offline (`EDGAR_EXECUTION_MODE=auto`).
 - **Tools, Live GCP Adapters & Resilience (`tools.py`, `resilience.py`):** Explicit ADK `FunctionTool` definitions (`MetricFetchTool`, `LookerQueryTool`, `VarianceCalculationTool`, `HybridSearchTool`, `ContextCacheTool`, `QueryCached10KTool`) backed by live GCP client adapters (`BigQueryAdapter`, `VertexAISearchAdapter`, `VertexVectorSearchAdapter`, `GcsCorpusAdapter`, and `VertexAIEmbedder` `text-embedding-005`) with `EDGAR_DATA_BACKEND` (`"auto"` | `"gcp"` | `"local"`) dispatch and `@with_tool_resilience` HTTP 429 exponential backoff and timeout handling. `@with_tool_resilience` also runs every tool inside a `tool.<name>` OpenTelemetry span that records attempts, `tool.retry` events, and error status.
-- **Structured ReAct Execution Loop (`react_loop.py`, `chat_engine.py`):** Evaluates deterministic period variances first, pre-queries 10-K passages and metadata-filtered hybrid search (evidence leads and the offline fallback), lets the live agent retrieve the rest itself, synthesizes inline-cited Markdown (`[TICKER FYxxxx | Section | chunk_id](sec_filing_url)`) via live `FinancialAnalystAgent` or offline template synthesis, and runs post-generation numeric and citation fact-checks (`verify_narrative_against_calculations`).
+- **Structured ReAct Execution Loop (`react_loop.py`, `chat_engine.py`):**
+  - Evaluates deterministic period variances first.
+  - Pre-queries 10-K passages and metadata-filtered hybrid search; these become evidence leads for the live agent and feed the offline fallback.
+  - Lets the live agent retrieve the rest itself.
+  - Produces the answer from the live `FinancialAnalystAgent`'s verified structured report, or from offline template synthesis. Either way the answer is Markdown with inline `[TICKER FYxxxx | Section | chunk_id](sec_filing_url)` citations.
+  - Runs post-generation numeric and citation fact-checks (`verify_narrative_against_calculations`).
 - **Context Latency, Cost Telemetry & Session Memory (`context_memory.py`, `telemetry.py`, `callbacks.py`):**
   - `ContextLatencyTracker` decomposes every model call into context preparation + prefill latency vs. decode latency, computes exact USD input/output cost and cached-token discount savings (`gemini-3.8-flash`, `gemini-3.5-flash`, and legacy `gemini-2.5-pro` profiles), monitors TTFT against the `<= 3000 ms` target, and streams per-call records directly to BigQuery (`sec_edgar.llm_telemetry_events`) via `BigQueryTelemetrySink` (`tabledata.insertAll` + structured Cloud Logging sink records).
   - `BigQueryTelemetrySink` also streams conversational turn/session metrics (`session_telemetry_events`: cumulative session length, companies analyzed, reports generated, ADK tool usage, and latency/cost) and authentication / 10-K access audit trails (`security_audit_logs`), with `"auto"` | `"gcp"` | `"local"` fallback (`EDGAR_TELEMETRY_BACKEND`).
@@ -211,14 +226,22 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
   - The process-local `_SESSION_10K_CONTEXT_CACHE` is a bounded LRU + TTL map (`EDGAR_10K_SECTION_CACHE_MAX_ENTRIES=256`, `EDGAR_10K_SECTION_CACHE_TTL_SECONDS=3600`).
 
 ### 3. FastAPI Backend, Persistent Feedback, LookML Semantic Layer & Split-Pane Frontend (`server.py`, `looker/`, `frontend/`)
-- **Backend API & Firestore Feedback Persistence:** Exposes `/health`, `/api/v1/chat`, `/api/v1/variances`, `/api/v1/search`, `/api/v1/metrics`, `/api/v1/explore/{explore_name}`, `/api/v1/looker/catalog`, `/api/v1/section`, `/api/v1/companies`, `/api/v1/evaluate`, `/api/v1/coding-assist`, `/api/v1/telemetry/context-latency`, `/api/v1/telemetry/sessions`, `/api/v1/feedback`, `/api/v1/secrets/status`, and `/api/v1/auth/*`. `FirestoreFeedbackStore` persists analyst thumbs-up/down ratings and audit comments to Google Cloud Firestore Native (`analyst_feedback` collection via REST v1 `documents` & `:runQuery`, controlled by `EDGAR_FEEDBACK_BACKEND`). Serves the compiled React bundle from `/` in production.
+- **Backend API & Firestore Feedback Persistence:** Exposes:
+  - health: `/health`, `/healthz`;
+  - chat and data: `/api/v1/chat`, `/api/v1/variances`, `/api/v1/search`, `/api/v1/intent`, `/api/v1/metrics`, `/api/v1/explore/{explore_name}`, `/api/v1/looker/catalog`, `/api/v1/section` (GET/POST), `/api/v1/companies`;
+  - evaluation and coding: `/api/v1/evaluate`, `/api/v1/coding-assist`;
+  - telemetry: `/api/v1/telemetry/context-latency`, `/api/v1/telemetry/sessions`;
+  - feedback: `/api/v1/feedback` (GET/POST);
+  - auth and admin: `/api/v1/auth/{config,sso/exchange,sso/dev-token,me,logout,audit,rbac}`, `/api/v1/admin/rbac/policies`, `/api/v1/secrets/status`.
+
+  `/api/v1/chat` responses include the rendered `answer_markdown` plus `structured_report`, `report_verification`, and `adk_runtime.agent_retrieval`. `FirestoreFeedbackStore` persists analyst thumbs-up/down ratings and audit comments to Google Cloud Firestore Native (`analyst_feedback` collection via REST v1 `documents` & `:runQuery`, controlled by `EDGAR_FEEDBACK_BACKEND`). Serves the compiled React bundle from `/` in production.
 - **LookML Semantic Layer & Dashboards (`looker/`):** Defines `manifest.lkml`, model `sec_edgar_analytics.model.lkml` (7 explores: `yoy_variances`, `sector_benchmarks`, `peer_comparison`, `chunk_health`, `llm_telemetry_and_cost`, `session_analytics`, `security_audit_logs`), 6 `.view.lkml` files mapped to BigQuery tables/views (the three telemetry views now have a `trace_id` dimension that links to Cloud Trace), and 2 `.dashboard.lookml` executive dashboards (`sec_edgar_observability_and_cost` and `sec_edgar_financial_variances`), introspected via `GET /api/v1/looker/catalog` and queried through `LookerQueryTool`.
-- **Split-Pane Terminal UI:** Built with React 19, TypeScript, Tailwind CSS v4, and Vite. Left pane renders conversational queries, scope filters, deterministic variance tables, and interactive citation chips; right pane displays retrieved 10-K chunks and full cached Item 1A / Item 7 filing sections, with graceful offline fallback data if the backend is unreachable.
+- **Split-Pane Terminal UI:** Built with React 19, TypeScript, Tailwind CSS v4, and Vite. Left pane renders conversational queries, scope filters, deterministic variance tables, and interactive citation chips; right pane displays retrieved 10-K chunks and full cached Item 1A / Item 7 filing sections, with graceful offline fallback data if the backend is unreachable. Live answers arrive as the compact rendered structured report (headline, key metrics, quote-backed findings, notes). Details are in [`frontend/README.md`](frontend/README.md).
 
 ### 4. Security, Model Armor Guardrails, Infrastructure & CI/CD (`security/`, `terraform/`, `cloudbuild.yaml`)
 - **AuthN / AuthZ:** Verifies IAP (`ES256`) and Google Workspace / Okta OIDC (`RS256`) JWTs, enforces Cloud Identity group RBAC (`admins`, `analysts`, `viewers` with `user:` bindings disallowed in Terraform), runs under custom runtime SA `sec-analyst-sa`, and enforces least-privilege S2S tool boundaries across four per-agent service accounts (`root-orchestrator-agent-sa`, `financial-analyst-agent-sa`, `context-cache-agent-sa`, `model-armor-guardrail-sa`) with SPIFFE IDs.
 - **Managed Model Armor, Cloud SDP & Projection Filters (`security/model_armor.py`, `terraform/model_armor.tf`):** Replaces regex prompt-injection filters with regional Google Cloud Model Armor v1 (`sanitizeUserPrompt` & `sanitizeModelResponse` on `sec-edgar-analyst-armor`), Google Cloud Sensitive Data Protection (`content:deidentify` via `sec-edgar-sdp-inspect` & `sec-edgar-sdp-deidentify`), SEC forward-looking financial projection / MNPI leak filters, and ADK `ModelArmorSafetyPlugin` (`BasePlugin`) with session-poisoning prevention.
-- **Terraform & CI/CD:** Provisions BigQuery analytical tables, streaming telemetry/audit sink tables (`llm_telemetry_events`, `session_telemetry_events`, `security_audit_logs` with table-scoped custom append role `secEdgarTelemetrySinkAppend` + Cloud Logging sink) and SQL views (`v_financial_variances_yoy`, `v_filing_chunk_coverage`, `v_chunk_health_metrics`, `v_telemetry_cost_and_latency`), Firestore Native feedback database (`analyst_feedback_db`), Vertex AI Vector Search, Vertex AI Search (Discovery Engine), Google Cloud Model Armor & Cloud SDP templates, Secret Manager, Cloud Monitoring chunk-health dashboards, Cloud Run v2 with IAP enabled on the service itself (`cloud_run_access_mode = "iap_direct"`, the default; see [Sharing the App Internally](#sharing-the-app-internally)) or, optionally, an IAP backend service behind a global external HTTPS load balancer (`cloud_run_access_mode = "load_balancer"`; `load_balancer.tf`: managed TLS certificate for `lb_domain` or `<ip>.nip.io`, `RESTRICTED` SSL policy, URL map, HTTPS proxy, and 80→443 redirect), a VPC Service Controls perimeter definition (`vpc_service_controls.tf`, dry-run by default), and Workload Identity Federation. `terraform/cloudbuild.tf` manages a 2nd-gen GitHub connection plus two Cloud Build triggers, both running as the dedicated least-privilege `sec-edgar-cloudbuild-sa`: merges to `main` run `cloudbuild.yaml` with `_PIPELINE_MODE=deploy`, and pull requests run it with `_PIPELINE_MODE=verify` (no push or deploy). `cloudbuild.yaml` first runs four quality gates in parallel: `lint-python` (`ruff check` + `ruff format --check`), `lint-terraform` (`terraform fmt -check` + `validate`), `frontend` (ESLint + Vitest), and `test`. `.github/workflows/deploy.yml` runs the same gates on every push; its build and deploy jobs are opt-in via the `DEPLOY_WITH_GITHUB_ACTIONS` repository variable, so a merge never deploys twice. The pipelines run secret scanning (`verify_no_secrets.py`), tests, container builds, an offline in-image smoke test before pushing (`scripts/container_smoke_test.py --in-process --expect-corpus baked`), and Cloud Run deployments wired with `GOOGLE_GENAI_USE_VERTEXAI=true`, `EDGAR_MODEL_ARMOR_MODE=gcp`, `MODEL_ARMOR_TEMPLATE_ID=sec-edgar-analyst-armor`, `EDGAR_PROMPT_STORE_BACKEND=auto`, `EDGAR_TELEMETRY_BACKEND=gcp`, `EDGAR_FEEDBACK_BACKEND=gcp`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and `EDGAR_EXECUTION_MODE=auto`.
+- **Terraform & CI/CD:** Provisions BigQuery analytical tables, streaming telemetry/audit sink tables (`llm_telemetry_events`, `session_telemetry_events`, `security_audit_logs` with table-scoped custom append role `secEdgarTelemetrySinkAppend` + Cloud Logging sink) and SQL views (`v_financial_variances_yoy`, `v_filing_chunk_coverage`, `v_chunk_health_metrics`, `v_telemetry_cost_and_latency`), Firestore Native feedback database (`analyst_feedback_db`), Vertex AI Vector Search, Vertex AI Search (Discovery Engine), Google Cloud Model Armor & Cloud SDP templates, Secret Manager, Cloud Monitoring chunk-health dashboards, Cloud Run v2 with IAP enabled on the service itself (`cloud_run_access_mode = "iap_direct"`, the default; see [Sharing the App Internally](#sharing-the-app-internally)) or, optionally, an IAP backend service behind a global external HTTPS load balancer (`cloud_run_access_mode = "load_balancer"`; `load_balancer.tf`: managed TLS certificate for `lb_domain` or `<ip>.nip.io`, `RESTRICTED` SSL policy, URL map, HTTPS proxy, and 80→443 redirect), a VPC Service Controls perimeter definition (`vpc_service_controls.tf`, dry-run by default), and Workload Identity Federation. `terraform/cloudbuild.tf` manages a 2nd-gen GitHub connection plus two Cloud Build triggers, both running as the dedicated least-privilege `sec-edgar-cloudbuild-sa`: merges to `main` run `cloudbuild.yaml` with `_PIPELINE_MODE=deploy`, and pull requests run it with `_PIPELINE_MODE=verify` (no push or deploy). `cloudbuild.yaml` first runs four quality gates in parallel: `lint-python` (`ruff check` + `ruff format --check`), `lint-terraform` (`terraform fmt -check` + `validate`), `frontend` (ESLint + Vitest), and `test`. `.github/workflows/deploy.yml` runs the same gates on every push; its build and deploy jobs are opt-in via the `DEPLOY_WITH_GITHUB_ACTIONS` repository variable, so a merge never deploys twice. The pipelines run secret scanning (`verify_no_secrets.py`), tests, container builds, an offline in-image smoke test before pushing (`scripts/container_smoke_test.py --in-process --expect-corpus baked`), and Cloud Run deployments wired with `GOOGLE_GENAI_USE_VERTEXAI=true`, `EDGAR_MODEL_ARMOR_MODE=gcp`, `MODEL_ARMOR_TEMPLATE_ID=sec-edgar-analyst-armor`, `EDGAR_PROMPT_STORE_BACKEND=auto`, `EDGAR_TELEMETRY_BACKEND=gcp`, `EDGAR_FEEDBACK_BACKEND=gcp`, `EDGAR_ANALYST_MODEL=gemini-3.8-flash`, `EDGAR_FLASH_MODEL=gemini-3.5-flash`, `EDGAR_GEMINI_LOCATION=global`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and `EDGAR_EXECUTION_MODE=auto`. No Cloud Build triggers exist in the project yet (`enable_cloudbuild_trigger` defaults to `false`).
 
 ### 5. Observability: End-to-End Latency Tracing & Structured Logs (`observability/`, `terraform/observability.tf`)
 - **OpenTelemetry → Cloud Trace (`observability/tracing.py`):**
@@ -273,7 +296,7 @@ The app is never anonymous. IAP sits on the Cloud Run service, so anyone who ope
 4. **Revoke** by removing the principal and applying again. Users can sign out from the header; that clears their IAP session cookie.
 
 > [!NOTE]
-> The new revision needs the backend and frontend changes in this repo, which teach the app to accept the IAP session assertion. Until a new image is deployed (merge to `main`), people who pass IAP still see the Okta/Bearer sign-in panel.
+> As of 2026-11-16, Cloud Run serves revision `sec-edgar-analyst-00011-kct`, built from commit `3d743f9`. None of the later work is deployed yet: the IAP-session sign-in, observability, `gemini-3.8-flash` on `global`, agent-driven retrieval, and structured output. Until a new image is built and deployed, people who pass IAP still see the Okta/Bearer sign-in panel.
 
 ---
 
@@ -309,7 +332,7 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 
 | # | Reference Area | Status | Main Blocker / Next Action |
 | :-- | :--- | :--- | :--- |
-| 1 | **Corpus publication and full S&P 500 breadth** *(Secs. 3, 7)* | In progress | The S&P 500 extraction is running. Next: Vertex embeddings, GCS/BigQuery/Search ingestion, and an R&D metric. |
+| 1 | **Corpus publication and full S&P 500 breadth** *(Secs. 3, 7)* | Partly done | Full-index extraction, chunking, and Vertex embeddings are done. Next: load BigQuery, publish the Vector Search embeddings, import into Vertex AI Search, and add an R&D metric. |
 | 2 | **VPC Service Controls and private networking** *(Sec. 8)* | Partly blocked | IAP-only access is done. The perimeter Terraform is written but can't be applied from this sandbox: the only available account has no org-level Access Context Manager rights. Still doable here: Private Service Connect for Vector Search. |
 | 3 | **OpenTelemetry, Cloud Trace, and trace-correlated JSON logs** *(Secs. 2, 4, 6, 10)* | Implemented; live check pending | Code, Terraform, and tests are done (see [`docs/observability.md`](docs/observability.md)). Next: deploy, then check one live `/api/v1/chat` trace in Cloud Trace. |
 | 4 | **Golden eval dataset, `make eval-all`, and coverage gate** *(Secs. 4, 9)* | Not started | No golden set, eval runner, coverage measurement, or CI gate. |
@@ -320,23 +343,31 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 
 **Reference requirement:** Item 1A and Item 7 Markdown for the **full S&P 500** from 2020 onward, stored in `gs://fde-sec-edgar-sandbox-dev-sec-corpus/`, searchable through Vertex AI Search, Vector Search, and BigQuery. Section 3's example query ("Compare NVIDIA and Apple's **R&D spend** from 2024–2026") assumes R&D data is available.
 
-**Current state:**
-- The committed catalogs still describe the 18-issuer sample: `dataset_catalog.json` has 114 profiles, and `vector_db_catalog.json` has 12,180 chunks.
-- A `scripts/build_sec_dataset.py --sp500` run is in progress locally. At the time of this revision, 155 ticker directories (940 structured JSON and 940 Markdown files) are on disk. The catalog is rewritten when the run finishes.
-- `vector_db_catalog.json` reports `embedding_backend: deterministic` along with `uploaded_to_gcs: false`, `loaded_to_bigquery: false`, and `published_monitoring_metrics: false`. Hash embeddings make Vector Search and BigQuery `VECTOR_SEARCH` semantically meaningless.
-- The bucket's `manifests/` folder holds only `bigquery_financials.jsonl`, `dataset_catalog.json`, and `vertex_ai_search_metadata.jsonl`. `bigquery_filing_chunks.jsonl` and `vector_search/embeddings/` are missing.
-- The Vector Search index reads embeddings from `contents_delta_uri`, which Terraform attaches only after embeddings exist in GCS. Nothing imports documents into the `sec-edgar-10k-corpus-ds` Discovery Engine data store; there is no `documents:import` call anywhere in `src/`, `scripts/`, or `terraform/`.
-- XBRL extraction covers only `Revenue`, `Operating Income`, and `Net Income`.
+**Done:**
+- **Extraction:** all 501 tickers, 3,022 FY2020–FY2026 profiles, with no failed tickers. Structured JSON and Markdown are in GCS.
+- **Chunking and embedding:** 342,945 chunks embedded with `text-embedding-005` (`embedding_backend: vertex_ai`). Chunk health is 99.76 (`HEALTHY`).
+- **Manifests in GCS:** `bigquery_filing_chunks.jsonl`, `bigquery_financials.jsonl`, `vertex_ai_search_metadata.jsonl`, and the catalogs are in `manifests/`.
+
+**Still open:**
+- **BigQuery isn't loaded.** `sec_edgar.filing_chunks` has 0 rows and `sec_edgar.financial_metrics` still holds the 114-row sample. `vector_db_catalog.json` reports `loaded_to_bigquery: false` and `published_monitoring_metrics: false`.
+- **Vector Search has no embeddings.** `vector_search/embeddings/` (about 6 GB locally) isn't in GCS, so the index has nothing to serve.
+- **Vertex AI Search is empty.** Nothing imports documents into the `sec-edgar-10k-corpus-ds` data store; there is no `documents:import` call anywhere in `src/`, `scripts/`, or `terraform/`.
+- **No R&D metric.** XBRL extraction covers only `Revenue`, `Operating Income`, and `Net Income`, so Section 3's R&D example query can't be answered quantitatively.
 
 **Work to close:**
-1. Let the `--sp500` run finish. Then check `failed_tickers`, `warnings`, and `uploaded_to_gcs` in `dataset_catalog.json`, and re-run failed tickers with `--tickers ... --force`.
-2. Rebuild the chunks with real embeddings: `scripts/build_vector_db.py --embedding-backend vertex --force-reembed`. Leave out `--local-only`, `--no-load-bigquery`, and `--no-publish-metrics` so the run uploads to GCS, loads `sec_edgar.filing_chunks`, and publishes chunk-health metrics.
-3. Attach the embeddings to the Vector Search index by setting `seed_vertex_vector_index = true` and running `terraform apply`. Then confirm `:findNeighbors` returns results from `sec-edgar-10k-chunks-endpoint`.
-4. Add a Discovery Engine `documents:import` step that reads from GCS, using `vertex_ai_search_metadata.jsonl` plus the `unstructured/` Markdown. Add it to `build_vector_db.py` or a new `scripts/index_vertex_search.py`, and poll the import operation until it completes.
-5. Add an R&D metric. Map `us-gaap_ResearchAndDevelopmentExpense` (and `..._ExcludingAcquiredInProcessCost`) in `dataset/extractor.py`, then update `FinancialDataProfile`, `terraform/schemas/financial_metrics.json`, `v_financial_variances_yoy`, the LookML views, `VarianceCalculationTool`, and the frontend variance table. Issuers that don't report R&D should get `null`, not `0`.
-6. Refresh the corpus counts in this README and in `chunk_health_report.json`, then remove the `[!IMPORTANT]` upload note above.
+1. Load BigQuery: rerun `scripts/build_vector_db.py --upload-only` without `--no-load-bigquery` (or start the load job for `manifests/bigquery_filing_chunks.jsonl`), and reload `financial_metrics` from the 3,022-row `bigquery_financials.jsonl`. Publish the chunk-health metrics too.
+2. Upload `vector_search/embeddings/` to GCS. Then set `seed_vertex_vector_index = true`, run `terraform apply`, and confirm `:findNeighbors` returns results from `sec-edgar-10k-chunks-endpoint`.
+3. Add a Discovery Engine `documents:import` step that reads from GCS (`vertex_ai_search_metadata.jsonl` plus the `unstructured/` Markdown), either in `build_vector_db.py` or a new `scripts/index_vertex_search.py`, and poll the import operation until it completes.
+4. Add an R&D metric:
+   - Map `us-gaap_ResearchAndDevelopmentExpense` (and `..._ExcludingAcquiredInProcessCost`) in `dataset/extractor.py`.
+   - Update `FinancialDataProfile`, `terraform/schemas/financial_metrics.json`, `v_financial_variances_yoy`, the LookML views, `VarianceCalculationTool`, `AnalystMetricReference`, and the frontend variance table.
+   - Issuers that don't report R&D should get `null`, not `0`.
 
-**Done when:** `make docker-smoke-hydrated` passes with the default `chunks,unstructured` scopes; both catalogs report about 500 issuers, `embedding_backend: vertex`, and every upload/load flag set to `true`; Vertex AI Search returns hits for a non-sample ticker; and the NVDA vs. AAPL R&D query returns a deterministic variance table with citations.
+**Done when:**
+- `sec_edgar.filing_chunks` and `financial_metrics` hold the full index.
+- `vector_db_catalog.json` shows every upload/load flag set to `true`.
+- Vector Search and Vertex AI Search both return hits for a ticker outside the old 18-company sample.
+- The NVDA vs. AAPL R&D query returns a deterministic variance table with citations.
 
 ### 2. VPC Service Controls and Private Networking *(Sec. 8)*
 
@@ -380,7 +411,7 @@ These limit who can reach the app and data, but unlike a perimeter they don't st
 
 **Reference requirement:** End-to-end latency tracing through OpenTelemetry and Cloud Trace, plus FastAPI structured JSON logs with trace IDs exported to Cloud Logging.
 
-**Current state:** implemented in code, Terraform, and tests. See [Current State § 5](#5-observability-end-to-end-latency-tracing--structured-logs-observability-terraformobservabilitytf) and [`docs/observability.md`](docs/observability.md). This was verified locally (135 passing tests, plus a uvicorn run in Cloud Run JSON mode with upstream `traceparent` continuation), but not yet against live Cloud Trace.
+**Current state:** implemented in code, Terraform, and tests. See [Current State § 5](#5-observability-end-to-end-latency-tracing--structured-logs-observability-terraformobservabilitytf) and [`docs/observability.md`](docs/observability.md). This was verified locally (the test suite, plus a uvicorn run in Cloud Run JSON mode with upstream `traceparent` continuation), but not yet against live Cloud Trace. The deployed revision predates this work (see [Sharing the App Internally](#sharing-the-app-internally)).
 
 **Remaining:**
 1. Run `terraform apply`. It only adds things: the `sec_edgar/api_request_latencies` metric and the nullable BigQuery `trace_id` columns.

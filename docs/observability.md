@@ -1,6 +1,6 @@
 # Observability: End-to-End Latency Tracing & Structured Logs
 
-The FastAPI service exports **OpenTelemetry spans to Cloud Trace** and writes **structured JSON logs carrying trace IDs** to stdout. Cloud Run ingests those logs into **Cloud Logging**. A single `/api/v1/chat` request produces one trace covering the load balancer, FastAPI, guardrails, ReAct steps, tools, ADK model calls, and outbound GCP REST calls. That request's log lines appear grouped under the trace, and its BigQuery telemetry rows carry the same `trace_id`.
+The FastAPI service exports **OpenTelemetry spans to Cloud Trace** and writes **structured JSON logs carrying trace IDs** to stdout. Cloud Run ingests those logs into **Cloud Logging**. A single `/api/v1/chat` request produces one trace covering the Cloud Run front end (or the HTTPS load balancer in `load_balancer` access mode), FastAPI, guardrails, ReAct steps, tools, ADK model calls, and outbound GCP REST calls. That request's log lines appear grouped under the trace, and its BigQuery telemetry rows carry the same `trace_id`.
 
 Code lives in [`src/edgar_capstone/observability/`](../src/edgar_capstone/observability):
 
@@ -14,7 +14,7 @@ Code lives in [`src/edgar_capstone/observability/`](../src/edgar_capstone/observ
 
 ```mermaid
 flowchart TD
-    LB["HTTPS LB / Cloud Run front end (traceparent, X-Cloud-Trace-Context)"] --> S["FastAPI server span: POST /api/v1/chat"]
+    LB["Cloud Run front end / optional HTTPS LB (traceparent, X-Cloud-Trace-Context)"] --> S["FastAPI server span: POST /api/v1/chat"]
     S --> A["auth.verify_jwt"]
     S --> T["chat.rag_turn"]
     T --> G["guardrail.inspect_user_prompt (+ Model Armor / SDP HTTP spans)"]
