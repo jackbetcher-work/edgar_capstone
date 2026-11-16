@@ -26,6 +26,7 @@ locals {
     "monitoring.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",
+    "serviceconsumermanagement.googleapis.com", # Vertex AI context caching tenant project
     "serviceusage.googleapis.com",
     "storage.googleapis.com",
     "sts.googleapis.com",
