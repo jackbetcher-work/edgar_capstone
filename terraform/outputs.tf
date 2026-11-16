@@ -157,8 +157,18 @@ output "cloud_run_service_uri" {
 }
 
 output "iap_backend_service_audience" {
-  description = "Expected IAP JWT 'aud' claim string for the IAP-protected Cloud Run backend service."
-  value       = local.iap_backend_audience
+  description = "Expected IAP JWT 'aud' claim: the Cloud Run service path in iap_direct mode, the backend service path in load_balancer mode."
+  value       = local.iap_jwt_audience
+}
+
+output "cloud_run_access_mode" {
+  description = "How users reach the app: iap_direct (IAP on the run.app URL) or load_balancer (external HTTPS LB + IAP)."
+  value       = var.cloud_run_access_mode
+}
+
+output "iap_authorized_principals" {
+  description = "Principals that can sign in to the app through IAP (roles/iap.httpsResourceAccessor)."
+  value       = sort(tolist(local.effective_iap_group_principals))
 }
 
 output "model_armor_template_name" {
@@ -207,8 +217,22 @@ output "lb_ip_address" {
 }
 
 output "app_url" {
-  description = "Public IAP-protected application URL served through the HTTPS load balancer."
-  value       = local.enable_https_lb ? "https://${local.lb_domain}" : null
+  description = "IAP-protected URL to share with authorized users: the Cloud Run run.app URL (iap_direct) or the HTTPS load balancer URL (load_balancer)."
+  value = (
+    local.cloud_run_direct_iap
+    ? google_cloud_run_v2_service.sec_edgar_analyst[0].uri
+    : (local.enable_https_lb ? "https://${local.lb_domain}" : null)
+  )
+}
+
+output "vpc_sc_perimeter_name" {
+  description = "Resource name of the VPC Service Controls perimeter, or null when it isn't managed."
+  value       = local.vpc_sc_enabled ? google_access_context_manager_service_perimeter.sec_edgar[0].name : null
+}
+
+output "vpc_sc_mode" {
+  description = "VPC Service Controls state: disabled, dry_run, or enforced."
+  value       = local.vpc_sc_enabled ? (var.vpc_sc_enforce ? "enforced" : "dry_run") : "disabled"
 }
 
 output "vertex_vector_search_deployed_index_id" {

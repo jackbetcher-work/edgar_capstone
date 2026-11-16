@@ -30,7 +30,7 @@ resource "google_secret_manager_secret_version" "bootstrap_placeholders" {
   # real value (see iap_audience below) instead of a placeholder.
   for_each = (
     var.seed_placeholder_secret_versions
-    ? (local.iap_backend_audience != null ? setsubtract(local.managed_secret_ids, ["sec-edgar-iap-audience"]) : local.managed_secret_ids)
+    ? (local.iap_jwt_audience != null ? setsubtract(local.managed_secret_ids, ["sec-edgar-iap-audience"]) : local.managed_secret_ids)
     : toset([])
   )
 
@@ -42,14 +42,15 @@ resource "google_secret_manager_secret_version" "bootstrap_placeholders" {
   }
 }
 
-# Keep the IAP JWT audience secret in sync with the real backend service. If the
-# backend service is ever recreated, a new version is written automatically and
-# Cloud Run (pinned to this version below) rolls a new revision to pick it up.
+# Keep the IAP JWT audience secret in sync with the IAP-protected resource (the
+# Cloud Run service in iap_direct mode, the backend service in load_balancer mode).
+# If it changes, a new version is written automatically and Cloud Run (pinned to
+# this version below) rolls a new revision to pick it up.
 resource "google_secret_manager_secret_version" "iap_audience" {
-  count = local.iap_backend_audience != null ? 1 : 0
+  count = local.iap_jwt_audience != null ? 1 : 0
 
   secret      = google_secret_manager_secret.managed_secrets["sec-edgar-iap-audience"].id
-  secret_data = local.iap_backend_audience
+  secret_data = local.iap_jwt_audience
 }
 
 # Grant least-privilege Secret Accessor role exclusively to the custom Cloud Run runtime SA
@@ -167,12 +168,19 @@ import {
 }
 
 resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
-  count = var.enable_cloud_run_service ? 1 : 0
+  # google-beta: `iap_enabled` is still a beta-only field in provider 6.x.
+  provider = google-beta
+  count    = var.enable_cloud_run_service ? 1 : 0
 
-  project             = var.project_id
-  name                = var.cloud_run_service_name
-  location            = var.region
-  ingress             = "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+  project  = var.project_id
+  name     = var.cloud_run_service_name
+  location = var.region
+  # iap_direct: the run.app URL is reachable, but IAP requires a Google sign-in from
+  # an iap_authorized_principals member on every request (no anonymous access).
+  # load_balancer: only the external HTTPS LB (with IAP on its backend) can reach it.
+  ingress             = local.cloud_run_direct_iap ? "INGRESS_TRAFFIC_ALL" : "INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"
+  iap_enabled         = local.cloud_run_direct_iap
+  launch_stage        = local.cloud_run_direct_iap ? "BETA" : null
   deletion_protection = var.deletion_protection
   labels              = var.labels
 
@@ -333,6 +341,11 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       env {
         name  = "IAP_STRICT_MODE"
         value = "true"
+      }
+
+      env {
+        name  = "IAP_ASSERTION_DEFAULT_ROLE"
+        value = var.iap_default_app_role
       }
 
       env {

@@ -295,6 +295,10 @@ def auth_discovery_config(
             "assertion_header": "X-Goog-IAP-JWT-Assertion",
             "agent_s2s_assertion_header": S2S_AGENT_ASSERTION_HEADER,
             "audience_configured": bool(settings.audiences),
+            # In Cloud Run the browser can sign in through the IAP session alone; the
+            # frontend probes /api/v1/auth/me without a Bearer token when this is true.
+            "session_auth_enabled": settings.strict_production_mode,
+            "default_role": settings.iap_default_role,
         },
         "rbac": settings.rbac_policy().to_public_dict(),
         "service_account": runtime_sa.to_public_dict(),

@@ -162,6 +162,22 @@ _AUDITOR_REPORT_HEADING_RE = re.compile(
 )
 _MAX_BOUNDARY_LINE_CHARS = 120
 
+# Some filers place a next-item heading (or a stub for it) BEFORE the real section body, e.g.
+# RF "Item 7A" heading leading a combined Item 7/7A MD&A, or SO an Item 7 page index followed by a
+# one-line Item 7A stub and then the full "COMBINED MANAGEMENT'S DISCUSSION AND ANALYSIS". Cutting at
+# such a heading discards the entire section, so a boundary is skipped when the text before it is
+# only a fragment and the text after it (up to the next boundary) is clearly the section's content.
+_SECTION_CONTENT_MARKER_RES: dict[str, tuple[re.Pattern[str], ...]] = {
+    "item_7": (
+        re.compile(r"(?i)\bresults\s+of\s+operations\b"),
+        re.compile(r"(?i)\bliquidity\b"),
+        re.compile(r"(?i)\bcritical\s+accounting\s+(?:policies|estimates)\b"),
+        re.compile(r"(?i)\boverview\b"),
+        re.compile(r"(?i)\bmanagement\\?['’]?s\s+discussion\s+and\s+analysis\b"),
+    ),
+}
+_MIN_SECTION_CONTENT_MARKERS = 3
+
 # Minimum lengths for validating extracted 10-K sections
 MIN_ABSOLUTE_SECTION_CHARS = 350
 MIN_SUBSTANTIVE_SECTION_CHARS = 2000
@@ -414,14 +430,20 @@ def truncate_at_section_boundary(
     *,
     item_id: Literal["item_1a", "item_7"],
 ) -> str:
-    """Cut `text` at the first heading of a subsequent 10-K item (or the auditor's report for MD&A)."""
+    """Cut `text` at the first heading of a subsequent 10-K item (or the auditor's report for MD&A).
+
+    A boundary heading is skipped (not cut) when the text before it is only a fragment and the
+    text after it, up to the next boundary, is substantive section content (see
+    `_SECTION_CONTENT_MARKER_RES`). This preserves sections whose real body follows a misplaced or
+    stub next-item heading (RF combined Item 7/7A, SO Item 7 index + Item 7A stub).
+    """
     if not text:
         return text
     patterns = [_SECTION_BOUNDARY_RES[item_id]]
     if item_id == "item_7":
         patterns.append(_AUDITOR_REPORT_HEADING_RE)
 
-    cut_pos: int | None = None
+    candidates: set[int] = set()
     for pattern in patterns:
         for m in pattern.finditer(text):
             line = m.group(0)
@@ -429,13 +451,37 @@ def truncate_at_section_boundary(
                 continue
             if _TOC_PAGE_NUMBER_TAIL_RE.search(line) or re.search(r"(?i)\bnotes?\b", line):
                 continue
-            if cut_pos is None or m.start() < cut_pos:
-                cut_pos = m.start()
-            break
+            candidates.add(m.start())
 
-    if cut_pos is None:
-        return text
-    return _MULTI_NEWLINE_RE.sub("\n\n", text[:cut_pos]).strip()
+    ordered = sorted(candidates)
+    for idx, pos in enumerate(ordered):
+        next_pos = ordered[idx + 1] if idx + 1 < len(ordered) else len(text)
+        if _is_misplaced_leading_boundary(text[:pos], text[pos:next_pos], item_id=item_id):
+            continue
+        return _MULTI_NEWLINE_RE.sub("\n\n", text[:pos]).strip()
+    return text
+
+
+def _is_misplaced_leading_boundary(
+    prefix: str,
+    segment: str,
+    *,
+    item_id: Literal["item_1a", "item_7"],
+) -> bool:
+    """Return True if a boundary heading precedes the real section body and must not be cut at."""
+    markers = _SECTION_CONTENT_MARKER_RES.get(item_id)
+    if not markers:
+        return False
+    prefix = prefix.strip()
+    if len(prefix) >= MIN_SUBSTANTIVE_SECTION_CHARS and is_substantive_section_markdown(
+        prefix, item_id=item_id
+    ):
+        # Normal bleed: a full section precedes the next-item heading -> cut.
+        return False
+    if len(segment) < MIN_SUBSTANTIVE_SECTION_CHARS:
+        return False
+    found = sum(1 for marker in markers if marker.search(segment))
+    return found >= _MIN_SECTION_CONTENT_MARKERS
 
 
 def _clean_and_bound_section(raw_text: str, *, item_id: Literal["item_1a", "item_7"]) -> str:

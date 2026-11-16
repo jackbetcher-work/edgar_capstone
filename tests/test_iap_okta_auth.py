@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 import time
 from typing import Any
@@ -507,3 +508,112 @@ def test_workspace_domain_rbac_production_lockdown_logout_and_audit_trail(idp_ke
         assert replay_resp.status_code == 401
     finally:
         app.dependency_overrides.pop(get_auth_verifier, None)
+
+
+TEST_CLOUD_RUN_IAP_AUDIENCE = (
+    "/projects/991122334455/locations/us-central1/services/sec-edgar-analyst"
+)
+
+
+def test_cloud_run_iap_assertion_only_browser_session(idp_keyring) -> None:
+    """Behind IAP on Cloud Run the browser sends only X-Goog-IAP-JWT-Assertion (no Bearer)."""
+    settings = dataclasses.replace(
+        idp_keyring["settings"],
+        audiences=(TEST_CLOUD_RUN_IAP_AUDIENCE,),
+        allowed_workspace_domains=(),
+        iap_default_role="analyst",
+    )
+    verifier = IAPJwtVerifier(settings=settings, jwks_store=idp_keyring["jwks_store"])
+    app.dependency_overrides[get_auth_verifier] = lambda: verifier
+    now = int(time.time())
+
+    def _iap_assertion(*, aud: str = TEST_CLOUD_RUN_IAP_AUDIENCE, key: Any = None) -> str:
+        return sign_jwt_es256(
+            {
+                "iss": GOOGLE_IAP_ISSUER,
+                "sub": "accounts.google.com:5566778899",
+                "aud": aud,
+                "email": "accounts.google.com:colleague@jackbetcher.altostrat.com",
+                "hd": "jackbetcher.altostrat.com",
+                "iat": now,
+                "exp": now + 600,
+            },
+            key or idp_keyring["iap_ec_key"],
+            kid="iap-es256-k1",
+        )
+
+    try:
+        client = TestClient(app)
+
+        cfg = client.get("/api/v1/auth/config").json()
+        assert cfg["iap"]["session_auth_enabled"] is True
+        assert cfg["iap"]["default_role"] == "analyst"
+
+        # IAP assertion alone, no group claims -> configured default role (analyst)
+        headers = {"X-Goog-IAP-JWT-Assertion": _iap_assertion()}
+        me = client.get("/api/v1/auth/me", headers=headers)
+        assert me.status_code == 200, me.text
+        user = me.json()["user"]
+        assert user["email"] == "colleague@jackbetcher.altostrat.com"
+        assert user["identity_provider"] == "google_iap"
+        assert user["iap_assertion_verified"] is True
+        assert user["roles"] == ["authenticated", "analyst"]
+        assert client.get("/api/v1/companies", headers=headers).status_code == 200
+
+        # Admin-only endpoints stay closed: admin must come from a Cloud Identity group
+        assert client.get("/api/v1/admin/rbac/policies", headers=headers).status_code == 403
+
+        # Assertion minted for a different IAP resource (audience mismatch) -> 401
+        wrong_aud = {
+            "X-Goog-IAP-JWT-Assertion": _iap_assertion(
+                aud="/projects/991122334455/global/backendServices/111"
+            )
+        }
+        assert client.get("/api/v1/auth/me", headers=wrong_aud).status_code == 401
+
+        # Forged assertion (not signed by the IAP key) -> 401
+        forged = {
+            "X-Goog-IAP-JWT-Assertion": _iap_assertion(key=ec.generate_private_key(ec.SECP256R1()))
+        }
+        assert client.get("/api/v1/auth/me", headers=forged).status_code == 401
+
+        # A non-IAP issuer in the IAP header is rejected even if otherwise valid -> 401
+        gws_jwt = sign_jwt_rs256(
+            {
+                "iss": "https://accounts.google.com",
+                "sub": "10987654321",
+                "aud": TEST_CLOUD_RUN_IAP_AUDIENCE,
+                "email": "colleague@jackbetcher.altostrat.com",
+                "email_verified": True,
+                "groups": ["sec-edgar-analysts"],
+                "iat": now,
+                "exp": now + 600,
+            },
+            idp_keyring["google_rsa_key"],
+            kid="gws-rs256-k1",
+        )
+        assert (
+            client.get("/api/v1/auth/me", headers={"X-Goog-IAP-JWT-Assertion": gws_jwt}).status_code
+            == 401
+        )
+
+        # Without a default role, an IAP-only user with no group is authenticated but forbidden
+        no_default = dataclasses.replace(settings, iap_default_role=None)
+        app.dependency_overrides[get_auth_verifier] = lambda: IAPJwtVerifier(
+            settings=no_default, jwks_store=idp_keyring["jwks_store"]
+        )
+        assert client.get("/api/v1/auth/me", headers=headers).status_code == 403
+    finally:
+        app.dependency_overrides.pop(get_auth_verifier, None)
+
+
+def test_iap_default_role_env_validation(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("IAP_ASSERTION_DEFAULT_ROLE", "Viewer")
+    assert AuthSettings.from_env().iap_default_role == "viewer"
+
+    monkeypatch.setenv("IAP_ASSERTION_DEFAULT_ROLE", "")
+    assert AuthSettings.from_env().iap_default_role is None
+
+    monkeypatch.setenv("IAP_ASSERTION_DEFAULT_ROLE", "admin")
+    with pytest.raises(ValueError, match="IAP_ASSERTION_DEFAULT_ROLE"):
+        AuthSettings.from_env()

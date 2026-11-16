@@ -1,18 +1,16 @@
 # ------------------------------------------------------------------------------
 # Global External HTTPS Application Load Balancer fronting the IAP backend
 # ------------------------------------------------------------------------------
-# Cloud Run ingress is INTERNAL_LOAD_BALANCER, so this load balancer is the only
+# Only built when var.cloud_run_access_mode = "load_balancer". In the default
+# "iap_direct" mode IAP sits on the Cloud Run service itself and none of this exists.
+# Cloud Run ingress is then INTERNAL_LOAD_BALANCER, so this load balancer is the only
 # public entry point. Traffic flow:
 #   client -> forwarding rule (443) -> HTTPS proxy (managed cert) -> URL map
 #          -> IAP-enabled backend service -> serverless NEG -> Cloud Run
 # Port 80 is redirected to HTTPS.
 
 locals {
-  enable_https_lb = (
-    var.enable_https_load_balancer
-    && var.enable_iap_backend_service
-    && var.enable_cloud_run_service
-  )
+  enable_https_lb = var.enable_https_load_balancer && local.cloud_run_lb_iap
 
   # Use the supplied domain or fall back to <ip>.nip.io, which resolves to the
   # load balancer IP without any DNS setup (fine for sandbox environments).
@@ -62,6 +60,17 @@ resource "google_compute_url_map" "sec_edgar_https" {
   default_service = google_compute_backend_service.sec_edgar_iap_backend[0].id
 }
 
+resource "google_compute_ssl_policy" "sec_edgar_tls" {
+  count = local.enable_https_lb ? 1 : 0
+
+  project = var.project_id
+  name    = "${var.cloud_run_service_name}-tls-policy"
+  # RESTRICTED + TLS 1.2 minimum. Google front ends negotiate TLS 1.3 with clients that
+  # support it, but LB SSL policies can't set a 1.3-only minimum.
+  profile         = "RESTRICTED"
+  min_tls_version = "TLS_1_2"
+}
+
 resource "google_compute_target_https_proxy" "sec_edgar_https" {
   count = local.enable_https_lb ? 1 : 0
 
@@ -69,6 +78,7 @@ resource "google_compute_target_https_proxy" "sec_edgar_https" {
   name             = "${var.cloud_run_service_name}-https-proxy"
   url_map          = google_compute_url_map.sec_edgar_https[0].id
   ssl_certificates = [google_compute_managed_ssl_certificate.sec_edgar_cert[0].id]
+  ssl_policy       = google_compute_ssl_policy.sec_edgar_tls[0].id
 }
 
 resource "google_compute_global_forwarding_rule" "sec_edgar_https" {

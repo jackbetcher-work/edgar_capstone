@@ -325,6 +325,8 @@ export interface AuthDiscoveryConfig {
     assertion_header: string
     agent_s2s_assertion_header?: string
     audience_configured: boolean
+    session_auth_enabled?: boolean
+    default_role?: string | null
   }
   rbac?: {
     management_plane: string

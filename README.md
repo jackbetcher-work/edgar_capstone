@@ -85,16 +85,48 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 > [!IMPORTANT]
 > `gs://fde-sec-edgar-sandbox-dev-sec-corpus/` currently has no `manifests/bigquery_filing_chunks.jsonl`. The vector DB artifacts were never uploaded because of an upload bug that is now fixed. Publish the locally staged artifacts once with `.venv/bin/python scripts/build_vector_db.py --upload-only`. Until then, use `HYDRATION_SCOPES=unstructured`. The local tools will chunk the hydrated 10-K Markdown on the fly, using deterministic embeddings.
 
+### Observability: Latency Tracing & Structured Logs
+Each API request is one OpenTelemetry trace, exported to **Cloud Trace**. Every log line is structured JSON carrying the same trace ID and goes to **Cloud Logging**. On Cloud Run (`K_SERVICE` set) both turn on automatically, so Cloud Build and GitHub Actions don't need extra env vars. Locally, spans stay in-process unless you choose an exporter, and logs are readable text that still includes `[trace=… span=…]`. Full details are in [`docs/observability.md`](docs/observability.md).
+
+```bash
+# Print spans to stdout and emit Cloud Logging-style JSON logs locally
+EDGAR_TRACE_EXPORTER=console EDGAR_LOG_FORMAT=json make backend
+
+# Send local spans to Cloud Trace with ADC
+gcloud auth application-default login
+EDGAR_TRACE_EXPORTER=gcp GOOGLE_CLOUD_PROJECT=iron-radio-514217-q7 make backend
+
+# Every response carries its trace ID and server-side latency
+curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | grep -i -E 'x-trace-id|server-timing'
+```
+
+| Variable | Default | Purpose |
+| :--- | :--- | :--- |
+| `EDGAR_TRACING_ENABLED` | `true` | Master switch for tracing (`OTEL_SDK_DISABLED=true` also turns it off). |
+| `EDGAR_TRACE_EXPORTER` | `auto` | `auto` exports to Cloud Trace on Cloud Run and keeps spans in-process elsewhere. Other values: `gcp`, `console`, `otlp`, `none`. |
+| `EDGAR_TRACE_SAMPLE_RATIO` | `1.0` | Head-sampling ratio. A sampled upstream parent (load balancer / Cloud Run) is always honored. |
+| `EDGAR_TRACE_CAPTURE_CONTENT` | `false` | Default for ADK's `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS`. Keeps prompts, 10-K text, and model output out of Cloud Trace. |
+| `EDGAR_TRACE_EXCLUDED_URLS` | health + static assets | Comma-separated URL regexes that get no server span. |
+| `EDGAR_TRACE_INSTRUMENT_HTTPX` | `true` | Client spans for outbound httpx calls (Vertex AI, BigQuery, Firestore, Model Armor, SDP, …). |
+| `EDGAR_LOG_FORMAT` | `auto` | `json` on Cloud Run, `text` locally. |
+| `EDGAR_LOG_LEVEL` | `INFO` | Root log level for app, uvicorn, and library loggers. |
+
+`GET /health` now includes an `observability` block showing the active exporter, sampling ratio, instrumentation state, and log format.
+
 ---
 
 ## Repository Structure
 
 ```text
 ├── docs/project_reference.md        # Target architecture and product specification
+├── docs/observability.md            # Tracing, structured logging, correlation surfaces & GCP lookup guide
 ├── src/edgar_capstone/
 │   ├── server.py                    # FastAPI gateway, auth/RBAC routes, RAG & telemetry APIs
 │   ├── telemetry.py                 # Streaming BigQuery telemetry/audit sinks, Firestore feedback & LookML catalog
-│   ├── observability/               # OpenTelemetry -> Cloud Trace, trace-correlated JSON logs -> Cloud Logging (docs/observability.md)
+│   ├── observability/               # OpenTelemetry -> Cloud Trace, trace-correlated JSON logs -> Cloud Logging
+│   │   ├── tracing.py               # TracerProvider + CloudTraceSpanExporter, propagators, FastAPI/httpx instrumentation, @traced
+│   │   ├── structured_logging.py    # Cloud Logging JSON formatter (trace/span IDs, Error Reporting), uvicorn log routing
+│   │   └── middleware.py            # Per-request log context, X-Trace-Id / Server-Timing headers, latency access log
 │   ├── agents/                      # Google ADK agents, live Runner SSE engine, ReAct & context tracking
 │   │   ├── live_runtime.py          # ADK Runner (StreamingMode.SSE), Vertex/Gemini config & retry backoff
 │   │   ├── react_loop.py            # Structured ReAct loop + post-generation numeric/citation lock
@@ -111,7 +143,7 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 ├── looker/                          # LookML semantic layer (manifest, model, 6 views, 2 LookML dashboards)
 ├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI
 ├── scripts/                         # CLI entrypoints: dataset build, vector DB build (+ --upload-only), corpus hydration, container smoke test, secret scanner
-├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP + HTTPS LB, Cloud Build triggers
+├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP + HTTPS LB, Cloud Build triggers, log-based latency metric
 ├── tests/                           # Automated pytest suite (135 tests across agents, live ADK, GCP adapters, telemetry, observability, APIs, IaC, container packaging)
 ├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + Python 3.11 runtime) with baked manifests + build-time corpus check
 ├── .dockerignore                    # Keeps secrets and gitignored heavy corpus artifacts out of the build context
@@ -138,11 +170,12 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 - **Live ADK `Runner` Streaming & Grounding Fallback (`live_runtime.py`):**
   - Executes ADK `Agent`s inside `create_edgar_adk_app` (`ModelArmorSafetyPlugin`, `ContextCacheConfig`, and `EventsCompactionConfig`) via `google.adk.runners.Runner` (`StreamingMode.SSE`, `InMemorySessionService`, `InMemoryMemoryService`) with `HttpRetryOptions` backoff (`429`, `500`, `502`, `503`, `504`) against Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`) or Gemini API (`GEMINI_API_KEY` / `GOOGLE_API_KEY`).
   - Captures real wall-clock streaming Time-to-First-Thought / Time-to-First-Token (`observed_ttft_ms`) on the first partial SSE chunk (`llm_response.partial == True`) in `after_model_fact_check_callback`, reconciles Gemini `usage_metadata` token counts on the final chunk, enforces post-generation `verify_narrative_against_calculations` grounding locks, and falls back deterministically when offline (`EDGAR_EXECUTION_MODE=auto`).
-- **Tools, Live GCP Adapters & Resilience (`tools.py`, `resilience.py`):** Explicit ADK `FunctionTool` definitions (`MetricFetchTool`, `LookerQueryTool`, `VarianceCalculationTool`, `HybridSearchTool`, `ContextCacheTool`, `QueryCached10KTool`) backed by live GCP client adapters (`BigQueryAdapter`, `VertexAISearchAdapter`, `VertexVectorSearchAdapter`, `GcsCorpusAdapter`, and `VertexAIEmbedder` `text-embedding-005`) with `EDGAR_DATA_BACKEND` (`"auto"` | `"gcp"` | `"local"`) dispatch and `@with_tool_resilience` HTTP 429 exponential backoff and timeout handling.
+- **Tools, Live GCP Adapters & Resilience (`tools.py`, `resilience.py`):** Explicit ADK `FunctionTool` definitions (`MetricFetchTool`, `LookerQueryTool`, `VarianceCalculationTool`, `HybridSearchTool`, `ContextCacheTool`, `QueryCached10KTool`) backed by live GCP client adapters (`BigQueryAdapter`, `VertexAISearchAdapter`, `VertexVectorSearchAdapter`, `GcsCorpusAdapter`, and `VertexAIEmbedder` `text-embedding-005`) with `EDGAR_DATA_BACKEND` (`"auto"` | `"gcp"` | `"local"`) dispatch and `@with_tool_resilience` HTTP 429 exponential backoff and timeout handling. `@with_tool_resilience` also runs every tool inside a `tool.<name>` OpenTelemetry span that records attempts, `tool.retry` events, and error status.
 - **Structured ReAct Execution Loop (`react_loop.py`, `chat_engine.py`):** Evaluates deterministic period variances first, queries cached 10-K sections + metadata-filtered hybrid search for causal explanations, synthesizes inline-cited Markdown (`[TICKER FYxxxx | Section | chunk_id](sec_filing_url)`) via live `FinancialAnalystAgent` or offline template synthesis, and runs post-generation numeric and citation fact-checks (`verify_narrative_against_calculations`).
 - **Context Latency, Cost Telemetry & Session Memory (`context_memory.py`, `telemetry.py`, `callbacks.py`):**
   - `ContextLatencyTracker` decomposes every model call into context preparation + prefill latency vs. decode latency, computes exact USD input/output cost and cached-token discount savings (`gemini-3.8-flash`, `gemini-3.5-flash`, and legacy `gemini-2.5-pro` profiles), monitors TTFT against the `<= 3000 ms` target, and streams per-call records directly to BigQuery (`sec_edgar.llm_telemetry_events`) via `BigQueryTelemetrySink` (`tabledata.insertAll` + structured Cloud Logging sink records).
   - `BigQueryTelemetrySink` also streams conversational turn/session metrics (`session_telemetry_events`: cumulative session length, companies analyzed, reports generated, ADK tool usage, and latency/cost) and authentication / 10-K access audit trails (`security_audit_logs`), with `"auto"` | `"gcp"` | `"local"` fallback (`EDGAR_TELEMETRY_BACKEND`).
+  - Every row in all three tables carries the request's `trace_id`, so BigQuery telemetry joins back to Cloud Trace and Cloud Logging. The Cloud Logging copies of these sink records are written as top-level `jsonPayload` fields (`component`, `log_sink_target`, `event_payload`), which is what the `google_logging_project_sink` filter matches. Before this change they were plain INFO strings with no configured handler, so they never reached stdout.
   - `ConversationMemoryManager` maintains multi-turn session state for follow-up entity/period recall and compacts older turns above a configurable token threshold.
   - `create_edgar_adk_app` configures an ADK `App` with `ContextCacheConfig` and `EventsCompactionConfig`.
 - **Vertex AI Context Caching for 10-K Sections (`tenk_context_cache.py`):**
@@ -167,23 +200,78 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 
 ### 3. FastAPI Backend, Persistent Feedback, LookML Semantic Layer & Split-Pane Frontend (`server.py`, `looker/`, `frontend/`)
 - **Backend API & Firestore Feedback Persistence:** Exposes `/health`, `/api/v1/chat`, `/api/v1/variances`, `/api/v1/search`, `/api/v1/metrics`, `/api/v1/explore/{explore_name}`, `/api/v1/looker/catalog`, `/api/v1/section`, `/api/v1/companies`, `/api/v1/evaluate`, `/api/v1/coding-assist`, `/api/v1/telemetry/context-latency`, `/api/v1/telemetry/sessions`, `/api/v1/feedback`, `/api/v1/secrets/status`, and `/api/v1/auth/*`. `FirestoreFeedbackStore` persists analyst thumbs-up/down ratings and audit comments to Google Cloud Firestore Native (`analyst_feedback` collection via REST v1 `documents` & `:runQuery`, controlled by `EDGAR_FEEDBACK_BACKEND`). Serves the compiled React bundle from `/` in production.
-- **LookML Semantic Layer & Dashboards (`looker/`):** Defines `manifest.lkml`, model `sec_edgar_analytics.model.lkml` (7 explores: `yoy_variances`, `sector_benchmarks`, `peer_comparison`, `chunk_health`, `llm_telemetry_and_cost`, `session_analytics`, `security_audit_logs`), 6 `.view.lkml` files mapped to BigQuery tables/views, and 2 `.dashboard.lookml` executive dashboards (`sec_edgar_observability_and_cost` and `sec_edgar_financial_variances`), introspected via `GET /api/v1/looker/catalog` and queried through `LookerQueryTool`.
+- **LookML Semantic Layer & Dashboards (`looker/`):** Defines `manifest.lkml`, model `sec_edgar_analytics.model.lkml` (7 explores: `yoy_variances`, `sector_benchmarks`, `peer_comparison`, `chunk_health`, `llm_telemetry_and_cost`, `session_analytics`, `security_audit_logs`), 6 `.view.lkml` files mapped to BigQuery tables/views (the three telemetry views now have a `trace_id` dimension that links to Cloud Trace), and 2 `.dashboard.lookml` executive dashboards (`sec_edgar_observability_and_cost` and `sec_edgar_financial_variances`), introspected via `GET /api/v1/looker/catalog` and queried through `LookerQueryTool`.
 - **Split-Pane Terminal UI:** Built with React 19, TypeScript, Tailwind CSS v4, and Vite. Left pane renders conversational queries, scope filters, deterministic variance tables, and interactive citation chips; right pane displays retrieved 10-K chunks and full cached Item 1A / Item 7 filing sections, with graceful offline fallback data if the backend is unreachable.
 
 ### 4. Security, Model Armor Guardrails, Infrastructure & CI/CD (`security/`, `terraform/`, `cloudbuild.yaml`)
 - **AuthN / AuthZ:** Verifies IAP (`ES256`) and Google Workspace / Okta OIDC (`RS256`) JWTs, enforces Cloud Identity group RBAC (`admins`, `analysts`, `viewers` with `user:` bindings disallowed in Terraform), runs under custom runtime SA `sec-analyst-sa`, and enforces least-privilege S2S tool boundaries across four per-agent service accounts (`root-orchestrator-agent-sa`, `financial-analyst-agent-sa`, `context-cache-agent-sa`, `model-armor-guardrail-sa`) with SPIFFE IDs.
 - **Managed Model Armor, Cloud SDP & Projection Filters (`security/model_armor.py`, `terraform/model_armor.tf`):** Replaces regex prompt-injection filters with regional Google Cloud Model Armor v1 (`sanitizeUserPrompt` & `sanitizeModelResponse` on `sec-edgar-analyst-armor`), Google Cloud Sensitive Data Protection (`content:deidentify` via `sec-edgar-sdp-inspect` & `sec-edgar-sdp-deidentify`), SEC forward-looking financial projection / MNPI leak filters, and ADK `ModelArmorSafetyPlugin` (`BasePlugin`) with session-poisoning prevention.
-- **Terraform & CI/CD:** Provisions BigQuery analytical tables, streaming telemetry/audit sink tables (`llm_telemetry_events`, `session_telemetry_events`, `security_audit_logs` with table-scoped custom append role `secEdgarTelemetrySinkAppend` + Cloud Logging sink) and SQL views (`v_financial_variances_yoy`, `v_filing_chunk_coverage`, `v_chunk_health_metrics`, `v_telemetry_cost_and_latency`), Firestore Native feedback database (`analyst_feedback_db`), Vertex AI Vector Search, Vertex AI Search (Discovery Engine), Google Cloud Model Armor & Cloud SDP templates, Secret Manager, Cloud Monitoring chunk-health dashboards, Cloud Run v2 (ingress `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`), an IAP backend service behind a global external HTTPS load balancer (`load_balancer.tf`: managed TLS certificate for `lb_domain` or `<ip>.nip.io`, URL map, HTTPS proxy, and 80→443 redirect), and Workload Identity Federation. `terraform/cloudbuild.tf` manages a 2nd-gen GitHub connection plus two Cloud Build triggers, both running as the dedicated least-privilege `sec-edgar-cloudbuild-sa`: merges to `main` run `cloudbuild.yaml` with `_PIPELINE_MODE=deploy`, and pull requests run it with `_PIPELINE_MODE=verify` (no push or deploy). `cloudbuild.yaml` first runs four quality gates in parallel: `lint-python` (`ruff check` + `ruff format --check`), `lint-terraform` (`terraform fmt -check` + `validate`), `frontend` (ESLint + Vitest), and `test`. `.github/workflows/deploy.yml` runs the same gates on every push; its build and deploy jobs are opt-in via the `DEPLOY_WITH_GITHUB_ACTIONS` repository variable, so a merge never deploys twice. The pipelines run secret scanning (`verify_no_secrets.py`), tests, container builds, an offline in-image smoke test before pushing (`scripts/container_smoke_test.py --in-process --expect-corpus baked`), and Cloud Run deployments wired with `GOOGLE_GENAI_USE_VERTEXAI=true`, `EDGAR_MODEL_ARMOR_MODE=gcp`, `MODEL_ARMOR_TEMPLATE_ID=sec-edgar-analyst-armor`, `EDGAR_PROMPT_STORE_BACKEND=auto`, `EDGAR_TELEMETRY_BACKEND=gcp`, `EDGAR_FEEDBACK_BACKEND=gcp`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and `EDGAR_EXECUTION_MODE=auto`.
+- **Terraform & CI/CD:** Provisions BigQuery analytical tables, streaming telemetry/audit sink tables (`llm_telemetry_events`, `session_telemetry_events`, `security_audit_logs` with table-scoped custom append role `secEdgarTelemetrySinkAppend` + Cloud Logging sink) and SQL views (`v_financial_variances_yoy`, `v_filing_chunk_coverage`, `v_chunk_health_metrics`, `v_telemetry_cost_and_latency`), Firestore Native feedback database (`analyst_feedback_db`), Vertex AI Vector Search, Vertex AI Search (Discovery Engine), Google Cloud Model Armor & Cloud SDP templates, Secret Manager, Cloud Monitoring chunk-health dashboards, Cloud Run v2 with IAP enabled on the service itself (`cloud_run_access_mode = "iap_direct"`, the default; see [Sharing the App Internally](#sharing-the-app-internally)) or, optionally, an IAP backend service behind a global external HTTPS load balancer (`cloud_run_access_mode = "load_balancer"`; `load_balancer.tf`: managed TLS certificate for `lb_domain` or `<ip>.nip.io`, `RESTRICTED` SSL policy, URL map, HTTPS proxy, and 80→443 redirect), a VPC Service Controls perimeter definition (`vpc_service_controls.tf`, dry-run by default), and Workload Identity Federation. `terraform/cloudbuild.tf` manages a 2nd-gen GitHub connection plus two Cloud Build triggers, both running as the dedicated least-privilege `sec-edgar-cloudbuild-sa`: merges to `main` run `cloudbuild.yaml` with `_PIPELINE_MODE=deploy`, and pull requests run it with `_PIPELINE_MODE=verify` (no push or deploy). `cloudbuild.yaml` first runs four quality gates in parallel: `lint-python` (`ruff check` + `ruff format --check`), `lint-terraform` (`terraform fmt -check` + `validate`), `frontend` (ESLint + Vitest), and `test`. `.github/workflows/deploy.yml` runs the same gates on every push; its build and deploy jobs are opt-in via the `DEPLOY_WITH_GITHUB_ACTIONS` repository variable, so a merge never deploys twice. The pipelines run secret scanning (`verify_no_secrets.py`), tests, container builds, an offline in-image smoke test before pushing (`scripts/container_smoke_test.py --in-process --expect-corpus baked`), and Cloud Run deployments wired with `GOOGLE_GENAI_USE_VERTEXAI=true`, `EDGAR_MODEL_ARMOR_MODE=gcp`, `MODEL_ARMOR_TEMPLATE_ID=sec-edgar-analyst-armor`, `EDGAR_PROMPT_STORE_BACKEND=auto`, `EDGAR_TELEMETRY_BACKEND=gcp`, `EDGAR_FEEDBACK_BACKEND=gcp`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, and `EDGAR_EXECUTION_MODE=auto`.
+
+### 5. Observability: End-to-End Latency Tracing & Structured Logs (`observability/`, `terraform/observability.tf`)
+- **OpenTelemetry → Cloud Trace (`observability/tracing.py`):**
+  - At import time, `server.py` installs a global `TracerProvider` (GCP resource detection, `ParentBased` ratio sampling) with `BatchSpanProcessor(CloudTraceSpanExporter)`. Buffered spans are flushed in the FastAPI lifespan shutdown hook.
+  - Propagation reads both `X-Cloud-Trace-Context` and W3C `traceparent`, so the server span continues the trace started by the HTTPS load balancer / Cloud Run front end.
+- **Span coverage for one `/api/v1/chat` request:**
+  - FastAPI server span (`opentelemetry-instrumentation-fastapi`).
+  - Custom `@traced` spans: `auth.verify_jwt`, `chat.rag_turn`, `guardrail.inspect_user_prompt` / `inspect_model_response`, `chat.resolve_scope`, `orchestrator.classify_intent`, `chat.retrieve_citations`, `react.execute` → `react.evaluate_variances` / `react.query_cached_10k` / `react.format_grounded_output`, `adk.run_agent_stream`, `evaluation.narrative_judge`, and `coding.assist`.
+  - A `tool.<name>` span for every ADK tool.
+  - ADK's built-in `invoke_agent` / `call_llm` / `execute_tool` spans.
+  - httpx client spans for every outbound GCP REST call (Vertex AI Gemini, BigQuery, Firestore, Model Armor, SDP, Secret Manager, IAM Credentials).
+  - Each recorded model call adds an `llm.call` span event with `gen_ai.request.model`, input/output/cached/thinking tokens, `edgar.ttft_ms`, latency, and cost.
+  - `_run_coro_sync` now copies `contextvars` into its worker thread, so live ADK runs stay children of the request span instead of starting orphan traces.
+- **Structured JSON logs → Cloud Logging (`observability/structured_logging.py`):**
+  - One root handler formats app, uvicorn, and library logs as single-line Cloud Logging JSON. Fields include `severity`, `message`, `time`, `logging.googleapis.com/trace` (`projects/<project>/traces/<trace_id>`), `logging.googleapis.com/spanId`, `logging.googleapis.com/trace_sampled`, `sourceLocation`, plain `trace_id` / `span_id`, and any `extra={"json_fields": {...}}`.
+  - Exceptions logged at ERROR or above get the Error Reporting `@type` and `serviceContext`.
+  - Health probes are excluded from tracing, but their logs still pick up the inbound trace header, so they line up with Cloud Run's request logs.
+- **Request telemetry (`observability/middleware.py`):**
+  - `RequestTelemetryMiddleware` binds `request_id` / method / path to every log line during the request.
+  - It returns `X-Trace-Id`, `X-Request-Id`, and `Server-Timing: app;dur=…`. These are exposed via CORS for the Vite UI.
+  - It writes one `http_request_completed` access log per request with `http_route`, `http_status`, and `latency_ms`, replacing uvicorn's access log.
+  - `/api/v1/chat` responses include an `observability` block with `trace_id` and a Cloud Trace console deep link.
+- **Infrastructure:**
+  - `terraform/observability.tf` adds the log-based distribution metric `logging.googleapis.com/user/sec_edgar/api_request_latencies`: per-route / method / status latency with trace exemplars, for p50/p95/p99 dashboards and alerting.
+  - The three telemetry tables get an additive, nullable `trace_id` column.
+  - Already in place: `cloudtrace.googleapis.com` and `logging.googleapis.com` are enabled, and `sec-analyst-sa` holds `roles/cloudtrace.agent` and `roles/logging.logWriter`.
+- **Dependencies:** `opentelemetry-exporter-gcp-trace`, `-propagator-gcp`, `-resourcedetector-gcp`, `-instrumentation-fastapi`, and `-instrumentation-httpx` were added to `pyproject.toml`, `requirements.txt`, and `uv.lock`.
+- **Tests (`tests/test_observability.py`, 12 tests):**
+  - An in-memory span exporter checks the full chat-turn span hierarchy, propagation of upstream `traceparent` and `X-Cloud-Trace-Context`, response headers, and that health probes are excluded from tracing.
+  - Other tests cover the JSON log format and reserved fields, uvicorn log routing, error-path tool spans, context propagation across worker threads, and `trace_id` on BigQuery telemetry rows.
+
+> [!TIP]
+> Spans are exported in batches on a background thread. Under Cloud Run's default request-based CPU allocation, an idle instance may hold spans until its next request or until shutdown. Deploy with `--no-cpu-throttling` if you need spans to appear within seconds even under low traffic.
+
+---
+
+## Sharing the App Internally
+
+The app is never anonymous. IAP sits on the Cloud Run service, so anyone who opens the URL has to sign in with a Google account, and only principals in `iap_authorized_principals` get through.
+
+1. **Choose who can open the app** in `terraform/variables.tf` or a tfvars file. Use groups or whole domains only; individual `user:` bindings are rejected:
+   ```hcl
+   iap_authorized_principals = [
+     "domain:jackbetcher.altostrat.com",        # default: everyone in this Argolis domain
+     "group:sec-edgar-analysts@example.com",     # a Google Group
+   ]
+   iap_default_app_role = "analyst"             # or "viewer"; "" admits nobody without an RBAC group
+   ```
+   The org policy `iam.allowedPolicyMemberDomains` decides which outside domains (for example `google.com` groups) can be granted access.
+2. **Apply:** `terraform -chdir=terraform apply`.
+3. **Share the link** from `terraform -chdir=terraform output -raw app_url` (the `https://sec-edgar-analyst-…run.app` URL). People who aren't authorized get an IAP "You don't have access" page, and the app never sees their requests.
+4. **Revoke** by removing the principal and applying again. Users can sign out from the header; that clears their IAP session cookie.
+
+> [!NOTE]
+> The new revision needs the backend and frontend changes in this repo, which teach the app to accept the IAP session assertion. Until a new image is deployed (merge to `main`), people who pass IAP still see the Okta/Bearer sign-in panel.
 
 ---
 
 ## Implementation Gaps vs. `docs/project_reference.md`
 
-These pieces are wired up end-to-end across the backend, Terraform, and Cloud Run: live Gemini (`gemini-3.8-flash` and `gemini-3.5-flash`), Google ADK `Runner` SSE streaming, Model Armor with SDP and projection filters, versioned prompt loading, streaming BigQuery telemetry and audit sinks, Firestore feedback, and LookML models and dashboards.
+These pieces are wired up end-to-end across the backend, Terraform, and Cloud Run: live Gemini (`gemini-3.8-flash` and `gemini-3.5-flash`), Google ADK `Runner` SSE streaming, Model Armor with SDP and projection filters, versioned prompt loading, streaming BigQuery telemetry and audit sinks, Firestore feedback, LookML models and dashboards, and OpenTelemetry tracing plus trace-correlated JSON logging (live Cloud Trace check pending; see gap 3).
 
 **Closed since the last revision (removed from the gap list):**
 - **Container corpus packaging** *(Secs. 4, 6)*: data paths resolve correctly for every install layout, the corpus can be hydrated from GCS at startup, `/health` reports where the corpus comes from, and Cloud Build and GitHub Actions run an offline smoke test inside the image before `docker push`. The one leftover step, publishing the vector DB artifacts, is now part of gap 1 below.
-- **External HTTPS load balancer in front of IAP** *(Sec. 8)*: `terraform/load_balancer.tf` provisions a global IP, a Google-managed certificate, a URL map, an HTTPS proxy, a 443 forwarding rule, and an 80→443 redirect. Cloud Run ingress is `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`, so the load balancer is the only public entry point.
+- **External HTTPS load balancer in front of IAP** *(Sec. 8)*: `terraform/load_balancer.tf` provisions a global IP, a Google-managed certificate, a `RESTRICTED` TLS policy, a URL map, an HTTPS proxy, a 443 forwarding rule, and an 80→443 redirect. It is now optional (`cloud_run_access_mode = "load_balancer"`); the default is IAP directly on Cloud Run (see gap 2).
 - **Vertex AI Context Caching for 10-K sections** *(Secs. 2, 6, 7)*: see `tenk_context_cache.py` above.
   - Full sections are now shared across Cloud Run instances as remote `CachedContent` resources, and the local section cache is bounded.
   - **Verified live on 2026-11-16.**
@@ -201,7 +289,7 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 | # | Reference Area | Status | Main Blocker / Next Action |
 | :-- | :--- | :--- | :--- |
 | 1 | **Corpus publication and full S&P 500 breadth** *(Secs. 3, 7)* | In progress | The S&P 500 extraction is running. Next: Vertex embeddings, GCS/BigQuery/Search ingestion, and an R&D metric. |
-| 2 | **VPC Service Controls and private networking** *(Sec. 8)* | Not started | No service perimeter. The Vector Search endpoint is public. No TLS policy. |
+| 2 | **VPC Service Controls and private networking** *(Sec. 8)* | Partly blocked | IAP-only access is done. The perimeter Terraform is written but can't be applied from this sandbox: the only available account has no org-level Access Context Manager rights. Still doable here: Private Service Connect for Vector Search. |
 | 3 | **OpenTelemetry, Cloud Trace, and trace-correlated JSON logs** *(Secs. 2, 4, 6, 10)* | Implemented; live check pending | Code, Terraform, and tests are done (see [`docs/observability.md`](docs/observability.md)). Next: deploy, then check one live `/api/v1/chat` trace in Cloud Trace. |
 | 4 | **Golden eval dataset, `make eval-all`, and coverage gate** *(Secs. 4, 9)* | Not started | No golden set, eval runner, coverage measurement, or CI gate. |
 
@@ -233,33 +321,50 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 
 **Reference requirement:** "A strict service perimeter locks down Vertex AI, Cloud Run, GCS, and BigQuery"; TLS 1.3 in transit; GMEK at rest.
 
-**Current state:**
-- There are no `google_access_context_manager_*` resources.
-- `terraform/vector_search.tf` sets `public_endpoint_enabled = true` on `sec-edgar-10k-chunks-endpoint`.
-- The HTTPS proxy has no `google_compute_ssl_policy`.
-- Data at rest uses Google-managed encryption (GMEK) by default, so that part of the requirement is already met.
+**Done (code, Terraform, and tests):**
+- **No anonymous or public access.** By default (`cloud_run_access_mode = "iap_direct"`), IAP is turned on for the Cloud Run service itself (`iap_enabled = true`). Every request to the `run.app` URL needs a Google sign-in from a principal in `iap_authorized_principals`, and only the IAP service agent holds `roles/run.invoker`. There's no load balancer, static IP, or certificate to run. The old LB path is still available with `cloud_run_access_mode = "load_balancer"`, and its HTTPS proxy now uses a `RESTRICTED` / TLS 1.2+ SSL policy.
+- **IAP-session sign-in in the app.** When there's no `Authorization` header, the backend accepts the `X-Goog-IAP-JWT-Assertion` that IAP injects. It must be ES256, issued by `https://cloud.google.com/iap`, and carry the Cloud Run audience `/projects/<number>/locations/<region>/services/<name>`, which Terraform writes to `sec-edgar-iap-audience`. IAP assertions carry no group claims, so users who match no RBAC group get `IAP_ASSERTION_DEFAULT_ROLE` (`analyst` by default; `viewer` or empty are the other options). Admin still requires a group. The frontend signs in from the IAP session silently, and Sign Out clears the IAP cookie.
+- **Perimeter definition.** `terraform/vpc_service_controls.tf` restricts `aiplatform`, `artifactregistry`, `bigquery`, `discoveryengine`, `dlp`, `firestore`, `modelarmor`, `run`, `secretmanager`, and `storage`. Its ingress rules allow:
+  - by identity, from any source: operators (`vpc_sc_admin_identities`), the CI/CD and Cloud Build SAs, the runtime and per-agent SAs, and the Cloud Logging → BigQuery sink writer;
+  - from any identity: invocations of `run.googleapis.com`. VPC-SC can't evaluate IAM identities on Cloud Run invocations, so IAP decides who gets in. Set `vpc_sc_app_ingress_access_levels` to an IP-based access level to also restrict by network.
 
-**Work to close:**
-1. Create or import an Access Context Manager access policy. This is an org-level resource and needs Access Context Manager Admin on the Argolis org. Add access levels for administrators and CI identities (the Cloud Build SA and the GitHub WIF principal).
-2. Add a `google_access_context_manager_service_perimeter` around the project. Restrict `aiplatform`, `run`, `storage`, `bigquery`, `discoveryengine`, `secretmanager`, `firestore`, `modelarmor`, `dlp`, and `artifactregistry` (`.googleapis.com`). Add ingress/egress rules for IAP, Cloud Build, and the Cloud Logging → BigQuery sink. Roll out in **dry-run** mode first (`use_explicit_dry_run_spec = true`), review the violation logs, then enforce.
-3. Replace the public Vector Search endpoint with a Private Service Connect endpoint. Add a VPC/subnet, Cloud Run Direct VPC egress, and the PSC forwarding rule and DNS, then point `VertexVectorSearchAdapter` at the private `:findNeighbors` host.
-4. Attach a `google_compute_ssl_policy` (`profile = "RESTRICTED"`, `min_tls_version = "TLS_1_2"`) to the HTTPS proxy. Google front ends negotiate TLS 1.3 by default; LB SSL policies can't enforce a 1.3-only minimum, so document that limitation.
-5. Add Terraform plan tests in `tests/test_deployment_pipeline.py` that check the perimeter, the restricted services, and that no public endpoints remain.
+  It deploys as a dry-run spec (`use_explicit_dry_run_spec = true`) unless `vpc_sc_enforce = true`.
+- Plan-level tests are in `tests/test_deployment_pipeline.py`. Auth tests in `tests/test_iap_okta_auth.py` cover IAP-only sessions, wrong-audience and forged assertions, and default-role handling. A Vitest case covers the silent IAP sign-in.
 
-**Done when:** the perimeter is enforced; the smoke test passes through the HTTPS load balancer; and BigQuery or GCS calls from outside the perimeter are denied with `VPC_SERVICE_CONTROLS` errors.
+**Can't be done in this sandbox:** every VPC-SC perimeter lives in an Access Context Manager policy, and every policy belongs to an organization. That includes policies scoped to a single project. Creating one requires `accesscontextmanager.policies.create` granted at the org level; Access Context Manager roles granted on a project have no effect. Org `1059565594977` is administered by Argolis-managed Google groups. `admin@jackbetcher.altostrat.com`, the only account available, holds no org roles beyond `resourcemanager.projectCreator` (`testIamPermissions` fails for `accesscontextmanager.policies.create` and `.list`). It also lacks `orgpolicy.policy.set` and `iam.denypolicies.create`, so org-policy and IAM-deny substitutes are out too. `vpc_service_controls.tf` stays off (`enable_vpc_service_controls = false`). In an org where someone can create a scoped policy and delegate it, apply it with:
+
+```bash
+terraform -chdir=terraform apply \
+  -var=enable_vpc_service_controls=true \
+  -var=vpc_sc_access_policy_id=<POLICY_NUMBER>
+```
+
+**Controls in place here instead:**
+- IAP-only access to Cloud Run, with only the IAP service agent holding `run.invoker`.
+- Public access prevention and uniform bucket-level access on the corpus and Terraform state buckets.
+- Least-privilege runtime and per-agent service accounts.
+- Model Armor and SDP on prompts and responses.
+- Security audit logs routed to BigQuery.
+
+These limit who can reach the app and data, but unlike a perimeter they don't stop a stolen credential from being used outside the project.
+
+**Remaining:**
+1. *(Only if a scoped access policy becomes available.)* Apply in dry-run. Review the dry-run violations in Logs Explorer (`protoPayload.metadata.dryRun=true`, `@type=...VpcServiceControlAuditMetadata`), add any missing ingress rules, then set `vpc_sc_enforce = true`.
+2. Replace the public Vector Search endpoint (`public_endpoint_enabled = true`) with Private Service Connect: VPC/subnet, Cloud Run Direct VPC egress (all traffic, `restricted.googleapis.com`), PSC forwarding rule and DNS, and point `VertexVectorSearchAdapter` at the private `:findNeighbors` host. Once Cloud Run egress goes through the VPC, drop the runtime and agent SAs from the identity-based ingress rule.
+3. Data at rest already uses Google-managed encryption (GMEK), so nothing is needed there.
+
+**Done when:** the perimeter is enforced; signed-in users reach the app through IAP; and BigQuery or GCS calls from outside the perimeter by an unlisted identity are denied with `VPC_SERVICE_CONTROLS` errors.
 
 ### 3. OpenTelemetry, Cloud Trace, and Trace-Correlated JSON Logs *(Secs. 2, 4, 6, 10)*
 
 **Reference requirement:** End-to-end latency tracing through OpenTelemetry and Cloud Trace, plus FastAPI structured JSON logs with trace IDs exported to Cloud Logging.
 
-**Current state (implemented; see [`docs/observability.md`](docs/observability.md)):**
-- `src/edgar_capstone/observability/` installs a global `TracerProvider` with `BatchSpanProcessor(CloudTraceSpanExporter)`, configured by `EDGAR_TRACE_EXPORTER` (`auto | gcp | console | otlp | none`) and `EDGAR_TRACE_SAMPLE_RATIO`. `auto` exports to Cloud Trace on Cloud Run. Propagation reads `CloudTraceFormatPropagator` + W3C `traceparent`, so the load balancer / Cloud Run trace context is continued.
-- FastAPI server spans and httpx client spans (Vertex AI, BigQuery, Firestore, Model Armor, SDP, and so on) come from auto-instrumentation. Custom spans cover the chat turn, guardrails, scope and intent routing, hybrid retrieval, each ReAct step, the evaluator, and JWT verification. Every ADK tool runs in a `tool.<name>` span. ADK's own agent/LLM/tool spans attach to the same trace. Model calls add `llm.call` events with the model, token counts, and `ttft_ms`. ADK prompt/response content is kept out of spans by default (`EDGAR_TRACE_CAPTURE_CONTENT=false`).
-- Every logger (app, uvicorn, libraries) writes Cloud Logging JSON (`severity`, `message`, `logging.googleapis.com/trace`, `spanId`, `trace_sampled`, `sourceLocation`, and Error Reporting fields for exceptions) when `EDGAR_LOG_FORMAT=json`, which is the default on Cloud Run. `RequestTelemetryMiddleware` writes one `http_request_completed` access log per request with `latency_ms` and returns `X-Trace-Id` / `Server-Timing` headers. `/api/v1/chat` responses include a Cloud Trace deep link.
-- `llm_telemetry_events`, `session_telemetry_events`, and `security_audit_logs` gained a nullable `trace_id` column (schemas, sink rows, LookML). `terraform/observability.tf` adds the `sec_edgar/api_request_latencies` log-based latency distribution metric.
-- `tests/test_observability.py` checks the span hierarchy with an in-memory exporter, header propagation, the log format, and `trace_id` on telemetry rows.
+**Current state:** implemented in code, Terraform, and tests. See [Current State § 5](#5-observability-end-to-end-latency-tracing--structured-logs-observability-terraformobservabilitytf) and [`docs/observability.md`](docs/observability.md). This was verified locally (135 passing tests, plus a uvicorn run in Cloud Run JSON mode with upstream `traceparent` continuation), but not yet against live Cloud Trace.
 
-**Remaining:** `terraform apply` (new metric plus the BigQuery `trace_id` columns, both additive), deploy, and confirm a live `/api/v1/chat` request in Cloud Trace.
+**Remaining:**
+1. Run `terraform apply`. It only adds things: the `sec_edgar/api_request_latencies` metric and the nullable BigQuery `trace_id` columns.
+2. Deploy, send one `/api/v1/chat` request, and confirm in Cloud Trace / Logs Explorer (`trace="projects/iron-radio-514217-q7/traces/<X-Trace-Id>"`).
+3. Optionally, add a p95 latency alert policy on the new log-based metric once notification channels exist.
 
 **Done when:** one `/api/v1/chat` request shows a single Cloud Trace with nested FastAPI, ReAct, tool, and model spans; that request's Cloud Logging entries are grouped under the trace; and its BigQuery telemetry rows carry the same `trace_id`.
 

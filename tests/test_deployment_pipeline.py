@@ -331,6 +331,92 @@ def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
     assert "roles/run.invoker" in iap_tf
 
 
+def test_cloud_run_direct_iap_internal_sharing_terraform() -> None:
+    """Default access: IAP on the Cloud Run service itself, shared with an org domain/group."""
+    tf_dir = REPO_ROOT / "terraform"
+    cicd_tf = (tf_dir / "cicd_and_secrets.tf").read_text(encoding="utf-8")
+    iap_tf = (tf_dir / "iap_and_sso.tf").read_text(encoding="utf-8")
+    lb_tf = (tf_dir / "load_balancer.tf").read_text(encoding="utf-8")
+    vars_tf = (tf_dir / "variables.tf").read_text(encoding="utf-8")
+    outputs_tf = (tf_dir / "outputs.tf").read_text(encoding="utf-8")
+
+    assert 'default     = "iap_direct"' in vars_tf
+    assert 'contains(["iap_direct", "load_balancer"], var.cloud_run_access_mode)' in vars_tf
+
+    # Cloud Run: IAP on the service; ingress opens only when IAP is on, else LB-only.
+    assert "provider = google-beta" in cicd_tf
+    assert "iap_enabled         = local.cloud_run_direct_iap" in cicd_tf
+    assert (
+        'ingress             = local.cloud_run_direct_iap ? "INGRESS_TRAFFIC_ALL" : '
+        '"INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"'
+    ) in cicd_tf
+    assert 'name  = "IAP_ASSERTION_DEFAULT_ROLE"' in cicd_tf
+
+    # IAP audience matches the Cloud Run IAP JWT `aud` format in direct mode.
+    assert "/locations/${var.region}/services/${var.cloud_run_service_name}" in iap_tf
+    assert 'resource "google_iap_web_cloud_run_service_iam_member"' in iap_tf
+    assert "local.cloud_run_direct_iap ? local.effective_iap_group_principals" in iap_tf
+
+    # No public LB unless load_balancer mode is chosen; when it is, it carries a TLS policy.
+    assert "enable_https_lb = var.enable_https_load_balancer && local.cloud_run_lb_iap" in lb_tf
+    assert 'profile         = "RESTRICTED"' in lb_tf
+    assert "ssl_policy       = google_compute_ssl_policy.sec_edgar_tls[0].id" in lb_tf
+
+    # Sharing is by group or whole domain, never by individual user.
+    assert 'startswith(lower(trimspace(p)), "domain:")' in vars_tf
+    assert "google_cloud_run_v2_service.sec_edgar_analyst[0].uri" in outputs_tf
+
+    # CI deploys use --set-env-vars (replaces all env vars), so they must keep the IAP role.
+    cloudbuild = (REPO_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
+    deploy_yml = (REPO_ROOT / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+    assert "IAP_ASSERTION_DEFAULT_ROLE=${_IAP_DEFAULT_ROLE}" in cloudbuild
+    assert "IAP_ASSERTION_DEFAULT_ROLE=analyst" in deploy_yml
+
+
+def test_vpc_service_controls_perimeter_terraform() -> None:
+    tf_dir = REPO_ROOT / "terraform"
+    vpcsc_tf = (tf_dir / "vpc_service_controls.tf").read_text(encoding="utf-8")
+    vars_tf = (tf_dir / "variables.tf").read_text(encoding="utf-8")
+    apis_tf = (tf_dir / "apis.tf").read_text(encoding="utf-8")
+
+    assert '"accesscontextmanager.googleapis.com"' in apis_tf
+    assert 'resource "google_access_context_manager_service_perimeter" "sec_edgar"' in vpcsc_tf
+    assert 'resource "google_access_context_manager_access_policy" "sec_edgar_scoped"' in vpcsc_tf
+    assert "scopes = [local.vpc_sc_project_resource]" in vpcsc_tf
+    assert 'perimeter_type = "PERIMETER_TYPE_REGULAR"' in vpcsc_tf
+
+    # Dry run first: the config goes to `spec` unless enforcement is switched on.
+    assert "use_explicit_dry_run_spec = !var.vpc_sc_enforce" in vpcsc_tf
+    assert 'dynamic "spec"' in vpcsc_tf and 'dynamic "status"' in vpcsc_tf
+    enforce_block = vars_tf.split('variable "vpc_sc_enforce"', 1)[1].split("}", 1)[0]
+    assert "default     = false" in enforce_block
+
+    # Every service named by the reference architecture is restricted.
+    restricted_block = vars_tf.split('variable "vpc_sc_restricted_services"', 1)[1].split("]", 1)[0]
+    for svc in (
+        "aiplatform",
+        "artifactregistry",
+        "bigquery",
+        "discoveryengine",
+        "dlp",
+        "firestore",
+        "modelarmor",
+        "run",
+        "secretmanager",
+        "storage",
+    ):
+        assert f'"{svc}.googleapis.com"' in restricted_block
+
+    # Ingress: identity-based for operators/CI/runtime/log sink; ANY_IDENTITY only for
+    # Cloud Run invocation (IAP gates users), as VPC-SC can't see IAM on invocations.
+    assert "google_service_account.cicd_runner.email" in vpcsc_tf
+    assert "local.runtime_service_account_email" in vpcsc_tf
+    assert "writer_identity" in vpcsc_tf
+    assert vpcsc_tf.count('identity_type = "ANY_IDENTITY"') == 2
+    assert vpcsc_tf.count('service_name = "run.googleapis.com"') == 2
+    assert "precondition" in vpcsc_tf
+
+
 def test_frontend_lockfile_uses_public_npm_registry() -> None:
     pkg_json = json.loads((REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
     lock_json = json.loads(

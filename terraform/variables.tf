@@ -225,9 +225,39 @@ variable "deletion_protection" {
 }
 
 variable "enable_iap_backend_service" {
-  description = "Whether to provision the Identity-Aware Proxy (IAP) Serverless NEG and Backend Service protecting Cloud Run."
+  description = "Whether to provision the Identity-Aware Proxy (IAP) Serverless NEG and Backend Service protecting Cloud Run. Only used when cloud_run_access_mode = \"load_balancer\"."
   type        = bool
   default     = true
+}
+
+variable "cloud_run_access_mode" {
+  description = <<-EOT
+    How people reach the Cloud Run app. Neither mode allows anonymous access.
+      iap_direct    (default) IAP is turned on for the Cloud Run service itself. Share the
+                    run.app URL; every request needs a Google sign-in from a principal in
+                    iap_authorized_principals. No load balancer, no static IP, no cert.
+      load_balancer Cloud Run ingress is internal-and-cloud-load-balancing behind the global
+                    external HTTPS load balancer + IAP backend service (load_balancer.tf).
+    IAP can't be enabled on both a load balancer backend and the Cloud Run service at once.
+  EOT
+  type        = string
+  default     = "iap_direct"
+
+  validation {
+    condition     = contains(["iap_direct", "load_balancer"], var.cloud_run_access_mode)
+    error_message = "cloud_run_access_mode must be \"iap_direct\" or \"load_balancer\"."
+  }
+}
+
+variable "iap_default_app_role" {
+  description = "App role (IAP_ASSERTION_DEFAULT_ROLE) given to users who sign in through IAP and match no Cloud Identity RBAC group. IAP has already checked iap_authorized_principals. Use \"analyst\", \"viewer\", or \"\" to deny. Admin always requires a group."
+  type        = string
+  default     = "analyst"
+
+  validation {
+    condition     = contains(["", "analyst", "viewer"], var.iap_default_app_role)
+    error_message = "iap_default_app_role must be \"analyst\", \"viewer\", or \"\"."
+  }
 }
 
 variable "allowed_workspace_domains" {
@@ -249,13 +279,13 @@ variable "okta_client_id" {
 }
 
 variable "iap_authorized_principals" {
-  description = "Cloud Identity / Google Workspace SSO group principals granted roles/iap.httpsResourceAccessor (e.g. group:sec-edgar-analysts@example.com)."
+  description = "Principals granted roles/iap.httpsResourceAccessor, i.e. who can open the app. Use group:<group>@<domain> or domain:<workspace-domain> (everyone in that Workspace/Cloud Identity domain). The org policy iam.allowedPolicyMemberDomains decides which outside domains (e.g. google.com) are allowed."
   type        = list(string)
-  default     = []
+  default     = ["domain:jackbetcher.altostrat.com"]
 
   validation {
-    condition     = alltrue([for p in var.iap_authorized_principals : !startswith(lower(trimspace(p)), "user:")])
-    error_message = "Individual user: bindings are prohibited under Cloud Identity Group RBAC; use group:<group-id>@<domain>."
+    condition     = alltrue([for p in var.iap_authorized_principals : startswith(lower(trimspace(p)), "group:") || startswith(lower(trimspace(p)), "domain:")])
+    error_message = "Use group:<group-id>@<domain> or domain:<workspace-domain>; individual user: bindings are prohibited under Cloud Identity Group RBAC."
   }
 }
 
@@ -322,7 +352,7 @@ variable "labels" {
 # HTTPS Load Balancer
 # ------------------------------------------------------------------------------
 variable "enable_https_load_balancer" {
-  description = "Whether to provision the global external HTTPS load balancer in front of the IAP backend service."
+  description = "Whether to provision the global external HTTPS load balancer in front of the IAP backend service. Only used when cloud_run_access_mode = \"load_balancer\"."
   type        = bool
   default     = true
 }
@@ -426,4 +456,60 @@ variable "cloudbuild_service_account_id" {
   description = "Account ID for the dedicated Cloud Build trigger service account."
   type        = string
   default     = "sec-edgar-cloudbuild-sa"
+}
+
+# ------------------------------------------------------------------------------
+# VPC Service Controls (vpc_service_controls.tf)
+# ------------------------------------------------------------------------------
+variable "enable_vpc_service_controls" {
+  description = "Whether to manage the VPC Service Controls perimeter around this project. Needs an access policy: set vpc_sc_access_policy_id (delegated scoped policy) or create_vpc_sc_scoped_access_policy = true (needs org-level Access Context Manager permissions)."
+  type        = bool
+  default     = false
+}
+
+variable "vpc_sc_access_policy_id" {
+  description = "Numeric ID (or accessPolicies/<id>) of an existing Access Context Manager policy to put the perimeter in, typically a policy scoped to this project that an org admin created and delegated to you with roles/accesscontextmanager.policyAdmin."
+  type        = string
+  default     = ""
+}
+
+variable "create_vpc_sc_scoped_access_policy" {
+  description = "Create a new Access Context Manager policy scoped to this project. Requires accesscontextmanager.policies.create on the organization."
+  type        = bool
+  default     = false
+}
+
+variable "vpc_sc_enforce" {
+  description = "false (default): the perimeter is dry-run only (use_explicit_dry_run_spec); violations are logged, nothing is blocked. true: enforce the same configuration."
+  type        = bool
+  default     = false
+}
+
+variable "vpc_sc_restricted_services" {
+  description = "Google APIs protected by the perimeter."
+  type        = list(string)
+  default = [
+    "aiplatform.googleapis.com",
+    "artifactregistry.googleapis.com",
+    "bigquery.googleapis.com",
+    "discoveryengine.googleapis.com",
+    "dlp.googleapis.com",
+    "firestore.googleapis.com",
+    "modelarmor.googleapis.com",
+    "run.googleapis.com",
+    "secretmanager.googleapis.com",
+    "storage.googleapis.com",
+  ]
+}
+
+variable "vpc_sc_admin_identities" {
+  description = "Human operators allowed to call restricted APIs from outside the perimeter (Terraform, gcloud, the console, local scripts). Use user:<email> or serviceAccount:<email>."
+  type        = list(string)
+  default     = ["user:admin@jackbetcher.altostrat.com"]
+}
+
+variable "vpc_sc_app_ingress_access_levels" {
+  description = "Access levels whose callers may reach run.googleapis.com (i.e. invoke the app through IAP). VPC-SC can't match IAM identities on Cloud Run invocations, so the default [\"*\"] admits any source and leaves who-gets-in to IAP. Swap in an IP-based access level to also restrict by network."
+  type        = list(string)
+  default     = ["*"]
 }

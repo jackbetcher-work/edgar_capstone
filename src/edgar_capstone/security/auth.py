@@ -74,6 +74,12 @@ DEFAULT_LOCAL_IAP_AUDIENCE = (
 ALLOWED_JWS_ALGORITHMS: frozenset[str] = frozenset({"RS256", "ES256"})
 MAX_JWT_LENGTH_BYTES = 16_384
 
+IAP_ASSERTION_HEADER = "X-Goog-IAP-JWT-Assertion"
+
+# Roles that IAP_ASSERTION_DEFAULT_ROLE may grant to IAP-verified users who carry no
+# Cloud Identity group claims. Admin is deliberately excluded: it must come from a group.
+IAP_DEFAULT_ROLE_CHOICES: frozenset[str] = frozenset({"analyst", "viewer"})
+
 
 class AuthenticationError(Exception):
     """Raised when a request lacks a valid JWT bearer credential (HTTP 401)."""
@@ -300,6 +306,10 @@ class AuthSettings:
         DEFAULT_PROJECT_NAME,
     )
     allowed_custom_service_accounts: tuple[str, ...] = ()
+    # Role granted to users authenticated only by a Cloud IAP assertion that carries no
+    # matching group claims. IAP has already checked roles/iap.httpsResourceAccessor, so
+    # this only decides what an admitted user can do in the app. None = deny.
+    iap_default_role: str | None = None
 
     @classmethod
     def from_env(
@@ -390,6 +400,12 @@ class AuthSettings:
             "false",
             "no",
         }
+        raw_iap_default_role = os.environ.get("IAP_ASSERTION_DEFAULT_ROLE", "").strip().lower()
+        if raw_iap_default_role and raw_iap_default_role not in IAP_DEFAULT_ROLE_CHOICES:
+            raise ValueError(
+                "IAP_ASSERTION_DEFAULT_ROLE must be one of "
+                f"{sorted(IAP_DEFAULT_ROLE_CHOICES)} or empty, got {raw_iap_default_role!r}"
+            )
 
         return cls(
             audiences=tuple(aud_list),
@@ -408,6 +424,7 @@ class AuthSettings:
             runtime_service_account=runtime_sa_cfg.email,
             allowed_service_account_projects=runtime_sa_cfg.allowed_projects(),
             allowed_custom_service_accounts=allowed_custom_sas,
+            iap_default_role=raw_iap_default_role or None,
         )
 
     def rbac_policy(self) -> CloudIdentityRBACPolicy:
@@ -966,6 +983,15 @@ class IAPJwtVerifier:
             user_groups=groups,
             hosted_domain=hosted_domain,
         )
+        if not roles and idp == "google_iap" and self.settings.iap_default_role:
+            # IAP assertions carry no group claims. IAP only signs one after the caller
+            # passed roles/iap.httpsResourceAccessor on this service, so grant the
+            # configured default role instead of rejecting every IAP-only user.
+            for role_def in policy.role_definitions:
+                if role_def.role == self.settings.iap_default_role:
+                    roles = ("authenticated", role_def.role)
+                    permissions = tuple(sorted(role_def.permissions))
+                    break
         if not roles:
             raise AuthorizationError(
                 "Authenticated Workspace/Okta user is not a member of any required Cloud Identity RBAC group."
@@ -1128,15 +1154,26 @@ def require_authenticated_user(
     request: Request,
     verifier: IAPJwtVerifier = Depends(get_auth_verifier),
 ) -> AuthenticatedUser:
-    """FastAPI dependency enforcing IAP + Google Workspace Okta/SSO JWT Bearer authentication."""
+    """FastAPI dependency enforcing IAP + Google Workspace Okta/SSO JWT Bearer authentication.
+
+    Browser sessions behind Cloud IAP send no `Authorization` header; IAP injects a signed
+    `X-Goog-IAP-JWT-Assertion` instead. That assertion alone is accepted when it verifies
+    as ES256, issued by https://cloud.google.com/iap, for a configured audience.
+    """
     try:
-        raw_bearer = extract_bearer_token_from_request(request)
-        user = verifier.verify_jwt(raw_bearer)
+        iap_assertion = request.headers.get(IAP_ASSERTION_HEADER, "").strip()
+        iap_session_only = bool(iap_assertion) and not request.headers.get("Authorization")
+
+        if iap_session_only:
+            raw_bearer = ""
+            user = verifier.verify_jwt(iap_assertion, require_iap_issuer=True)
+        else:
+            raw_bearer = extract_bearer_token_from_request(request)
+            user = verifier.verify_jwt(raw_bearer)
 
         # Defense-in-depth: if routed through Google Cloud IAP proxy with X-Goog-IAP-JWT-Assertion,
         # cryptographically validate the proxy assertion as well and ensure identity consistency.
-        iap_assertion = request.headers.get("X-Goog-IAP-JWT-Assertion", "").strip()
-        if iap_assertion:
+        if iap_assertion and not iap_session_only:
             iap_user = verifier.verify_jwt(iap_assertion, require_iap_issuer=True)
             if iap_user.email != user.email and not user.email.endswith(".gserviceaccount.com"):
                 raise AuthenticationError(

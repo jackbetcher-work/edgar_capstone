@@ -267,4 +267,48 @@ describe('Google Workspace (Okta SSO) & IAP JWT Bearer Authentication UI', () =>
       expect(screen.getByText('analyst@fde-workspace.corp')).toBeTruthy()
     })
   })
+
+  it('signs in silently from the Cloud IAP session when session auth is enabled', async () => {
+    const seenAuthHeaders: Record<string, string | undefined> = {}
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString()
+      const headers = (init?.headers ?? {}) as Record<string, string>
+      seenAuthHeaders[url] = headers.Authorization
+      if (url === '/api/v1/auth/config') {
+        return new Response(
+          JSON.stringify({
+            ...MOCK_PROD_AUTH_CONFIG,
+            iap: { ...MOCK_PROD_AUTH_CONFIG.iap, session_auth_enabled: true },
+          }),
+          { status: 200 }
+        )
+      }
+      if (url === '/api/v1/auth/me') {
+        return new Response(
+          JSON.stringify({
+            status: 'authenticated',
+            user: {
+              ...MOCK_AUTHENTICATED_USER,
+              email: 'colleague@jackbetcher.altostrat.com',
+              identity_provider: 'google_iap',
+            },
+          }),
+          { status: 200 }
+        )
+      }
+      if (url === '/api/v1/companies') {
+        return new Response(JSON.stringify(MOCK_COMPANIES_CATALOG), { status: 200 })
+      }
+      return new Response('{}', { status: 404 })
+    })
+
+    render(<App />)
+
+    await waitFor(() => {
+      expect(screen.getByText('colleague@jackbetcher.altostrat.com')).toBeTruthy()
+    })
+    expect(screen.queryByText(/AUTH LOCKED/i)).toBeNull()
+    // No Bearer token: the IAP-injected assertion header authenticates the browser.
+    expect(seenAuthHeaders['/api/v1/auth/me']).toBeUndefined()
+  })
 })

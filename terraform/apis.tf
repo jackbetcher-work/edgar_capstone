@@ -6,6 +6,7 @@ resource "google_project_service" "crm_api" {
 
 locals {
   required_services = toset([
+    "accesscontextmanager.googleapis.com", # VPC Service Controls (quota project for ACM calls)
     "aiplatform.googleapis.com",
     "artifactregistry.googleapis.com",
     "bigquery.googleapis.com",

@@ -734,3 +734,68 @@ def test_section_boundary_truncation() -> None:
         * 6,
         item_id="item_7",
     )
+
+
+_MDNA_BODY = (
+    "**EXECUTIVE OVERVIEW**\n\nManagement's discussion and analysis of results. "
+    + "Results of operations improved on higher volumes and pricing. " * 30
+    + "\n\n**Liquidity and Capital Resources**\n\n"
+    + "Cash flows from operations funded capital expenditures. " * 30
+    + "\n\n**Critical Accounting Estimates**\n\nImpairment testing requires judgment.\n"
+)
+
+
+def test_section_boundary_keeps_body_after_leading_item_7a_heading() -> None:
+    # RF FY2020: combined Item 7/7A MD&A whose text begins with the Item 7A heading
+    rf = (
+        "**Item 7A\\. ** **Quantitative and Qualitative Disclosures about Market Risk**\n\n"
+        + _MDNA_BODY
+        + "\n\n**Item 8\\. ** **Financial Statements and Supplementary Data**\n\nBalance sheet."
+    )
+    trimmed = truncate_at_section_boundary(rf, item_id="item_7")
+    assert "Critical Accounting Estimates" in trimmed
+    assert "Balance sheet" not in trimmed
+    assert is_substantive_section_markdown(trimmed, item_id="item_7")
+    # Idempotent, so the cached-bundle health check accepts the trimmed text
+    assert truncate_at_section_boundary(trimmed, item_id="item_7") == trimmed
+
+
+def test_section_boundary_keeps_body_after_item_7_index_and_7a_stub() -> None:
+    # SO: Item 7 page index, one-line Item 7A stub, then the full combined MD&A
+    so = (
+        "**Item 7\\.** **MANAGEMENT'S DISCUSSION AND ANALYSIS**\n\n| | Page |\n| --- | --- |\n"
+        "| Combined Management's Discussion and Analysis | II-3 |\n\n"
+        "**Item 7A\\.** **QUANTITATIVE AND QUALITATIVE DISCLOSURES ABOUT MARKET RISK**\n\n"
+        'See MANAGEMENT\'S DISCUSSION AND ANALYSIS – "Market Price Risk" in Item 7 herein\\.\n\n'
+        "**COMBINED MANAGEMENT'S DISCUSSION AND ANALYSIS**\n\n" + _MDNA_BODY
+    )
+    trimmed = truncate_at_section_boundary(so, item_id="item_7")
+    assert trimmed == so
+    assert truncate_at_section_boundary(trimmed, item_id="item_7") == trimmed
+
+
+def test_section_boundary_still_cuts_stubs_and_real_7a_sections() -> None:
+    # ETR: cross-reference stub followed by Items 7A-9A stubs -> cut at Item 7A (stub rejected)
+    etr = (
+        "### Refer to\n\n**MANAGEMENT'S FINANCIAL DISCUSSION AND ANALYSIS of each registrant**\n\n"
+        "**Item 7A\\. ** **Quantitative and Qualitative Disclosures About Market Risk**\n\nRefer to.\n\n"
+        "**Item 8\\. ** **Financial Statements and Supplementary Data**\n\nRefer to.\n"
+    )
+    trimmed = truncate_at_section_boundary(etr, item_id="item_7")
+    assert "Item 7A" not in trimmed
+    assert not is_substantive_section_markdown(trimmed, item_id="item_7")
+    # Short MD&A stub followed by a genuine (non-MD&A) Item 7A section -> still cut at Item 7A
+    market_risk = "Interest rate risk and foreign currency exposure are hedged with swaps. " * 60
+    stub_then_7a = (
+        "See the Annual Report to shareholders\\.\n\n"
+        "**Item 7A\\. Quantitative and Qualitative Disclosures About Market Risk**\n\n"
+        + market_risk
+    )
+    assert "Interest rate risk" not in truncate_at_section_boundary(stub_then_7a, item_id="item_7")
+    # Item 1A behaviour is unchanged (no content markers): leading boundary still cuts
+    assert (
+        truncate_at_section_boundary(
+            "**Item 1B\\. Unresolved Staff Comments**\n\n" + _MDNA_BODY, item_id="item_1a"
+        )
+        == ""
+    )

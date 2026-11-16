@@ -56,6 +56,7 @@ export function App() {
     useState<AuthenticatedUserProfile | null>(null)
   const [isAuthenticating, setIsAuthenticating] = useState<boolean>(false)
   const [authErrorMessage, setAuthErrorMessage] = useState<string | null>(null)
+  const [isIapSession, setIsIapSession] = useState<boolean>(false)
 
   const [companies, setCompanies] = useState<CompanySummary[]>([])
   const [sectors, setSectors] = useState<string[]>([])
@@ -168,6 +169,23 @@ export function App() {
         }
       }
 
+      if (config.auth_required && config.iap?.session_auth_enabled) {
+        // Behind Cloud IAP the browser already holds an IAP session, and IAP adds a
+        // signed X-Goog-IAP-JWT-Assertion header to every request. Probe /auth/me
+        // without a Bearer token; a 401 just means no IAP session, so stay quiet.
+        try {
+          const user = await fetchAuthenticatedUser()
+          if (!active) return
+          setAuthenticatedUser(user)
+          setIsIapSession(true)
+          setAuthErrorMessage(null)
+          await loadCompaniesCatalog()
+          return
+        } catch {
+          if (!active) return
+        }
+      }
+
       if (!config.auth_required) {
         await loadCompaniesCatalog()
       }
@@ -243,6 +261,11 @@ export function App() {
   }
 
   const handleLogout = async () => {
+    if (isIapSession) {
+      // The IAP session cookie is what signs this user in, so clear it at IAP.
+      window.location.assign('/?gcp-iap-mode=CLEAR_LOGIN_COOKIE')
+      return
+    }
     await logoutAuthenticatedSession()
     setAuthenticatedUser(null)
     setTurns([])
