@@ -19,12 +19,14 @@ from edgar_capstone.dataset.constituents import (
 )
 from edgar_capstone.dataset.extractor import (
     _extract_single_section,
+    _filter_non_dimensional_income_df,
     clean_markdown_section,
     extract_financial_metrics,
     format_combined_10k_markdown,
     is_substantive_section_markdown,
     reconcile_company_fiscal_years,
     resolve_fiscal_year,
+    truncate_at_section_boundary,
 )
 from edgar_capstone.dataset.gcs_storage import (
     GCSAccessError,
@@ -667,3 +669,68 @@ def test_unhealthy_cache_invalidation_and_stale_pruning(tmp_path: Path) -> None:
     assert not (unstruct_dir / "2021_10k.md").exists()
     assert (struct_dir / "2022_financials.json").exists()
     assert (unstruct_dir / "2022_10k.md").exists()
+
+
+def test_jan_spillover_fiscal_year_ignores_calendar_year_dei() -> None:
+    # DPZ tags DEI fiscal_year with the calendar year of a Jan 1-10 52/53-week period end
+    assert resolve_fiscal_year(dei_fiscal_year="2022", report_date_str="2022-01-02") == 2021
+    assert resolve_fiscal_year(dei_fiscal_year="2023", report_date_str="2023-01-01") == 2022
+    assert resolve_fiscal_year(dei_fiscal_year="2020", report_date_str="2021-01-03") == 2020
+    # Late-January retail year-ends keep the DEI convention
+    assert resolve_fiscal_year(dei_fiscal_year="2026", report_date_str="2026-01-25") == 2026
+
+
+def test_income_df_never_falls_back_to_prior_year_column() -> None:
+    # EXE FY2021 (fresh-start successor period column lacks the "(FY)" suffix)
+    df = pd.DataFrame(
+        {
+            "concept": ["us-gaap_NetIncomeLoss"],
+            "label": ["Net income"],
+            "dimension": [False],
+            "is_breakdown": [False],
+            "abstract": [False],
+            "2021-12-31": [6.3e9],
+            "2020-12-31 (FY)": [-9.734e9],
+            "2019-12-31 (FY)": [-3.0e8],
+        }
+    )
+    _, col = _filter_non_dimensional_income_df(df, report_date_str="2021-12-31")
+    assert col == "2021-12-31"
+    # No column for the reporting period at all -> refuse rather than return FY2020 values
+    _, col = _filter_non_dimensional_income_df(
+        df.drop(columns=["2021-12-31"]), report_date_str="2021-12-31"
+    )
+    assert col is None
+
+
+def test_section_boundary_truncation() -> None:
+    body = "Liquidity and capital resources discussion. " * 80
+    mdna = body + "\n\n**Report of Independent Registered Public Accounting Firm**\n\nOpinion text."
+    assert truncate_at_section_boundary(mdna, item_id="item_7") == body.strip()
+    bleed_7a = (
+        body + "\n\n**Item 7A\\. ** <u>Quantitative and Qualitative Disclosures</u>\n\nRates."
+    )
+    assert truncate_at_section_boundary(bleed_7a, item_id="item_7") == body.strip()
+    # Prose cross-references to Item 8 must not truncate MD&A
+    prose = body + "\nItem 8 of this report\\.\n" + body
+    assert truncate_at_section_boundary(prose, item_id="item_7") == prose
+    note_ref = (
+        body
+        + "\nItem 8\\. Financial Statements and Supplementary Data—Notes to the Consolidated Financial Statements—Note 4\n"
+        + body
+    )
+    assert truncate_at_section_boundary(note_ref, item_id="item_7") == note_ref
+    # Item 1A bleeding into Item 1B / Item 2 (FDX "see pages 88-99" stub)
+    fdx = (
+        "We present information about our risk factors on pages 88 through 99 of this Annual Report\\.\n\n"
+        "ITEM 1B\\. UNRESOLVED STAFF COMMENTS\n\nNone\\.\n\nITEM 2\\. PROPERTIES\n\n" + body
+    )
+    trimmed = truncate_at_section_boundary(fdx, item_id="item_1a")
+    assert "PROPERTIES" not in trimmed
+    assert not is_substantive_section_markdown(trimmed, item_id="item_1a")
+    # "Refer to ..." cross-reference stubs are rejected
+    assert not is_substantive_section_markdown(
+        "### Refer to\n\n**MANAGEMENT'S FINANCIAL DISCUSSION AND ANALYSIS of each registrant** "
+        * 6,
+        item_id="item_7",
+    )

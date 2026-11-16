@@ -1049,6 +1049,11 @@ class StructuredReActExecutor:
             ),
             "grounding_fallback_applied": grounding_fallback_applied,
             "fallback_reason": fallback_reason,
+            "vertex_context_cache": (
+                live_stream_result.session_state.get("tenk_context_cache")
+                if live_stream_result is not None
+                else None
+            ),
         }
 
         return {

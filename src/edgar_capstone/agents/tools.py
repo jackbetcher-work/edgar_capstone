@@ -13,9 +13,11 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import urllib.parse
 from collections import OrderedDict, defaultdict
+from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -97,8 +99,106 @@ DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID = "sec-edgar-10k-hybrid-search"
 DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID = "sec-edgar-10k-corpus-ds"
 DEFAULT_VERTEX_VECTOR_ENDPOINT_DISPLAY_NAME = "sec-edgar-10k-chunks-endpoint"
 
-# In-memory process cache for context caching simulation & fast corpus access
-_SESSION_10K_CONTEXT_CACHE: dict[str, dict[str, Any]] = {}
+DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES = 256
+DEFAULT_10K_SECTION_CACHE_TTL_SECONDS = 3600.0
+_10K_CACHE_KEY_RE = re.compile(
+    r"^(?P<ticker>.+)_(?P<fiscal_year>\d{4})_(?P<section_id>item_1a|item_7)$"
+)
+
+
+def _env_positive_number(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+class _BoundedSectionCache(MutableMapping[str, dict[str, Any]]):
+    """Thread-safe, bounded LRU + TTL map for parsed 10-K sections (process-local L1 cache).
+
+    This is only the local copy of parsed section text. Model calls share the
+    sections across Cloud Run instances through remote Vertex AI `CachedContent`
+    resources (`agents/tenk_context_cache.py`). Bounding the map keeps memory
+    flat when the full S&P 500 corpus (~500 issuers x 7 years x 2 sections) is in play.
+    """
+
+    def __init__(self, *, max_entries: int, ttl_seconds: float) -> None:
+        self.max_entries = max(1, int(max_entries))
+        self.ttl_seconds = float(ttl_seconds)
+        self._data: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
+        self._lock = threading.RLock()
+        self.evictions = 0
+
+    def _expired(self, stored_at: float) -> bool:
+        return (time.monotonic() - stored_at) > self.ttl_seconds
+
+    def _purge_expired_locked(self) -> None:
+        expired = [k for k, (ts, _) in self._data.items() if self._expired(ts)]
+        for k in expired:
+            del self._data[k]
+            self.evictions += 1
+
+    def __getitem__(self, key: str) -> dict[str, Any]:
+        with self._lock:
+            stored_at, value = self._data[key]
+            if self._expired(stored_at):
+                del self._data[key]
+                self.evictions += 1
+                raise KeyError(key)
+            self._data.move_to_end(key)
+            return value
+
+    def __setitem__(self, key: str, value: dict[str, Any]) -> None:
+        with self._lock:
+            self._data[key] = (time.monotonic(), value)
+            self._data.move_to_end(key)
+            while len(self._data) > self.max_entries:
+                self._data.popitem(last=False)
+                self.evictions += 1
+
+    def __delitem__(self, key: str) -> None:
+        with self._lock:
+            del self._data[key]
+
+    def __contains__(self, key: object) -> bool:
+        with self._lock:
+            item = self._data.get(key)  # type: ignore[call-overload]
+            if item is None:
+                return False
+            if self._expired(item[0]):
+                del self._data[key]  # type: ignore[arg-type]
+                self.evictions += 1
+                return False
+            return True
+
+    def __iter__(self) -> Iterator[str]:
+        with self._lock:
+            self._purge_expired_locked()
+            return iter(list(self._data.keys()))
+
+    def __len__(self) -> int:
+        with self._lock:
+            self._purge_expired_locked()
+            return len(self._data)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._data.clear()
+
+
+# Process-local L1 cache of parsed 10-K sections (bounded LRU + TTL)
+_SESSION_10K_CONTEXT_CACHE: _BoundedSectionCache = _BoundedSectionCache(
+    max_entries=int(
+        _env_positive_number(
+            "EDGAR_10K_SECTION_CACHE_MAX_ENTRIES", DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES
+        )
+    ),
+    ttl_seconds=_env_positive_number(
+        "EDGAR_10K_SECTION_CACHE_TTL_SECONDS", DEFAULT_10K_SECTION_CACHE_TTL_SECONDS
+    ),
+)
 _CONTEXT_CACHE_RUNTIME_COUNTERS: dict[str, float | int] = {
     "hits": 0,
     "misses": 0,
@@ -1752,12 +1852,20 @@ def get_context_cache_runtime_stats() -> dict[str, Any]:
     total = hits + misses
     hit_ms = float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_hit_latency_ms", 0.0))
     miss_ms = float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_miss_latency_ms", 0.0))
+    # Lazy import: tenk_context_cache imports this module for section hydration.
+    from edgar_capstone.agents.tenk_context_cache import get_tenk_context_cache_manager
+
+    resident = dict(_SESSION_10K_CONTEXT_CACHE.items())
     return {
-        "cached_sections_count": len(_SESSION_10K_CONTEXT_CACHE),
-        "cached_keys": sorted(_SESSION_10K_CONTEXT_CACHE.keys()),
+        "cached_sections_count": len(resident),
+        "cached_keys": sorted(resident.keys()),
         "total_cached_tokens_resident": sum(
-            int(v.get("token_estimate", 0)) for v in _SESSION_10K_CONTEXT_CACHE.values()
+            int(v.get("token_estimate", 0)) for v in resident.values()
         ),
+        "section_cache_max_entries": _SESSION_10K_CONTEXT_CACHE.max_entries,
+        "section_cache_ttl_seconds": _SESSION_10K_CONTEXT_CACHE.ttl_seconds,
+        "section_cache_evictions": _SESSION_10K_CONTEXT_CACHE.evictions,
+        "vertex_context_cache": get_tenk_context_cache_manager().stats(),
         "hits": hits,
         "misses": misses,
         "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
@@ -3015,9 +3123,10 @@ def load_cached_10k_section(
         }
 
     cache_id = f"{norm_ticker}_{fiscal_year}_{sec_key}"
-    cache_hit = cache_id in _SESSION_10K_CONTEXT_CACHE
+    entry: dict[str, Any] | None = _SESSION_10K_CONTEXT_CACHE.get(cache_id)
+    cache_hit = entry is not None
 
-    if not cache_hit:
+    if entry is None:
         matched_prof: FinancialDataProfile | None = None
         md_content: str | None = None
         adapters, strict_gcp = _resolve_gcp_dispatch()
@@ -3081,7 +3190,7 @@ def load_cached_10k_section(
         sections = extract_sections_from_combined_markdown(md_content)
         sec_text = sections.get(sec_key, "")
         token_est = estimate_token_count(sec_text)
-        _SESSION_10K_CONTEXT_CACHE[cache_id] = {
+        entry = {
             "profile_id": matched_prof.profile_id,
             "ticker": matched_prof.ticker,
             "company_name": matched_prof.company_name,
@@ -3092,8 +3201,8 @@ def load_cached_10k_section(
             "token_estimate": token_est,
             "full_text": sec_text,
         }
+        _SESSION_10K_CONTEXT_CACHE[cache_id] = entry
 
-    entry = _SESSION_10K_CONTEXT_CACHE[cache_id]
     effective_max = max(500, min(int(max_chars), 50000))
     excerpt = str(entry["full_text"])[:effective_max]
     lookup_latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
@@ -3153,6 +3262,39 @@ def load_cached_10k_section(
         "content": excerpt,
         "truncated": len(str(entry["full_text"])) > effective_max,
     }
+
+
+def parse_10k_cache_key(cache_key: str) -> tuple[str, int, str] | None:
+    """Split a `{TICKER}_{FY}_{item_1a|item_7}` section cache key into its parts."""
+    match = _10K_CACHE_KEY_RE.match(str(cache_key).strip())
+    if match is None:
+        return None
+    return match["ticker"].upper(), int(match["fiscal_year"]), match["section_id"]
+
+
+def get_full_10k_section(cache_key: str) -> dict[str, Any] | None:
+    """Return the full parsed 10-K section entry for a cache key, hydrating the L1 cache on miss.
+
+    Unlike `load_cached_10k_section`, this returns the untruncated `full_text`. It is
+    used to register complete sections as remote Vertex AI `CachedContent` resources.
+    """
+    parsed = parse_10k_cache_key(cache_key)
+    if parsed is None:
+        return None
+    ticker, fiscal_year, section_id = parsed
+    norm_key = f"{ticker}_{fiscal_year}_{section_id}"
+    entry = _SESSION_10K_CONTEXT_CACHE.get(norm_key)
+    if entry is None:
+        res = load_cached_10k_section(
+            ticker=ticker,
+            fiscal_year=fiscal_year,
+            section_id=section_id,
+            max_chars=500,
+        )
+        if res.get("status") != "success":
+            return None
+        entry = _SESSION_10K_CONTEXT_CACHE.get(norm_key)
+    return dict(entry) if entry is not None else None
 
 
 @with_tool_resilience(tool_name="query_cached_10k_context")

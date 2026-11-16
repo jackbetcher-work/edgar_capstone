@@ -49,6 +49,11 @@ from edgar_capstone.agents.schemas import (
     ModelTaskCategory,
     NarrativeEvaluationReport,
 )
+from edgar_capstone.agents.tenk_context_cache import (
+    TENK_CACHE_SECTION_KEYS_STATE,
+    get_tenk_context_cache_manager,
+    is_cached_content_error,
+)
 from edgar_capstone.security.model_armor import ModelArmorSafetyPlugin
 from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID
 
@@ -621,6 +626,12 @@ async def run_live_adk_financial_reasoning_async(
     cached_tokens = sum(
         int(c.get("token_estimate") or 0) for c in cached_explanations if c.get("cache_hit")
     )
+    # Full 10-K sections queried by the ReAct loop, in priority order, for remote context caching
+    tenk_section_keys: list[str] = []
+    for c in cached_explanations:
+        key = str(c.get("cache_key") or "").strip()
+        if key and key not in tenk_section_keys:
+            tenk_section_keys.append(key)
     state_seed: dict[str, Any] = {
         "calculated_variances": calc_map,
         "retrieved_citations": list(citations),
@@ -630,6 +641,7 @@ async def run_live_adk_financial_reasoning_async(
             "misses": cache_misses,
             "cached_tokens_saved": cached_tokens,
         },
+        TENK_CACHE_SECTION_KEYS_STATE: tenk_section_keys,
     }
 
     prompt_text = _build_financial_reasoning_prompt(
@@ -645,17 +657,27 @@ async def run_live_adk_financial_reasoning_async(
         memory_summary_text=str((memory_context or {}).get("memory_summary_text") or ""),
     )
 
-    return await run_adk_agent_stream_async(
-        agent=analyst_agent,
-        prompt_text=prompt_text,
-        user_id=user_id,
-        session_id=session_id,
-        app_name="edgar_chat_app",
-        state_delta=state_seed,
-        use_adk_app=True,
-        summarizer_llm=flash_llm if isinstance(flash_llm, BaseLlm) else None,
-        backend=resolved.backend,
-    )
+    stream_kwargs: dict[str, Any] = {
+        "agent": analyst_agent,
+        "prompt_text": prompt_text,
+        "user_id": user_id,
+        "session_id": session_id,
+        "app_name": "edgar_chat_app",
+        "state_delta": state_seed,
+        "use_adk_app": True,
+        "summarizer_llm": flash_llm if isinstance(flash_llm, BaseLlm) else None,
+        "backend": resolved.backend,
+    }
+    try:
+        return await run_adk_agent_stream_async(**stream_kwargs)
+    except Exception as exc:
+        if not tenk_section_keys or not is_cached_content_error(exc):
+            raise
+        # The remote CachedContent expired or was deleted between lookup and use: drop
+        # local handles and retry once, which rediscovers or recreates the cache.
+        logger.warning("10-K CachedContent rejected at generate time (%s); retrying once.", exc)
+        get_tenk_context_cache_manager().invalidate()
+        return await run_adk_agent_stream_async(**stream_kwargs)
 
 
 def run_live_adk_financial_reasoning(**kwargs: Any) -> AdkStreamResult:

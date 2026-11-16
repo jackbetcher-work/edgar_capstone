@@ -18,10 +18,12 @@ from edgar_capstone.dataset.constituents import (
 from edgar_capstone.dataset.extractor import (
     DEFAULT_SEC_USER_AGENT,
     MIN_SUBSTANTIVE_SECTION_CHARS,
+    PARSE_FAILURE_MARKER,
     configure_sec_identity,
     extract_company_10k_bundles,
     is_substantive_section_markdown,
     resolve_fiscal_year,
+    truncate_at_section_boundary,
 )
 from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_BUCKET_NAME,
@@ -95,6 +97,12 @@ def _is_cached_bundle_healthy(bundle: ExtractedFilingBundle) -> bool:
     if not is_substantive_section_markdown(sec_1a, item_id="item_1a"):
         return False
     if not is_substantive_section_markdown(sec_7, item_id="item_7"):
+        return False
+    # Sections that bleed into the next 10-K item (Item 1B/1C/2, Item 7A/8, auditor's report)
+    # were staged before boundary trimming existed; re-extract so the trimmed text is used.
+    if truncate_at_section_boundary(sec_1a, item_id="item_1a") != sec_1a:
+        return False
+    if truncate_at_section_boundary(sec_7, item_id="item_7") != sec_7:
         return False
     # If one section is full-sized SEC text (>=2k chars) and the other is a tiny fragment (<1.5k),
     # treat as truncated so full-document/exhibit fallback can recover it.
@@ -349,13 +357,22 @@ def run_dataset_pipeline(
                 all_warnings.extend(comp_warnings)
                 for bundle in bundles:
                     _write_bundle_to_disk(output_dir, bundle)
-                _prune_stale_company_files(
-                    output_dir,
-                    constituent.ticker,
-                    start_year=config.start_year,
-                    end_year=config.end_year,
-                    valid_fiscal_years={b.profile.fiscal_year for b in bundles},
-                )
+                had_parse_failure = any(PARSE_FAILURE_MARKER in w for w in comp_warnings)
+                if had_parse_failure:
+                    # A 10-K failed to download/parse (often transient). Its fiscal year is
+                    # unknown, so pruning could delete a previously staged good file.
+                    logger.warning(
+                        "[%s] Skipping stale-file pruning because a 10-K failed to parse.",
+                        constituent.ticker,
+                    )
+                else:
+                    _prune_stale_company_files(
+                        output_dir,
+                        constituent.ticker,
+                        start_year=config.start_year,
+                        end_year=config.end_year,
+                        valid_fiscal_years={b.profile.fiscal_year for b in bundles},
+                    )
                 processed_tickers.append(constituent.ticker)
             except Exception as exc:
                 err_msg = str(exc)

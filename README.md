@@ -24,7 +24,7 @@ make dev
 # 3. Or build the frontend bundle and serve the single-origin app from FastAPI (:8000)
 make start
 
-# 4. Run secret scan, backend pytest suite (109 tests), ESLint, and frontend Vitest suite (6 tests)
+# 4. Run secret scan, backend pytest suite (119 tests), ESLint, and frontend Vitest suite (6 tests)
 make test
 
 # 5. Run the CI lint/format gates (ruff check + format --check, terraform fmt/validate, ESLint),
@@ -97,7 +97,8 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 │   │   ├── context_memory.py        # Pro/Flash model routing, ContextLatencyTracker, session compaction
 │   │   ├── evaluation_and_coding.py # Flash LLM-as-a-Judge evaluator & SQL/Python/LookML coding assist
 │   │   ├── callbacks.py             # Guardrails, first-chunk SSE TTFT capture & grounding callbacks
-│   │   └── tools.py                 # Resilient ADK FunctionTools for metrics, variances, RAG & 10-K cache
+│   │   ├── tenk_context_cache.py    # Full 10-K sections as shared Vertex AI CachedContent (L1 -> discovery -> create)
+│   │   └── tools.py                 # Resilient ADK FunctionTools for metrics, variances, RAG & bounded 10-K section cache
 │   ├── dataset/                     # SEC EDGAR 10-K XBRL + Markdown extraction pipeline (edgartools)
 │   │   ├── paths.py                 # Install-layout-aware data root resolution (source tree, /app/data, cwd)
 │   │   └── corpus_hydration.py      # GCS -> local corpus hydration (startup + CLI) and /health corpus status
@@ -107,7 +108,7 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 ├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI
 ├── scripts/                         # CLI entrypoints: dataset build, vector DB build (+ --upload-only), corpus hydration, container smoke test, secret scanner
 ├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP + HTTPS LB, Cloud Build triggers
-├── tests/                           # Automated pytest suite (109 tests across agents, live ADK, GCP adapters, telemetry, APIs, IaC, container packaging)
+├── tests/                           # Automated pytest suite (119 tests across agents, live ADK, GCP adapters, telemetry, APIs, IaC, container packaging)
 ├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + Python 3.11 runtime) with baked manifests + build-time corpus check
 ├── .dockerignore                    # Keeps secrets and gitignored heavy corpus artifacts out of the build context
 ├── cloudbuild.yaml                  # Cloud Build: parallel lint/test gates -> build (+ offline smoke test) -> push + deploy (main) / verify-only (PRs)
@@ -140,6 +141,25 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
   - `BigQueryTelemetrySink` also streams conversational turn/session metrics (`session_telemetry_events`: cumulative session length, companies analyzed, reports generated, ADK tool usage, and latency/cost) and authentication / 10-K access audit trails (`security_audit_logs`), with `"auto"` | `"gcp"` | `"local"` fallback (`EDGAR_TELEMETRY_BACKEND`).
   - `ConversationMemoryManager` maintains multi-turn session state for follow-up entity/period recall and compacts older turns above a configurable token threshold.
   - `create_edgar_adk_app` configures an ADK `App` with `ContextCacheConfig` and `EventsCompactionConfig`.
+- **Vertex AI Context Caching for 10-K Sections (`tenk_context_cache.py`):**
+  - The full Item 1A / Item 7 sections that the ReAct loop queried are registered as one remote Gemini `CachedContent` per synthesis (`google.genai.Client.caches`). The resource also holds `FinancialAnalystAgent`'s resolved system instruction and tool declarations, because Gemini rejects requests that set `cached_content` together with `system_instruction` or `tools`.
+  - A `before_model_callback` runs after the Model Armor guardrail. It attaches the cache with `config.cached_content` and skips ADK's own prefix cache for that call.
+  - Lookup order: an in-process handle, then cross-instance discovery by a deterministic `display_name` (`caches.list()`, built from a SHA-256 of the model, instruction, tools, and section content), then `caches.create`. TTLs are extended with `caches.update` once less than half remains.
+  - Fallbacks: bundles below the model's minimum cacheable size are sent inline. Cache API errors and timeouts fall back to passages-only grounding and trip a circuit breaker. If a cache expires between lookup and use, the synthesis is retried once.
+  - Decisions appear in `adk_runtime.vertex_context_cache` on chat responses. Counters appear under `context_cache_runtime.vertex_context_cache` in `/api/v1/telemetry/context-latency`. Real cached-token savings flow through `cached_content_token_count` into the cost telemetry.
+  - The process-local `_SESSION_10K_CONTEXT_CACHE` is now a bounded LRU + TTL map (`EDGAR_10K_SECTION_CACHE_MAX_ENTRIES=256`, `EDGAR_10K_SECTION_CACHE_TTL_SECONDS=3600`).
+  - Configuration:
+
+    | Variable | Default | Purpose |
+    | :--- | :--- | :--- |
+    | `EDGAR_10K_CONTEXT_CACHE` | `auto` | `off` disables remote caching |
+    | `EDGAR_10K_CONTEXT_CACHE_TTL_SECONDS` | `1800` | Cache TTL |
+    | `EDGAR_10K_CONTEXT_CACHE_MAX_TOKENS` | `200000` | Token budget per bundle |
+    | `EDGAR_10K_CONTEXT_CACHE_MIN_TOKENS` | per model | Minimum cacheable size: 2,048 for Gemini 2.5, 4,096 for Gemini 3 |
+    | `EDGAR_10K_CONTEXT_CACHE_DISCOVERY` | `true` | Cross-instance lookup |
+    | `EDGAR_10K_CONTEXT_CACHE_CREATE_TIMEOUT_SECONDS` | `20` | Create timeout |
+    | `EDGAR_10K_CONTEXT_CACHE_DISCOVERY_TIMEOUT_SECONDS` | `5` | Discovery timeout |
+    | `EDGAR_10K_CONTEXT_CACHE_FAILURE_COOLDOWN_SECONDS` | `600` | Circuit-breaker cooldown |
 
 ### 3. FastAPI Backend, Persistent Feedback, LookML Semantic Layer & Split-Pane Frontend (`server.py`, `looker/`, `frontend/`)
 - **Backend API & Firestore Feedback Persistence:** Exposes `/health`, `/api/v1/chat`, `/api/v1/variances`, `/api/v1/search`, `/api/v1/metrics`, `/api/v1/explore/{explore_name}`, `/api/v1/looker/catalog`, `/api/v1/section`, `/api/v1/companies`, `/api/v1/evaluate`, `/api/v1/coding-assist`, `/api/v1/telemetry/context-latency`, `/api/v1/telemetry/sessions`, `/api/v1/feedback`, `/api/v1/secrets/status`, and `/api/v1/auth/*`. `FirestoreFeedbackStore` persists analyst thumbs-up/down ratings and audit comments to Google Cloud Firestore Native (`analyst_feedback` collection via REST v1 `documents` & `:runQuery`, controlled by `EDGAR_FEEDBACK_BACKEND`). Serves the compiled React bundle from `/` in production.
@@ -160,6 +180,9 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 **Closed since the last revision (removed from the gap list):**
 - **Container corpus packaging** *(Secs. 4, 6)*: data paths resolve correctly for every install layout, the corpus can be hydrated from GCS at startup, `/health` reports where the corpus comes from, and Cloud Build and GitHub Actions run an offline smoke test inside the image before `docker push`. The one leftover step, publishing the vector DB artifacts, is now part of gap 1 below.
 - **External HTTPS load balancer in front of IAP** *(Sec. 8)*: `terraform/load_balancer.tf` provisions a global IP, a Google-managed certificate, a URL map, an HTTPS proxy, a 443 forwarding rule, and an 80→443 redirect. Cloud Run ingress is `INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER`, so the load balancer is the only public entry point.
+- **Vertex AI Context Caching for 10-K sections** *(Secs. 2, 6, 7)*: see `tenk_context_cache.py` above.
+  - Full sections are now shared across Cloud Run instances as remote `CachedContent` resources, and the local section cache is bounded.
+  - **Live verification is blocked in `iron-radio-514217-q7`.** The first `caches.create` call failed with `500 INTERNAL: Failed to create the tenant project ... Permission denied to enable service [iam.googleapis.com]` (`FLOW_TU_ADD_ACTIVATION_NEEDED`, `serviceconsumermanagement.googleapis.com`). This is a Vertex AI tenant-project provisioning issue at the project or org level, not an application error. The circuit breaker keeps it from adding latency, and the app falls back to passages-only grounding. A project or org admin needs to resolve it. Try enabling `serviceconsumermanagement.googleapis.com` or reviewing the Argolis org policies on service enablement, then re-run the live smoke test.
 - **Cloud Build trigger and lint/format gates** *(Sec. 8: CI/CD)*:
   - `terraform/cloudbuild.tf` manages the GitHub connection, the `main` deploy trigger, the PR verify trigger, and the dedicated `sec-edgar-cloudbuild-sa` service account. Set `enable_cloudbuild_trigger = true` after the one-time GitHub App and token setup described in [`terraform/README.md`](terraform/README.md).
   - `cloudbuild.yaml` gates the build on `ruff check` / `ruff format --check`, `terraform fmt` / `validate`, ESLint + Vitest, the secret scan, and pytest.
@@ -171,10 +194,9 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 | # | Reference Area | Status | Main Blocker / Next Action |
 | :-- | :--- | :--- | :--- |
 | 1 | **Corpus publication and full S&P 500 breadth** *(Secs. 3, 7)* | In progress | The S&P 500 extraction is running. Next: Vertex embeddings, GCS/BigQuery/Search ingestion, and an R&D metric. |
-| 2 | **Vertex AI Context Caching for 10-K sections** *(Secs. 2, 6, 7)* | Partial | 10-K sections are cached only in each process's memory. They need to become shared, remote `CachedContent` resources. |
-| 3 | **VPC Service Controls and private networking** *(Sec. 8)* | Not started | No service perimeter. The Vector Search endpoint is public. No TLS policy. |
-| 4 | **OpenTelemetry, Cloud Trace, and trace-correlated JSON logs** *(Secs. 2, 4, 6, 10)* | Not started | No span exporter or tracer provider. App logs are not JSON and carry no trace IDs. |
-| 5 | **Golden eval dataset, `make eval-all`, and coverage gate** *(Secs. 4, 9)* | Not started | No golden set, eval runner, coverage measurement, or CI gate. |
+| 2 | **VPC Service Controls and private networking** *(Sec. 8)* | Not started | No service perimeter. The Vector Search endpoint is public. No TLS policy. |
+| 3 | **OpenTelemetry, Cloud Trace, and trace-correlated JSON logs** *(Secs. 2, 4, 6, 10)* | Not started | No span exporter or tracer provider. App logs are not JSON and carry no trace IDs. |
+| 4 | **Golden eval dataset, `make eval-all`, and coverage gate** *(Secs. 4, 9)* | Not started | No golden set, eval runner, coverage measurement, or CI gate. |
 
 ---
 
@@ -200,26 +222,7 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 
 **Done when:** `make docker-smoke-hydrated` passes with the default `chunks,unstructured` scopes; both catalogs report about 500 issuers, `embedding_backend: vertex`, and every upload/load flag set to `true`; Vertex AI Search returns hits for a non-sample ticker; and the NVDA vs. AAPL R&D query returns a deterministic variance table with citations.
 
-### 2. Vertex AI Context Caching for 10-K Sections *(Secs. 2, 6, 7)*
-
-**Reference requirement:** The Context Cache Manager checks the cache, loads the 10-K from GCS on a miss, and manages a **Vertex AI Context Cache** so that Gemini answers against cached 10-K context ("Real-time narrative synthesis using Gemini Context Caching").
-
-**Current state:**
-- `create_edgar_adk_app` sets the ADK `ContextCacheConfig` (`min_tokens=2048`, `ttl_seconds=1800`, `cache_intervals=10`). This lets ADK cache each agent's request prefix. 10-K sections are not registered as their own cache resources.
-- `QueryCached10KTool` stores parsed sections in a module-level dict, `_SESSION_10K_CONTEXT_CACHE` in `tools.py`. That cache is per process: it isn't shared across Cloud Run instances, it's lost on cold start, and it has no TTL or eviction. With about 500 issuers × 7 years × 2 sections, it grows without bound.
-- `context_memory.py` already parses `cached_content_token_count` and computes the 75% discount, so the telemetry is ready once real cache hits happen.
-
-**Work to close:**
-1. Add a `CachedContentManager` (e.g. `agents/context_cache_manager.py`) that registers each `{TICKER}_{FY}_{section}` Markdown section with `google.genai.Client.caches.create(model=..., config=CreateCachedContentConfig(display_name=cache_id, contents=[...], system_instruction=..., ttl="1800s"))`.
-2. Make cache lookups work across instances. Either keep a `cache_id → cachedContents/{name}` mapping (with `expire_time`) in Firestore, or resolve by `display_name` through `caches.list()`. Extend the TTL with `caches.update` on each hit, and add a bounded LRU in front as a local L1 cache.
-3. Pass `cached_content=<name>` in the synthesis step's `GenerateContentConfig`. Either extend ADK's cache manager or call the model directly for the grounded synthesis step, so the 10-K cache doesn't conflict with ADK's prefix caching. A cache can only be used with the model it was created for, so key caches by model.
-4. Fall back to inline context when a section is under the model's minimum cacheable token count, or when the cache returns 404 or has expired. Delete caches when `/api/v1/section` content changes.
-5. Grant `aiplatform.cachedContents.*` (via `roles/aiplatform.user`) to `context-cache-agent-sa` and `financial-analyst-agent-sa`, and add cache hit/miss/create counts to `llm_telemetry_events` and the LookML cost dashboard.
-6. Write tests that mock `client.caches`, covering create, hit, expiry, fallback, and cross-instance reuse.
-
-**Done when:** two Cloud Run instances answering the same company-year question reuse one `CachedContent` resource; telemetry shows `cached_content_token_count > 0` and non-zero cache savings; and nothing remains in process-local memory that can grow without bound.
-
-### 3. VPC Service Controls and Private Networking *(Sec. 8)*
+### 2. VPC Service Controls and Private Networking *(Sec. 8)*
 
 **Reference requirement:** "A strict service perimeter locks down Vertex AI, Cloud Run, GCS, and BigQuery"; TLS 1.3 in transit; GMEK at rest.
 
@@ -238,7 +241,7 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 
 **Done when:** the perimeter is enforced; the smoke test passes through the HTTPS load balancer; and BigQuery or GCS calls from outside the perimeter are denied with `VPC_SERVICE_CONTROLS` errors.
 
-### 4. OpenTelemetry, Cloud Trace, and Trace-Correlated JSON Logs *(Secs. 2, 4, 6, 10)*
+### 3. OpenTelemetry, Cloud Trace, and Trace-Correlated JSON Logs *(Secs. 2, 4, 6, 10)*
 
 **Reference requirement:** End-to-end latency tracing through OpenTelemetry and Cloud Trace, plus FastAPI structured JSON logs with trace IDs exported to Cloud Logging.
 
@@ -257,12 +260,12 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 
 **Done when:** one `/api/v1/chat` request shows a single Cloud Trace with nested FastAPI, ReAct, tool, and model spans; that request's Cloud Logging entries are grouped under the trace; and its BigQuery telemetry rows carry the same `trace_id`.
 
-### 5. Golden Eval Dataset, `make eval-all`, and Coverage Gate *(Secs. 4, 9)*
+### 4. Golden Eval Dataset, `make eval-all`, and Coverage Gate *(Secs. 4, 9)*
 
 **Reference requirement:** A golden dataset of 20+ query–variance–explanation mappings in BigQuery; Gemini 3.5 Flash LLM-as-a-Judge regression checks through `make eval-all` before deployment; >80% pytest coverage; ≥92% grounding recall; 100% numeric agreement and citation coverage; p95 TTFT ≤ 3.0 s; 100% safety compliance.
 
 **Current state:**
-- 109 pytest tests with mocked LLM and Search APIs.
+- 119 pytest tests with mocked LLM and Search APIs.
 - `NarrativeEvaluatorAgent` (4-axis rubric) and `/api/v1/evaluate`.
 - `verify_narrative_against_calculations` enforces numeric and citation locks for each response.
 - No golden dataset or BigQuery eval tables, no `make eval-all` target, and `pytest-cov` is not installed, so coverage is unmeasured.

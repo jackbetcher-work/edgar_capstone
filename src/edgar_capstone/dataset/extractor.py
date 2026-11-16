@@ -107,10 +107,68 @@ _LEADING_ITEM_HEADER_RE = re.compile(
 )
 _LEADING_TABLE_RULE_RE = re.compile(r"^\s*(?:\|\s*---[^\n]*\|?\s*\n+)+")
 _MULTI_NEWLINE_RE = re.compile(r"\n{3,}")
+_DATE_COLUMN_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+
+# Headings of the NEXT 10-K item, used to cut sections that bleed past their own boundary
+# (e.g., ETR/CCL "Item 7" = cross-ref stub followed by Items 7A-14; AEP/CVX MD&A running into
+# audited financial statements; CSX/ED Item 1A running into Item 1B/1C/2). A boundary line must
+# be a short title-style line: the item label followed by its canonical title keyword, or the
+# bare label alone (e.g., "| ITEM 1B. |"). Prose cross-references such as
+# "Item 8 of this report." or "Item 8. Financial Statements...—Note 4" do not qualify.
+_ITEM_LABEL_PREFIX = (
+    r"(?im)^[ \t]*(?:\|\s*)?(?:#{1,6}\s*|\*\*\s*)?(?:PART\s+I{1,3}[\s.,:|\\—–-]*)?ITEM\s+"
+)
+_ITEM_TITLE_GAP = r"[\s*|\\.:—–-]*(?:<u>\s*)?(?:\*\*\s*)?"
+_SECTION_BOUNDARY_RES: dict[str, re.Pattern[str]] = {
+    "item_1a": re.compile(
+        _ITEM_LABEL_PREFIX
+        + r"(?:"
+        + r"1\\?\.?\s*B\\?\.?"
+        + _ITEM_TITLE_GAP
+        + r"Unresolve"
+        + r"|1\\?\.?\s*C\\?\.?"
+        + _ITEM_TITLE_GAP
+        + r"Cybersecurity"
+        + r"|2\\?\.?"
+        + _ITEM_TITLE_GAP
+        + r"Propert"
+        + r"|3\\?\.?"
+        + _ITEM_TITLE_GAP
+        + r"Legal\s+Proceeding"
+        + r"|(?:1\\?\.?\s*[BC]|2|3)\\?\.?[\s*|\\.:]*$"
+        + r")[^\n]*$"
+    ),
+    "item_7": re.compile(
+        _ITEM_LABEL_PREFIX
+        + r"(?:"
+        + r"7\\?\.?\s*A\\?\.?"
+        + _ITEM_TITLE_GAP
+        + r"Quantitative"
+        + r"|8\\?\.?"
+        + _ITEM_TITLE_GAP
+        + r"Financial\s+Statements"
+        + r"|9\\?\.?"
+        + _ITEM_TITLE_GAP
+        + r"Changes\s+in"
+        + r"|9\\?\.?\s*A\\?\.?"
+        + _ITEM_TITLE_GAP
+        + r"Controls"
+        + r"|(?:7\\?\.?\s*A|8|9A?)\\?\.?[\s*|\\.:]*$"
+        + r")[^\n]*$"
+    ),
+}
+_AUDITOR_REPORT_HEADING_RE = re.compile(
+    r"(?im)^[ \t]*(?:\|\s*|\*\*\s*|#{1,6}\s*)Report\s+of\s+Independent\s+Registered\s+Public\s+Accounting\s+Firm\b[^\n]*$"
+)
+_MAX_BOUNDARY_LINE_CHARS = 120
 
 # Minimum lengths for validating extracted 10-K sections
 MIN_ABSOLUTE_SECTION_CHARS = 350
 MIN_SUBSTANTIVE_SECTION_CHARS = 2000
+
+# Marker embedded in per-company warnings when a 10-K could not be downloaded/parsed, so the
+# pipeline can avoid pruning previously staged files for that company on transient failures.
+PARSE_FAILURE_MARKER = "Failed to parse 10-K"
 
 _CROSS_REF_STUB_RE = re.compile(
     r"(?is)(?:"
@@ -119,7 +177,9 @@ _CROSS_REF_STUB_RE = re.compile(
     r"information\s+(?:required|called\s+for)\s+by\s+(?:this\s+)?item(?:\s+(?:1\\?\.?a|7))?\s+(?:is\s+(?:set\s+forth|shown|presented)|appears)|"
     r"(?:this\s+)?information\s+appears\s+under\s+[“\"']?(?:management|risk\s+factors)|"
     r"index\s+to\s+management['\u2019]?s\s+discussion\s+and\s+analysis|"
-    r"is\s+shown\s+in\s+.*?exhibit\s+(?:13|99)"
+    r"is\s+shown\s+in\s+.*?exhibit\s+(?:13|99)|"
+    r"\A[\W_]*(?:#{1,6}\s*)?refer\s+to\b|"
+    r"\bon\s+pages?\s+\d+\s*(?:through|to|and|-|–|—)\s*\d+"
     r")"
 )
 _WRONG_ITEM_1A_RE = re.compile(
@@ -250,11 +310,22 @@ def resolve_fiscal_year(
     """
     parsed_date = date.fromisoformat(str(report_date_str).strip()[:10])
     # 52/53-week calendar-year companies whose fiscal year spills a few days into early Jan
-    date_fallback_fy = (
-        parsed_date.year - 1
-        if (parsed_date.month == 1 and parsed_date.day <= 10)
-        else parsed_date.year
-    )
+    is_jan_spillover = parsed_date.month == 1 and parsed_date.day <= 10
+    date_fallback_fy = parsed_date.year - 1 if is_jan_spillover else parsed_date.year
+
+    if is_jan_spillover:
+        # A fiscal year ending Jan 1-10 is always the prior calendar year's 52/53-week year
+        # (e.g., DPZ 2022-01-02 = FY2021). Some filers tag DEI with the calendar year of the
+        # period end, which previously shifted labels forward one year and caused FY
+        # collisions that silently dropped a real 10-K (DPZ FY2022 lost, FY2021 gap).
+        if dei_fiscal_year is not None and str(dei_fiscal_year).strip() != str(date_fallback_fy):
+            logger.warning(
+                "Ignoring DEI fiscal_year=%s for Jan 1-10 52/53-week period_of_report=%s; using %d",
+                dei_fiscal_year,
+                report_date_str,
+                date_fallback_fy,
+            )
+        return date_fallback_fy
 
     if dei_fiscal_year is not None:
         try:
@@ -338,6 +409,40 @@ def clean_markdown_section(raw_text: str) -> str:
     return text
 
 
+def truncate_at_section_boundary(
+    text: str,
+    *,
+    item_id: Literal["item_1a", "item_7"],
+) -> str:
+    """Cut `text` at the first heading of a subsequent 10-K item (or the auditor's report for MD&A)."""
+    if not text:
+        return text
+    patterns = [_SECTION_BOUNDARY_RES[item_id]]
+    if item_id == "item_7":
+        patterns.append(_AUDITOR_REPORT_HEADING_RE)
+
+    cut_pos: int | None = None
+    for pattern in patterns:
+        for m in pattern.finditer(text):
+            line = m.group(0)
+            if len(line.strip()) > _MAX_BOUNDARY_LINE_CHARS:
+                continue
+            if _TOC_PAGE_NUMBER_TAIL_RE.search(line) or re.search(r"(?i)\bnotes?\b", line):
+                continue
+            if cut_pos is None or m.start() < cut_pos:
+                cut_pos = m.start()
+            break
+
+    if cut_pos is None:
+        return text
+    return _MULTI_NEWLINE_RE.sub("\n\n", text[:cut_pos]).strip()
+
+
+def _clean_and_bound_section(raw_text: str, *, item_id: Literal["item_1a", "item_7"]) -> str:
+    """Normalize section Markdown and trim any bleed into the following 10-K item."""
+    return truncate_at_section_boundary(clean_markdown_section(raw_text), item_id=item_id)
+
+
 def is_substantive_section_markdown(
     cleaned_text: str | None,
     *,
@@ -387,7 +492,7 @@ def _slice_markdown_between(
         if end_pos - body_start < min_slice_chars:
             continue
 
-        cleaned = clean_markdown_section(full_md[body_start:end_pos])
+        cleaned = _clean_and_bound_section(full_md[body_start:end_pos], item_id=item_id)
         if is_substantive_section_markdown(cleaned, item_id=item_id, min_chars=min_slice_chars):
             if best_candidate is None or len(cleaned) > len(best_candidate):
                 best_candidate = cleaned
@@ -509,7 +614,7 @@ def _extract_single_section(
             md_attr = getattr(sec_obj, "markdown", None)
             raw = md_attr() if callable(md_attr) else md_attr
             if isinstance(raw, str):
-                cleaned = clean_markdown_section(raw)
+                cleaned = _clean_and_bound_section(raw, item_id=resolved_item_id)
                 if is_substantive_section_markdown(cleaned, item_id=resolved_item_id):
                     if len(cleaned) >= MIN_SUBSTANTIVE_SECTION_CHARS:
                         return cleaned
@@ -518,7 +623,7 @@ def _extract_single_section(
     # Fallback 1: direct TenK property (e.g., tenk.risk_factors / tenk.management_discussion)
     prop_val = getattr(tenk, fallback_attr, None)
     if isinstance(prop_val, str):
-        cleaned = clean_markdown_section(prop_val)
+        cleaned = _clean_and_bound_section(prop_val, item_id=resolved_item_id)
         if is_substantive_section_markdown(cleaned, item_id=resolved_item_id):
             if len(cleaned) >= MIN_SUBSTANTIVE_SECTION_CHARS:
                 return cleaned
@@ -530,7 +635,7 @@ def _extract_single_section(
             py_warnings.simplefilter("ignore", FutureWarning)
             indexed_val = tenk[item_key]
         if isinstance(indexed_val, str):
-            cleaned = clean_markdown_section(indexed_val)
+            cleaned = _clean_and_bound_section(indexed_val, item_id=resolved_item_id)
             if is_substantive_section_markdown(cleaned, item_id=resolved_item_id):
                 if len(cleaned) >= MIN_SUBSTANTIVE_SECTION_CHARS:
                     return cleaned
@@ -671,20 +776,48 @@ def _filter_non_dimensional_income_df(
         return None, None
 
     fy_cols = [c for c in df.columns if "(FY)" in str(c)]
-    if not fy_cols:
-        fy_cols = [c for c in df.columns if re.match(r"^\d{4}-\d{2}-\d{2}", str(c))]
-    if not fy_cols:
+    date_cols = [c for c in df.columns if _DATE_COLUMN_RE.match(str(c))]
+    # Full-year "(FY)" columns first, then any other dated period columns (e.g., a fresh-start
+    # successor period labelled "2021-12-31" without the "(FY)" suffix).
+    candidate_cols = fy_cols + [c for c in date_cols if c not in fy_cols]
+    if not candidate_cols:
         return None, None
 
-    primary_col = fy_cols[0]
-    if report_date_str:
-        report_prefix = str(report_date_str).strip()[:7]  # YYYY-MM
-        for col in fy_cols:
-            if str(col).startswith(report_prefix):
-                primary_col = col
-                break
+    if not report_date_str:
+        return df, candidate_cols[0]
 
-    return df, primary_col
+    report_str = str(report_date_str).strip()
+    try:
+        target_date: date | None = date.fromisoformat(report_str[:10])
+    except ValueError:
+        target_date = None
+
+    if target_date is not None:
+        for col in candidate_cols:
+            m = _DATE_COLUMN_RE.match(str(col))
+            if not m:
+                continue
+            try:
+                col_date = date.fromisoformat(m.group(0))
+            except ValueError:
+                continue
+            if abs((col_date - target_date).days) <= 7:
+                return df, col
+
+    report_prefix = report_str[:7]  # YYYY-MM
+    for col in candidate_cols:
+        if str(col).startswith(report_prefix):
+            return df, col
+
+    # No column covers the reporting period. Previously this fell back to the first "(FY)"
+    # column, which silently attributed PRIOR-YEAR values to the current fiscal year
+    # (e.g., EXE FY2021 profile carried FY2020 operating/net income). Refuse instead.
+    logger.debug(
+        "No income statement column matches period_of_report=%s (columns=%s)",
+        report_str,
+        candidate_cols,
+    )
+    return None, None
 
 
 def _canonical_xbrl_tag(raw_concept: str) -> str:
@@ -1050,7 +1183,7 @@ def extract_company_10k_bundles(
                 description=f"parse 10-K {constituent.ticker} {accession_no}",
             )
         except Exception as exc:
-            msg = f"[{constituent.ticker}] Failed to parse 10-K {accession_no}: {exc}"
+            msg = f"[{constituent.ticker}] {PARSE_FAILURE_MARKER} {accession_no}: {exc}"
             logger.warning(msg)
             warnings.append(msg)
             continue
@@ -1088,6 +1221,14 @@ def extract_company_10k_bundles(
             continue
         # Filings are iterated newest-first; keep the most recent 10-K per fiscal year
         if fiscal_year in bundles_by_fy:
+            kept = bundles_by_fy[fiscal_year].profile
+            w = (
+                f"[{constituent.ticker} FY{fiscal_year}] Fiscal-year collision: dropping 10-K "
+                f"{entry['accession_no']} (period {entry['report_date']}) in favor of "
+                f"{kept.accession_number} (period {kept.period_of_report})."
+            )
+            logger.warning(w)
+            warnings.append(w)
             continue
 
         accession_no = entry["accession_no"]
@@ -1187,6 +1328,16 @@ def extract_company_10k_bundles(
             )
             logger.warning(w)
             warnings.append(w)
+        if revenue is not None and revenue > 0:
+            for name, val in (("operating_income", operating_income), ("net_income", net_income)):
+                if val is not None and val > 1.5 * revenue:
+                    w = (
+                        f"[{constituent.ticker} FY{fiscal_year}] Implausible {name}={val:,.0f} "
+                        f"exceeds 1.5x revenue={revenue:,.0f} ({provenance.revenue}); "
+                        "revenue concept may be a mis-tagged subtotal."
+                    )
+                    logger.warning(w)
+                    warnings.append(w)
 
         unstructured_blob = f"unstructured/{constituent.ticker}/{fiscal_year}_10k.md"
         structured_blob = f"structured/{constituent.ticker}/{fiscal_year}_financials.json"

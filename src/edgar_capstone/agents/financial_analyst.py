@@ -23,6 +23,7 @@ from edgar_capstone.agents.prompt_store import (
     load_agent_prompt,
     make_adk_instruction_provider,
 )
+from edgar_capstone.agents.tenk_context_cache import tenk_context_cache_before_model_callback
 from edgar_capstone.agents.tools import (
     ContextCacheTool,
     HybridSearchTool,
@@ -69,7 +70,12 @@ def create_financial_analyst_agent(
         output_key="financial_analyst_report",
         before_agent_callback=before_agent_telemetry_callback,
         after_agent_callback=after_agent_memory_callback,
-        before_model_callback=before_model_safety_and_latency_callback,
+        # Guardrails run first (a blocked prompt never creates a cache), then the full
+        # 10-K sections in scope are attached as a remote Vertex AI CachedContent.
+        before_model_callback=[
+            before_model_safety_and_latency_callback,
+            tenk_context_cache_before_model_callback,
+        ],
         after_model_callback=after_model_fact_check_callback,
         before_tool_callback=before_tool_agent_identity_callback,
     )
