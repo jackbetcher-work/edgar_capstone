@@ -161,4 +161,15 @@ view: session_telemetry_events {
     value_format: "$0.0000"
     sql: ${TABLE}.cached_token_savings_usd ;;
   }
+
+  dimension: trace_id {
+    type: string
+    label: "Cloud Trace ID"
+    description: "OpenTelemetry trace ID of the originating API request. Links to the end-to-end latency trace in Cloud Trace."
+    sql: ${TABLE}.trace_id ;;
+    link: {
+      label: "Open in Cloud Trace"
+      url: "https://console.cloud.google.com/traces/list?project=@{GCP_PROJECT_ID}&tid={{ value }}"
+    }
+  }
 }

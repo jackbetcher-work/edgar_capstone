@@ -8,7 +8,7 @@ resource "google_bigquery_table" "llm_telemetry_events" {
   project             = var.project_id
   dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
   table_id            = "llm_telemetry_events"
-  description         = "Streaming LLM telemetry sink capturing per-call token breakdowns, USD cost, cached-token discount savings, TTFT, and prefill/decode latency across Gemini 2.5 Pro and Gemini 3.5 Flash."
+  description         = "Streaming LLM telemetry sink capturing per-call token breakdowns, USD cost, cached-token discount savings, TTFT, and prefill/decode latency across Gemini 3.8 Flash and Gemini 3.5 Flash."
   deletion_protection = var.deletion_protection
   labels              = var.labels
 

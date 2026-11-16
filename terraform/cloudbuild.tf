@@ -44,6 +44,9 @@ locals {
     _RUNTIME_SA        = local.runtime_service_account_email
     _BIGQUERY_DATASET  = var.dataset_id
     _SEC_CORPUS_BUCKET = local.sec_corpus_bucket_name
+    _ANALYST_MODEL     = var.financial_reasoning_model
+    _FLASH_MODEL       = var.coding_and_evaluation_model
+    _GEMINI_LOCATION   = var.gemini_location
   }
 
   # Doc-only changes never trigger a build.

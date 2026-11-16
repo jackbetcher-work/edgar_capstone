@@ -276,6 +276,8 @@ def test_live_runtime_resolution_and_gemini_client_wiring(
         "GOOGLE_API_KEY",
         "GEMINI_API_KEY",
         "EDGAR_EXECUTION_MODE",
+        "EDGAR_GEMINI_LOCATION",
+        "GOOGLE_CLOUD_LOCATION",
     ):
         monkeypatch.delenv(env_key, raising=False)
 
@@ -299,7 +301,7 @@ def test_live_runtime_resolution_and_gemini_client_wiring(
     flash_gemini = build_adk_llm_for_task("evaluation", resolution=vertex_res)
     assert isinstance(pro_gemini, Gemini)
     assert isinstance(flash_gemini, Gemini)
-    assert pro_gemini.model == "gemini-2.5-pro"
+    assert pro_gemini.model == "gemini-3.8-flash"
     assert flash_gemini.model == "gemini-3.5-flash"
     assert pro_gemini.client_kwargs == {
         "vertexai": True,
@@ -309,6 +311,14 @@ def test_live_runtime_resolution_and_gemini_client_wiring(
     assert pro_gemini.retry_options is not None
     assert pro_gemini.retry_options.attempts == 3
     assert 429 in (pro_gemini.retry_options.http_status_codes or [])
+
+    # Gemini can be pinned to the `global` endpoint while GCP_REGION stays regional
+    monkeypatch.setenv("EDGAR_GEMINI_LOCATION", "global")
+    global_res = resolve_live_adk_runtime()
+    assert global_res.location == "global"
+    global_gemini = build_adk_llm_for_task("financial_reasoning", resolution=global_res)
+    assert global_gemini.client_kwargs["location"] == "global"
+    monkeypatch.delenv("EDGAR_GEMINI_LOCATION")
 
     # 3. Gemini API key mode -> redacts secret from repr & public status metadata
     monkeypatch.delenv("GOOGLE_GENAI_USE_VERTEXAI", raising=False)

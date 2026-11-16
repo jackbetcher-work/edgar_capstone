@@ -229,7 +229,7 @@ class ModelContextLatencyRecord(BaseModel):
     timestamp: str = Field(..., description="ISO-8601 UTC timestamp")
     agent_name: str = Field(..., description="ADK agent executing the model call")
     model_name: str = Field(
-        ..., description="Gemini model identifier (e.g., gemini-2.5-pro or gemini-3.5-flash)"
+        ..., description="Gemini model identifier (e.g., gemini-3.8-flash or gemini-3.5-flash)"
     )
     task_category: ModelTaskCategory = Field(
         default="financial_reasoning",

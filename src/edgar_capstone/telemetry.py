@@ -35,6 +35,7 @@ from google.auth.exceptions import DefaultCredentialsError, RefreshError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from edgar_capstone.dataset.gcs_storage import DEFAULT_LOCATION, DEFAULT_PROJECT_ID
+from edgar_capstone.observability.tracing import add_span_event, current_trace_correlation
 
 if TYPE_CHECKING:
     from edgar_capstone.agents.schemas import ModelContextLatencyRecord
@@ -176,15 +177,30 @@ class TelemetryConfig:
         )
 
 
+def _current_trace_id() -> str | None:
+    """Cloud Trace / OpenTelemetry trace ID of the active request (joins BigQuery rows to traces)."""
+    corr = current_trace_correlation()
+    return corr.trace_id if corr else None
+
+
 def emit_cloud_logging_sink_record(sink_table: str, payload: dict[str, Any]) -> None:
-    """Emit structured JSON log line targeted at Cloud Logging -> BigQuery project sinks."""
+    """Emit a structured log entry targeted at Cloud Logging -> BigQuery project sinks.
+
+    The envelope is passed as `json_fields`, so `CloudLoggingJsonFormatter` writes
+    `component` / `log_sink_target` / `event_payload` as top-level `jsonPayload` keys (the
+    `google_logging_project_sink` filter matches `jsonPayload.component`) next to the
+    active trace ID, so every BigQuery telemetry row can be joined back to its Cloud Trace trace.
+    """
     envelope = {
-        "severity": "INFO",
         "component": "sec-edgar-telemetry-sink",
         "log_sink_target": sink_table,
         "event_payload": payload,
     }
-    cloud_sink_logger.info(json.dumps(envelope, default=str, separators=(",", ":")))
+    cloud_sink_logger.info(
+        "telemetry sink record -> %s",
+        sink_table,
+        extra={"json_fields": envelope},
+    )
 
 
 class _AuthenticatedRestTransport:
@@ -538,6 +554,25 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
     def record_llm_telemetry(self, record: ModelContextLatencyRecord) -> dict[str, Any]:
         """Stream an LLM token/cost/latency call record to `llm_telemetry_events`."""
         row = self.serialize_llm_record(record)
+        row["trace_id"] = _current_trace_id()
+        # Surface the model call on the active span (ReAct step / ADK agent) for Cloud Trace.
+        add_span_event(
+            "llm.call",
+            **{
+                "gen_ai.request.model": record.model_name,
+                "edgar.agent_name": record.agent_name,
+                "edgar.react_phase": record.react_phase,
+                "edgar.task_category": record.task_category,
+                "gen_ai.usage.input_tokens": row["total_context_tokens"],
+                "gen_ai.usage.output_tokens": record.output_tokens,
+                "edgar.cached_context_tokens": row["cached_context_tokens"],
+                "edgar.thoughts_tokens": record.thoughts_tokens,
+                "edgar.ttft_ms": record.ttft_ms,
+                "edgar.total_model_latency_ms": record.total_model_latency_ms,
+                "edgar.cache_hit": row["cache_hit"],
+                "edgar.total_cost_usd": record.total_cost_usd,
+            },
+        )
         delivery = self._deliver_row(
             table_id=self.llm_table,
             insert_id=record.call_id,
@@ -648,6 +683,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             "evaluation_score": (
                 round(float(evaluation_score), 4) if evaluation_score is not None else None
             ),
+            "trace_id": _current_trace_id(),
         }
         delivery = self._deliver_row(
             table_id=self.session_table,
@@ -682,6 +718,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             "spiffe_id": entry.get("spiffe_id"),
             "iap_assertion_verified": bool(entry.get("iap_assertion_verified", False)),
             "detail": str(entry.get("detail") or ""),
+            "trace_id": entry.get("trace_id") or _current_trace_id(),
         }
         delivery = self._deliver_row(
             table_id=self.audit_table,

@@ -37,6 +37,7 @@ from edgar_capstone.agents.tools import (
     MetricFetchTool,
     VarianceCalculationTool,
 )
+from edgar_capstone.observability.tracing import traced
 
 DEFAULT_ORCHESTRATOR_MODEL = os.environ.get("EDGAR_ORCHESTRATOR_MODEL", DEFAULT_ANALYST_MODEL)
 
@@ -63,6 +64,7 @@ _CHUNK_HEALTH_RE = re.compile(
 )
 
 
+@traced("orchestrator.classify_intent")
 def classify_query_intent(query: str, tickers: list[str] | None = None) -> QueryIntentType:
     """Deterministically classify an analyst query into one of the supported routing intents."""
     if _CHUNK_HEALTH_RE.search(query):
@@ -110,9 +112,9 @@ def create_root_orchestrator(
         model=model,
         planner=PlanReActPlanner(),
         description=(
-            "Central Gemini 2.5 Pro ReAct supervisor for the SEC EDGAR Natural Language Analyst system. "
+            "Central Gemini ReAct supervisor for the SEC EDGAR Natural Language Analyst system. "
             "Routes queries across longitudinal single-company analysis, multi-company peer comparison, "
-            "and thematic 10-K trend tracking, orchestrating FinancialAnalystAgent (gemini-2.5-pro) alongside "
+            "and thematic 10-K trend tracking, orchestrating FinancialAnalystAgent (financial reasoning model) alongside "
             "ContextCacheAgent, NarrativeEvaluatorAgent, and CodingAssistantAgent (gemini-3.5-flash) "
             "under granular per-agent least-privilege identities."
         ),
@@ -130,7 +132,8 @@ def create_root_orchestrator(
         ],
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.1,
-            max_output_tokens=4096,
+            # Includes thinking tokens on Gemini 3.x; a 4096 cap truncated full reports.
+            max_output_tokens=16384,
         ),
         output_key="orchestrator_response",
         before_agent_callback=before_agent_telemetry_callback,

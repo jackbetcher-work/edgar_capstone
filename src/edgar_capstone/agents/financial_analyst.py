@@ -50,7 +50,7 @@ def create_financial_analyst_agent(
         model=model,
         planner=PlanReActPlanner(),
         description=(
-            "Gemini 2.5 Pro SEC 10-K financial reasoning agent employing a structured ReAct "
+            "Gemini SEC 10-K financial reasoning agent employing a structured ReAct "
             "loop to evaluate deterministic period-over-period variances, query cached 10-K "
             "context (Item 1A Risk Factors & Item 7 MD&A), and format strictly cited reports."
         ),
@@ -65,7 +65,8 @@ def create_financial_analyst_agent(
         ],
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.1,
-            max_output_tokens=4096,
+            # Includes thinking tokens on Gemini 3.x; a 4096 cap truncated full reports.
+            max_output_tokens=16384,
         ),
         output_key="financial_analyst_report",
         before_agent_callback=before_agent_telemetry_callback,

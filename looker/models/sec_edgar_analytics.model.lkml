@@ -53,7 +53,7 @@ explore: chunk_health {
 
 explore: llm_telemetry_and_cost {
   label: "LLM Token Cost, Cache Savings & Latency"
-  description: "Streaming Gemini 2.5 Pro & Gemini 3.5 Flash token consumption, cached-token USD savings, TTFT SLO compliance, and prefill/decode latency."
+  description: "Streaming Gemini 3.8 Flash & Gemini 3.5 Flash token consumption, cached-token USD savings, TTFT SLO compliance, and prefill/decode latency."
   persist_with: sec_edgar_streaming_telemetry_datagroup
   view_name: llm_telemetry_events
 }

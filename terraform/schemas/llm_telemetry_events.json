@@ -33,7 +33,7 @@
     "name": "model_name",
     "type": "STRING",
     "mode": "REQUIRED",
-    "description": "Gemini model identifier (gemini-2.5-pro or gemini-3.5-flash)"
+    "description": "Gemini model identifier (e.g. gemini-3.8-flash or gemini-3.5-flash)"
   },
   {
     "name": "task_category",
@@ -208,5 +208,11 @@
     "type": "FLOAT",
     "mode": "REQUIRED",
     "description": "USD cost saved via context-cached input tokens"
+  },
+  {
+    "name": "trace_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "OpenTelemetry / Cloud Trace trace ID (32 hex chars) of the API request that produced this row; joins to Cloud Trace and to Cloud Logging entries"
   }
 ]

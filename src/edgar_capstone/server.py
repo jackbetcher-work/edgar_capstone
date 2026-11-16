@@ -49,6 +49,18 @@ from edgar_capstone.dataset.corpus_hydration import (
     get_corpus_status_metadata,
     run_startup_corpus_hydration,
 )
+from edgar_capstone.observability import (
+    TRACE_ID_HEADER,
+    RequestTelemetryMiddleware,
+    configure_logging,
+    configure_tracing,
+    current_trace_metadata,
+    flush_tracing,
+    instrument_fastapi_app,
+    logging_status_metadata,
+    set_span_attributes,
+    tracing_status_metadata,
+)
 from edgar_capstone.security.agent_identity import (
     PER_AGENT_IDENTITIES,
     S2S_AGENT_ASSERTION_HEADER,
@@ -83,6 +95,11 @@ from edgar_capstone.telemetry import (
     load_lookml_project_catalog,
 )
 
+# Structured JSON logs (Cloud Logging) + OpenTelemetry tracing (Cloud Trace) must be configured
+# before the app object is built so the FastAPI instrumentation and every module logger see them.
+configure_logging()
+configure_tracing()
+
 logger = logging.getLogger(__name__)
 
 _FEEDBACK_AUDIT_LOG: list[dict[str, Any]] = []
@@ -101,7 +118,21 @@ async def _app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
         _load_all_profiles_cached.cache_clear()
         _load_all_chunks_cached.cache_clear()
         _SESSION_10K_CONTEXT_CACHE.clear()
-    yield
+    logger.info(
+        "SEC EDGAR analyst API ready",
+        extra={
+            "json_fields": {
+                "event": "service_started",
+                "tracing": tracing_status_metadata(),
+                "logging": logging_status_metadata(),
+            }
+        },
+    )
+    try:
+        yield
+    finally:
+        # Drain batched spans before Cloud Run stops the instance (SIGTERM -> lifespan shutdown).
+        await asyncio.to_thread(flush_tracing)
 
 
 app = FastAPI(
@@ -131,9 +162,17 @@ app.add_middleware(
         "Content-Type",
         "X-Goog-IAP-JWT-Assertion",
         S2S_AGENT_ASSERTION_HEADER,
+        "traceparent",
+        "tracestate",
+        "X-Cloud-Trace-Context",
+        "X-Request-Id",
     ],
-    expose_headers=["WWW-Authenticate"],
+    expose_headers=["WWW-Authenticate", TRACE_ID_HEADER, "X-Request-Id", "Server-Timing"],
 )
+# Added after CORS so it wraps it: preflight responses also carry trace/latency headers.
+app.add_middleware(RequestTelemetryMiddleware)
+# Outermost: OpenTelemetry server span, continuing upstream `traceparent` / X-Cloud-Trace-Context.
+instrument_fastapi_app(app)
 
 
 class VarianceRequest(BaseModel):
@@ -213,6 +252,10 @@ def health() -> dict[str, Any]:
         "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
         "iap_jwt_auth_enabled": True,
         "corpus": get_corpus_status_metadata(),
+        "observability": {
+            "tracing": tracing_status_metadata(),
+            "logging": logging_status_metadata(),
+        },
     }
 
 
@@ -777,6 +820,17 @@ def conversational_rag_chat(
         "cloud_identity_groups": list(user.cloud_identity_groups),
         "agent_identity": user.agent_identity,
     }
+    set_span_attributes(
+        **{
+            "edgar.chat.intent": turn_result.get("intent"),
+            "edgar.chat.status": turn_result.get("status"),
+            "edgar.chat.execution_mode": turn_result.get("execution_mode"),
+            "edgar.chat.citations_count": len(turn_result.get("citations") or []),
+            "edgar.chat.total_latency_ms": turn_result.get("total_latency_ms"),
+            "edgar.chat.session_id": req.session_id,
+        }
+    )
+    turn_result["observability"] = current_trace_metadata()
     return turn_result
 
 

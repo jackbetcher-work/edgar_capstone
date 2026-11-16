@@ -99,9 +99,15 @@ variable "embedding_model" {
 }
 
 variable "financial_reasoning_model" {
-  description = "Gemini Pro model used by FinancialAnalystAgent and RootOrchestrator for complex multi-period financial reasoning."
+  description = "Gemini model used by FinancialAnalystAgent and RootOrchestrator for complex multi-period financial reasoning (the reference spec names gemini-2.5-pro, which this project cannot access)."
   type        = string
-  default     = "gemini-2.5-pro"
+  default     = "gemini-3.8-flash"
+}
+
+variable "gemini_location" {
+  description = "Vertex AI location used for Gemini model calls and context caches (EDGAR_GEMINI_LOCATION). The configured models are only served from the global endpoint in this project; BigQuery, GCS, Model Armor, and embeddings stay in var.region."
+  type        = string
+  default     = "global"
 }
 
 variable "coding_and_evaluation_model" {

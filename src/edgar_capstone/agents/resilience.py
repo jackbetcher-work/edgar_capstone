@@ -12,6 +12,13 @@ from typing import Any, TypeVar
 
 import httpx
 
+from edgar_capstone.observability.tracing import (
+    add_span_event,
+    mark_span_error,
+    set_span_attributes,
+    start_span,
+)
+
 logger = logging.getLogger(__name__)
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -94,6 +101,10 @@ def with_tool_resilience(
 ) -> Callable[[F], F]:
     """Decorator wrapping an ADK tool function with HTTP 429/timeout retries and telemetry.
 
+    Each invocation runs inside an OpenTelemetry `tool.<name>` span (child of the ADK
+    `execute_tool` span in live mode, or of the chat-turn span in deterministic mode) that
+    records attempts, retry events, and the final status for Cloud Trace.
+
     Preserves the original function signature (`__signature__`, `__name__`, `__doc__`)
     so Google ADK's `FunctionTool` schema introspection works without alteration.
     """
@@ -103,6 +114,24 @@ def with_tool_resilience(
 
         @functools.wraps(func)
         def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            with start_span(
+                f"tool.{resolved_name}",
+                attributes={"edgar.tool.name": resolved_name, "code.function": func.__qualname__},
+            ) as span:
+                result = _invoke_with_retries(*args, **kwargs)
+                status = (
+                    str(result.get("status", "success")) if isinstance(result, dict) else "success"
+                )
+                set_span_attributes(span, **{"edgar.tool.status": status})
+                if status == "error" and isinstance(result, dict):
+                    mark_span_error(
+                        str(result.get("message") or "tool error"),
+                        span,
+                        **{"edgar.tool.error_type": result.get("error_type")},
+                    )
+                return result
+
+        def _invoke_with_retries(*args: Any, **kwargs: Any) -> dict[str, Any]:
             start_ts = time.perf_counter()
             tool_ctx = kwargs.get("tool_context")
             if tool_ctx is None:
@@ -115,6 +144,7 @@ def with_tool_resilience(
                 try:
                     result = func(*args, **kwargs)
                     elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
+                    set_span_attributes(**{"edgar.tool.attempts": attempt})
                     _record_tool_telemetry(
                         tool_ctx,
                         tool_name=resolved_name,
@@ -140,12 +170,19 @@ def with_tool_resilience(
                             exc,
                             backoff,
                         )
+                        add_span_event(
+                            "tool.retry",
+                            attempt=attempt,
+                            backoff_seconds=backoff,
+                            error_type=type(exc).__name__,
+                        )
                         time.sleep(backoff)
                         continue
 
                     elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
                     err_type = type(exc).__name__
                     err_msg = str(exc)
+                    set_span_attributes(**{"edgar.tool.attempts": attempt})
                     logger.error(
                         "Tool '%s' failed after %d attempt(s) (%.1f ms): [%s] %s",
                         resolved_name,

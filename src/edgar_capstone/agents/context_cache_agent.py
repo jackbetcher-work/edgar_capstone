@@ -15,6 +15,7 @@ from edgar_capstone.agents.callbacks import (
 from edgar_capstone.agents.context_memory import (
     FLASH_CODING_AND_EVAL_MODEL,
     after_agent_memory_callback,
+    low_thinking_config_for_model,
 )
 from edgar_capstone.agents.prompt_store import (
     load_agent_prompt,
@@ -43,7 +44,8 @@ def create_context_cache_agent(
         tools=[ContextCacheTool],
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.0,
-            max_output_tokens=2048,
+            max_output_tokens=4096,
+            thinking_config=low_thinking_config_for_model(model),
         ),
         output_key="cached_10k_section",
         before_agent_callback=before_agent_telemetry_callback,

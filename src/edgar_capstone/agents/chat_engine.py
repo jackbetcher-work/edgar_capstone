@@ -34,6 +34,7 @@ from edgar_capstone.agents.tools import (
     query_looker_financial_explore,
     search_10k_chunks_rag,
 )
+from edgar_capstone.observability.tracing import traced
 from edgar_capstone.security.agent_identity import (
     VerifiedAgentS2SClaims,
     authorize_agent_s2s_hop,
@@ -197,6 +198,7 @@ def list_curated_companies() -> dict[str, Any]:
     }
 
 
+@traced("chat.resolve_scope", record_args=("tickers", "gics_sector", "section_id"))
 def resolve_query_scope(
     query: str,
     tickers: str = "ALL",
@@ -298,6 +300,7 @@ def resolve_query_scope(
     }
 
 
+@traced("chat.retrieve_citations", record_args=("section_id", "top_k"))
 def _retrieve_balanced_citations(
     query: str,
     tickers: list[str],
@@ -551,6 +554,19 @@ def _synthesize_grounded_report(
     return "\n".join(lines)
 
 
+@traced(
+    "chat.rag_turn",
+    record_args=(
+        "tickers",
+        "gics_sector",
+        "section_id",
+        "start_year",
+        "end_year",
+        "top_k",
+        "session_id",
+        "execution_mode",
+    ),
+)
 def run_conversational_rag_turn(
     *,
     query: str,

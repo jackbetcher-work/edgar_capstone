@@ -418,12 +418,11 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     assert audit_row["event_type"] == "filing_10k_section_read"
     assert audit_row["tickers"] == ["NVDA"]
 
-    # Verify Cloud Logging JSON sink records were also emitted
+    # Verify Cloud Logging structured sink records were also emitted (as jsonPayload fields)
     sink_logs = [
-        json.loads(r.message)
-        for r in caplog.records
-        if r.name == "edgar_capstone.cloud_logging_sink"
+        r.json_fields for r in caplog.records if r.name == "edgar_capstone.cloud_logging_sink"
     ]
+    assert all(item["component"] == "sec-edgar-telemetry-sink" for item in sink_logs)
     logged_targets = {item["log_sink_target"] for item in sink_logs}
     assert {
         "llm_telemetry_events",

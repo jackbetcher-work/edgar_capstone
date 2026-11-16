@@ -7,7 +7,7 @@ Implements the structured ReAct loop (`Thought -> Action -> Observation -> ... -
 2. Query Cached 10-K Context for Explanation: Queries resident/warmed 10-K sections (`item_7` MD&A
    and `item_1a` Risk Factors) via `query_cached_10k_context` + metadata-filtered Hybrid RAG,
    adapting across iterations if peer or boundary-year coverage is incomplete.
-3. Format Grounded Output & Evaluate: Synthesizes the grounded report using `gemini-2.5-pro`
+3. Format Grounded Output & Evaluate: Synthesizes the grounded report using the financial reasoning model (`EDGAR_ANALYST_MODEL`)
    financial reasoning (with strict numeric & citation fact-checking) and scores output quality
    using `gemini-3.5-flash`, tracking context-induced latency across every model call.
 """
@@ -44,6 +44,7 @@ from edgar_capstone.agents.schemas import (
     VarianceEvaluationItem,
 )
 from edgar_capstone.agents.tools import query_cached_10k_context
+from edgar_capstone.observability.tracing import traced
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,7 @@ def _inline_citation_tag(cit: dict[str, Any]) -> str:
     return f"[{ticker} FY{fy} | {sec_label} | {chunk_id}]({url})"
 
 
+@traced("react.evaluate_variances")
 def evaluate_calculated_variances(
     variance_reports: list[dict[str, Any]],
     *,
@@ -235,6 +237,7 @@ def evaluate_calculated_variances(
     return evaluations
 
 
+@traced("react.query_cached_10k")
 def query_cached_10k_for_explanations(
     *,
     variance_evaluations: list[VarianceEvaluationItem],
@@ -313,6 +316,7 @@ def query_cached_10k_for_explanations(
     return explanations, linked_citations
 
 
+@traced("react.format_grounded_output")
 def format_react_grounded_output(
     *,
     query: str,
@@ -547,6 +551,7 @@ class StructuredReActExecutor:
         self.reasoning_llm = reasoning_llm
         self.judge_llm = judge_llm
 
+    @traced("react.execute", record_args=("intent", "session_id"))
     def execute_post_retrieval_reasoning(
         self,
         *,
@@ -581,7 +586,7 @@ class StructuredReActExecutor:
         turn_latency_records: list[ModelContextLatencyRecord] = []
 
         # ------------------------------------------------------------------
-        # ReAct Iteration 1: Evaluate Calculated Variances (Gemini 2.5 Pro)
+        # ReAct Iteration 1: Evaluate Calculated Variances (financial reasoning model)
         # ------------------------------------------------------------------
         t_eval = time.perf_counter()
         variance_evaluations = evaluate_calculated_variances(
@@ -775,7 +780,7 @@ class StructuredReActExecutor:
             )
 
         # ------------------------------------------------------------------
-        # ReAct Iteration 3: Format Grounded Output (Gemini 2.5 Pro)
+        # ReAct Iteration 3: Format Grounded Output (financial reasoning model)
         # ------------------------------------------------------------------
         t_synth = time.perf_counter()
         deterministic_markdown = format_react_grounded_output(

@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.asymmetric.utils import (
 )
 from fastapi import Depends, HTTPException, Request, status
 
+from edgar_capstone.observability.tracing import traced
 from edgar_capstone.security.agent_identity import (
     S2S_AGENT_ASSERTION_HEADER,
     AgentAuthorizationError,
@@ -972,6 +973,7 @@ class IAPJwtVerifier:
 
         return hosted_domain, roles, permissions, matched_ci_groups, None, None
 
+    @traced("auth.verify_jwt")
     def verify_jwt(
         self,
         raw_jwt: str,

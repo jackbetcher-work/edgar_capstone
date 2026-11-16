@@ -44,6 +44,7 @@ from google.adk.tools.tool_context import ToolContext
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.genai import types as genai_types
 
+from edgar_capstone.observability.tracing import traced
 from edgar_capstone.security.agent_identity import (
     GcpAgentIamCredentialsClient,
     authorize_agent_s2s_hop,
@@ -1211,6 +1212,7 @@ class ModelArmorGuardrailService:
         )
         return claims.service_account_email, claims.spiffe_id
 
+    @traced("guardrail.inspect_user_prompt")
     def inspect_user_prompt(
         self,
         text: str,
@@ -1415,6 +1417,7 @@ class ModelArmorGuardrailService:
             s2s_spiffe_id=spiffe_id,
         )
 
+    @traced("guardrail.inspect_model_response")
     def inspect_model_response(
         self,
         text: str,

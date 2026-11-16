@@ -2,7 +2,7 @@
   title: "SEC EDGAR ADK Observability, Cost Savings & Security Audit"
   layout: newspaper
   preferred_viewer: dashboards-next
-  description: "Real-time BI observability dashboard tracking Gemini 2.5 Pro & 3.5 Flash token spend, cached-token cost savings, TTFT/p95 latency SLO compliance, ADK tool usage, conversational session analytics, and 10-K access audit logs."
+  description: "Real-time BI observability dashboard tracking Gemini 3.8 Flash & 3.5 Flash token spend, cached-token cost savings, TTFT/p95 latency SLO compliance, ADK tool usage, conversational session analytics, and 10-K access audit logs."
   refresh: 5 minutes
 
   filters:

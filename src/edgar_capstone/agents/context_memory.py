@@ -2,7 +2,8 @@
 
 Implements:
 1. Dual-Model Specialization Strategy:
-   - `gemini-2.5-pro`: Complex financial reasoning, multi-period variance synthesis, and ReAct orchestration.
+   - `gemini-3.8-flash` (`EDGAR_ANALYST_MODEL`): Complex financial reasoning, multi-period variance synthesis,
+     and ReAct orchestration. (The reference spec names Gemini 2.5 Pro, which this project cannot access.)
    - `gemini-3.5-flash`: Coding assistance, LLM-as-a-Judge evaluation tasks, and context compaction summarization.
 2. Context-Induced Latency Tracking:
    - Decomposes every model call into context preparation latency, context prefill latency (cached vs. uncached),
@@ -54,7 +55,7 @@ logger = logging.getLogger(__name__)
 # 1. Model Tier Constants & Task Specialization Strategy
 # ---------------------------------------------------------------------------
 
-FINANCIAL_REASONING_MODEL: str = os.environ.get("EDGAR_ANALYST_MODEL", "gemini-2.5-pro")
+FINANCIAL_REASONING_MODEL: str = os.environ.get("EDGAR_ANALYST_MODEL", "gemini-3.8-flash")
 FLASH_CODING_AND_EVAL_MODEL: str = os.environ.get("EDGAR_FLASH_MODEL", "gemini-3.5-flash")
 
 TTFT_SLO_TARGET_MS: float = float(os.environ.get("EDGAR_TTFT_SLO_MS", "3000.0"))
@@ -83,6 +84,24 @@ class ModelPerformanceProfile:
 
 
 MODEL_PROFILES: dict[str, ModelPerformanceProfile] = {
+    # Vertex AI introductory pricing (list price from 2027-01-01: $1.50 input / $7.50 output).
+    "gemini-3.8-flash": ModelPerformanceProfile(
+        model_name="gemini-3.8-flash",
+        tier="complex_financial_reasoning",
+        primary_use_cases=(
+            "financial_reasoning",
+            "variance_explanation",
+            "peer_comparison",
+            "thematic_synthesis",
+            "orchestration",
+        ),
+        uncached_prefill_ms_per_token=0.05,
+        cached_prefill_discount_factor=0.18,
+        decode_ms_per_token=0.60,
+        uncached_input_usd_per_1m=0.75,
+        cached_input_usd_per_1m=0.075,
+        output_usd_per_1m=3.75,
+    ),
     "gemini-2.5-pro": ModelPerformanceProfile(
         model_name="gemini-2.5-pro",
         tier="complex_financial_reasoning",
@@ -142,6 +161,22 @@ AGENT_DEFAULT_TASK_CATEGORY: dict[str, ModelTaskCategory] = {
 }
 
 
+def low_thinking_config_for_model(model: str | BaseLlm) -> genai_types.ThinkingConfig | None:
+    """Low-effort thinking for structured Flash tasks (judge JSON, code, cache warmup).
+
+    Gemini 2.5+/3.x models count thinking tokens against `max_output_tokens`. Left at the
+    default effort, they can spend the whole output budget thinking and return truncated
+    JSON. Gemini 3.x takes `thinking_level`; Gemini 2.5 takes `thinking_budget`.
+    """
+    name = (model.model if isinstance(model, BaseLlm) else str(model or "")).lower()
+    short = name.rsplit("/", maxsplit=1)[-1]
+    if short.startswith("gemini-3"):
+        return genai_types.ThinkingConfig(thinking_level=genai_types.ThinkingLevel.LOW)
+    if short.startswith("gemini-2.5"):
+        return genai_types.ThinkingConfig(thinking_budget=1024)
+    return None
+
+
 def resolve_model_for_task(task_category: ModelTaskCategory) -> str:
     """Resolve the active Gemini model identifier for a given workload category."""
     tier = TASK_TO_MODEL_TIER.get(task_category, "complex_financial_reasoning")
@@ -162,7 +197,12 @@ def resolve_task_and_model_for_agent(
 
 
 def _get_profile_for_model(model_name: str) -> ModelPerformanceProfile:
-    norm = model_name.strip().lower()
+    norm = model_name.strip().lower().rsplit("/", maxsplit=1)[-1]
+    if norm in MODEL_PROFILES:
+        return MODEL_PROFILES[norm]
+    for known in MODEL_PROFILES:  # versioned ids, e.g. "gemini-3.8-flash-001"
+        if norm.startswith(known):
+            return MODEL_PROFILES[known]
     if "flash" in norm:
         return MODEL_PROFILES["gemini-3.5-flash"]
     return MODEL_PROFILES["gemini-2.5-pro"]

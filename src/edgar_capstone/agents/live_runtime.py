@@ -1,4 +1,4 @@
-"""Live Google ADK `Runner` & Gemini (`gemini-2.5-pro` / `gemini-3.5-flash`) Streaming Execution Engine.
+"""Live Google ADK `Runner` & Gemini (`gemini-3.8-flash` / `gemini-3.5-flash`) Streaming Execution Engine.
 
 Bridges the ADK multi-agent hierarchy (`edgar_adk_app`, `RootOrchestrator`, `FinancialAnalystAgent`,
 `ContextCacheAgent`, `NarrativeEvaluatorAgent`, and `CodingAssistantAgent`) to live Vertex AI / Gemini
@@ -18,6 +18,7 @@ Execution Modes (`EDGAR_EXECUTION_MODE`):
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -54,6 +55,7 @@ from edgar_capstone.agents.tenk_context_cache import (
     get_tenk_context_cache_manager,
     is_cached_content_error,
 )
+from edgar_capstone.observability.tracing import set_span_attributes, traced
 from edgar_capstone.security.model_armor import ModelArmorSafetyPlugin
 from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID
 
@@ -159,8 +161,11 @@ def resolve_live_adk_runtime(
         or os.environ.get("GCP_PROJECT_ID", "").strip()
         or DEFAULT_PROJECT_ID
     )
+    # Gemini models may only be served from the `global` endpoint while BigQuery, GCS,
+    # Model Armor, and embeddings stay regional, so the Gemini location is set separately.
     location = (
-        os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
+        os.environ.get("EDGAR_GEMINI_LOCATION", "").strip()
+        or os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
         or os.environ.get("GCP_REGION", "").strip()
         or "us-central1"
     )
@@ -280,8 +285,11 @@ def _run_coro_sync(coro: Coroutine[Any, Any, _T]) -> _T:
     except RuntimeError:
         return asyncio.run(coro)
 
+    # Copy contextvars into the worker thread so the active OpenTelemetry span (and the
+    # request log context) stays the parent of ADK agent / LLM / tool spans.
+    ctx = contextvars.copy_context()
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="adk-live-runner") as pool:
-        future = pool.submit(asyncio.run, coro)
+        future = pool.submit(ctx.run, asyncio.run, coro)
         return future.result()
 
 
@@ -310,6 +318,7 @@ def _extract_json_object(raw_text: str) -> dict[str, Any] | None:
     return None
 
 
+@traced("adk.run_agent_stream", record_args=("app_name", "backend", "session_id", "max_llm_calls"))
 async def run_adk_agent_stream_async(
     *,
     agent: BaseAgent,
@@ -325,6 +334,7 @@ async def run_adk_agent_stream_async(
     plugins: list[BasePlugin] | None = None,
 ) -> AdkStreamResult:
     """Drive an ADK `Agent` via `Runner.run_async` with `StreamingMode.SSE` and capture real TTFT."""
+    set_span_attributes(**{"adk.agent_name": getattr(agent, "name", type(agent).__name__)})
     memory_mgr = get_conversation_memory_manager()
     session_svc = memory_mgr.adk_session_service
     memory_svc = memory_mgr.adk_memory_service
@@ -598,7 +608,7 @@ async def run_live_adk_financial_reasoning_async(
     custom_llm: BaseLlm | None = None,
     summarizer_llm: BaseLlm | None = None,
 ) -> AdkStreamResult:
-    """Execute `FinancialAnalystAgent` (`gemini-2.5-pro`) via ADK `Runner` with SSE streaming TTFT."""
+    """Execute `FinancialAnalystAgent` (`EDGAR_ANALYST_MODEL`) via ADK `Runner` with SSE streaming TTFT."""
     from edgar_capstone.agents.financial_analyst import create_financial_analyst_agent
 
     resolved = resolution or resolve_live_adk_runtime(custom_llm=custom_llm)

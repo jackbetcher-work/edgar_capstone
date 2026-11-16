@@ -100,5 +100,11 @@
     "type": "STRING",
     "mode": "NULLABLE",
     "description": "Additional structured context (fiscal period, section_id, intent, rating)"
+  },
+  {
+    "name": "trace_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "OpenTelemetry / Cloud Trace trace ID (32 hex chars) of the API request that produced this row; joins to Cloud Trace and to Cloud Logging entries"
   }
 ]

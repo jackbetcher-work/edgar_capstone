@@ -196,5 +196,11 @@
     "type": "FLOAT",
     "mode": "NULLABLE",
     "description": "Gemini 3.5 Flash composite evaluation score [0.0, 1.0]"
+  },
+  {
+    "name": "trace_id",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "OpenTelemetry / Cloud Trace trace ID (32 hex chars) of the API request that produced this row; joins to Cloud Trace and to Cloud Logging entries"
   }
 ]

@@ -3,7 +3,7 @@
 Model Strategy:
 - `gemini-3.5-flash` (`DEFAULT_FLASH_MODEL`): Dedicated to LLM-as-a-Judge evaluation tasks
   (`NarrativeEvaluatorAgent`, `evaluate_variance_explanation`) and analytical coding assistance
-  (`CodingAssistantAgent`, `generate_financial_coding_assistance`), while `gemini-2.5-pro`
+  (`CodingAssistantAgent`, `generate_financial_coding_assistance`), while the financial reasoning model (`gemini-3.8-flash`)
   handles complex financial reasoning in `FinancialAnalystAgent` and `RootOrchestrator`.
 """
 
@@ -30,6 +30,7 @@ from edgar_capstone.agents.context_memory import (
     FLASH_CODING_AND_EVAL_MODEL,
     after_agent_memory_callback,
     get_context_latency_tracker,
+    low_thinking_config_for_model,
     resolve_model_for_task,
 )
 from edgar_capstone.agents.live_runtime import (
@@ -47,6 +48,7 @@ from edgar_capstone.agents.schemas import (
     NarrativeEvaluationReport,
 )
 from edgar_capstone.agents.tools import _parse_ticker_list
+from edgar_capstone.observability.tracing import traced
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
 logger = logging.getLogger(__name__)
@@ -75,9 +77,11 @@ def create_narrative_evaluator_agent(
         instruction=make_adk_instruction_provider("narrative_evaluator", version=prompt_version),
         output_schema=NarrativeEvaluationReport,
         output_key="narrative_evaluation_report",
+        # Thinking tokens count against max_output_tokens; keep headroom for the JSON report.
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.0,
-            max_output_tokens=1024,
+            max_output_tokens=8192,
+            thinking_config=low_thinking_config_for_model(resolved_model),
         ),
         before_agent_callback=before_agent_telemetry_callback,
         after_agent_callback=after_agent_memory_callback,
@@ -106,7 +110,8 @@ def create_coding_assistant_agent(
         output_key="coding_assistance_report",
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.1,
-            max_output_tokens=2048,
+            max_output_tokens=8192,
+            thinking_config=low_thinking_config_for_model(resolved_model),
         ),
         before_agent_callback=before_agent_telemetry_callback,
         after_agent_callback=after_agent_memory_callback,
@@ -115,6 +120,7 @@ def create_coding_assistant_agent(
     )
 
 
+@traced("evaluation.narrative_judge")
 def evaluate_variance_explanation(
     *,
     query: str,
@@ -326,6 +332,7 @@ def evaluate_variance_explanation(
     )
 
 
+@traced("coding.assist", record_args=("language",))
 def generate_financial_coding_assistance(
     *,
     prompt: str,

@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from google.adk.apps import App
 from google.adk.memory import InMemoryMemoryService
@@ -214,8 +215,8 @@ class _DeterministicReActProLlm(BaseLlm):
 
 
 def test_dual_model_specialization_and_adk_app_configuration() -> None:
-    """Verify Gemini 2.5 Pro handles complex financial reasoning while Gemini 3.5 Flash handles coding, eval, & compaction."""
-    assert FINANCIAL_REASONING_MODEL == "gemini-2.5-pro"
+    """Verify Gemini 3.8 Flash handles complex financial reasoning while Gemini 3.5 Flash handles coding, eval, & compaction."""
+    assert FINANCIAL_REASONING_MODEL == "gemini-3.8-flash"
     assert FLASH_CODING_AND_EVAL_MODEL == "gemini-3.5-flash"
 
     # Task routing assertions
@@ -226,7 +227,7 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
         "thematic_synthesis",
         "orchestration",
     ):
-        assert resolve_model_for_task(pro_task) == "gemini-2.5-pro"  # type: ignore[arg-type]
+        assert resolve_model_for_task(pro_task) == "gemini-3.8-flash"  # type: ignore[arg-type]
 
     for flash_task in (
         "evaluation",
@@ -238,8 +239,8 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
         assert resolve_model_for_task(flash_task) == "gemini-3.5-flash"  # type: ignore[arg-type]
 
     # ADK Agent model assignments & PlanReActPlanner registration
-    assert RootOrchestrator.model == "gemini-2.5-pro"
-    assert FinancialAnalystAgent.model == "gemini-2.5-pro"
+    assert RootOrchestrator.model == "gemini-3.8-flash"
+    assert FinancialAnalystAgent.model == "gemini-3.8-flash"
     assert isinstance(RootOrchestrator.planner, PlanReActPlanner)
     assert isinstance(FinancialAnalystAgent.planner, PlanReActPlanner)
 
@@ -248,7 +249,7 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     assert ContextCacheAgent.model == "gemini-3.5-flash"
 
     sub_agent_models = {sa.name: sa.model for sa in RootOrchestrator.sub_agents}
-    assert sub_agent_models["FinancialAnalystAgent"] == "gemini-2.5-pro"
+    assert sub_agent_models["FinancialAnalystAgent"] == "gemini-3.8-flash"
     assert sub_agent_models["ContextCacheAgent"] == "gemini-3.5-flash"
     assert sub_agent_models["NarrativeEvaluatorAgent"] == "gemini-3.5-flash"
     assert sub_agent_models["CodingAssistantAgent"] == "gemini-3.5-flash"
@@ -269,7 +270,7 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     assert custom_app.events_compaction_config.summarizer._llm.model == "gemini-3.5-flash"  # type: ignore[attr-defined]
 
     meta = get_model_strategy_metadata()
-    assert meta["financial_reasoning_model"] == "gemini-2.5-pro"
+    assert meta["financial_reasoning_model"] == "gemini-3.8-flash"
     assert meta["coding_and_evaluation_model"] == "gemini-3.5-flash"
 
 
@@ -533,7 +534,7 @@ def test_structured_react_executor_and_gemini_3_5_flash_tasks() -> None:
         memory_tokens=48,
         memory_prep_latency_ms=0.8,
     )
-    assert out["reasoning_model"] == "gemini-2.5-pro"
+    assert out["reasoning_model"] == "gemini-3.8-flash"
     assert out["evaluation_model"] == "gemini-3.5-flash"
     assert len(out["cached_explanations"]) >= 2
     assert len(out["citations"]) >= 2
@@ -647,7 +648,7 @@ def test_fastapi_react_telemetry_evaluation_and_coding_endpoints() -> None:
     h_body = health_resp.json()
     assert h_body["reasoning_strategy"] == "structured_react_loop"
     assert h_body["models"] == {
-        "financial_reasoning": "gemini-2.5-pro",
+        "financial_reasoning": "gemini-3.8-flash",
         "coding_and_evaluation": "gemini-3.5-flash",
     }
 
@@ -666,7 +667,7 @@ def test_fastapi_react_telemetry_evaluation_and_coding_endpoints() -> None:
     assert c_body["react_execution"]["iterations"] >= 4
     assert len(c_body["react_execution"]["cached_10k_explanations"]) >= 1
     assert c_body["evaluation"]["evaluator_model"] == "gemini-3.5-flash"
-    assert c_body["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-2.5-pro"
+    assert c_body["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
     assert c_body["context_and_memory"]["turn_context_latency"]["total_calls"] >= 3
 
     # Context-induced latency telemetry endpoint
@@ -715,3 +716,34 @@ def test_fastapi_react_telemetry_evaluation_and_coding_endpoints() -> None:
     code_body = code_resp.json()["coding_assistance"]
     assert code_body["assistant_model"] == "gemini-3.5-flash"
     assert "v_financial_variances_yoy" in code_body["code"]
+
+
+def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """gemini-3.8-flash has its own cost profile and agents render the configured model names."""
+    from types import SimpleNamespace
+
+    from edgar_capstone.agents.context_memory import _get_profile_for_model
+    from edgar_capstone.agents.prompt_store import make_adk_instruction_provider
+
+    prof = _get_profile_for_model("gemini-3.8-flash")
+    assert prof.model_name == "gemini-3.8-flash"
+    assert prof.tier == "complex_financial_reasoning"
+    assert (prof.uncached_input_usd_per_1m, prof.cached_input_usd_per_1m) == (0.75, 0.075)
+    assert prof.output_usd_per_1m == 3.75
+    assert _get_profile_for_model("publishers/google/models/gemini-3.8-flash-001") is prof
+    assert _get_profile_for_model("gemini-3.5-flash").model_name == "gemini-3.5-flash"
+    assert _get_profile_for_model("gemini-2.5-pro").model_name == "gemini-2.5-pro"
+
+    ctx = SimpleNamespace(state={})
+    analyst_text = make_adk_instruction_provider("financial_analyst")(ctx)
+    assert "FinancialAnalystAgent (`gemini-3.8-flash`)" in analyst_text
+    root_text = make_adk_instruction_provider("root_orchestrator")(ctx)
+    assert "RootOrchestrator (`gemini-3.8-flash`)" in root_text
+    assert "gemini-2.5-pro" not in root_text
+
+    monkeypatch.setenv("EDGAR_ANALYST_MODEL", "gemini-next-pro")
+    assert "FinancialAnalystAgent (`gemini-next-pro`)" in make_adk_instruction_provider(
+        "financial_analyst"
+    )(ctx)

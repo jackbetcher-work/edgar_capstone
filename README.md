@@ -24,7 +24,7 @@ make dev
 # 3. Or build the frontend bundle and serve the single-origin app from FastAPI (:8000)
 make start
 
-# 4. Run secret scan, backend pytest suite (119 tests), ESLint, and frontend Vitest suite (6 tests)
+# 4. Run secret scan, backend pytest suite (135 tests), ESLint, and frontend Vitest suite (6 tests)
 make test
 
 # 5. Run the CI lint/format gates (ruff check + format --check, terraform fmt/validate, ESLint),
@@ -48,14 +48,17 @@ gcloud auth application-default login
 GOOGLE_GENAI_USE_VERTEXAI=true \
 GOOGLE_CLOUD_PROJECT=iron-radio-514217-q7 \
 GOOGLE_CLOUD_LOCATION=us-central1 \
+EDGAR_GEMINI_LOCATION=global \
 EDGAR_EXECUTION_MODE=live \
 make dev
 
 # Live mode via Gemini API key
 GEMINI_API_KEY="$YOUR_GEMINI_API_KEY" EDGAR_EXECUTION_MODE=live make dev
 
-# Optional model & latency target overrides (defaults shown)
-# EDGAR_ANALYST_MODEL=gemini-2.5-pro  EDGAR_FLASH_MODEL=gemini-3.5-flash  EDGAR_TTFT_SLO_MS=3000
+# Optional model, Gemini endpoint & latency target overrides (defaults shown). In iron-radio-514217-q7
+# the Gemini models are only served from the `global` endpoint, so set EDGAR_GEMINI_LOCATION=global
+# (Cloud Run does this via Terraform); BigQuery / GCS / Model Armor stay in GOOGLE_CLOUD_LOCATION.
+# EDGAR_ANALYST_MODEL=gemini-3.8-flash  EDGAR_FLASH_MODEL=gemini-3.5-flash  EDGAR_GEMINI_LOCATION=global  EDGAR_TTFT_SLO_MS=3000
 ```
 
 ### Container Packaging & Offline Smoke Tests
@@ -91,6 +94,7 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 ├── src/edgar_capstone/
 │   ├── server.py                    # FastAPI gateway, auth/RBAC routes, RAG & telemetry APIs
 │   ├── telemetry.py                 # Streaming BigQuery telemetry/audit sinks, Firestore feedback & LookML catalog
+│   ├── observability/               # OpenTelemetry -> Cloud Trace, trace-correlated JSON logs -> Cloud Logging (docs/observability.md)
 │   ├── agents/                      # Google ADK agents, live Runner SSE engine, ReAct & context tracking
 │   │   ├── live_runtime.py          # ADK Runner (StreamingMode.SSE), Vertex/Gemini config & retry backoff
 │   │   ├── react_loop.py            # Structured ReAct loop + post-generation numeric/citation lock
@@ -108,7 +112,7 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 ├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI
 ├── scripts/                         # CLI entrypoints: dataset build, vector DB build (+ --upload-only), corpus hydration, container smoke test, secret scanner
 ├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP + HTTPS LB, Cloud Build triggers
-├── tests/                           # Automated pytest suite (119 tests across agents, live ADK, GCP adapters, telemetry, APIs, IaC, container packaging)
+├── tests/                           # Automated pytest suite (135 tests across agents, live ADK, GCP adapters, telemetry, observability, APIs, IaC, container packaging)
 ├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + Python 3.11 runtime) with baked manifests + build-time corpus check
 ├── .dockerignore                    # Keeps secrets and gitignored heavy corpus artifacts out of the build context
 ├── cloudbuild.yaml                  # Cloud Build: parallel lint/test gates -> build (+ offline smoke test) -> push + deploy (main) / verify-only (PRs)
@@ -127,7 +131,7 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 
 ### 2. ADK Agents, Live Runner Execution & Model/Context Strategy (`agents/`)
 - **Agent Hierarchy & Dual-Model Routing:**
-  - **`gemini-2.5-pro`** handles financial reasoning and orchestration in `RootOrchestrator` and `FinancialAnalystAgent` (both configured with ADK `PlanReActPlanner`).
+  - **`gemini-3.8-flash`** handles financial reasoning and orchestration in `RootOrchestrator` and `FinancialAnalystAgent` (both configured with ADK `PlanReActPlanner`). This departs from the reference spec, which names Gemini 2.5 Pro: that model returns HTTP 404 in this project. Override it with `EDGAR_ANALYST_MODEL`. The prompts render whichever model is configured at runtime, and `gemini-3.8-flash` has its own cost profile ($0.75 input / $0.075 cached / $3.75 output per 1M tokens, introductory Vertex pricing until 2027-01-01).
   - **`gemini-3.5-flash`** is assigned to `NarrativeEvaluatorAgent` (4-axis rubric evaluation), `CodingAssistantAgent` (BigQuery SQL, Python audit scripts, LookML snippets), `ContextCacheAgent` (10-K section cache warmup), and ADK `LlmEventSummarizer` context compaction.
 - **Versioned Prompt Store & Dynamic Loader (`prompts/`, `agents/prompt_store.py`):**
   - Agent instructions and guardrail policy templates (`root_orchestrator`, `financial_analyst`, `context_cache_agent`, `narrative_evaluator`, `coding_assistant`, `model_armor_policy`) are stored in a versioned catalog (`prompts/registry.yaml` + `prompts/v1/*.yaml`) with SHA-256 integrity hashing and dynamic ADK `InstructionProvider` resolution across `local` (`prompts/`), Google Cloud Storage (`gs://...`), and Vertex AI Prompt Management backends (`EDGAR_PROMPT_STORE_BACKEND`).
@@ -137,7 +141,7 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 - **Tools, Live GCP Adapters & Resilience (`tools.py`, `resilience.py`):** Explicit ADK `FunctionTool` definitions (`MetricFetchTool`, `LookerQueryTool`, `VarianceCalculationTool`, `HybridSearchTool`, `ContextCacheTool`, `QueryCached10KTool`) backed by live GCP client adapters (`BigQueryAdapter`, `VertexAISearchAdapter`, `VertexVectorSearchAdapter`, `GcsCorpusAdapter`, and `VertexAIEmbedder` `text-embedding-005`) with `EDGAR_DATA_BACKEND` (`"auto"` | `"gcp"` | `"local"`) dispatch and `@with_tool_resilience` HTTP 429 exponential backoff and timeout handling.
 - **Structured ReAct Execution Loop (`react_loop.py`, `chat_engine.py`):** Evaluates deterministic period variances first, queries cached 10-K sections + metadata-filtered hybrid search for causal explanations, synthesizes inline-cited Markdown (`[TICKER FYxxxx | Section | chunk_id](sec_filing_url)`) via live `FinancialAnalystAgent` or offline template synthesis, and runs post-generation numeric and citation fact-checks (`verify_narrative_against_calculations`).
 - **Context Latency, Cost Telemetry & Session Memory (`context_memory.py`, `telemetry.py`, `callbacks.py`):**
-  - `ContextLatencyTracker` decomposes every model call into context preparation + prefill latency vs. decode latency, computes exact USD input/output cost and 75% cached-token discount savings (`gemini-2.5-pro` & `gemini-3.5-flash`), monitors TTFT against the `<= 3000 ms` target, and streams per-call records directly to BigQuery (`sec_edgar.llm_telemetry_events`) via `BigQueryTelemetrySink` (`tabledata.insertAll` + structured Cloud Logging sink records).
+  - `ContextLatencyTracker` decomposes every model call into context preparation + prefill latency vs. decode latency, computes exact USD input/output cost and cached-token discount savings (`gemini-3.8-flash`, `gemini-3.5-flash`, and legacy `gemini-2.5-pro` profiles), monitors TTFT against the `<= 3000 ms` target, and streams per-call records directly to BigQuery (`sec_edgar.llm_telemetry_events`) via `BigQueryTelemetrySink` (`tabledata.insertAll` + structured Cloud Logging sink records).
   - `BigQueryTelemetrySink` also streams conversational turn/session metrics (`session_telemetry_events`: cumulative session length, companies analyzed, reports generated, ADK tool usage, and latency/cost) and authentication / 10-K access audit trails (`security_audit_logs`), with `"auto"` | `"gcp"` | `"local"` fallback (`EDGAR_TELEMETRY_BACKEND`).
   - `ConversationMemoryManager` maintains multi-turn session state for follow-up entity/period recall and compacts older turns above a configurable token threshold.
   - `create_edgar_adk_app` configures an ADK `App` with `ContextCacheConfig` and `EventsCompactionConfig`.
@@ -175,7 +179,7 @@ make hydrate-corpus          # Download the same artifacts into a fresh local ch
 
 ## Implementation Gaps vs. `docs/project_reference.md`
 
-These pieces are wired up end-to-end across the backend, Terraform, and Cloud Run: live Gemini (`gemini-2.5-pro` and `gemini-3.5-flash`), Google ADK `Runner` SSE streaming, Model Armor with SDP and projection filters, versioned prompt loading, streaming BigQuery telemetry and audit sinks, Firestore feedback, and LookML models and dashboards.
+These pieces are wired up end-to-end across the backend, Terraform, and Cloud Run: live Gemini (`gemini-3.8-flash` and `gemini-3.5-flash`), Google ADK `Runner` SSE streaming, Model Armor with SDP and projection filters, versioned prompt loading, streaming BigQuery telemetry and audit sinks, Firestore feedback, and LookML models and dashboards.
 
 **Closed since the last revision (removed from the gap list):**
 - **Container corpus packaging** *(Secs. 4, 6)*: data paths resolve correctly for every install layout, the corpus can be hydrated from GCS at startup, `/health` reports where the corpus comes from, and Cloud Build and GitHub Actions run an offline smoke test inside the image before `docker push`. The one leftover step, publishing the vector DB artifacts, is now part of gap 1 below.
@@ -185,7 +189,7 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
   - **Verified live on 2026-11-16.**
     - Setup: `serviceconsumermanagement.googleapis.com` had to be enabled (now in `terraform/apis.tf`). The first cache in a project waits about 2 minutes while Vertex provisions it, so that first call times out and trips the circuit breaker; later calls work normally.
     - Results: a 34k-token NVDA FY2026 bundle was created in about 4 s, a generate call served 29,402 of 29,419 prompt tokens from the cache, and a second manager instance found the same cache in about 0.2 s.
-    - **Open issue:** this project can't reach `gemini-2.5-pro` (HTTP 404 in both `us-central1` and `global`). Of the models tested, only `gemini-3.5-flash` responded, and only on the `global` endpoint. The verification used that model.
+    - **Model note:** this project can't reach `gemini-2.5-pro` (HTTP 404 in both `us-central1` and `global`), so the financial reasoning model is now `gemini-3.8-flash`, served from the `global` endpoint (`EDGAR_GEMINI_LOCATION=global`). The live verification above used `gemini-3.5-flash` on `global`. A full live `/api/v1/chat` turn on 2026-11-16 (NVDA FY2024–FY2026) worked end to end: `gemini-3.8-flash` synthesis read 32,384 of 39,587 context tokens from a shared 10-K `CachedContent`, the numeric and citation fact-check passed, and `gemini-3.5-flash` ran the judge. **TTFT was ~27.7 s, far above the 3 s target.** This is driven by default-effort thinking over about 40k tokens of context.
 - **Cloud Build trigger and lint/format gates** *(Sec. 8: CI/CD)*:
   - `terraform/cloudbuild.tf` manages the GitHub connection, the `main` deploy trigger, the PR verify trigger, and the dedicated `sec-edgar-cloudbuild-sa` service account. Set `enable_cloudbuild_trigger = true` after the one-time GitHub App and token setup described in [`terraform/README.md`](terraform/README.md).
   - `cloudbuild.yaml` gates the build on `ruff check` / `ruff format --check`, `terraform fmt` / `validate`, ESLint + Vitest, the secret scan, and pytest.
@@ -198,7 +202,7 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 | :-- | :--- | :--- | :--- |
 | 1 | **Corpus publication and full S&P 500 breadth** *(Secs. 3, 7)* | In progress | The S&P 500 extraction is running. Next: Vertex embeddings, GCS/BigQuery/Search ingestion, and an R&D metric. |
 | 2 | **VPC Service Controls and private networking** *(Sec. 8)* | Not started | No service perimeter. The Vector Search endpoint is public. No TLS policy. |
-| 3 | **OpenTelemetry, Cloud Trace, and trace-correlated JSON logs** *(Secs. 2, 4, 6, 10)* | Not started | No span exporter or tracer provider. App logs are not JSON and carry no trace IDs. |
+| 3 | **OpenTelemetry, Cloud Trace, and trace-correlated JSON logs** *(Secs. 2, 4, 6, 10)* | Implemented; live check pending | Code, Terraform, and tests are done (see [`docs/observability.md`](docs/observability.md)). Next: deploy, then check one live `/api/v1/chat` trace in Cloud Trace. |
 | 4 | **Golden eval dataset, `make eval-all`, and coverage gate** *(Secs. 4, 9)* | Not started | No golden set, eval runner, coverage measurement, or CI gate. |
 
 ---
@@ -248,18 +252,14 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 
 **Reference requirement:** End-to-end latency tracing through OpenTelemetry and Cloud Trace, plus FastAPI structured JSON logs with trace IDs exported to Cloud Logging.
 
-**Current state:**
-- `cloudtrace.googleapis.com` is enabled, and `sec-analyst-sa` already has `roles/cloudtrace.agent`.
-- `opentelemetry-api` and `opentelemetry-sdk` are installed only as dependencies of `google-adk`. ADK creates spans internally, but no `TracerProvider` or exporter is configured, so no spans leave the process.
-- Only the telemetry/audit sink records are JSON. Application loggers use plain stdlib formatting and include no `logging.googleapis.com/trace` field.
+**Current state (implemented; see [`docs/observability.md`](docs/observability.md)):**
+- `src/edgar_capstone/observability/` installs a global `TracerProvider` with `BatchSpanProcessor(CloudTraceSpanExporter)`, configured by `EDGAR_TRACE_EXPORTER` (`auto | gcp | console | otlp | none`) and `EDGAR_TRACE_SAMPLE_RATIO`. `auto` exports to Cloud Trace on Cloud Run. Propagation reads `CloudTraceFormatPropagator` + W3C `traceparent`, so the load balancer / Cloud Run trace context is continued.
+- FastAPI server spans and httpx client spans (Vertex AI, BigQuery, Firestore, Model Armor, SDP, and so on) come from auto-instrumentation. Custom spans cover the chat turn, guardrails, scope and intent routing, hybrid retrieval, each ReAct step, the evaluator, and JWT verification. Every ADK tool runs in a `tool.<name>` span. ADK's own agent/LLM/tool spans attach to the same trace. Model calls add `llm.call` events with the model, token counts, and `ttft_ms`. ADK prompt/response content is kept out of spans by default (`EDGAR_TRACE_CAPTURE_CONTENT=false`).
+- Every logger (app, uvicorn, libraries) writes Cloud Logging JSON (`severity`, `message`, `logging.googleapis.com/trace`, `spanId`, `trace_sampled`, `sourceLocation`, and Error Reporting fields for exceptions) when `EDGAR_LOG_FORMAT=json`, which is the default on Cloud Run. `RequestTelemetryMiddleware` writes one `http_request_completed` access log per request with `latency_ms` and returns `X-Trace-Id` / `Server-Timing` headers. `/api/v1/chat` responses include a Cloud Trace deep link.
+- `llm_telemetry_events`, `session_telemetry_events`, and `security_audit_logs` gained a nullable `trace_id` column (schemas, sink rows, LookML). `terraform/observability.tf` adds the `sec_edgar/api_request_latencies` log-based latency distribution metric.
+- `tests/test_observability.py` checks the span hierarchy with an in-memory exporter, header propagation, the log format, and `trace_id` on telemetry rows.
 
-**Work to close:**
-1. Add these dependencies to `pyproject.toml` and `requirements.txt`: `opentelemetry-exporter-gcp-trace`, `opentelemetry-propagator-gcp`, `opentelemetry-instrumentation-fastapi`, and `opentelemetry-instrumentation-requests` / `-httpx`.
-2. Create an `observability.py` module that initializes a `TracerProvider` with `BatchSpanProcessor(CloudTraceSpanExporter())` at FastAPI startup. Control it with `EDGAR_TRACING_BACKEND` (`auto | gcp | local | off`) and `EDGAR_TRACE_SAMPLE_RATIO`. Set the `CloudTraceFormatPropagator` and the W3C `traceparent` propagator so the trace context from the load balancer is carried through.
-3. Instrument FastAPI and outbound HTTP calls (BigQuery, Vertex AI Search, Vector Search, GCS, Model Armor, Firestore). Add custom spans for each ReAct step: variance calculation, 10-K cache lookup, hybrid search, synthesis, and fact-check. Give the spans attributes such as `ticker`, `fiscal_year`, `model`, token counts, and `ttft_ms`.
-4. Add a JSON log formatter that writes `severity`, `message`, `logging.googleapis.com/trace` (`projects/{project}/traces/{trace_id}`), `logging.googleapis.com/spanId`, and `logging.googleapis.com/trace_sampled` for every logger.
-5. Add a `trace_id` column to `llm_telemetry_events`, `session_telemetry_events`, and `security_audit_logs` (schemas, sinks, and LookML) so BigQuery telemetry joins to Cloud Trace.
-6. Add tests that use an in-memory span exporter to check the span hierarchy and log-record format.
+**Remaining:** `terraform apply` (new metric plus the BigQuery `trace_id` columns, both additive), deploy, and confirm a live `/api/v1/chat` request in Cloud Trace.
 
 **Done when:** one `/api/v1/chat` request shows a single Cloud Trace with nested FastAPI, ReAct, tool, and model spans; that request's Cloud Logging entries are grouped under the trace; and its BigQuery telemetry rows carry the same `trace_id`.
 
@@ -268,7 +268,7 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 **Reference requirement:** A golden dataset of 20+ query–variance–explanation mappings in BigQuery; Gemini 3.5 Flash LLM-as-a-Judge regression checks through `make eval-all` before deployment; >80% pytest coverage; ≥92% grounding recall; 100% numeric agreement and citation coverage; p95 TTFT ≤ 3.0 s; 100% safety compliance.
 
 **Current state:**
-- 119 pytest tests with mocked LLM and Search APIs.
+- 135 pytest tests with mocked LLM and Search APIs.
 - `NarrativeEvaluatorAgent` (4-axis rubric) and `/api/v1/evaluate`.
 - `verify_narrative_against_calculations` enforces numeric and citation locks for each response.
 - No golden dataset or BigQuery eval tables, no `make eval-all` target, and `pytest-cov` is not installed, so coverage is unmeasured.

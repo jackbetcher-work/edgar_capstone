@@ -266,6 +266,11 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "EDGAR_GEMINI_LOCATION"
+        value = var.gemini_location
+      }
+
+      env {
         name  = "EDGAR_MODEL_ARMOR_MODE"
         value = "gcp"
       }

@@ -186,4 +186,15 @@ view: llm_telemetry_events {
     value_format_name: percent_1
     sql: SAFE_DIVIDE(${cached_token_savings_usd}, NULLIF(${uncached_baseline_cost_usd}, 0)) ;;
   }
+
+  dimension: trace_id {
+    type: string
+    label: "Cloud Trace ID"
+    description: "OpenTelemetry trace ID of the originating API request. Links to the end-to-end latency trace in Cloud Trace."
+    sql: ${TABLE}.trace_id ;;
+    link: {
+      label: "Open in Cloud Trace"
+      url: "https://console.cloud.google.com/traces/list?project=@{GCP_PROJECT_ID}&tid={{ value }}"
+    }
+  }
 }
