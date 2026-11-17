@@ -61,7 +61,7 @@ class VertexAIEmbedder:
         model_name: str = DEFAULT_EMBEDDING_MODEL,
         dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
         batch_size: int = 50,
-        max_retries: int = 3,
+        max_retries: int = 5,
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
         max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
@@ -76,8 +76,24 @@ class VertexAIEmbedder:
         self.max_batch_chars = max(1, max_batch_chars)
         self.max_workers = max(1, max_workers)
         self._http_client = http_client
+        self._pooled_http_client: httpx.Client | None = None
         self._credentials = credentials
         self._credentials_lock = threading.Lock()
+        self._http_lock = threading.Lock()
+        self._query_cache_lock = threading.Lock()
+        self._query_cache: dict[tuple[str, str], list[float]] = {}
+        self._query_cache_max = 512
+
+    def _get_http_client(self) -> httpx.Client:
+        if self._http_client is not None:
+            return self._http_client
+        with self._http_lock:
+            if self._pooled_http_client is None or self._pooled_http_client.is_closed:
+                self._pooled_http_client = httpx.Client(
+                    timeout=60.0,
+                    limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+                )
+            return self._pooled_http_client
 
     def _get_access_token(self) -> str:
         """Obtain a valid OAuth2 bearer token from Application Default Credentials."""
@@ -138,68 +154,63 @@ class VertexAIEmbedder:
             },
         }
 
-        client = self._http_client or httpx.Client(timeout=60.0)
-        close_client = self._http_client is None
-        try:
-            for attempt in range(1, self.max_retries + 1):
-                token = self._get_access_token()
-                try:
-                    resp = client.post(
-                        url,
-                        json=payload,
-                        headers={
-                            "Authorization": f"Bearer {token}",
-                            "Content-Type": "application/json",
-                        },
-                    )
-                except httpx.TransportError as exc:
-                    if attempt < self.max_retries:
-                        backoff = _retry_backoff_seconds(attempt)
-                        logger.warning(
-                            "Vertex AI embedding transport error %s (attempt %d/%d); retrying in %.1fs...",
-                            type(exc).__name__,
-                            attempt,
-                            self.max_retries,
-                            backoff,
-                        )
-                        time.sleep(backoff)
-                        continue
-                    raise
-                if resp.status_code == 200:
-                    data = resp.json()
-                    predictions = data.get("predictions", [])
-                    vectors: list[list[float]] = []
-                    for pred in predictions:
-                        emb_obj = pred.get("embeddings", pred)
-                        values = emb_obj.get("values", [])
-                        vectors.append([float(v) for v in values])
-                    if len(vectors) != len(texts):
-                        raise RuntimeError(
-                            f"Vertex AI returned {len(vectors)} embeddings for {len(texts)} inputs"
-                        )
-                    return vectors
-
-                if resp.status_code == 400 and len(texts) > 1 and "token" in resp.text.lower():
-                    raise _BatchTooLargeError(resp.text[:400])
-
-                if resp.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+        client = self._get_http_client()
+        for attempt in range(1, self.max_retries + 1):
+            token = self._get_access_token()
+            try:
+                resp = client.post(
+                    url,
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+            except httpx.TransportError as exc:
+                if attempt < self.max_retries:
                     backoff = _retry_backoff_seconds(attempt)
                     logger.warning(
-                        "Vertex AI embedding HTTP %d (attempt %d/%d); retrying in %.1fs...",
-                        resp.status_code,
+                        "Vertex AI embedding transport error %s (attempt %d/%d); retrying in %.1fs...",
+                        type(exc).__name__,
                         attempt,
                         self.max_retries,
                         backoff,
                     )
                     time.sleep(backoff)
                     continue
+                raise
+            if resp.status_code == 200:
+                data = resp.json()
+                predictions = data.get("predictions", [])
+                vectors: list[list[float]] = []
+                for pred in predictions:
+                    emb_obj = pred.get("embeddings", pred)
+                    values = emb_obj.get("values", [])
+                    vectors.append([float(v) for v in values])
+                if len(vectors) != len(texts):
+                    raise RuntimeError(
+                        f"Vertex AI returned {len(vectors)} embeddings for {len(texts)} inputs"
+                    )
+                return vectors
 
-                raise RuntimeError(
-                    f"Vertex AI embedding request failed (HTTP {resp.status_code}): {resp.text[:400]}"
+            if resp.status_code == 400 and len(texts) > 1 and "token" in resp.text.lower():
+                raise _BatchTooLargeError(resp.text[:400])
+
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                backoff = _retry_backoff_seconds(attempt)
+                logger.warning(
+                    "Vertex AI embedding HTTP %d (attempt %d/%d); retrying in %.1fs...",
+                    resp.status_code,
+                    attempt,
+                    self.max_retries,
+                    backoff,
                 )
-        finally:
-            if close_client:
-                client.close()
+                time.sleep(backoff)
+                continue
+
+            raise RuntimeError(
+                f"Vertex AI embedding request failed (HTTP {resp.status_code}): {resp.text[:400]}"
+            )
 
         raise RuntimeError("Exhausted retries calling Vertex AI embedding API")
 
@@ -237,6 +248,28 @@ class VertexAIEmbedder:
         `on_batch_complete(start, end, vectors)` is called after each batch finishes
         (from the calling thread), which lets callers checkpoint progress.
         """
+        # Cache live single/repeated query embeddings (bypassed when a custom http_client is
+        # injected so unit tests always exercise their mock transport).
+        if (
+            self._http_client is None
+            and task_type == "RETRIEVAL_QUERY"
+            and len(texts) == 1
+            and titles is None
+            and on_batch_complete is None
+        ):
+            cache_key = (task_type, texts[0])
+            with self._query_cache_lock:
+                hit = self._query_cache.get(cache_key)
+            if hit is not None:
+                return [list(hit)]
+            vecs = self._embed_batch_adaptive(texts, task_type=task_type, titles=None)
+            with self._query_cache_lock:
+                if len(self._query_cache) >= self._query_cache_max:
+                    # Evict oldest inserted key
+                    self._query_cache.pop(next(iter(self._query_cache)), None)
+                self._query_cache[cache_key] = list(vecs[0])
+            return vecs
+
         batches = self._plan_batches(texts)
         results: list[list[float] | None] = [None] * len(texts)
 

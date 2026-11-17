@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
+  Database,
   ExternalLink,
   FileText,
   Loader2,
@@ -11,16 +12,22 @@ import type {
   CachedSectionResponse,
   CompanySummary,
   GroundedCitation,
+  XbrlFactSelection,
 } from '../types/edgar'
-import { clean10kDocumentBlock, clean10kExcerpt } from '../utils/formatters'
+import {
+  clean10kDocumentBlock,
+  clean10kExcerpt,
+  formatUsdCompact,
+} from '../utils/formatters'
 
 interface SourceInspectorPaneProps {
   citations: GroundedCitation[]
   companies: CompanySummary[]
   activeChunkId: string | null
   onSelectChunkId: (chunkId: string | null) => void
-  activeTab: 'citations' | 'document'
-  onChangeTab: (tab: 'citations' | 'document') => void
+  activeTab: 'citations' | 'document' | 'xbrl'
+  onChangeTab: (tab: 'citations' | 'document' | 'xbrl') => void
+  selectedXbrlFact?: XbrlFactSelection | null
   cachedSection: CachedSectionResponse | null
   isLoadingSection: boolean
   sectionError?: string | null
@@ -90,6 +97,7 @@ export function SourceInspectorPane({
   onSelectChunkId,
   activeTab,
   onChangeTab,
+  selectedXbrlFact = null,
   cachedSection,
   isLoadingSection,
   sectionError = null,
@@ -206,6 +214,22 @@ export function SourceInspectorPane({
           >
             <span>Full 10-K Filing</span>
           </button>
+
+          {selectedXbrlFact && (
+            <button
+              id="tab-xbrl-fact-provenance"
+              type="button"
+              onClick={() => onChangeTab('xbrl')}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 text-[11px] uppercase tracking-wider cursor-pointer ${
+                activeTab === 'xbrl'
+                  ? 'btn-terminal-key-active font-semibold'
+                  : 'btn-terminal-key'
+              }`}
+            >
+              <Database className="w-3 h-3" />
+              <span>XBRL Fact</span>
+            </button>
+          )}
         </div>
 
         <button
@@ -311,6 +335,11 @@ export function SourceInspectorPane({
                         <span className="text-[11px] text-ink-primary">
                           FY{cit.fiscal_year}
                         </span>
+                        {cit.period_of_report && (
+                          <span className="text-[10px] text-ink-muted">
+                            ({cit.period_of_report})
+                          </span>
+                        )}
                         <span
                           className={`px-1.5 py-0.2 text-[10px] font-semibold uppercase ${
                             isRisk ? 'badge-amber' : 'badge-accent'
@@ -638,6 +667,237 @@ export function SourceInspectorPane({
               </p>
             )}
           </div>
+        </div>
+      )}
+
+      {/* TAB 3: XBRL Numeric Fact Provenance */}
+      {activeTab === 'xbrl' && (
+        <div className="flex-1 overflow-y-auto p-3.5 surface-filing-sheet tabular-nums-mono">
+          {selectedXbrlFact ? (
+            <div id="xbrl-fact-inspector" className="space-y-3">
+              <div className="pb-2.5 border-b border-hairline">
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-[10px] uppercase tracking-wider font-bold text-bb-amber">
+                    SEC XBRL NUMERIC PROVENANCE
+                  </span>
+                  <span className="px-1.5 py-0.2 text-[9.5px] uppercase font-semibold badge-accent">
+                    AUDITED 10-K FACT
+                  </span>
+                </div>
+                <h3 className="text-sm font-semibold text-ink-primary">
+                  {selectedXbrlFact.title}
+                </h3>
+                {selectedXbrlFact.companyName && (
+                  <p className="text-[11px] text-ink-secondary font-sans mt-0.5">
+                    {selectedXbrlFact.companyName} ({selectedXbrlFact.ticker})
+                  </p>
+                )}
+              </div>
+
+              {(selectedXbrlFact.valueFormatted ||
+                selectedXbrlFact.deltaFormatted) && (
+                <div className="grid grid-cols-2 gap-2">
+                  {selectedXbrlFact.valueFormatted && (
+                    <div className="p-2 border border-hairline surface-subtle">
+                      <div className="text-[9.5px] uppercase text-ink-muted">
+                        REPORTED VALUE
+                      </div>
+                      <div className="text-xs font-semibold text-ink-primary mt-0.5">
+                        {selectedXbrlFact.valueFormatted}
+                      </div>
+                    </div>
+                  )}
+                  {selectedXbrlFact.deltaFormatted && (
+                    <div className="p-2 border border-hairline surface-subtle">
+                      <div className="text-[9.5px] uppercase text-ink-muted">
+                        COMPUTED VARIANCE
+                      </div>
+                      <div className="text-xs font-semibold text-bb-amber mt-0.5">
+                        {selectedXbrlFact.deltaFormatted}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="border border-hairline surface-panel divide-y divide-[var(--border-hairline)] text-[11px]">
+                <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                  <span className="text-ink-muted uppercase text-[10px]">
+                    Metric
+                  </span>
+                  <span className="text-ink-primary font-medium">
+                    {selectedXbrlFact.metricLabel}
+                  </span>
+                </div>
+                <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                  <span className="text-ink-muted uppercase text-[10px]">
+                    Fiscal Year / Period End
+                  </span>
+                  <span className="text-ink-primary">
+                    FY{selectedXbrlFact.fiscalYear}
+                    {selectedXbrlFact.periodOfReport
+                      ? ` (${selectedXbrlFact.periodOfReport})`
+                      : ''}
+                  </span>
+                </div>
+                {selectedXbrlFact.filingDate && (
+                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                    <span className="text-ink-muted uppercase text-[10px]">
+                      SEC Filing Date
+                    </span>
+                    <span className="text-ink-primary">
+                      {selectedXbrlFact.filingDate}
+                    </span>
+                  </div>
+                )}
+                {selectedXbrlFact.xbrlConcept && (
+                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                    <span className="text-ink-muted uppercase text-[10px]">
+                      XBRL Concept
+                    </span>
+                    <code className="text-bb-cyan text-[10.5px] break-all">
+                      {selectedXbrlFact.xbrlConcept}
+                    </code>
+                  </div>
+                )}
+                {selectedXbrlFact.accessionNumber && (
+                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                    <span className="text-ink-muted uppercase text-[10px]">
+                      Accession Number
+                    </span>
+                    <code className="text-ink-primary text-[10.5px]">
+                      {selectedXbrlFact.accessionNumber}
+                    </code>
+                  </div>
+                )}
+                {selectedXbrlFact.denominatorXbrlConcept && (
+                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                    <span className="text-ink-muted uppercase text-[10px]">
+                      Denominator Concept
+                    </span>
+                    <code className="text-bb-cyan text-[10.5px] break-all">
+                      {selectedXbrlFact.denominatorXbrlConcept}
+                    </code>
+                  </div>
+                )}
+                {selectedXbrlFact.priorFiscalYear && (
+                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                    <span className="text-ink-muted uppercase text-[10px]">
+                      Prior Period
+                    </span>
+                    <span className="text-ink-secondary">
+                      FY{selectedXbrlFact.priorFiscalYear}
+                      {selectedXbrlFact.priorPeriodOfReport
+                        ? ` (${selectedXbrlFact.priorPeriodOfReport})`
+                        : ''}
+                    </span>
+                  </div>
+                )}
+                {selectedXbrlFact.priorXbrlConcept && (
+                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                    <span className="text-ink-muted uppercase text-[10px]">
+                      Prior XBRL Concept
+                    </span>
+                    <code className="text-ink-secondary text-[10.5px] break-all">
+                      {selectedXbrlFact.priorXbrlConcept}
+                    </code>
+                  </div>
+                )}
+                {selectedXbrlFact.priorAccessionNumber && (
+                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
+                    <span className="text-ink-muted uppercase text-[10px]">
+                      Prior Accession Number
+                    </span>
+                    <code className="text-ink-secondary text-[10.5px]">
+                      {selectedXbrlFact.priorAccessionNumber}
+                    </code>
+                  </div>
+                )}
+              </div>
+
+              {selectedXbrlFact.derivedFrom &&
+                selectedXbrlFact.derivedFrom.length > 0 && (
+                  <div className="border border-hairline surface-panel overflow-hidden">
+                    <div className="px-2.5 py-1 surface-subtle border-b border-hairline text-[10px] uppercase text-ink-muted font-semibold">
+                      DERIVED CALCULATION INPUTS
+                    </div>
+                    <div className="divide-y divide-[var(--border-hairline)] text-[10.5px]">
+                      {selectedXbrlFact.derivedFrom.map((inp, idx) => (
+                        <div
+                          key={`${inp.ticker}-${inp.fiscal_year}-${inp.metric}-${idx}`}
+                          className="px-2.5 py-1.5 space-y-0.5"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-bb-yellow font-semibold">
+                              {inp.ticker} FY{inp.fiscal_year} · {inp.metric}
+                            </span>
+                            <span className="text-ink-primary font-semibold">
+                              {inp.value !== undefined && inp.value !== null
+                                ? formatUsdCompact(inp.value)
+                                : '—'}
+                            </span>
+                          </div>
+                          <div className="text-[9.5px] text-ink-muted flex flex-wrap gap-x-2">
+                            {inp.xbrl_concept && <span>{inp.xbrl_concept}</span>}
+                            {inp.accession_number && (
+                              <span>acc:{inp.accession_number}</span>
+                            )}
+                            {inp.period_of_report && (
+                              <span>ended {inp.period_of_report}</span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  id="btn-xbrl-open-mdna"
+                  type="button"
+                  onClick={() => {
+                    onChangeTab('document')
+                    onRequestFilingSection(
+                      selectedXbrlFact.ticker,
+                      selectedXbrlFact.fiscalYear,
+                      'item_7'
+                    )
+                  }}
+                  className="px-2.5 py-1 text-[10.5px] uppercase btn-terminal-key cursor-pointer"
+                >
+                  Open FY{selectedXbrlFact.fiscalYear} Item 7 MD&amp;A
+                </button>
+                {selectedXbrlFact.secFilingUrl && (
+                  <a
+                    href={selectedXbrlFact.secFilingUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[10.5px] uppercase text-bb-cyan border border-hairline hover:underline"
+                  >
+                    <span>SEC EDGAR FY{selectedXbrlFact.fiscalYear}</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                )}
+                {selectedXbrlFact.priorSecFilingUrl &&
+                  selectedXbrlFact.priorFiscalYear && (
+                    <a
+                      href={selectedXbrlFact.priorSecFilingUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 px-2.5 py-1 text-[10.5px] uppercase text-ink-secondary border border-hairline hover:text-ink-primary"
+                    >
+                      <span>SEC EDGAR FY{selectedXbrlFact.priorFiscalYear}</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  )}
+              </div>
+            </div>
+          ) : (
+            <p className="text-xs text-ink-muted text-center py-12 uppercase">
+              CLICK ANY [XBRL] TAG OR NUMERIC CITATION TO INSPECT PROVENANCE.
+            </p>
+          )}
         </div>
       )}
     </aside>

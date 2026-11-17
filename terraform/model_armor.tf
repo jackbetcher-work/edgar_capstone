@@ -32,6 +32,28 @@ resource "google_data_loss_prevention_inspect_template" "sec_edgar_sdp_inspect" 
       name = "AUTH_TOKEN"
     }
 
+    rule_set {
+      info_types {
+        name = "EMAIL_ADDRESS"
+      }
+      rules {
+        exclusion_rule {
+          matching_type = "MATCHING_TYPE_FULL_MATCH"
+          regex {
+            pattern = ".*@.*\\.iam\\.gserviceaccount\\.com$"
+          }
+        }
+      }
+      rules {
+        exclusion_rule {
+          matching_type = "MATCHING_TYPE_FULL_MATCH"
+          regex {
+            pattern = ".*@(sec\\.gov|.*\\.googleapis\\.com)$"
+          }
+        }
+      }
+    }
+
     custom_info_types {
       info_type {
         name = "CONFIDENTIAL_MNPI_OR_PROJECTION_LEAK"

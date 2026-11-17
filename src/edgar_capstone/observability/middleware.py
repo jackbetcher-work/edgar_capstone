@@ -113,7 +113,7 @@ class RequestTelemetryMiddleware:
         finally:
             latency_ms = round((time.perf_counter() - start) * 1000.0, 2)
             route_path = _route_template(scope) or path
-            if self.access_log and (not failed) and path not in self.quiet_paths:
+            if self.access_log and path not in self.quiet_paths:
                 self._log_access(
                     scope=scope,
                     headers=headers,
@@ -122,6 +122,7 @@ class RequestTelemetryMiddleware:
                     route=route_path,
                     status_code=status_code,
                     latency_ms=latency_ms,
+                    failed=failed,
                 )
             reset_request_context(ctx_token)
             if fallback_token is not None:
@@ -137,6 +138,7 @@ class RequestTelemetryMiddleware:
         route: str,
         status_code: int,
         latency_ms: float,
+        failed: bool = False,
     ) -> None:
         if status_code >= 500:
             level = logging.ERROR
@@ -152,6 +154,7 @@ class RequestTelemetryMiddleware:
             "http_route": route,
             "http_status": status_code,
             "latency_ms": latency_ms,
+            "unhandled_exception": failed,
             "user_agent": headers.get("user-agent", "")[:256],
             "remote_ip": (
                 headers.get("x-forwarded-for", "").split(",")[0].strip()

@@ -554,7 +554,10 @@ def after_model_fact_check_callback(
         if structured is not None:
             reports = [v for v in calc_vars.values() if isinstance(v, dict)]
             verified = verify_analyst_report(
-                structured, variance_reports=reports, citations=citations
+                structured,
+                variance_reports=reports,
+                citations=citations,
+                material_flags=state.get("material_variance_flags"),
             )
             checked_text = render_analyst_report_markdown(
                 verified, variance_reports=reports, citations=citations

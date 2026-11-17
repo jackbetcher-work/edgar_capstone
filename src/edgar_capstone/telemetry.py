@@ -15,6 +15,8 @@ Implements:
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -24,6 +26,7 @@ import time
 import urllib.parse
 import uuid
 from collections import Counter, defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,6 +56,7 @@ DEFAULT_BQ_TELEMETRY_COST_VIEW = "v_telemetry_cost_and_latency"
 
 DEFAULT_FIRESTORE_DATABASE_ID = "(default)"
 DEFAULT_FIRESTORE_FEEDBACK_COLLECTION = "analyst_feedback"
+DEFAULT_FIRESTORE_SESSION_COLLECTION = "analyst_sessions"
 
 _SAFE_BQ_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
@@ -61,6 +65,14 @@ _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
 class TelemetrySinkError(RuntimeError):
     """Raised when streaming or persisting telemetry/feedback to GCP fails."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class TelemetryNotFoundError(TelemetrySinkError):
+    """Raised when a Firestore document returns HTTP 404 Not Found."""
 
 
 class TelemetryRateLimitError(TelemetrySinkError):
@@ -106,6 +118,7 @@ class TelemetryConfig:
     bq_telemetry_cost_view: str = DEFAULT_BQ_TELEMETRY_COST_VIEW
     firestore_database_id: str = DEFAULT_FIRESTORE_DATABASE_ID
     firestore_feedback_collection: str = DEFAULT_FIRESTORE_FEEDBACK_COLLECTION
+    firestore_session_collection: str = DEFAULT_FIRESTORE_SESSION_COLLECTION
     gcp_auto_triggered: bool = False
 
     @classmethod
@@ -118,7 +131,6 @@ class TelemetryConfig:
 
         auto_signals = (
             os.environ.get("EDGAR_USE_GCP_TELEMETRY", "").strip().lower() in _TRUTHY_ENV_VALUES
-            or os.environ.get("EDGAR_USE_GCP_TOOLS", "").strip().lower() in _TRUTHY_ENV_VALUES
             or bool(os.environ.get("K_SERVICE", "").strip())
             or bool(os.environ.get("BIGQUERY_DATASET_ID", "").strip())
             or bool(os.environ.get("FIRESTORE_DATABASE_ID", "").strip())
@@ -165,6 +177,10 @@ class TelemetryConfig:
                 os.environ.get("FIRESTORE_FEEDBACK_COLLECTION")
                 or DEFAULT_FIRESTORE_FEEDBACK_COLLECTION
             ).strip(),
+            firestore_session_collection=(
+                os.environ.get("FIRESTORE_SESSION_COLLECTION")
+                or DEFAULT_FIRESTORE_SESSION_COLLECTION
+            ).strip(),
             gcp_auto_triggered=auto_signals,
         )
 
@@ -196,7 +212,7 @@ def emit_cloud_logging_sink_record(sink_table: str, payload: dict[str, Any]) -> 
 
 
 class _AuthenticatedRestTransport:
-    """ADC OAuth2 bearer authentication and HTTP helper for BigQuery & Firestore REST APIs."""
+    """ADC OAuth2 bearer authentication and pooled HTTP helper for BigQuery & Firestore REST APIs."""
 
     def __init__(
         self,
@@ -206,19 +222,34 @@ class _AuthenticatedRestTransport:
         default_timeout: float = 15.0,
     ) -> None:
         self._http_client = http_client
+        self._pooled_http_client: httpx.Client | None = None
         self._credentials = credentials
         self._default_timeout = default_timeout
+        self._auth_lock = threading.Lock()
+        self._client_lock = threading.Lock()
+
+    def _get_http_client(self) -> httpx.Client:
+        if self._http_client is not None:
+            return self._http_client
+        with self._client_lock:
+            if self._pooled_http_client is None or self._pooled_http_client.is_closed:
+                self._pooled_http_client = httpx.Client(
+                    timeout=self._default_timeout,
+                    limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+                )
+            return self._pooled_http_client
 
     def _get_bearer_token(self) -> str:
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-        if not getattr(self._credentials, "valid", False) or not getattr(
-            self._credentials, "token", None
-        ):
-            self._credentials.refresh(GoogleAuthRequest())
-        token = getattr(self._credentials, "token", None)
+        with self._auth_lock:
+            if self._credentials is None:
+                self._credentials, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+            if not getattr(self._credentials, "valid", False) or not getattr(
+                self._credentials, "token", None
+            ):
+                self._credentials.refresh(GoogleAuthRequest())
+            token = getattr(self._credentials, "token", None)
         if not token:
             raise DefaultCredentialsError(
                 "Application Default Credentials did not return an OAuth2 bearer token."
@@ -238,8 +269,7 @@ class _AuthenticatedRestTransport:
         if json_body is not None:
             headers["Content-Type"] = "application/json"
 
-        client = self._http_client or httpx.Client(timeout=self._default_timeout)
-        close_client = self._http_client is None
+        client = self._get_http_client()
         try:
             resp = client.request(
                 method,
@@ -250,17 +280,20 @@ class _AuthenticatedRestTransport:
             )
         except httpx.TimeoutException as exc:
             raise TelemetryTimeoutError(f"Timed out calling GCP endpoint {url}: {exc}") from exc
-        finally:
-            if close_client:
-                client.close()
 
         if resp.status_code == 429:
             raise TelemetryRateLimitError(
                 f"GCP API HTTP 429 Too Many Requests for {url}: {resp.text[:300]}"
             )
+        if resp.status_code == 404:
+            raise TelemetryNotFoundError(
+                f"GCP REST resource not found (HTTP 404) for {url}: {resp.text[:300]}",
+                status_code=404,
+            )
         if resp.status_code >= 400:
             raise TelemetrySinkError(
-                f"GCP REST request failed (HTTP {resp.status_code}) for {url}: {resp.text[:500]}"
+                f"GCP REST request failed (HTTP {resp.status_code}) for {url}: {resp.text[:500]}",
+                status_code=resp.status_code,
             )
         if not resp.content:
             return {}
@@ -397,6 +430,24 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         self._fallback_counts: dict[str, int] = defaultdict(int)
         self._last_streamed_at: str | None = None
         self._last_error: str | None = None
+        # Non-blocking background streaming pool for live BigQuery insertAll when no test client
+        # is injected; Cloud Logging JSON sink emission remains synchronous for trace correlation.
+        self._async_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="edgar-bq-sink")
+        self._pending_writes: list[Future[Any]] = []
+
+    def flush_async_writes(self, timeout: float = 10.0) -> int:
+        """Wait for any in-flight background BigQuery streaming writes to complete."""
+        with self._lock:
+            pending = list(self._pending_writes)
+            self._pending_writes.clear()
+        done = 0
+        for fut in pending:
+            try:
+                fut.result(timeout=timeout)
+                done += 1
+            except Exception:
+                logger.debug("Async BigQuery telemetry write raised during flush", exc_info=True)
+        return done
 
     def _should_attempt_gcp(self) -> tuple[bool, bool]:
         """Return `(attempt_gcp, strict_gcp)`."""
@@ -526,6 +577,30 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         attempt_gcp, strict_gcp = self._should_attempt_gcp()
         if not attempt_gcp:
             return "local_buffer"
+
+        # When running live (no injected test http_client or credentials), stream BigQuery insertAll
+        # off the request thread so interactive /api/v1/chat latency is never blocked by telemetry I/O.
+        if self._http_client is None and self._credentials is None:
+
+            def _bg_stream() -> None:
+                try:
+                    self.stream_rows(table_id, [(insert_id, row)])
+                except Exception as exc:
+                    with self._lock:
+                        self._fallback_counts[table_id] += 1
+                        self._last_error = str(exc)
+                    logger.warning(
+                        "Background BigQuery telemetry sink '%s' write failed: %s",
+                        table_id,
+                        exc,
+                    )
+
+            ctx = contextvars.copy_context()
+            fut = self._async_pool.submit(ctx.run, _bg_stream)
+            with self._lock:
+                self._pending_writes[:] = [f for f in self._pending_writes if not f.done()]
+                self._pending_writes.append(fut)
+            return "bigquery_streaming_async"
 
         try:
             self.stream_rows(table_id, [(insert_id, row)])
@@ -1282,6 +1357,161 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
             self._local_feedback.clear()
             self._persisted_firestore_count = 0
             self._last_error = None
+
+
+# ---------------------------------------------------------------------------
+# 2b. Firestore Persistent Session Memory Store (multi-instance Cloud Run)
+# ---------------------------------------------------------------------------
+
+
+def session_firestore_doc_id(user_id: str, session_id: str) -> str:
+    """Compute a deterministic, tenant-isolated Firestore document ID for `(user_id, session_id)`."""
+    raw = f"{user_id.strip().lower()}::{session_id.strip()}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
+
+
+class FirestoreSessionStore(_AuthenticatedRestTransport):
+    """Durable, user-isolated conversational session store backed by Cloud Firestore Native REST v1.
+
+    Uses the existing `(default)` Firestore database provisioned in `terraform/telemetry.tf`
+    under collection `analyst_sessions` (`roles/datastore.user` is already bound on `sec-analyst-sa`).
+    Follows the same `gcp` / `local` backend resolution as `FirestoreFeedbackStore` (no silent
+    fallback masking errors in production `gcp` mode; tests run with `EDGAR_FEEDBACK_BACKEND=local`).
+    """
+
+    def __init__(
+        self,
+        config: TelemetryConfig | None = None,
+        *,
+        http_client: httpx.Client | None = None,
+        credentials: Any | None = None,
+        collection_id: str | None = None,
+    ) -> None:
+        super().__init__(http_client=http_client, credentials=credentials, default_timeout=15.0)
+        self.config = config or TelemetryConfig.from_env()
+        self.project_id = _validate_bq_id(self.config.project_id, "project_id")
+        self.database_id = self.config.firestore_database_id or DEFAULT_FIRESTORE_DATABASE_ID
+        self.collection_id = (
+            collection_id
+            or self.config.firestore_session_collection
+            or DEFAULT_FIRESTORE_SESSION_COLLECTION
+        )
+        self._lock = threading.Lock()
+        self._reads = 0
+        self._writes = 0
+        self._last_error: str | None = None
+
+    @property
+    def documents_base_url(self) -> str:
+        return (
+            f"https://firestore.googleapis.com/v1/projects/{self.project_id}"
+            f"/databases/{self.database_id}/documents"
+        )
+
+    def is_live_enabled(self) -> bool:
+        """Return True when session persistence targets live Cloud Firestore."""
+        override = os.environ.get("EDGAR_SESSION_BACKEND", "").strip()
+        mode = _resolve_backend_mode(override) if override else self.config.feedback_backend
+        if self._http_client is not None:
+            return mode != "local"
+        if mode == "local":
+            return False
+        if mode == "gcp":
+            return True
+        return self.config.gcp_auto_triggered
+
+    def _doc_url(self, user_id: str, session_id: str) -> str:
+        doc_id = session_firestore_doc_id(user_id, session_id)
+        return f"{self.documents_base_url}/{self.collection_id}/{doc_id}"
+
+    def load_session(self, user_id: str, session_id: str) -> dict[str, Any] | None:
+        """Load a persisted session document for `(user_id, session_id)` (None if 404)."""
+        if not self.is_live_enabled():
+            return None
+        try:
+            raw = self._request_json("GET", self._doc_url(user_id, session_id))
+            with self._lock:
+                self._reads += 1
+            return decode_firestore_document(raw)
+        except TelemetryNotFoundError:
+            return None
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+            raise
+
+    def save_session(self, user_id: str, session_id: str, payload: dict[str, Any]) -> None:
+        """Upsert a session document via Firestore REST v1 `PATCH`."""
+        if not self.is_live_enabled():
+            return
+        fields = encode_firestore_fields(payload)
+        try:
+            self._request_json(
+                "PATCH",
+                self._doc_url(user_id, session_id),
+                json_body={"fields": fields},
+            )
+            with self._lock:
+                self._writes += 1
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+            raise
+
+    def delete_session(self, user_id: str, session_id: str) -> bool:
+        """Delete a persisted session document for `(user_id, session_id)`."""
+        if not self.is_live_enabled():
+            return False
+        try:
+            self._request_json("DELETE", self._doc_url(user_id, session_id))
+            return True
+        except TelemetryNotFoundError:
+            return False
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+            raise
+
+    def list_sessions(self, user_id: str, *, limit: int = 25) -> list[dict[str, Any]]:
+        """List recent sessions belonging to `user_id`."""
+        if not self.is_live_enabled():
+            return []
+        url = f"{self.documents_base_url}:runQuery"
+        query_body: dict[str, Any] = {
+            "structuredQuery": {
+                "from": [{"collectionId": self.collection_id}],
+                "where": {
+                    "fieldFilter": {
+                        "field": {"fieldPath": "user_id"},
+                        "op": "EQUAL",
+                        "value": {"stringValue": user_id.strip().lower()},
+                    }
+                },
+                "limit": max(1, min(int(limit), 100)),
+            }
+        }
+        raw_results = self._request_json("POST", url, json_body=query_body)
+        items: list[dict[str, Any]] = []
+        if isinstance(raw_results, list):
+            for entry in raw_results:
+                doc = entry.get("document") if isinstance(entry, dict) else None
+                if doc:
+                    items.append(decode_firestore_document(doc))
+        items.sort(key=lambda d: str(d.get("updated_at") or ""), reverse=True)
+        return items[:limit]
+
+    def status_metadata(self) -> dict[str, Any]:
+        with self._lock:
+            reads, writes, last_err = self._reads, self._writes, self._last_error
+        return {
+            "live_firestore_enabled": self.is_live_enabled(),
+            "project_id": self.project_id,
+            "database_id": self.database_id,
+            "collection": self.collection_id,
+            "reads": reads,
+            "writes": writes,
+            "last_error": last_err,
+        }
 
 
 # ---------------------------------------------------------------------------

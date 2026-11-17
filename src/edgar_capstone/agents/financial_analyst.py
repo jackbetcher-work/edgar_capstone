@@ -19,6 +19,7 @@ from edgar_capstone.agents.callbacks import (
 from edgar_capstone.agents.context_memory import (
     FINANCIAL_REASONING_MODEL,
     after_agent_memory_callback,
+    low_thinking_config_for_model,
 )
 from edgar_capstone.agents.disclosure_deltas import DisclosureDeltaTool
 from edgar_capstone.agents.material_variances import AnomalyFlagTool
@@ -60,10 +61,20 @@ def create_financial_analyst_agent(
     instead of issuing a real function call, so retrieval never ran. The ReAct structure
     lives in the system prompt and the deterministic pre-pass instead.
     """
+    base_thinking = low_thinking_config_for_model(model)
+    if base_thinking is not None:
+        thinking_cfg = genai_types.ThinkingConfig(
+            include_thoughts=True,
+            thinking_level=base_thinking.thinking_level,
+            thinking_budget=base_thinking.thinking_budget,
+        )
+    else:
+        thinking_cfg = genai_types.ThinkingConfig(include_thoughts=True)
+
     return Agent(
         name=name,
         model=model,
-        planner=BuiltInPlanner(thinking_config=genai_types.ThinkingConfig(include_thoughts=True)),
+        planner=BuiltInPlanner(thinking_config=thinking_cfg),
         description=(
             "Gemini SEC 10-K financial reasoning agent employing a structured ReAct "
             "loop to evaluate deterministic period-over-period variances, retrieve only the 10-K "

@@ -164,8 +164,15 @@ def evaluate_variance_explanation(
     cit_score = _clamp(raw_eval.get("citation_grounding_score"), 1.0)
     if citations and not fc.has_required_citations:
         cit_score = min(cit_score, 0.25)
+    raw_prec = raw_eval.get("citation_precision_score")
+    cit_precision = _clamp(raw_prec, cit_score) if raw_prec is not None else cit_score
     exp_score = _clamp(raw_eval.get("explanation_quality_score"), 1.0)
     thm_score = _clamp(raw_eval.get("thematic_consistency_score"), 1.0)
+    try:
+        raw_unsup = int(raw_eval.get("unsupported_claims_count", 0) or 0)
+    except (TypeError, ValueError):
+        raw_unsup = 0
+    unsupported_claims = max(0, raw_unsup)
     rationale = str(
         raw_eval.get("rationale")
         or f"Evaluated via live ADK NarrativeEvaluatorAgent ({eval_model})."
@@ -186,8 +193,10 @@ def evaluate_variance_explanation(
         overall_score=overall,
         numeric_fidelity_score=round(num_score, 4),
         citation_grounding_score=round(cit_score, 4),
+        citation_precision_score=round(cit_precision, 4),
         explanation_quality_score=round(exp_score, 4),
         thematic_consistency_score=round(thm_score, 4),
+        unsupported_claims_count=unsupported_claims,
         rationale=rationale,
         context_tokens=adk_lat.context_breakdown.total_context_tokens if adk_lat else 0,
         context_latency_ms=adk_lat.context_latency_ms if adk_lat else 0.0,

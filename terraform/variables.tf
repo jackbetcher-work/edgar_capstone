@@ -367,9 +367,9 @@ variable "lb_domain" {
 # Vertex AI Vector Search Index Deployment
 # ------------------------------------------------------------------------------
 variable "deploy_vertex_vector_index" {
-  description = "Whether to deploy the Vector Search index to the index endpoint (incurs always-on node cost)."
+  description = "Whether to deploy the Vector Search index to the index endpoint (incurs always-on node cost). Disabled by default because runtime hybrid retrieval uses BigQuery VECTOR_SEARCH + Vertex AI Search directly."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "vector_search_deployed_index_id" {
@@ -529,4 +529,19 @@ variable "private_subnet_cidr" {
   description = "CIDR of the private subnet used for Cloud Run Direct VPC egress and the Vector Search PSC endpoint IP."
   type        = string
   default     = "10.20.0.0/24"
+}
+
+# ------------------------------------------------------------------------------
+# Observability Alerting (observability.tf)
+# ------------------------------------------------------------------------------
+variable "monitoring_notification_channels" {
+  description = "Optional Cloud Monitoring notification channel resource names (projects/<id>/notificationChannels/<id>) attached to latency alert policies."
+  type        = list(string)
+  default     = []
+}
+
+variable "api_latency_p95_alert_threshold_ms" {
+  description = "p95 server-side latency threshold (ms) for the /api/v1/chat alert policy on logging.googleapis.com/user/sec_edgar/api_request_latencies."
+  type        = number
+  default     = 30000
 }

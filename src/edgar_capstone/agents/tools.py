@@ -1,13 +1,15 @@
 """ADK tools: MetricFetchTool, LookerQueryTool, VarianceCalculationTool, HybridSearchTool, and ContextCacheTool.
 
 Every tool reads live GCP data through the client adapters below: BigQuery (financial metrics,
-filing chunks, `VECTOR_SEARCH`), Vertex AI Search / Discovery Engine, Vertex AI Vector Search,
-Vertex AI `text-embedding-005` embeddings, and the Cloud Storage SEC corpus bucket. There is no
-local or synthesized data backend.
+filing chunks, `VECTOR_SEARCH`, and sector-wide `ML.DISTANCE` ranking), Vertex AI Search /
+Discovery Engine, Vertex AI `text-embedding-005` embeddings, and the Cloud Storage SEC corpus
+bucket. There is no local or synthesized data backend, and no undeployed Vertex Vector Search
+runtime fallback.
 """
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import re
@@ -16,6 +18,7 @@ import time
 import urllib.parse
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, MutableMapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -38,6 +41,7 @@ from edgar_capstone.agents.schemas import (
     GroundedCitation,
     MetricRecord,
     MetricVariance,
+    NumericCitation,
 )
 from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_BUCKET_NAME,
@@ -87,7 +91,6 @@ DEFAULT_VERTEX_AI_SEARCH_LOCATION = "global"
 DEFAULT_VERTEX_AI_SEARCH_COLLECTION = "default_collection"
 DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID = "sec-edgar-10k-hybrid-search"
 DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID = "sec-edgar-10k-corpus-ds"
-DEFAULT_VERTEX_VECTOR_ENDPOINT_DISPLAY_NAME = "sec-edgar-10k-chunks-endpoint"
 
 DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES = 256
 DEFAULT_10K_SECTION_CACHE_TTL_SECONDS = 3600.0
@@ -108,10 +111,8 @@ def _env_positive_number(name: str, default: float) -> float:
 class _BoundedSectionCache(MutableMapping[str, dict[str, Any]]):
     """Thread-safe, bounded LRU + TTL map for parsed 10-K sections (process-local L1 cache).
 
-    This is only the local copy of parsed section text. Model calls share the
-    sections across Cloud Run instances through remote Vertex AI `CachedContent`
-    resources (`agents/tenk_context_cache.py`). Bounding the map keeps memory
-    flat when the full S&P 500 corpus (~500 issuers x 7 years x 2 sections) is in play.
+    Bounding the map keeps memory flat when the full S&P 500 corpus (~500 issuers x 7 years
+    x 2 sections) is in play.
     """
 
     def __init__(self, *, max_entries: int, ttl_seconds: float) -> None:
@@ -189,6 +190,18 @@ _SESSION_10K_CONTEXT_CACHE: _BoundedSectionCache = _BoundedSectionCache(
         "EDGAR_10K_SECTION_CACHE_TTL_SECONDS", DEFAULT_10K_SECTION_CACHE_TTL_SECONDS
     ),
 )
+# Process-local L1 cache of BigQuery filing_chunks (with pre-computed 768-d embeddings) per section.
+# Eliminates redundant BigQuery section scans and avoids re-embedding paragraphs via Vertex AI.
+_SECTION_CHUNKS_CACHE: _BoundedSectionCache = _BoundedSectionCache(
+    max_entries=int(
+        _env_positive_number(
+            "EDGAR_10K_SECTION_CACHE_MAX_ENTRIES", DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES
+        )
+    ),
+    ttl_seconds=_env_positive_number(
+        "EDGAR_10K_SECTION_CACHE_TTL_SECONDS", DEFAULT_10K_SECTION_CACHE_TTL_SECONDS
+    ),
+)
 _CONTEXT_CACHE_RUNTIME_COUNTERS: dict[str, float | int] = {
     "hits": 0,
     "misses": 0,
@@ -237,7 +250,7 @@ def _canonicalize_gics_sector(sector: str | None) -> str | None:
 
 @dataclass(frozen=True, slots=True)
 class GcpToolConfig:
-    """Runtime configuration for BigQuery, Vertex AI Search, Vector Search, and GCS adapters."""
+    """Runtime configuration for BigQuery, Vertex AI Search, and GCS adapters."""
 
     project_id: str = DEFAULT_PROJECT_ID
     location: str = DEFAULT_LOCATION
@@ -251,13 +264,6 @@ class GcpToolConfig:
     vais_collection_id: str = DEFAULT_VERTEX_AI_SEARCH_COLLECTION
     vais_engine_id: str = DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID
     vais_datastore_id: str = DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID
-    vvs_endpoint_id: str = ""
-    vvs_endpoint_display_name: str = DEFAULT_VERTEX_VECTOR_ENDPOINT_DISPLAY_NAME
-    vvs_public_domain: str = ""
-    # Internal IP of the Private Service Connect forwarding rule for the index endpoint.
-    # When set, queries go over gRPC to <ip>:10000 inside the VPC instead of the public domain.
-    vvs_psc_address: str = ""
-    vvs_deployed_index_id: str = ""
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS
 
@@ -310,16 +316,6 @@ class GcpToolConfig:
             vais_datastore_id=os.environ.get(
                 "VERTEX_AI_SEARCH_DATASTORE_ID", DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID
             ).strip(),
-            vvs_endpoint_id=os.environ.get("VERTEX_VECTOR_SEARCH_ENDPOINT_ID", "").strip(),
-            vvs_endpoint_display_name=(
-                os.environ.get("VERTEX_VECTOR_SEARCH_ENDPOINT_DISPLAY_NAME")
-                or DEFAULT_VERTEX_VECTOR_ENDPOINT_DISPLAY_NAME
-            ).strip(),
-            vvs_public_domain=os.environ.get("VERTEX_VECTOR_SEARCH_PUBLIC_DOMAIN", "").strip(),
-            vvs_psc_address=os.environ.get("VERTEX_VECTOR_SEARCH_PSC_ADDRESS", "").strip(),
-            vvs_deployed_index_id=os.environ.get(
-                "VERTEX_VECTOR_SEARCH_DEPLOYED_INDEX_ID", ""
-            ).strip(),
             embedding_model=(
                 os.environ.get("VERTEX_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
             ).strip(),
@@ -328,7 +324,7 @@ class GcpToolConfig:
 
 
 class _GcpAuthenticatedRestClient:
-    """Shared ADC bearer authentication and resilient HTTP transport helper for GCP REST APIs."""
+    """Shared ADC bearer authentication and resilient pooled HTTP transport for GCP REST APIs."""
 
     def __init__(
         self,
@@ -338,20 +334,35 @@ class _GcpAuthenticatedRestClient:
         default_timeout: float = 30.0,
     ) -> None:
         self._http_client = http_client
+        self._pooled_http_client: httpx.Client | None = None
         self._credentials = credentials
         self._default_timeout = default_timeout
+        self._auth_lock = threading.Lock()
+        self._client_lock = threading.Lock()
+
+    def _get_http_client(self) -> httpx.Client:
+        if self._http_client is not None:
+            return self._http_client
+        with self._client_lock:
+            if self._pooled_http_client is None or self._pooled_http_client.is_closed:
+                self._pooled_http_client = httpx.Client(
+                    timeout=self._default_timeout,
+                    limits=httpx.Limits(max_connections=48, max_keepalive_connections=24),
+                )
+            return self._pooled_http_client
 
     def _get_bearer_token(self) -> str:
         """Obtain a valid OAuth2 bearer token from Application Default Credentials."""
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-        if not getattr(self._credentials, "valid", False) or not getattr(
-            self._credentials, "token", None
-        ):
-            self._credentials.refresh(GoogleAuthRequest())
-        bearer_tok = getattr(self._credentials, "token", None)
+        with self._auth_lock:
+            if self._credentials is None:
+                self._credentials, _ = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+            if not getattr(self._credentials, "valid", False) or not getattr(
+                self._credentials, "token", None
+            ):
+                self._credentials.refresh(GoogleAuthRequest())
+            bearer_tok = getattr(self._credentials, "token", None)
         if not bearer_tok:
             raise DefaultCredentialsError(
                 "Application Default Credentials did not return an OAuth2 bearer token."
@@ -382,8 +393,7 @@ class _GcpAuthenticatedRestClient:
         if json_body is not None:
             headers["Content-Type"] = "application/json"
 
-        client = self._http_client or httpx.Client(timeout=self._default_timeout)
-        close_client = self._http_client is None
+        client = self._get_http_client()
         try:
             resp = client.request(
                 method,
@@ -394,9 +404,6 @@ class _GcpAuthenticatedRestClient:
             )
         except httpx.TimeoutException as exc:
             raise UpstreamTimeoutError(f"Timed out calling GCP endpoint {url}: {exc}") from exc
-        finally:
-            if close_client:
-                client.close()
 
         if resp.status_code == 429:
             raise RateLimitExceededError(
@@ -634,9 +641,9 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
             "form_type": str(row.get("form_type") or "10-K"),
             "fiscal_year": fy,
             "fiscal_period": str(row.get("fiscal_period") or "FY"),
-            "period_of_report": str(row.get("period_of_report") or f"{fy}-12-31"),
-            "filing_date": str(row.get("filing_date") or f"{fy}-12-31"),
-            "accession_number": str(row.get("accession_number") or f"{ticker}-{fy}-10K"),
+            "period_of_report": str(row.get("period_of_report") or ""),
+            "filing_date": str(row.get("filing_date") or ""),
+            "accession_number": str(row.get("accession_number") or ""),
             "currency": str(row.get("currency") or "USD"),
             "revenue": row.get("revenue"),
             "operating_income": row.get("operating_income"),
@@ -713,6 +720,7 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
         sql = (
             "SELECT "
             "profile_id, ticker, company_name, gics_sector, fiscal_year, prev_fiscal_year, "
+            "period_of_report, filing_date, accession_number, "
             "revenue, revenue_yoy_delta, revenue_yoy_pct, "
             "operating_income, operating_income_yoy_delta, operating_income_yoy_pct, "
             "net_income, net_income_yoy_delta, net_income_yoy_pct, "
@@ -747,6 +755,9 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
                         if r.get("prev_fiscal_year") is not None
                         else None
                     ),
+                    "period_of_report": str(r.get("period_of_report") or "") or None,
+                    "filing_date": str(r.get("filing_date") or "") or None,
+                    "accession_number": str(r.get("accession_number") or "") or None,
                     "revenue": rev,
                     "revenue_yoy_delta": (
                         round(float(r["revenue_yoy_delta"]), 2)
@@ -989,7 +1000,7 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
             _bq_scalar_param("end_year", "INT64", int(end_year)),
             _bq_scalar_param("embedding_dim", "INT64", int(len(query_embedding))),
             _bq_array_param("query_embedding", "FLOAT64", query_embedding),
-            _bq_scalar_param("top_k", "INT64", int(max(1, min(top_k, 50)))),
+            _bq_scalar_param("top_k", "INT64", int(max(1, min(top_k, 500)))),
         ]
         if tickers:
             clauses.append("UPPER(REPLACE(ticker, '.', '-')) IN UNNEST(@tickers)")
@@ -1004,13 +1015,15 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
         sql = (
             "SELECT "
             "base.chunk_id, base.profile_id, base.ticker, base.company_name, "
-            "base.gics_sector, base.fiscal_year, base.section_id, base.section_title, "
+            "base.gics_sector, base.fiscal_year, base.period_of_report, base.filing_date, "
+            "base.accession_number, base.section_id, base.section_title, "
             "base.chunk_index, base.chunk_text, base.sec_filing_url, "
             "base.unstructured_gcs_uri, distance "
             "FROM VECTOR_SEARCH("
             "  ("
             "    SELECT chunk_id, profile_id, ticker, company_name, gics_sector, "
-            "           fiscal_year, section_id, section_title, chunk_index, "
+            "           fiscal_year, period_of_report, filing_date, accession_number, "
+            "           section_id, section_title, chunk_index, "
             "           chunk_text, embedding, sec_filing_url, unstructured_gcs_uri "
             f"   FROM {self._table_ref(self.filing_chunks_table)} "
             f"   WHERE {' AND '.join(clauses)}"
@@ -1036,14 +1049,76 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
             )
         return results
 
+    def vector_search_sector_top_per_ticker(
+        self,
+        query_embedding: list[float],
+        *,
+        gics_sector: str,
+        start_year: int,
+        end_year: int,
+        section_id: str | None = None,
+        per_company_year: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Retrieve top-N cosine-ranked chunks for EVERY issuer and fiscal year in a GICS sector.
+
+        Uses one BigQuery SQL query (`ML.DISTANCE` + `QUALIFY ROW_NUMBER()`) so sector-wide
+        thematic queries cover all ~76 Information Technology (or other GICS sector) issuers
+        in ~2-3 seconds instead of issuing hundreds of per-company RPCs.
+        """
+        clauses = [
+            "LOWER(gics_sector) = @gics_sector",
+            "fiscal_year BETWEEN @start_year AND @end_year",
+            "ARRAY_LENGTH(embedding) = @embedding_dim",
+        ]
+        params: list[dict[str, Any]] = [
+            _bq_scalar_param("gics_sector", "STRING", gics_sector.strip().lower()),
+            _bq_scalar_param("start_year", "INT64", int(start_year)),
+            _bq_scalar_param("end_year", "INT64", int(end_year)),
+            _bq_scalar_param("embedding_dim", "INT64", int(len(query_embedding))),
+            _bq_array_param("query_embedding", "FLOAT64", query_embedding),
+            _bq_scalar_param("per_company_year", "INT64", int(max(1, min(per_company_year, 10)))),
+        ]
+        if section_id and section_id.strip().lower() in ("item_1a", "item_7"):
+            clauses.append("LOWER(section_id) = @section_id")
+            params.append(_bq_scalar_param("section_id", "STRING", section_id.strip().lower()))
+
+        sql = (
+            "SELECT "
+            "chunk_id, profile_id, ticker, company_name, gics_sector, fiscal_year, "
+            "period_of_report, filing_date, accession_number, section_id, section_title, "
+            "chunk_index, chunk_text, sec_filing_url, unstructured_gcs_uri, "
+            "ML.DISTANCE(embedding, @query_embedding, 'COSINE') AS distance "
+            f"FROM {self._table_ref(self.filing_chunks_table)} "
+            f"WHERE {' AND '.join(clauses)} "
+            "QUALIFY ROW_NUMBER() OVER ("
+            "  PARTITION BY ticker, fiscal_year "
+            "  ORDER BY ML.DISTANCE(embedding, @query_embedding, 'COSINE') ASC"
+            ") <= @per_company_year "
+            "ORDER BY ticker ASC, fiscal_year ASC, distance ASC"
+        )
+        rows = self.run_query(sql, params)
+        results: list[dict[str, Any]] = []
+        for r in rows:
+            dist = float(r.get("distance") or 0.0)
+            sim = max(0.0, min(1.0, 1.0 - dist))
+            results.append(
+                {
+                    **r,
+                    "similarity": sim,
+                    "source_backend": "bigquery_sector_vector_search",
+                }
+            )
+        return results
+
     def fetch_chunks_by_ids(self, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Hydrate full `chunk_text` and metadata from `filing_chunks` for Vector Search neighbor IDs."""
+        """Hydrate full `chunk_text` and metadata from `filing_chunks` by chunk_id."""
         unique_ids = sorted({cid.strip() for cid in chunk_ids if cid and cid.strip()})
         if not unique_ids:
             return {}
         sql = (
             "SELECT chunk_id, profile_id, ticker, company_name, gics_sector, "
-            "fiscal_year, section_id, section_title, chunk_index, chunk_text, "
+            "fiscal_year, period_of_report, filing_date, accession_number, "
+            "section_id, section_title, chunk_index, chunk_text, "
             "sec_filing_url, unstructured_gcs_uri "
             f"FROM {self._table_ref(self.filing_chunks_table)} "
             "WHERE chunk_id IN UNNEST(@chunk_ids)"
@@ -1052,12 +1127,19 @@ class BigQueryAdapter(_GcpAuthenticatedRestClient):
         return {str(r["chunk_id"]): r for r in rows if r.get("chunk_id")}
 
     def fetch_section_chunks(
-        self, *, ticker: str, fiscal_year: int, section_id: str
+        self,
+        *,
+        ticker: str,
+        fiscal_year: int,
+        section_id: str,
+        include_embedding: bool = True,
     ) -> list[dict[str, Any]]:
-        """Fetch canonical chunks for a single `(ticker, fiscal_year, section_id)` filing section."""
+        """Fetch canonical chunks (and optionally pre-computed embeddings) for one filing section."""
+        emb_col = ", embedding" if include_embedding else ""
         sql = (
             "SELECT chunk_id, profile_id, ticker, company_name, gics_sector, "
-            "fiscal_year, section_id, section_title, chunk_index, chunk_text, "
+            "fiscal_year, period_of_report, filing_date, accession_number, "
+            f"section_id, section_title, chunk_index, chunk_text{emb_col}, "
             "sec_filing_url, unstructured_gcs_uri "
             f"FROM {self._table_ref(self.filing_chunks_table)} "
             "WHERE UPPER(REPLACE(ticker, '.', '-')) = @ticker "
@@ -1132,6 +1214,8 @@ class VertexAISearchAdapter(_GcpAuthenticatedRestClient):
         self.collection_id = config.vais_collection_id or "default_collection"
         self.engine_id = config.vais_engine_id
         self.datastore_id = config.vais_datastore_id
+        self._resolved_url: str | None = None
+        self._url_lock = threading.Lock()
 
     def _api_host(self) -> str:
         if self.location == "global":
@@ -1222,15 +1306,21 @@ class VertexAISearchAdapter(_GcpAuthenticatedRestClient):
 
         data: dict[str, Any] | None = None
         last_err: Exception | None = None
-        for idx, url in enumerate(urls):
+        with self._url_lock:
+            cached_url = self._resolved_url
+        candidate_urls = [cached_url] + [u for u in urls if u != cached_url] if cached_url else urls
+        for idx, url in enumerate(candidate_urls):
             try:
                 data = self._request_json("POST", url, json_body=payload)
+                if url != cached_url:
+                    with self._url_lock:
+                        self._resolved_url = url
                 break
             except GcpAdapterHttpError as exc:
                 last_err = exc
-                if exc.status_code == 404 and idx + 1 < len(urls):
+                if exc.status_code == 404 and idx + 1 < len(candidate_urls):
                     logger.info(
-                        "Vertex AI Search engine endpoint returned 404; falling back to datastore servingConfig."
+                        "Vertex AI Search endpoint returned 404; caching next servingConfig endpoint."
                     )
                     continue
                 raise
@@ -1349,6 +1439,9 @@ class VertexAISearchAdapter(_GcpAuthenticatedRestClient):
                         "company_name": company_name,
                         "gics_sector": doc_sector,
                         "fiscal_year": fy,
+                        "period_of_report": str(struct_data.get("period_of_report") or "") or None,
+                        "filing_date": str(struct_data.get("filing_date") or "") or None,
+                        "accession_number": str(struct_data.get("accession_number") or "") or None,
                         "section_id": resolved_sec,
                         "section_title": str(raw_title or _default_section_title(resolved_sec)),
                         "chunk_text": seg_text,
@@ -1363,327 +1456,7 @@ class VertexAISearchAdapter(_GcpAuthenticatedRestClient):
 
 
 # ---------------------------------------------------------------------------
-# 3. Vertex AI Vector Search (Matching Engine) Live Client Adapter
-# ---------------------------------------------------------------------------
-
-
-class VertexVectorSearchAdapter(_GcpAuthenticatedRestClient):
-    """Live Vertex AI Vector Search (`IndexEndpoint:findNeighbors`) ANN client adapter."""
-
-    def __init__(
-        self,
-        config: GcpToolConfig,
-        *,
-        http_client: httpx.Client | None = None,
-        credentials: Any | None = None,
-    ) -> None:
-        super().__init__(http_client=http_client, credentials=credentials, default_timeout=30.0)
-        self.project_id = config.project_id
-        self.location = config.location
-        self.endpoint_id = config.vvs_endpoint_id
-        self.endpoint_display_name = config.vvs_endpoint_display_name
-        self.public_domain = config.vvs_public_domain
-        self.psc_address = config.vvs_psc_address
-        self.deployed_index_id = config.vvs_deployed_index_id
-        self._resolved_target: tuple[str, str, str] | None = None
-        self._psc_endpoint: Any | None = None
-        # Seam for tests: builds an SDK MatchingEngineIndexEndpoint for a resource name.
-        self._psc_endpoint_factory: Any | None = None
-
-    def _regional_api_base(self) -> str:
-        return f"https://{self.location}-aiplatform.googleapis.com"
-
-    def _endpoint_resource_name(self, raw_endpoint_id: str) -> str:
-        if raw_endpoint_id.startswith("projects/"):
-            return raw_endpoint_id
-        return (
-            f"projects/{self.project_id}/locations/{self.location}/indexEndpoints/{raw_endpoint_id}"
-        )
-
-    def resolve_endpoint_target(self) -> tuple[str, str, str]:
-        """Resolve `(endpoint_resource_name, query_base_url, deployed_index_id)` and cache."""
-        if self._resolved_target is not None:
-            return self._resolved_target
-
-        if self.endpoint_id and self.deployed_index_id:
-            ep_name = self._endpoint_resource_name(self.endpoint_id)
-            base_url = (
-                f"https://{self.public_domain}" if self.public_domain else self._regional_api_base()
-            )
-            self._resolved_target = (ep_name, base_url, self.deployed_index_id)
-            return self._resolved_target
-
-        mgmt_base = self._regional_api_base()
-        endpoint_obj: dict[str, Any] | None = None
-
-        if self.endpoint_id:
-            ep_name = self._endpoint_resource_name(self.endpoint_id)
-            endpoint_obj = self._request_json("GET", f"{mgmt_base}/v1/{ep_name}")
-        else:
-            list_url = (
-                f"{mgmt_base}/v1/projects/{self.project_id}/"
-                f"locations/{self.location}/indexEndpoints"
-            )
-            list_data = self._request_json("GET", list_url)
-            endpoints = list_data.get("indexEndpoints") or []
-            for ep in endpoints:
-                if ep.get("displayName") == self.endpoint_display_name:
-                    endpoint_obj = ep
-                    break
-            if endpoint_obj is None and len(endpoints) == 1:
-                endpoint_obj = endpoints[0]
-
-        if not endpoint_obj:
-            raise GcpEndpointNotReadyError(
-                f"Vertex AI Vector Search IndexEndpoint '{self.endpoint_display_name}' "
-                f"not found in {self.project_id}/{self.location}."
-            )
-
-        ep_name = str(endpoint_obj.get("name") or "")
-        pub_domain = str(
-            self.public_domain or endpoint_obj.get("publicEndpointDomainName") or ""
-        ).strip()
-        deployed_indexes = endpoint_obj.get("deployedIndexes") or []
-        dep_id = self.deployed_index_id
-        if not dep_id and deployed_indexes:
-            dep_id = str(deployed_indexes[0].get("id") or "")
-
-        if not ep_name or not dep_id:
-            raise GcpEndpointNotReadyError(
-                f"Vertex AI Vector Search IndexEndpoint '{ep_name or self.endpoint_display_name}' "
-                "has no deployedIndexes ready to serve findNeighbors."
-            )
-
-        query_base = f"https://{pub_domain}" if pub_domain else mgmt_base
-        self._resolved_target = (ep_name, query_base, dep_id)
-        return self._resolved_target
-
-    def find_neighbors(
-        self,
-        query_embedding: list[float],
-        *,
-        tickers: set[str],
-        gics_sector: str | None,
-        section_id: str | None,
-        start_year: int,
-        end_year: int,
-        neighbor_count: int = 10,
-    ) -> list[dict[str, Any]]:
-        """Query Vertex AI Vector Search with token & numeric restricts.
-
-        Public endpoints are queried over REST (`:findNeighbors`). Private Service Connect
-        endpoints are queried over gRPC (`MatchService` on `<psc_address>:10000`) from inside
-        the VPC (Cloud Run Direct VPC egress).
-        """
-        if self.psc_address:
-            return self._find_neighbors_psc(
-                query_embedding,
-                tickers=tickers,
-                gics_sector=gics_sector,
-                section_id=section_id,
-                start_year=start_year,
-                end_year=end_year,
-                neighbor_count=neighbor_count,
-            )
-        ep_name, query_base, deployed_id = self.resolve_endpoint_target()
-
-        restricts: list[dict[str, Any]] = []
-        if tickers:
-            restricts.append({"namespace": "ticker", "allowList": sorted(tickers)})
-        canon_sector = _canonicalize_gics_sector(gics_sector)
-        if canon_sector:
-            restricts.append({"namespace": "gics_sector", "allowList": [canon_sector]})
-        if section_id in ("item_1a", "item_7"):
-            restricts.append({"namespace": "section_id", "allowList": [section_id]})
-
-        numeric_restricts: list[dict[str, Any]] = [
-            {
-                "namespace": "fiscal_year",
-                "valueInt": int(start_year),
-                "op": "GREATER_EQUAL",
-            },
-            {
-                "namespace": "fiscal_year",
-                "valueInt": int(end_year),
-                "op": "LESS_EQUAL",
-            },
-        ]
-
-        eff_k = max(1, min(int(neighbor_count), 50))
-        payload: dict[str, Any] = {
-            "deployedIndexId": deployed_id,
-            "returnFullDatapoint": True,
-            "queries": [
-                {
-                    "datapoint": {
-                        "datapointId": "rag_query",
-                        "featureVector": query_embedding,
-                        "restricts": restricts,
-                        "numericRestricts": numeric_restricts,
-                    },
-                    "neighborCount": eff_k,
-                    "perCrowdingAttributeNeighborCount": max(2, eff_k),
-                }
-            ],
-        }
-
-        url = f"{query_base}/v1/{ep_name}:findNeighbors"
-        data = self._request_json("POST", url, json_body=payload)
-
-        nearest_groups = data.get("nearestNeighbors") or []
-        if not nearest_groups:
-            return []
-
-        neighbors = nearest_groups[0].get("neighbors") or []
-        parsed: list[dict[str, Any]] = []
-        for nb in neighbors:
-            dp = nb.get("datapoint") or {}
-            chunk_id = str(dp.get("datapointId") or nb.get("datapointId") or "").strip()
-            if not chunk_id:
-                continue
-            dist = float(nb.get("distance") or 0.0)
-            sim = max(0.0, min(1.0, 1.0 - dist))
-
-            meta = dp.get("embeddingMetadata") or dp.get("embedding_metadata") or {}
-            dp_restrict_map: dict[str, str] = {}
-            for rest in dp.get("restricts") or []:
-                ns = rest.get("namespace")
-                allow_vals = rest.get("allowList") or rest.get("allow") or []
-                if ns and allow_vals:
-                    dp_restrict_map[str(ns)] = str(allow_vals[0])
-
-            parsed.append(
-                {
-                    "chunk_id": chunk_id,
-                    "profile_id": meta.get("profile_id") or dp_restrict_map.get("profile_id"),
-                    "ticker": meta.get("ticker") or dp_restrict_map.get("ticker"),
-                    "company_name": meta.get("company_name"),
-                    "gics_sector": meta.get("gics_sector") or dp_restrict_map.get("gics_sector"),
-                    "fiscal_year": (
-                        int(meta["fiscal_year"]) if meta.get("fiscal_year") is not None else None
-                    ),
-                    "section_id": meta.get("section_id") or dp_restrict_map.get("section_id"),
-                    "section_title": meta.get("section_title"),
-                    "chunk_text": meta.get("chunk_text"),
-                    "sec_filing_url": meta.get("sec_filing_url"),
-                    "unstructured_gcs_uri": meta.get("unstructured_gcs_uri"),
-                    "distance": dist,
-                    "similarity": sim,
-                    "source_backend": "vertex_vector_search",
-                }
-            )
-        return parsed
-
-    def _psc_index_endpoint(self) -> Any:
-        """SDK index endpoint bound to the PSC forwarding-rule IP (cached per adapter)."""
-        if self._psc_endpoint is not None:
-            return self._psc_endpoint
-        if not self.endpoint_id:
-            raise GcpEndpointNotReadyError(
-                "VERTEX_VECTOR_SEARCH_ENDPOINT_ID is required to query a Private Service "
-                "Connect index endpoint."
-            )
-        ep_name = self._endpoint_resource_name(self.endpoint_id)
-        if self._psc_endpoint_factory is not None:
-            endpoint = self._psc_endpoint_factory(ep_name)
-        else:
-            from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint import (
-                MatchingEngineIndexEndpoint,
-            )
-
-            endpoint = MatchingEngineIndexEndpoint(
-                index_endpoint_name=ep_name,
-                project=self.project_id,
-                location=self.location,
-                credentials=self._credentials,
-            )
-        endpoint.private_service_connect_ip_address = self.psc_address
-        self._psc_endpoint = endpoint
-        return endpoint
-
-    def _find_neighbors_psc(
-        self,
-        query_embedding: list[float],
-        *,
-        tickers: set[str],
-        gics_sector: str | None,
-        section_id: str | None,
-        start_year: int,
-        end_year: int,
-        neighbor_count: int = 10,
-    ) -> list[dict[str, Any]]:
-        from google.cloud.aiplatform.matching_engine.matching_engine_index_endpoint import (
-            Namespace,
-            NumericNamespace,
-        )
-
-        if not self.deployed_index_id:
-            raise GcpEndpointNotReadyError(
-                "VERTEX_VECTOR_SEARCH_DEPLOYED_INDEX_ID is required for Private Service Connect "
-                "queries."
-            )
-        token_filter: list[Any] = []
-        if tickers:
-            token_filter.append(Namespace(name="ticker", allow_tokens=sorted(tickers)))
-        canon_sector = _canonicalize_gics_sector(gics_sector)
-        if canon_sector:
-            token_filter.append(Namespace(name="gics_sector", allow_tokens=[canon_sector]))
-        if section_id in ("item_1a", "item_7"):
-            token_filter.append(Namespace(name="section_id", allow_tokens=[section_id]))
-        numeric_filter = [
-            NumericNamespace(name="fiscal_year", value_int=int(start_year), op="GREATER_EQUAL"),
-            NumericNamespace(name="fiscal_year", value_int=int(end_year), op="LESS_EQUAL"),
-        ]
-        eff_k = max(1, min(int(neighbor_count), 50))
-        try:
-            groups = self._psc_index_endpoint().match(
-                deployed_index_id=self.deployed_index_id,
-                queries=[list(query_embedding)],
-                num_neighbors=eff_k,
-                filter=token_filter,
-                numeric_filter=numeric_filter,
-                per_crowding_attribute_num_neighbors=max(2, eff_k),
-            )
-        except Exception as exc:  # grpc.RpcError and SDK errors
-            code = getattr(exc, "code", None)
-            code_name = getattr(code() if callable(code) else code, "name", "")
-            if code_name in ("UNAVAILABLE", "DEADLINE_EXCEEDED", "RESOURCE_EXHAUSTED"):
-                raise UpstreamTimeoutError(
-                    f"Vector Search PSC endpoint {self.psc_address}:10000 {code_name}: {exc}"
-                ) from exc
-            raise
-        neighbors = groups[0] if groups else []
-        parsed: list[dict[str, Any]] = []
-        for nb in neighbors:
-            chunk_id = str(getattr(nb, "id", "") or "").strip()
-            if not chunk_id:
-                continue
-            dist = float(getattr(nb, "distance", 0.0) or 0.0)
-            # Private match() returns IDs and distances only; chunk text and metadata are
-            # hydrated from BigQuery by chunk_id in _execute_live_gcp_hybrid_rag.
-            parsed.append(
-                {
-                    "chunk_id": chunk_id,
-                    "profile_id": None,
-                    "ticker": None,
-                    "company_name": None,
-                    "gics_sector": None,
-                    "fiscal_year": None,
-                    "section_id": None,
-                    "section_title": None,
-                    "chunk_text": None,
-                    "sec_filing_url": None,
-                    "unstructured_gcs_uri": None,
-                    "distance": dist,
-                    "similarity": max(0.0, min(1.0, 1.0 - dist)),
-                    "source_backend": "vertex_vector_search_psc",
-                }
-            )
-        return parsed
-
-
-# ---------------------------------------------------------------------------
-# 4. GCS Corpus Adapter (Unstructured 10-K Markdown Context Cache Loader)
+# 3. GCS Corpus Adapter (Unstructured 10-K Markdown Context Cache Loader)
 # ---------------------------------------------------------------------------
 
 
@@ -1736,7 +1509,6 @@ class GcpToolAdapters:
         *,
         bigquery: BigQueryAdapter | None = None,
         vertex_ai_search: VertexAISearchAdapter | None = None,
-        vertex_vector_search: VertexVectorSearchAdapter | None = None,
         gcs_corpus: GcsCorpusAdapter | None = None,
         embedder: VertexAIEmbedder | None = None,
         http_client: httpx.Client | None = None,
@@ -1749,9 +1521,6 @@ class GcpToolAdapters:
         self.vertex_ai_search = vertex_ai_search or VertexAISearchAdapter(
             self.config, http_client=http_client, credentials=credentials
         )
-        self.vertex_vector_search = vertex_vector_search or VertexVectorSearchAdapter(
-            self.config, http_client=http_client, credentials=credentials
-        )
         self.gcs_corpus = gcs_corpus or GcsCorpusAdapter(
             self.config, http_client=http_client, credentials=credentials
         )
@@ -1761,10 +1530,12 @@ class GcpToolAdapters:
             model_name=self.config.embedding_model,
             dimensions=self.config.embedding_dimensions,
             max_retries=1,
+            max_workers=4,
             http_client=http_client,
             credentials=credentials,
         )
         self._query_embedding_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
+        self._embed_cache_lock = threading.Lock()
 
     def embed_texts(
         self,
@@ -1777,10 +1548,11 @@ class GcpToolAdapters:
             return []
         if len(texts) == 1:
             cache_key = (task_type, texts[0])
-            cached = self._query_embedding_cache.get(cache_key)
-            if cached is not None:
-                self._query_embedding_cache.move_to_end(cache_key)
-                return [cached]
+            with self._embed_cache_lock:
+                cached = self._query_embedding_cache.get(cache_key)
+                if cached is not None:
+                    self._query_embedding_cache.move_to_end(cache_key)
+                    return [cached]
 
         try:
             vectors = self.embedder.embed_texts(texts, task_type=task_type)
@@ -1796,9 +1568,10 @@ class GcpToolAdapters:
 
         if len(texts) == 1 and vectors:
             cache_key = (task_type, texts[0])
-            self._query_embedding_cache[cache_key] = vectors[0]
-            if len(self._query_embedding_cache) > 128:
-                self._query_embedding_cache.popitem(last=False)
+            with self._embed_cache_lock:
+                self._query_embedding_cache[cache_key] = vectors[0]
+                if len(self._query_embedding_cache) > 256:
+                    self._query_embedding_cache.popitem(last=False)
         return vectors
 
     def embed_query(self, query: str) -> list[float]:
@@ -1814,6 +1587,7 @@ def configure_gcp_tool_adapters(adapters: GcpToolAdapters | None) -> None:
     """Explicitly inject a `GcpToolAdapters` bundle (used for custom transport or integration tests)."""
     global _CUSTOM_GCP_ADAPTERS
     _CUSTOM_GCP_ADAPTERS = adapters
+    _SECTION_CHUNKS_CACHE.clear()
 
 
 def reset_gcp_tool_adapters() -> None:
@@ -1821,13 +1595,14 @@ def reset_gcp_tool_adapters() -> None:
     global _CUSTOM_GCP_ADAPTERS, _ENV_GCP_ADAPTERS_CACHE
     _CUSTOM_GCP_ADAPTERS = None
     _ENV_GCP_ADAPTERS_CACHE = None
+    _SECTION_CHUNKS_CACHE.clear()
 
 
 def _gcp_adapters() -> GcpToolAdapters:
     """Return the live GCP adapter bundle: an injected one, or one built from the environment.
 
-    There is no local data backend: every tool reads BigQuery, Vertex AI Search / Vector
-    Search, Vertex AI embeddings, and the GCS corpus bucket.
+    There is no local data backend: every tool reads BigQuery, Vertex AI Search,
+    Vertex AI embeddings, and the GCS corpus bucket.
     """
     global _ENV_GCP_ADAPTERS_CACHE
     if _CUSTOM_GCP_ADAPTERS is not None:
@@ -1854,6 +1629,7 @@ def get_gcp_adapters_status_metadata() -> dict[str, Any]:
         "data_backend": "gcp",
         "project_id": cfg.project_id,
         "location": cfg.location,
+        "hybrid_retrieval_backends": ["bigquery_vector_search", "vertex_ai_search"],
         "bigquery": {
             "dataset_id": cfg.bq_dataset_id,
             "financial_metrics_table": cfg.bq_financial_metrics_table,
@@ -1866,13 +1642,6 @@ def get_gcp_adapters_status_metadata() -> dict[str, Any]:
             "collection_id": cfg.vais_collection_id,
             "engine_id": cfg.vais_engine_id,
             "datastore_id": cfg.vais_datastore_id,
-        },
-        "vertex_vector_search": {
-            "endpoint_id": cfg.vvs_endpoint_id or None,
-            "endpoint_display_name": cfg.vvs_endpoint_display_name,
-            "public_domain_configured": bool(cfg.vvs_public_domain),
-            "private_service_connect": bool(cfg.vvs_psc_address),
-            "deployed_index_id": cfg.vvs_deployed_index_id or None,
         },
         "gcs_corpus_bucket": cfg.sec_corpus_bucket,
         "embedding_model": cfg.embedding_model,
@@ -2009,14 +1778,55 @@ def _profile_to_metric_record(p: FinancialDataProfile) -> MetricRecord:
     )
 
 
+def _xbrl_concept_for_metric(profile: FinancialDataProfile, metric_name: str) -> str | None:
+    """Return the XBRL concept name recorded in `metric_provenance` for a metric."""
+    val = getattr(profile.metric_provenance, metric_name, None)
+    return str(val).strip() if val else None
+
+
+def _numeric_citation_for_profile(
+    profile: FinancialDataProfile, metric_name: str, value: float | None
+) -> NumericCitation:
+    """Build a traceable `NumericCitation` from a company-year `FinancialDataProfile`."""
+    return NumericCitation(
+        ticker=profile.ticker,
+        fiscal_year=profile.fiscal_year,
+        period_of_report=profile.period_of_report or None,
+        filing_date=profile.filing_date or None,
+        accession_number=profile.accession_number or None,
+        sec_filing_url=profile.sec_filing_url or None,
+        metric=metric_name,
+        xbrl_concept=_xbrl_concept_for_metric(profile, metric_name),
+        value=value,
+    )
+
+
 def _compute_single_metric_variance(
     metric_name: str,
     start_year: int,
     end_year: int,
     start_val: float | None,
     end_val: float | None,
+    *,
+    start_profile: FinancialDataProfile | None = None,
+    end_profile: FinancialDataProfile | None = None,
 ) -> MetricVariance:
-    """Deterministically compute USD delta, percentage delta, and CAGR for a metric."""
+    """Deterministically compute USD delta, percentage delta, CAGR, and XBRL provenance."""
+    start_period = (start_profile.period_of_report or None) if start_profile else None
+    end_period = (end_profile.period_of_report or None) if end_profile else None
+    start_acc = (start_profile.accession_number or None) if start_profile else None
+    end_acc = (end_profile.accession_number or None) if end_profile else None
+    start_url = (start_profile.sec_filing_url or None) if start_profile else None
+    end_url = (end_profile.sec_filing_url or None) if end_profile else None
+    start_concept = _xbrl_concept_for_metric(start_profile, metric_name) if start_profile else None
+    end_concept = _xbrl_concept_for_metric(end_profile, metric_name) if end_profile else None
+
+    derived_from: list[NumericCitation] = []
+    if start_profile is not None and start_val is not None:
+        derived_from.append(_numeric_citation_for_profile(start_profile, metric_name, start_val))
+    if end_profile is not None and end_val is not None and end_profile is not start_profile:
+        derived_from.append(_numeric_citation_for_profile(end_profile, metric_name, end_val))
+
     if start_val is None or end_val is None:
         return MetricVariance(
             metric_name=metric_name,  # type: ignore[arg-type]
@@ -2025,6 +1835,15 @@ def _compute_single_metric_variance(
             start_value=start_val,
             end_value=end_val,
             direction="unavailable",
+            start_period_of_report=start_period,
+            end_period_of_report=end_period,
+            start_accession_number=start_acc,
+            end_accession_number=end_acc,
+            start_sec_filing_url=start_url,
+            end_sec_filing_url=end_url,
+            start_xbrl_concept=start_concept,
+            end_xbrl_concept=end_concept,
+            derived_from=derived_from,
         )
 
     abs_delta = round(end_val - start_val, 2)
@@ -2053,6 +1872,15 @@ def _compute_single_metric_variance(
         percentage_delta=pct_delta,
         cagr_pct=cagr_pct,
         direction=direction,  # type: ignore[arg-type]
+        start_period_of_report=start_period,
+        end_period_of_report=end_period,
+        start_accession_number=start_acc,
+        end_accession_number=end_acc,
+        start_sec_filing_url=start_url,
+        end_sec_filing_url=end_url,
+        start_xbrl_concept=start_concept,
+        end_xbrl_concept=end_concept,
+        derived_from=derived_from,
     )
 
 
@@ -2063,7 +1891,7 @@ def _build_variance_reports_from_profiles(
     start_year: int,
     end_year: int,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Compute deterministic `CompanyVarianceReport` dicts from structured profiles."""
+    """Compute deterministic `CompanyVarianceReport` dicts with full XBRL & fiscal-period provenance."""
     by_ticker: dict[str, dict[int, FinancialDataProfile]] = defaultdict(dict)
     for p in profiles:
         norm_t = p.ticker.upper().replace(".", "-")
@@ -2072,12 +1900,14 @@ def _build_variance_reports_from_profiles(
 
     reports: list[dict[str, Any]] = []
     found_norm_tickers: set[str] = set()
+    requested_years = list(range(int(start_year), int(end_year) + 1))
 
     for ticker, fy_map in sorted(by_ticker.items()):
         avail_years = sorted(fy for fy in fy_map if start_year <= fy <= end_year)
         if not avail_years:
             continue
         found_norm_tickers.add(ticker.upper().replace(".", "-"))
+        missing_years = [fy for fy in requested_years if fy not in avail_years]
 
         eff_start = avail_years[0]
         eff_end = avail_years[-1]
@@ -2085,7 +1915,13 @@ def _build_variance_reports_from_profiles(
         end_prof = fy_map[eff_end]
 
         rev_var = _compute_single_metric_variance(
-            "revenue", eff_start, eff_end, start_prof.revenue, end_prof.revenue
+            "revenue",
+            eff_start,
+            eff_end,
+            start_prof.revenue,
+            end_prof.revenue,
+            start_profile=start_prof,
+            end_profile=end_prof,
         )
         op_var = _compute_single_metric_variance(
             "operating_income",
@@ -2093,9 +1929,17 @@ def _build_variance_reports_from_profiles(
             eff_end,
             start_prof.operating_income,
             end_prof.operating_income,
+            start_profile=start_prof,
+            end_profile=end_prof,
         )
         ni_var = _compute_single_metric_variance(
-            "net_income", eff_start, eff_end, start_prof.net_income, end_prof.net_income
+            "net_income",
+            eff_start,
+            eff_end,
+            start_prof.net_income,
+            end_prof.net_income,
+            start_profile=start_prof,
+            end_profile=end_prof,
         )
         rd_var = _compute_single_metric_variance(
             "research_and_development",
@@ -2103,6 +1947,8 @@ def _build_variance_reports_from_profiles(
             eff_end,
             start_prof.research_and_development,
             end_prof.research_and_development,
+            start_profile=start_prof,
+            end_profile=end_prof,
         )
 
         start_rec = _profile_to_metric_record(start_prof)
@@ -2125,11 +1971,62 @@ def _build_variance_reports_from_profiles(
             else None
         )
 
+        derived_margin_inputs: dict[str, list[NumericCitation]] = {}
+        if op_margin_bps is not None:
+            derived_margin_inputs["operating_margin_bps_delta"] = [
+                _numeric_citation_for_profile(
+                    start_prof, "operating_income", start_prof.operating_income
+                ),
+                _numeric_citation_for_profile(start_prof, "revenue", start_prof.revenue),
+                _numeric_citation_for_profile(
+                    end_prof, "operating_income", end_prof.operating_income
+                ),
+                _numeric_citation_for_profile(end_prof, "revenue", end_prof.revenue),
+            ]
+        if net_margin_bps is not None:
+            derived_margin_inputs["net_margin_bps_delta"] = [
+                _numeric_citation_for_profile(start_prof, "net_income", start_prof.net_income),
+                _numeric_citation_for_profile(start_prof, "revenue", start_prof.revenue),
+                _numeric_citation_for_profile(end_prof, "net_income", end_prof.net_income),
+                _numeric_citation_for_profile(end_prof, "revenue", end_prof.revenue),
+            ]
+        if rd_intensity_bps is not None:
+            derived_margin_inputs["rd_intensity_bps_delta"] = [
+                _numeric_citation_for_profile(
+                    start_prof, "research_and_development", start_prof.research_and_development
+                ),
+                _numeric_citation_for_profile(start_prof, "revenue", start_prof.revenue),
+                _numeric_citation_for_profile(
+                    end_prof, "research_and_development", end_prof.research_and_development
+                ),
+                _numeric_citation_for_profile(end_prof, "revenue", end_prof.revenue),
+            ]
+
         annual_series: list[AnnualStepVariance] = []
         source_urls: dict[int, str] = {}
+        period_end_dates: dict[int, str] = {}
+        filing_dates: dict[int, str] = {}
+        accession_numbers: dict[int, str] = {}
+        metric_provenance_by_year: dict[int, dict[str, str | None]] = {}
         for fy in avail_years:
             curr = fy_map[fy]
             source_urls[fy] = curr.sec_filing_url
+            if curr.period_of_report:
+                period_end_dates[fy] = curr.period_of_report
+            if curr.filing_date:
+                filing_dates[fy] = curr.filing_date
+            if curr.accession_number:
+                accession_numbers[fy] = curr.accession_number
+            prov_dict: dict[str, str | None] = {
+                "revenue": _xbrl_concept_for_metric(curr, "revenue"),
+                "operating_income": _xbrl_concept_for_metric(curr, "operating_income"),
+                "net_income": _xbrl_concept_for_metric(curr, "net_income"),
+                "research_and_development": _xbrl_concept_for_metric(
+                    curr, "research_and_development"
+                ),
+            }
+            metric_provenance_by_year[fy] = prov_dict
+
             prev = fy_map.get(fy - 1)
             rev_yoy_d = rev_yoy_p = op_yoy_d = op_yoy_p = ni_yoy_d = ni_yoy_p = None
             rd_yoy_d = rd_yoy_p = None
@@ -2156,6 +2053,12 @@ def _build_variance_reports_from_profiles(
                 AnnualStepVariance(
                     fiscal_year=fy,
                     prev_fiscal_year=prev.fiscal_year if prev else None,
+                    period_of_report=curr.period_of_report or None,
+                    filing_date=curr.filing_date or None,
+                    accession_number=curr.accession_number or None,
+                    prior_period_of_report=(prev.period_of_report or None) if prev else None,
+                    prior_accession_number=(prev.accession_number or None) if prev else None,
+                    prior_sec_filing_url=(prev.sec_filing_url or None) if prev else None,
                     revenue=curr.revenue,
                     revenue_yoy_delta=rev_yoy_d,
                     revenue_yoy_pct=rev_yoy_p,
@@ -2168,6 +2071,7 @@ def _build_variance_reports_from_profiles(
                     research_and_development=curr.research_and_development,
                     research_and_development_yoy_delta=rd_yoy_d,
                     research_and_development_yoy_pct=rd_yoy_p,
+                    metric_provenance=prov_dict,
                     sec_filing_url=curr.sec_filing_url,
                 )
             )
@@ -2180,6 +2084,10 @@ def _build_variance_reports_from_profiles(
             gics_sub_industry=end_prof.gics_sub_industry,
             start_year=eff_start,
             end_year=eff_end,
+            requested_start_year=int(start_year),
+            requested_end_year=int(end_year),
+            available_fiscal_years=avail_years,
+            missing_fiscal_years=missing_years,
             currency=end_prof.currency,
             revenue_variance=rev_var,
             operating_income_variance=op_var,
@@ -2190,6 +2098,11 @@ def _build_variance_reports_from_profiles(
             rd_intensity_bps_delta=rd_intensity_bps,
             annual_series=annual_series,
             source_urls=source_urls,
+            period_end_dates=period_end_dates,
+            filing_dates=filing_dates,
+            accession_numbers=accession_numbers,
+            metric_provenance=metric_provenance_by_year,
+            derived_margin_inputs=derived_margin_inputs,
         )
         reports.append(report.model_dump(mode="json"))
 
@@ -2208,43 +2121,29 @@ def _execute_live_gcp_hybrid_rag(
     end_year: int,
     effective_top_k: int,
 ) -> tuple[list[dict[str, Any]], int, list[str]]:
-    """Run hybrid retrieval across Vertex AI Vector Search, Vertex AI Search, and BigQuery."""
+    """Run parallel hybrid retrieval across BigQuery `VECTOR_SEARCH` and Vertex AI Search."""
     candidate_k = min(25, max(effective_top_k * 2, 10))
     services_hit: list[str] = []
     backend_errors: list[Exception] = []
 
-    query_embedding: list[float] | None = None
-    try:
-        query_embedding = adapters.embed_query(query)
-        services_hit.append("vertex_ai_embeddings")
-    except Exception as exc:
-        if _is_transient_gcp_error(exc):
-            raise
-        backend_errors.append(exc)
-        logger.warning("Vertex AI query embedding failed: %s", exc)
+    def _run_bq_vector_branch() -> tuple[list[dict[str, Any]], list[str]]:
+        local_services: list[str] = []
+        q_emb = adapters.embed_query(query)
+        local_services.append("vertex_ai_embeddings")
+        hits = adapters.bigquery.vector_search_chunks(
+            q_emb,
+            tickers=ticker_filter,
+            gics_sector=sector_norm,
+            section_id=sec_norm,
+            start_year=start_year,
+            end_year=end_year,
+            top_k=candidate_k,
+        )
+        local_services.append("bigquery_vector_search")
+        return hits, local_services
 
-    vvs_hits: list[dict[str, Any]] = []
-    if query_embedding is not None:
-        try:
-            vvs_hits = adapters.vertex_vector_search.find_neighbors(
-                query_embedding,
-                tickers=ticker_filter,
-                gics_sector=sector_norm,
-                section_id=sec_norm,
-                start_year=start_year,
-                end_year=end_year,
-                neighbor_count=candidate_k,
-            )
-            services_hit.append("vertex_vector_search")
-        except Exception as exc:
-            if _is_transient_gcp_error(exc):
-                raise
-            backend_errors.append(exc)
-            logger.info("Vertex AI Vector Search skipped/unavailable: %s", exc)
-
-    vais_hits: list[dict[str, Any]] = []
-    try:
-        vais_hits = adapters.vertex_ai_search.search_documents(
+    def _run_vais_branch() -> list[dict[str, Any]]:
+        return adapters.vertex_ai_search.search_documents(
             query,
             tickers=ticker_filter,
             gics_sector=sector_norm,
@@ -2253,67 +2152,43 @@ def _execute_live_gcp_hybrid_rag(
             end_year=end_year,
             page_size=candidate_k,
         )
-        services_hit.append("vertex_ai_search")
-    except Exception as exc:
-        if _is_transient_gcp_error(exc):
-            raise
-        backend_errors.append(exc)
-        logger.info("Vertex AI Search (Discovery Engine) skipped/unavailable: %s", exc)
 
     bq_vector_hits: list[dict[str, Any]] = []
-    if query_embedding is not None:
+    vais_hits: list[dict[str, Any]] = []
+
+    ctx_bq = contextvars.copy_context()
+    ctx_vais = contextvars.copy_context()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_bq = pool.submit(ctx_bq.run, _run_bq_vector_branch)
+        fut_vais = pool.submit(ctx_vais.run, _run_vais_branch)
+
         try:
-            bq_vector_hits = adapters.bigquery.vector_search_chunks(
-                query_embedding,
-                tickers=ticker_filter,
-                gics_sector=sector_norm,
-                section_id=sec_norm,
-                start_year=start_year,
-                end_year=end_year,
-                top_k=candidate_k,
-            )
-            services_hit.append("bigquery_vector_search")
+            bq_vector_hits, bq_services = fut_bq.result()
+            services_hit.extend(bq_services)
         except Exception as exc:
             if _is_transient_gcp_error(exc):
                 raise
             backend_errors.append(exc)
-            logger.info("BigQuery VECTOR_SEARCH skipped/unavailable: %s", exc)
+            logger.warning("BigQuery VECTOR_SEARCH branch failed: %s", exc)
+
+        try:
+            vais_hits = fut_vais.result()
+            services_hit.append("vertex_ai_search")
+        except Exception as exc:
+            if _is_transient_gcp_error(exc):
+                raise
+            backend_errors.append(exc)
+            logger.info("Vertex AI Search (Discovery Engine) unavailable: %s", exc)
 
     retrieval_backends = {
-        s
-        for s in services_hit
-        if s in ("vertex_vector_search", "vertex_ai_search", "bigquery_vector_search")
+        s for s in services_hit if s in ("vertex_ai_search", "bigquery_vector_search")
     }
     if not retrieval_backends:
         if backend_errors:
             raise backend_errors[0]
         raise ToolExecutionError(
-            "No live GCP RAG retrieval backends (Vertex AI Vector Search, Vertex AI Search, or BigQuery) succeeded."
+            "No live GCP RAG retrieval backends (BigQuery VECTOR_SEARCH or Vertex AI Search) succeeded."
         )
-
-    # Hydrate full chunk_text and metadata from BigQuery for any Vertex Vector Search neighbor IDs
-    known_bq_by_id: dict[str, dict[str, Any]] = {
-        str(r["chunk_id"]): r for r in bq_vector_hits if r.get("chunk_id")
-    }
-    missing_vvs_ids = [
-        str(nb["chunk_id"])
-        for nb in vvs_hits
-        if nb.get("chunk_id")
-        and not nb.get("chunk_text")
-        and str(nb["chunk_id"]) not in known_bq_by_id
-    ]
-    if missing_vvs_ids:
-        try:
-            hydrated = adapters.bigquery.fetch_chunks_by_ids(missing_vvs_ids)
-            known_bq_by_id.update(hydrated)
-            if "bigquery_chunk_hydration" not in services_hit:
-                services_hit.append("bigquery_chunk_hydration")
-        except Exception as exc:
-            if _is_transient_gcp_error(exc):
-                raise
-            raise ToolExecutionError(
-                f"BigQuery chunk hydration failed for Vector Search IDs: {exc}"
-            ) from exc
 
     # Reciprocal Rank Fusion (RRF) + semantic similarity + lexical keyword scoring
     fused: dict[str, dict[str, Any]] = {}
@@ -2322,14 +2197,11 @@ def _execute_live_gcp_hybrid_rag(
         cid = str(hit.get("chunk_id") or "").strip()
         if not cid:
             return
-        hydrated_row = known_bq_by_id.get(cid, {})
-        text = str(hit.get("chunk_text") or hydrated_row.get("chunk_text") or "").strip()
+        text = str(hit.get("chunk_text") or "").strip()
         if not text:
             return
-        ticker = str(hit.get("ticker") or hydrated_row.get("ticker") or "").strip()
+        ticker = str(hit.get("ticker") or "").strip()
         fy_val = hit.get("fiscal_year")
-        if fy_val is None:
-            fy_val = hydrated_row.get("fiscal_year")
         if not ticker or fy_val is None:
             return
         fy = int(fy_val)
@@ -2337,11 +2209,11 @@ def _execute_live_gcp_hybrid_rag(
             return
         if ticker_filter and ticker.upper().replace(".", "-") not in ticker_filter:
             return
-        sector_val = str(hit.get("gics_sector") or hydrated_row.get("gics_sector") or "Unknown")
+        sector_val = str(hit.get("gics_sector") or "Unknown")
         if sector_norm and sector_val.lower() != sector_norm:
             return
         resolved_sec = _normalize_section_id(
-            str(hit.get("section_id") or hydrated_row.get("section_id") or ""),
+            str(hit.get("section_id") or ""),
             requested_section=sec_norm,
             passage_text=text,
         )
@@ -2358,34 +2230,22 @@ def _execute_live_gcp_hybrid_rag(
 
         fused[cid] = {
             "chunk_id": cid,
-            "profile_id": str(
-                hit.get("profile_id") or hydrated_row.get("profile_id") or f"{ticker}_{fy}"
-            ),
+            "profile_id": str(hit.get("profile_id") or f"{ticker}_{fy}"),
             "ticker": ticker,
-            "company_name": str(
-                hit.get("company_name") or hydrated_row.get("company_name") or ticker
-            ),
+            "company_name": str(hit.get("company_name") or ticker),
             "gics_sector": sector_val,
             "fiscal_year": fy,
+            "period_of_report": str(hit.get("period_of_report") or "") or None,
+            "filing_date": str(hit.get("filing_date") or "") or None,
+            "accession_number": str(hit.get("accession_number") or "") or None,
             "section_id": resolved_sec,
-            "section_title": str(
-                hit.get("section_title")
-                or hydrated_row.get("section_title")
-                or _default_section_title(resolved_sec)
-            ),
+            "section_title": str(hit.get("section_title") or _default_section_title(resolved_sec)),
             "chunk_text": text,
-            "sec_filing_url": str(
-                hit.get("sec_filing_url") or hydrated_row.get("sec_filing_url") or ""
-            ),
-            "unstructured_gcs_uri": str(
-                hit.get("unstructured_gcs_uri") or hydrated_row.get("unstructured_gcs_uri") or ""
-            ),
+            "sec_filing_url": str(hit.get("sec_filing_url") or ""),
+            "unstructured_gcs_uri": str(hit.get("unstructured_gcs_uri") or ""),
             "rrf_score": rrf_inc,
             "max_similarity": sim,
         }
-
-    for rank, nb in enumerate(vvs_hits, start=1):
-        _upsert_canonical_hit(nb, rank)
 
     for rank, bq_hit in enumerate(bq_vector_hits, start=1):
         _upsert_canonical_hit(bq_hit, rank)
@@ -2438,6 +2298,9 @@ def _execute_live_gcp_hybrid_rag(
             company_name=cand["company_name"],
             gics_sector=cand["gics_sector"],
             fiscal_year=cand["fiscal_year"],
+            period_of_report=cand.get("period_of_report"),
+            filing_date=cand.get("filing_date"),
+            accession_number=cand.get("accession_number"),
             section_id=cand["section_id"],
             section_title=cand["section_title"],
             excerpt=cand["chunk_text"],
@@ -2978,11 +2841,13 @@ def query_cached_10k_context(
     max_passages: int,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
-    """Returns the passages of one company-year 10-K section most relevant to a specific question.
+    """Returns the canonical chunks of one company-year 10-K section most relevant to a question.
 
-    Use this for targeted evidence instead of reading whole sections: it ranks every paragraph of
-    the company's Item 7 (MD&A) or Item 1A (Risk Factors) against `variance_query` and returns only
-    the top `max_passages`, each with the `chunk_id` to cite.
+    Ranks pre-computed BigQuery `filing_chunks` embeddings against `variance_query` using
+    vectorized cosine similarity + lexical term boost, and caches each section's chunks and
+    embedding matrix in `_SECTION_CHUNKS_CACHE`. This avoids downloading full GCS Markdown or
+    re-embedding hundreds of paragraphs on the critical request path and guarantees exact
+    `chunk_id` attribution (`chunk_match='exact'`).
 
     Args:
         ticker: Company ticker symbol (e.g., 'NVDA', 'AAPL').
@@ -2993,67 +2858,111 @@ def query_cached_10k_context(
 
     Returns:
         Dictionary with 'status', 'passages' (each with 'text', 'chunk_id', 'chunk_match'),
-        'section_title', 'sec_filing_url', 'content_source' (always 'gcs': the filing
-        Markdown in the SEC corpus bucket), and 'matched_citations'.
+        'section_title', 'sec_filing_url', 'period_of_report', 'accession_number',
+        'content_source', and 'matched_citations'.
     """
     t0 = time.perf_counter()
-    cached_res = load_cached_10k_section(
-        ticker=ticker,
-        fiscal_year=fiscal_year,
-        section_id=section_id,
-        max_chars=50000,
-        tool_context=tool_context,
-    )
-    if cached_res.get("status") != "success":
-        return cached_res
+    norm_ticker = ticker.strip().upper().replace(".", "-")
+    sec_key = section_id.strip().lower()
+    if sec_key not in ("item_1a", "item_7"):
+        return {
+            "status": "error",
+            "message": f"section_id must be 'item_1a' or 'item_7', got {section_id!r}",
+        }
 
-    # Rank over the complete section, not the 50k-char excerpt returned to callers.
-    full_entry = get_full_10k_section(str(cached_res["cache_key"]))
-    full_text = str((full_entry or {}).get("full_text") or cached_res.get("content") or "")
-    content_source = str(cached_res.get("content_source") or "unknown")
-    raw_blocks = [
-        blk.strip()
-        for blk in re.split(r"\n\s*\n+", full_text)
-        if len(blk.strip()) >= 45 and not blk.strip().startswith("#")
-    ]
-    if not raw_blocks and full_text.strip():
-        raw_blocks = [full_text.strip()[:800]]
-
-    norm_ticker = str(cached_res["ticker"])
-    sec_key = str(cached_res["section_id"])
-    q_terms = set(_WORD_TOKEN_RE.findall(variance_query.lower()))
-
+    fy_int = int(fiscal_year)
+    cache_key = f"{norm_ticker}_{fy_int}_{sec_key}"
     adapters = _gcp_adapters()
-    dense_sims: list[float] = []
     services_hit: list[str] = []
-    if raw_blocks:
-        q_emb = np.asarray(adapters.embed_query(variance_query), dtype=np.float32)
-        # Paragraph embeddings depend only on the section text, so they are computed once per
-        # cached section and reused by every later query against it (flag explanations, the
-        # ReAct pre-pass, and agent tool calls often hit the same company-year section).
-        cache_key = str(cached_res["cache_key"])
-        section_entry = _SESSION_10K_CONTEXT_CACHE.get(cache_key)
-        cached_blocks = (section_entry or {}).get("block_embeddings")
-        if cached_blocks is not None and len(cached_blocks) == len(raw_blocks):
-            blk_embs = np.asarray(cached_blocks, dtype=np.float32)
-        else:
-            blk_embs = np.asarray(
-                adapters.embed_texts(
-                    [blk[:600] for blk in raw_blocks], task_type="RETRIEVAL_DOCUMENT"
+
+    cached_chunks_entry = _SECTION_CHUNKS_CACHE.get(cache_key)
+    section_text_entry = _SESSION_10K_CONTEXT_CACHE.get(cache_key)
+    cache_hit = (cached_chunks_entry is not None) or (section_text_entry is not None)
+
+    if cached_chunks_entry is None:
+        section_chunks = adapters.bigquery.fetch_section_chunks(
+            ticker=norm_ticker,
+            fiscal_year=fy_int,
+            section_id=sec_key,
+            include_embedding=True,
+        )
+        services_hit.append("bigquery")
+        if not section_chunks:
+            return {
+                "status": "error",
+                "message": (
+                    f"No indexed 10-K chunks found in BigQuery for "
+                    f"{norm_ticker} FY{fy_int} {sec_key}."
                 ),
-                dtype=np.float32,
+            }
+        # Build normalized embedding matrix from BigQuery's pre-computed embeddings when present.
+        raw_embs = [c.get("embedding") for c in section_chunks]
+        has_precomputed = all(isinstance(e, list) and len(e) > 0 for e in raw_embs)
+        if has_precomputed:
+            mat = np.asarray([[float(v) for v in e] for e in raw_embs], dtype=np.float32)
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms[norms == 0.0] = 1.0
+            mat = mat / norms
+            emb_source = "bigquery_precomputed"
+        else:
+            # Mock transports without embedding column: embed canonical chunk texts once.
+            embedded = adapters.embed_texts(
+                [str(c.get("chunk_text") or "")[:600] for c in section_chunks],
+                task_type="RETRIEVAL_DOCUMENT",
             )
-            if section_entry is not None:
-                section_entry["block_embeddings"] = blk_embs.tolist()
-        dense_sims = [float(x) for x in (blk_embs @ q_emb)]
+            mat = np.asarray(embedded, dtype=np.float32)
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms[norms == 0.0] = 1.0
+            mat = mat / norms
+            emb_source = "vertex_ai_embedded"
+            services_hit.append("vertex_ai_embeddings")
+
+        first = section_chunks[0]
+        cached_chunks_entry = {
+            "chunks": section_chunks,
+            "emb_matrix": mat,
+            "emb_source": emb_source,
+            "profile_id": str(first.get("profile_id") or f"{norm_ticker}_{fy_int}"),
+            "ticker": str(first.get("ticker") or norm_ticker),
+            "company_name": str(first.get("company_name") or norm_ticker),
+            "sec_filing_url": str(first.get("sec_filing_url") or ""),
+            "period_of_report": str(first.get("period_of_report") or "") or None,
+            "accession_number": str(first.get("accession_number") or "") or None,
+            "token_estimate": sum(
+                estimate_token_count(str(c.get("chunk_text") or "")) for c in section_chunks
+            ),
+        }
+        _SECTION_CHUNKS_CACHE[cache_key] = cached_chunks_entry
+
+    section_chunks = cached_chunks_entry["chunks"]
+    emb_matrix: np.ndarray = cached_chunks_entry["emb_matrix"]
+
+    q_vec = np.asarray(adapters.embed_query(variance_query), dtype=np.float32)
+    q_norm = float(np.linalg.norm(q_vec)) or 1.0
+    q_vec = q_vec / q_norm
+    if "vertex_ai_embeddings" not in services_hit:
         services_hit.append("vertex_ai_embeddings")
 
-    section_chunks = adapters.bigquery.fetch_section_chunks(
-        ticker=norm_ticker,
-        fiscal_year=int(fiscal_year),
-        section_id=sec_key,
-    )
-    services_hit.append("bigquery")
+    dense_sims: np.ndarray = emb_matrix @ q_vec
+    q_terms = set(_WORD_TOKEN_RE.findall(variance_query.lower()))
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for idx, chunk in enumerate(section_chunks):
+        chunk_text = str(chunk.get("chunk_text") or "").strip()
+        if not chunk_text:
+            continue
+        dense_sim = float(dense_sims[idx]) if idx < len(dense_sims) else 0.0
+        lex_boost = 0.0
+        if q_terms:
+            lower_text = chunk_text.lower()
+            hits = sum(1 for term in q_terms if term in lower_text)
+            lex_boost = 0.35 * (hits / len(q_terms))
+        scored.append((dense_sim + lex_boost, chunk))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    eff_limit = max(1, min(int(max_passages), 10))
+    top_scored = scored[:eff_limit]
+
     _record_gcp_backend_invocation(
         tool_context,
         tool_name="query_cached_10k_context",
@@ -3061,67 +2970,46 @@ def query_cached_10k_context(
         services_hit=services_hit,
     )
 
-    scored_blocks: list[tuple[float, str]] = []
-    for idx, blk in enumerate(raw_blocks):
-        dense_sim = dense_sims[idx] if idx < len(dense_sims) else 0.0
-        blk_lower = blk.lower()
-        lex_boost = 0.0
-        if q_terms:
-            hits = sum(1 for term in q_terms if term in blk_lower)
-            lex_boost = 0.40 * (hits / len(q_terms))
-        scored_blocks.append((dense_sim + lex_boost, blk))
-
-    scored_blocks.sort(key=lambda item: item[0], reverse=True)
-    eff_limit = max(1, min(int(max_passages), 10))
-    top_passages = [text for _, text in scored_blocks[:eff_limit]]
-
-    # Link cached section explanations to canonical chunk IDs for split-pane traceability
     matched_chunk_ids: list[str] = []
     matched_citations: list[dict[str, Any]] = []
     passages: list[dict[str, Any]] = []
-    for passage in top_passages:
-        snippet_probe = passage[:90].lower()
-        exact_chunk = next(
-            (
-                r
-                for r in section_chunks
-                if snippet_probe[:48] in str(r.get("chunk_text", "")).lower()
-                or str(r.get("chunk_text", ""))[:48].lower() in passage.lower()
-            ),
-            None,
-        )
-        best_chunk = exact_chunk or (section_chunks[0] if section_chunks else None)
+    top_passages: list[str] = []
+
+    for score_val, chunk in top_scored:
+        cid = str(chunk["chunk_id"])
+        chunk_text = str(chunk.get("chunk_text") or "").strip()
+        top_passages.append(chunk_text)
         passages.append(
             {
-                "text": passage,
-                "chunk_id": str(best_chunk["chunk_id"]) if best_chunk is not None else None,
-                # "section" means the passage was not located in a specific chunk; the
-                # chunk_id then points at the section's first chunk.
-                "chunk_match": "exact" if exact_chunk is not None else "section",
+                "text": chunk_text,
+                "chunk_id": cid,
+                "chunk_match": "exact",
+                "score": round(float(score_val), 4),
             }
         )
-        if best_chunk is not None:
-            cid = str(best_chunk["chunk_id"])
-            if cid not in matched_chunk_ids:
-                matched_chunk_ids.append(cid)
-                cit = GroundedCitation(
-                    chunk_id=cid,
-                    profile_id=str(best_chunk["profile_id"]),
-                    ticker=str(best_chunk["ticker"]),
-                    company_name=str(best_chunk["company_name"]),
-                    gics_sector=str(best_chunk.get("gics_sector") or "Unknown"),
-                    fiscal_year=int(best_chunk["fiscal_year"]),
-                    section_id=_normalize_section_id(
-                        str(best_chunk.get("section_id") or sec_key),
-                        requested_section=sec_key,
-                    ),
-                    section_title=str(best_chunk.get("section_title") or sec_key),
-                    excerpt=str(best_chunk["chunk_text"]),
-                    sec_filing_url=str(best_chunk.get("sec_filing_url") or ""),
-                    unstructured_gcs_uri=str(best_chunk.get("unstructured_gcs_uri") or ""),
-                    score=0.95,
-                )
-                matched_citations.append(cit.model_dump(mode="json"))
+        if cid not in matched_chunk_ids:
+            matched_chunk_ids.append(cid)
+            cit = GroundedCitation(
+                chunk_id=cid,
+                profile_id=str(chunk.get("profile_id") or f"{norm_ticker}_{fy_int}"),
+                ticker=str(chunk.get("ticker") or norm_ticker),
+                company_name=str(chunk.get("company_name") or norm_ticker),
+                gics_sector=str(chunk.get("gics_sector") or "Unknown"),
+                fiscal_year=int(chunk.get("fiscal_year") or fy_int),
+                period_of_report=str(chunk.get("period_of_report") or "") or None,
+                filing_date=str(chunk.get("filing_date") or "") or None,
+                accession_number=str(chunk.get("accession_number") or "") or None,
+                section_id=_normalize_section_id(
+                    str(chunk.get("section_id") or sec_key),
+                    requested_section=sec_key,
+                ),
+                section_title=str(chunk.get("section_title") or _default_section_title(sec_key)),  # type: ignore[arg-type]
+                excerpt=chunk_text,
+                sec_filing_url=str(chunk.get("sec_filing_url") or ""),
+                unstructured_gcs_uri=str(chunk.get("unstructured_gcs_uri") or ""),
+                score=round(max(0.0, min(1.0, float(score_val))), 4),
+            )
+            matched_citations.append(cit.model_dump(mode="json"))
 
     if tool_context is not None and hasattr(tool_context, "state") and matched_citations:
         existing_cits = list(tool_context.state.get("retrieved_citations", []))
@@ -3140,18 +3028,21 @@ def query_cached_10k_context(
     )
     return {
         "status": "success",
-        "cache_key": cached_res["cache_key"],
-        "cache_hit": cached_res["cache_hit"],
-        "profile_id": cached_res["profile_id"],
-        "ticker": norm_ticker,
-        "company_name": cached_res["company_name"],
-        "fiscal_year": int(fiscal_year),
+        "cache_key": cache_key,
+        "cache_hit": cache_hit,
+        "profile_id": cached_chunks_entry["profile_id"],
+        "ticker": cached_chunks_entry["ticker"],
+        "company_name": cached_chunks_entry["company_name"],
+        "fiscal_year": fy_int,
+        "period_of_report": cached_chunks_entry["period_of_report"],
+        "accession_number": cached_chunks_entry["accession_number"],
         "section_id": sec_key,
         "section_title": section_title,
-        "token_estimate": cached_res["token_estimate"],
+        "token_estimate": cached_chunks_entry["token_estimate"],
         "lookup_latency_ms": total_lookup_ms,
-        "sec_filing_url": cached_res["sec_filing_url"],
-        "content_source": content_source,
+        "sec_filing_url": cached_chunks_entry["sec_filing_url"],
+        "content_source": "bigquery_filing_chunks",
+        "embedding_source": cached_chunks_entry["emb_source"],
         "passages": passages,
         "explanations": top_passages,
         "matched_chunk_ids": matched_chunk_ids,

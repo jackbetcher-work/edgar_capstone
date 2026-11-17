@@ -20,7 +20,7 @@ prompts:
   financial_analyst:
     agent_name: "FinancialAnalystAgent"
     model: "gemini-3.8-flash"
-    latest: "v4"
+    latest: "v5"
     versions:
       v1:
         semver: "1.0.0"
@@ -46,6 +46,12 @@ prompts:
       "4.0.0":
         semver: "4.0.0"
         path: "v4/financial_analyst.yaml"
+      v5:
+        semver: "5.0.0"
+        path: "v5/financial_analyst.yaml"
+      "5.0.0":
+        semver: "5.0.0"
+        path: "v5/financial_analyst.yaml"
 
   context_cache_agent:
     agent_name: "ContextCacheAgent"

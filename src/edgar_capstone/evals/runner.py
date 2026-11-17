@@ -8,6 +8,7 @@ each answer against its reference explanation. The p95 TTFT gate always applies.
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import platform
@@ -25,16 +26,24 @@ import yaml
 
 from edgar_capstone.evals.golden import (
     REPO_ROOT,
+    SCOPE_CATEGORY,
     GoldenEvalItem,
     dataset_fingerprint,
 )
 from edgar_capstone.evals.metrics import (
     percentile,
+    score_anomaly_flags,
     score_citation_coverage,
     score_grounding,
+    score_metadata_filter_correctness,
     score_numeric_agreement,
+    score_numeric_citation_coverage,
+    score_retrieval_precision_at_10,
     score_routing,
     score_safety,
+    score_scope_or_coverage,
+    score_unsupported_claims,
+    score_wording_delta_accuracy,
 )
 
 DEFAULT_THRESHOLDS_PATH = REPO_ROOT / "evals" / "thresholds.yaml"
@@ -44,11 +53,19 @@ DEFAULT_THRESHOLDS_PATH = REPO_ROOT / "evals" / "thresholds.yaml"
 class EvalThresholds:
     numeric_agreement: float = 1.0
     citation_coverage: float = 1.0
+    numeric_citation_coverage: float = 1.0
     grounding_recall: float = 0.92
+    metadata_filter_correctness: float = 1.0
+    retrieval_precision_at_10: float = 0.85
+    wording_delta_accuracy: float = 0.90
+    anomaly_flag_recall: float = 1.0
+    scope_and_coverage_accuracy: float = 1.0
     routing_accuracy: float = 1.0
     judge_faithfulness: float = 0.85
+    judge_citation_precision: float = 0.95
     judge_explanation_quality: float = 0.75
     judge_thematic_consistency: float = 0.75
+    unsupported_claims_total: int = 0
     safety_compliance: float = 1.0
     p95_ttft_ms: float = 3000.0
     narrative_pct_tolerance: float = 0.1
@@ -79,10 +96,22 @@ class ItemResult:
     execution_mode: str | None = None
     numeric_agreement: bool | None = None
     citation_coverage: bool | None = None
+    numeric_citation_coverage: bool | None = None
     routing_ok: bool | None = None
     grounding_matched: int = 0
     grounding_expected: int = 0
+    metadata_filter_ok: bool | None = None
+    metadata_filter_ratio: float | None = None
+    retrieval_precision_at_10: float | None = None
+    delta_matched: int = 0
+    delta_expected: int = 0
+    flag_matched: int = 0
+    flag_expected: int = 0
+    scope_check_ok: bool | None = None
+    is_scope_early_exit: bool = False
+    unsupported_claims_count: int = 0
     faithfulness_score: float | None = None
+    citation_precision_score: float | None = None
     explanation_quality_score: float | None = None
     thematic_consistency_score: float | None = None
     judge_grade: str | None = None
@@ -99,6 +128,18 @@ class ItemResult:
         if self.grounding_expected == 0:
             return None
         return round(self.grounding_matched / self.grounding_expected, 4)
+
+    @property
+    def delta_accuracy(self) -> float | None:
+        if self.delta_expected == 0:
+            return None
+        return round(self.delta_matched / self.delta_expected, 4)
+
+    @property
+    def flag_recall(self) -> float | None:
+        if self.flag_expected == 0:
+            return None
+        return round(self.flag_matched / self.flag_expected, 4)
 
 
 @dataclass
@@ -126,7 +167,7 @@ class EvalRunReport:
     analyst_model: str | None
     judge_model: str | None
     item_results: list[ItemResult]
-    metrics: dict[str, float | None]
+    metrics: dict[str, float | int | None]
     gates: list[GateResult]
     thresholds: EvalThresholds
     duration_seconds: float
@@ -145,6 +186,8 @@ class EvalRunReport:
         payload["regressions"] = self.regressions
         for row, res in zip(payload["item_results"], self.item_results, strict=True):
             row["grounding_recall"] = res.grounding_recall
+            row["delta_accuracy"] = res.delta_accuracy
+            row["flag_recall"] = res.flag_recall
         return payload
 
     def to_bigquery_row(self) -> dict[str, Any]:
@@ -187,9 +230,17 @@ class EvalRunReport:
                     "intent": r.intent,
                     "numeric_agreement": r.numeric_agreement,
                     "citation_coverage": r.citation_coverage,
+                    "numeric_citation_coverage": r.numeric_citation_coverage,
                     "routing_ok": r.routing_ok,
                     "grounding_recall": r.grounding_recall,
+                    "metadata_filter_ratio": r.metadata_filter_ratio,
+                    "retrieval_precision_at_10": r.retrieval_precision_at_10,
+                    "delta_accuracy": r.delta_accuracy,
+                    "flag_recall": r.flag_recall,
+                    "scope_check_ok": r.scope_check_ok,
+                    "unsupported_claims_count": r.unsupported_claims_count,
                     "faithfulness_score": r.faithfulness_score,
+                    "citation_precision_score": r.citation_precision_score,
                     "explanation_quality_score": r.explanation_quality_score,
                     "thematic_consistency_score": r.thematic_consistency_score,
                     "judge_grade": r.judge_grade,
@@ -244,6 +295,16 @@ def _default_judge_fn() -> JudgeFn:
     return evaluate_variance_explanation
 
 
+def _supports_kwarg(fn: Callable[..., Any], name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    if name in sig.parameters:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+
 def evaluate_item(
     item: GoldenEvalItem,
     *,
@@ -253,20 +314,29 @@ def evaluate_item(
     turn_fn: TurnFn,
     judge_fn: JudgeFn,
 ) -> ItemResult:
-    res = ItemResult(item_id=item.id, category=item.category, query=item.query)
+    res = ItemResult(
+        item_id=item.id,
+        category=item.category,
+        query=item.query,
+        is_scope_early_exit=item.is_scope_early_exit,
+    )
     f = item.filters
+    turn_kwargs: dict[str, Any] = {
+        "query": item.query,
+        "tickers": f.tickers,
+        "gics_sector": f.gics_sector,
+        "section_id": f.section_id,
+        "start_year": f.start_year,
+        "end_year": f.end_year,
+        "top_k": f.top_k,
+        "session_id": f"golden-eval-{run_id}-{item.id}",
+        "user_id": "golden-eval-runner",
+    }
+    if _supports_kwarg(turn_fn, "skip_background_judge"):
+        turn_kwargs["skip_background_judge"] = True
+
     try:
-        response = turn_fn(
-            query=item.query,
-            tickers=f.tickers,
-            gics_sector=f.gics_sector,
-            section_id=f.section_id,
-            start_year=f.start_year,
-            end_year=f.end_year,
-            top_k=f.top_k,
-            session_id=f"golden-eval-{run_id}-{item.id}",
-            user_id="golden-eval-runner",
-        )
+        response = turn_fn(**turn_kwargs)
     except Exception as exc:  # noqa: BLE001 - one broken item must not abort the run
         res.error = f"{type(exc).__name__}: {exc}"
         res.failure_reasons.append(f"turn raised {res.error}")
@@ -290,12 +360,27 @@ def evaluate_item(
         res.passed = ok
         return res
 
+    if item.is_scope_early_exit:
+        ok, reasons = score_scope_or_coverage(item, response)
+        res.scope_check_ok = ok
+        res.failure_reasons.extend(reasons)
+        res.passed = ok
+        return res
+
     if res.status != "success":
         res.failure_reasons.append(f"unexpected status={res.status} (intent={res.intent})")
         res.numeric_agreement = False if item.expected_variances else None
         res.citation_coverage = False
+        res.numeric_citation_coverage = False if item.expected_variances else None
         res.routing_ok = False
+        res.metadata_filter_ok = False
+        res.metadata_filter_ratio = 0.0
+        res.retrieval_precision_at_10 = 0.0
         _, res.grounding_expected, _ = score_grounding(item, {}, score_chunk_ids=score_chunk_ids)
+        res.delta_expected = len(item.expected_deltas)
+        res.flag_expected = len(item.expected_flags)
+        if item.category == SCOPE_CATEGORY or item.expected_coverage_notice_codes:
+            res.scope_check_ok = False
         return res
 
     res.routing_ok, reasons = score_routing(item, response)
@@ -309,11 +394,40 @@ def evaluate_item(
     res.citation_coverage, reasons = score_citation_coverage(item, response)
     res.failure_reasons.extend(reasons)
 
+    res.numeric_citation_coverage, reasons = score_numeric_citation_coverage(item, response)
+    res.failure_reasons.extend(reasons)
+
     res.grounding_matched, res.grounding_expected, missing = score_grounding(
         item, response, score_chunk_ids=score_chunk_ids
     )
     if missing:
         res.failure_reasons.append(f"grounding missed: {missing}")
+
+    res.metadata_filter_ok, res.metadata_filter_ratio, reasons = score_metadata_filter_correctness(
+        item, response
+    )
+    if not res.metadata_filter_ok:
+        res.failure_reasons.extend(f"metadata_filter: {r}" for r in reasons)
+
+    res.retrieval_precision_at_10 = score_retrieval_precision_at_10(item, response)
+
+    res.delta_matched, res.delta_expected, missing_deltas = score_wording_delta_accuracy(
+        item, response
+    )
+    if missing_deltas:
+        res.failure_reasons.append(f"deltas missed: {missing_deltas}")
+
+    res.flag_matched, res.flag_expected, missing_flags = score_anomaly_flags(item, response)
+    if missing_flags:
+        res.failure_reasons.append(f"anomaly flags missed: {missing_flags}")
+
+    if item.category == SCOPE_CATEGORY or item.expected_coverage_notice_codes:
+        ok, reasons = score_scope_or_coverage(item, response)
+        res.scope_check_ok = ok
+        res.failure_reasons.extend(reasons)
+
+    res.unsupported_claims_count, unsup_reasons = score_unsupported_claims(response)
+    res.failure_reasons.extend(unsup_reasons)
 
     try:
         cached_count = len(
@@ -333,6 +447,10 @@ def evaluate_item(
             / 2.0,
             4,
         )
+        raw_prec = judged.get("citation_precision_score")
+        res.citation_precision_score = (
+            float(raw_prec) if raw_prec is not None else float(judged["citation_grounding_score"])
+        )
         res.explanation_quality_score = float(judged["explanation_quality_score"])
         res.thematic_consistency_score = float(judged["thematic_consistency_score"])
         res.judge_grade = judged.get("grade")
@@ -346,7 +464,13 @@ def evaluate_item(
         bool(res.routing_ok)
         and res.numeric_agreement is not False
         and bool(res.citation_coverage)
+        and res.numeric_citation_coverage is not False
+        and bool(res.metadata_filter_ok)
         and res.grounding_matched == res.grounding_expected
+        and res.delta_matched == res.delta_expected
+        and res.flag_matched == res.flag_expected
+        and res.scope_check_ok is not False
+        and res.unsupported_claims_count == 0
         and res.faithfulness_score is not None
         and res.judge_grade != "fail"
     )
@@ -361,13 +485,24 @@ def _mean(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 4) if values else None
 
 
-def aggregate_metrics(results: list[ItemResult]) -> dict[str, float | None]:
-    scored = [r for r in results if r.category != "safety_red_team"]
+def aggregate_metrics(results: list[ItemResult]) -> dict[str, float | int | None]:
+    scored = [r for r in results if r.category != "safety_red_team" and not r.is_scope_early_exit]
     safety = [r for r in results if r.category == "safety_red_team"]
+    scope_checks = [r for r in results if r.scope_check_ok is not None]
+
     g_matched = sum(r.grounding_matched for r in scored)
     g_expected = sum(r.grounding_expected for r in scored)
+    d_matched = sum(r.delta_matched for r in scored)
+    d_expected = sum(r.delta_expected for r in scored)
+    f_matched = sum(r.flag_matched for r in scored)
+    f_expected = sum(r.flag_expected for r in scored)
+
     ttfts = [r.ttft_ms for r in scored if r.ttft_ms is not None]
     latencies = [r.total_latency_ms for r in results if r.total_latency_ms is not None]
+    p10_vals = [
+        r.retrieval_precision_at_10 for r in scored if r.retrieval_precision_at_10 is not None
+    ]
+    filter_vals = [r.metadata_filter_ratio for r in scored if r.metadata_filter_ratio is not None]
 
     def _judge(attr: str) -> float | None:
         # Items whose turn or judge failed score 0 so they drag the mean down instead of vanishing.
@@ -378,11 +513,25 @@ def aggregate_metrics(results: list[ItemResult]) -> dict[str, float | None]:
             [bool(r.numeric_agreement) for r in scored if r.numeric_agreement is not None]
         ),
         "citation_coverage": _ratio([bool(r.citation_coverage) for r in scored]),
+        "numeric_citation_coverage": _ratio(
+            [
+                bool(r.numeric_citation_coverage)
+                for r in scored
+                if r.numeric_citation_coverage is not None
+            ]
+        ),
         "grounding_recall": round(g_matched / g_expected, 4) if g_expected else None,
+        "metadata_filter_correctness": _mean(filter_vals) if filter_vals else None,
+        "retrieval_precision_at_10": _mean(p10_vals) if p10_vals else None,
+        "wording_delta_accuracy": round(d_matched / d_expected, 4) if d_expected else None,
+        "anomaly_flag_recall": round(f_matched / f_expected, 4) if f_expected else None,
+        "scope_and_coverage_accuracy": _ratio([bool(r.scope_check_ok) for r in scope_checks]),
         "routing_accuracy": _ratio([bool(r.routing_ok) for r in scored]),
         "judge_faithfulness": _judge("faithfulness_score"),
+        "judge_citation_precision": _judge("citation_precision_score"),
         "judge_explanation_quality": _judge("explanation_quality_score"),
         "judge_thematic_consistency": _judge("thematic_consistency_score"),
+        "unsupported_claims_total": sum(r.unsupported_claims_count for r in scored),
         "safety_compliance": _ratio([r.passed for r in safety]),
         "p95_ttft_ms": percentile(ttfts, 95) if ttfts else None,
         "p95_total_latency_ms": percentile(latencies, 95) if latencies else None,
@@ -391,15 +540,22 @@ def aggregate_metrics(results: list[ItemResult]) -> dict[str, float | None]:
 
 
 def evaluate_gates(
-    metrics: dict[str, float | None], thresholds: EvalThresholds
+    metrics: dict[str, float | int | None], thresholds: EvalThresholds
 ) -> list[GateResult]:
     gates: list[GateResult] = []
     for name in (
         "numeric_agreement",
         "citation_coverage",
+        "numeric_citation_coverage",
         "grounding_recall",
+        "metadata_filter_correctness",
+        "retrieval_precision_at_10",
+        "wording_delta_accuracy",
+        "anomaly_flag_recall",
+        "scope_and_coverage_accuracy",
         "routing_accuracy",
         "judge_faithfulness",
+        "judge_citation_precision",
         "judge_explanation_quality",
         "judge_thematic_consistency",
         "safety_compliance",
@@ -409,22 +565,34 @@ def evaluate_gates(
         gates.append(
             GateResult(
                 name=name,
-                value=value,
+                value=float(value) if value is not None else None,
                 threshold=threshold,
                 comparator=">=",
-                passed=value is not None and value >= threshold,
+                passed=value is not None and float(value) >= threshold,
                 detail="" if value is not None else "no items contributed to this metric",
             )
         )
+
+    unsup = metrics.get("unsupported_claims_total")
+    gates.append(
+        GateResult(
+            name="unsupported_claims_total",
+            value=float(unsup) if unsup is not None else None,
+            threshold=float(thresholds.unsupported_claims_total),
+            comparator="<=",
+            passed=unsup is not None and float(unsup) <= float(thresholds.unsupported_claims_total),
+            detail="" if unsup is not None else "no items contributed to this metric",
+        )
+    )
 
     ttft = metrics.get("p95_ttft_ms")
     gates.append(
         GateResult(
             name="p95_ttft_ms",
-            value=ttft,
+            value=float(ttft) if ttft is not None else None,
             threshold=thresholds.p95_ttft_ms,
             comparator="<=",
-            passed=ttft is not None and ttft <= thresholds.p95_ttft_ms,
+            passed=ttft is not None and float(ttft) <= thresholds.p95_ttft_ms,
             detail="" if ttft is not None else "no streaming TTFT captured",
         )
     )

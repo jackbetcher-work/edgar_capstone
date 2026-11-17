@@ -25,6 +25,7 @@ from edgar_capstone.agents import (
     calculate_period_variances,
     create_financial_analyst_agent,
     evaluate_variance_explanation,
+    flush_pending_evaluations,
     generate_financial_coding_assistance,
     get_context_latency_tracker,
     get_conversation_memory_manager,
@@ -53,6 +54,7 @@ _ADK_RUNTIME_KEYS = {
     "adk_tool_calls",
     "answer_verified",
     "answer_withheld_reason",
+    "judge_mode",
     "structured_report",
     "report_verification",
     "agent_retrieval",
@@ -91,7 +93,6 @@ class StreamingProAnalystLlm(BaseLlm):
             final_md = report_json(
                 headline="Streaming timing probe",
                 findings=[],
-                notes="No claims; this response only exercises SSE timing.",
             )
 
         await asyncio.sleep(self.ttft_delay_s)
@@ -368,10 +369,14 @@ def test_conversational_rag_turn_executes_live_gemini_end_to_end() -> None:
     assert evaluation["grade"] in {"pass", "needs_revision", "fail"}
     assert 0.0 <= evaluation["overall_score"] <= 1.0
 
-    # Both the analyst (gemini-3.8-flash) and the judge (gemini-3.5-flash) calls were recorded
+    # The interactive turn runs only the analyst (gemini-3.8-flash) on the request path;
+    # the live Flash judge (gemini-3.5-flash) executes asynchronously off the critical path.
     models_called = [r["model_name"] for r in turn["context_and_memory"]["model_call_records"]]
     assert any(_is_model(m, "gemini-3.8-flash") for m in models_called), models_called
-    assert any(_is_model(m, "gemini-3.5-flash") for m in models_called), models_called
+    assert runtime["judge_mode"] == "async_background"
+    flush_pending_evaluations(timeout=30.0)
+    all_models_called = [r.model_name for r in tracker.recent_records(limit=20)]
+    assert any(_is_model(m, "gemini-3.5-flash") for m in all_models_called), all_models_called
 
     # All S2S cryptographic agent attestations remain strictly enforced
     assert len(turn["agent_trace"]) >= 4

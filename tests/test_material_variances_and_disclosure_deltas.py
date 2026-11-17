@@ -485,7 +485,11 @@ def test_prompt_carries_flags_and_disclosure_deltas() -> None:
 def _assert_citations_resolve(resp: dict[str, Any]) -> None:
     known = {c["chunk_id"] for c in resp["citations"]}
     cited = _CITATION_RE.findall(resp["answer_markdown"])
-    assert [c for c in cited if c not in known] == []
+    text_citations = [c for c in cited if not c.startswith("acc:")]
+    assert [c for c in text_citations if c not in known] == []
+    # Inline XBRL numeric provenance tags should also be present when variance reports exist
+    if resp.get("variance_reports") and "#### Key Metrics" in resp.get("answer_markdown", ""):
+        assert any(c.startswith("acc:") for c in cited)
 
 
 def test_live_chat_turn_attaches_explained_material_flags() -> None:

@@ -63,3 +63,55 @@ resource "google_logging_metric" "api_request_latencies" {
 
   depends_on = [google_project_service.required_apis]
 }
+
+resource "google_monitoring_alert_policy" "api_latency_p95" {
+  project      = var.project_id
+  display_name = "SEC EDGAR API p95 Latency Exceeded (${var.api_latency_p95_alert_threshold_ms} ms)"
+  combiner     = "OR"
+  enabled      = true
+
+  notification_channels = var.monitoring_notification_channels
+
+  documentation {
+    content   = "Triggered when p95 server-side request latency on `sec-edgar-analyst` exceeds ${var.api_latency_p95_alert_threshold_ms} ms over a 5-minute window. Follow the trace exemplars attached to `logging.googleapis.com/user/sec_edgar/api_request_latencies` directly into Cloud Trace."
+    mime_type = "text/markdown"
+  }
+
+  conditions {
+    display_name = "Cloud Run /api/v1/chat p95 latency > ${var.api_latency_p95_alert_threshold_ms} ms"
+
+    condition_threshold {
+      filter = join(" AND ", [
+        "metric.type=\"logging.googleapis.com/user/sec_edgar/api_request_latencies\"",
+        "resource.type=\"cloud_run_revision\"",
+        "resource.labels.service_name=\"${var.cloud_run_service_name}\"",
+        "metric.labels.http_route=monitoring.regex.full_match(\"/api/v1/chat(/stream)?\")",
+      ])
+      duration        = "300s"
+      comparison      = "COMPARISON_GT"
+      threshold_value = var.api_latency_p95_alert_threshold_ms
+
+      aggregations {
+        alignment_period     = "300s"
+        per_series_aligner   = "ALIGN_PERCENTILE_95"
+        cross_series_reducer = "REDUCE_MAX"
+        group_by_fields      = ["metric.labels.http_route"]
+      }
+
+      trigger {
+        count = 1
+      }
+    }
+  }
+
+  alert_strategy {
+    auto_close = "1800s"
+  }
+
+  user_labels = var.labels
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_logging_metric.api_request_latencies,
+  ]
+}

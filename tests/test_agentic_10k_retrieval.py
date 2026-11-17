@@ -75,7 +75,7 @@ def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() 
                 "sec_filing_url": "https://www.sec.gov/x",
                 "excerpt": long_excerpt,
             }
-            for i in range(12)
+            for i in range(16)
         ],
         sector_benchmarks=[],
         chunk_health=None,
@@ -84,9 +84,9 @@ def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() 
     assert "Full 10-K sections are NOT in this request" in prompt
     assert "query_cached_10k_context(" in prompt and "search_10k_chunks_rag(" in prompt
     assert "without redundant tool calls" not in prompt
-    # Leads are capped in count and length and point at citable chunk ids
-    assert prompt.count('"chunk_id": "NVDA_2026_item_7_') == 8
-    assert long_excerpt[:300] not in prompt
+    # Leads are capped in count (12) and length (850 chars) and point at citable chunk ids
+    assert prompt.count('"chunk_id": "NVDA_2026_item_7_') == 12
+    assert long_excerpt[:900] not in prompt
     assert '"pre_queried_sections"' in prompt
     # Suggested retrieval targets are surfaced once, not duplicated inside the evaluations JSON
     assert prompt.count("operating income & margin variance drivers") == 1
@@ -123,9 +123,11 @@ def test_query_cached_10k_context_ranks_full_live_section_and_returns_citable_pa
         max_passages=2,
     )
     assert res["status"] == "success"
-    assert res["content_source"] == "gcs"
+    assert res["content_source"] == "bigquery_filing_chunks"
     assert "warning" not in res
-    assert res["passages"][0]["text"] == target
+    norm_passage = " ".join(res["passages"][0]["text"].replace("\\", "").split())
+    norm_target = " ".join(target.replace("\\", "").split())
+    assert norm_target[:120] in norm_passage, (norm_target[:120], norm_passage[:300])
     assert all({"text", "chunk_id", "chunk_match"} <= set(p) for p in res["passages"])
 
     # Every passage points at a live BigQuery chunk returned as a matched citation

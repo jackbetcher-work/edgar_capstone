@@ -3,15 +3,24 @@ import {
   AlertTriangle,
   Check,
   Copy,
+  HelpCircle,
+  Info,
+  Layers,
   Loader2,
   ShieldCheck,
+  Sparkles,
   ThumbsDown,
   ThumbsUp,
 } from 'lucide-react'
-import type { ConversationTurn, GroundedCitation } from '../types/edgar'
+import type {
+  ConversationTurn,
+  GroundedCitation,
+  XbrlFactSelection,
+} from '../types/edgar'
 import {
   getIntentDisplayMeta,
   type ParsedInlineCitationToken,
+  type ParsedInlineXbrlToken,
 } from '../utils/formatters'
 import { DisclosureDeltaCard } from './DisclosureDeltaCard'
 import { GroundedMarkdown } from './GroundedMarkdown'
@@ -25,6 +34,12 @@ interface ChatTurnItemProps {
     token: ParsedInlineCitationToken,
     turnCitations: GroundedCitation[]
   ) => void
+  onSelectXbrlCitation?: (
+    token: ParsedInlineXbrlToken,
+    turn: ConversationTurn
+  ) => void
+  onInspectXbrlFact?: (fact: XbrlFactSelection) => void
+  onSelectFollowup?: (query: string) => void
   onFocusTurnCitations: (citations: GroundedCitation[]) => void
   onInspectFilingSection: (
     ticker: string,
@@ -38,10 +53,35 @@ interface ChatTurnItemProps {
   ) => void
 }
 
+function computeProgressPercent(meta: Record<string, unknown> | null | undefined): number | null {
+  if (!meta) return null
+  const num = (k: string): number | null => {
+    const v = meta[k]
+    return typeof v === 'number' && Number.isFinite(v) ? v : null
+  }
+  const completed =
+    num('companies_analyzed') ??
+    num('completed_batches') ??
+    num('completed') ??
+    null
+  const total =
+    num('total_companies') ??
+    num('total_batches') ??
+    num('total') ??
+    null
+  if (completed !== null && total !== null && total > 0) {
+    return Math.max(0, Math.min(100, Math.round((completed / total) * 100)))
+  }
+  return null
+}
+
 export function ChatTurnItem({
   turn,
   activeChunkId,
   onSelectInlineCitation,
+  onSelectXbrlCitation,
+  onInspectXbrlFact,
+  onSelectFollowup,
   onFocusTurnCitations,
   onInspectFilingSection,
   onSubmitFeedback,
@@ -106,23 +146,50 @@ export function ChatTurnItem({
         </div>
       </div>
 
-      {/* Loading State */}
-      {turn.isLoading && (
-        <div
-          id={`loading-turn-${turn.id}`}
-          className="p-3.5 space-y-2.5 tabular-nums-mono"
-        >
-          <div className="flex items-center gap-2 text-xs text-bb-amber">
-            <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-            <span>COMPUTING XBRL VARIANCES &amp; RETRIEVING 10-K FILINGS...</span>
+      {/* Loading State with Live SSE Stream Progress */}
+      {turn.isLoading && (() => {
+        const pct = computeProgressPercent(turn.progressMeta)
+        const elapsedLabel =
+          typeof turn.progressElapsedMs === 'number' && turn.progressElapsedMs > 0
+            ? `${(turn.progressElapsedMs / 1000).toFixed(1)}s`
+            : null
+        return (
+          <div
+            id={`loading-turn-${turn.id}`}
+            className="p-3.5 space-y-2.5 tabular-nums-mono"
+          >
+            <div className="flex items-center justify-between gap-2 text-xs text-bb-amber">
+              <div className="flex items-center gap-2 min-w-0">
+                <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                <span className="truncate">
+                  {turn.progressMessage ||
+                    'COMPUTING XBRL VARIANCES & RETRIEVING 10-K FILINGS...'}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 text-[10px] text-ink-muted shrink-0">
+                {pct !== null && (
+                  <span className="text-bb-yellow font-semibold">{pct}%</span>
+                )}
+                {elapsedLabel && <span>{elapsedLabel}</span>}
+              </div>
+            </div>
+            {pct !== null ? (
+              <div className="w-full h-1.5 surface-subtle overflow-hidden border border-hairline">
+                <div
+                  className="h-full bg-[var(--bb-amber)] transition-all duration-300"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                <div className="h-2.5 surface-subtle w-3/4 animate-pulse" />
+                <div className="h-2.5 surface-subtle w-full animate-pulse" />
+                <div className="h-2.5 surface-subtle w-2/3 animate-pulse" />
+              </div>
+            )}
           </div>
-          <div className="space-y-1.5">
-            <div className="h-2.5 surface-subtle w-3/4 animate-pulse" />
-            <div className="h-2.5 surface-subtle w-full animate-pulse" />
-            <div className="h-2.5 surface-subtle w-2/3 animate-pulse" />
-          </div>
-        </div>
-      )}
+        )
+      })()}
 
       {/* Error State */}
       {turn.errorMessage && !turn.isLoading && (
@@ -156,6 +223,16 @@ export function ChatTurnItem({
                   <AlertTriangle className="w-3 h-3" />
                   Guardrail Enforced
                 </span>
+              ) : resp.status === 'clarification' ? (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-amber">
+                  <HelpCircle className="w-3 h-3" />
+                  Clarification Needed
+                </span>
+              ) : resp.status === 'out_of_corpus' ? (
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-amber">
+                  <Info className="w-3 h-3" />
+                  Outside Corpus Scope
+                </span>
               ) : resp.answer_verified === false ? (
                 <span
                   className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-negative"
@@ -181,6 +258,23 @@ export function ChatTurnItem({
                   Review Citations
                 </span>
               )}
+
+              {resp.sector_coverage &&
+                typeof resp.sector_coverage.total_sector_companies === 'number' &&
+                resp.sector_coverage.total_sector_companies > 0 && (
+                  <span
+                    className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-accent"
+                    title={`Full-sector batched map-reduce: ${resp.sector_coverage.companies_analyzed ?? 0} of ${resp.sector_coverage.total_sector_companies} issuers analyzed across ${resp.sector_coverage.batches_executed ?? 0} parallel batches`}
+                  >
+                    <Layers className="w-3 h-3" />
+                    {resp.sector_coverage.companies_analyzed ?? 0}/
+                    {resp.sector_coverage.total_sector_companies}{' '}
+                    {resp.sector_coverage.gics_sector || 'SECTOR'} ISSUERS
+                    {typeof resp.sector_coverage.companies_with_matches === 'number'
+                      ? ` · ${resp.sector_coverage.companies_with_matches} MATCHED`
+                      : ''}
+                  </span>
+                )}
 
               {resp.context_and_memory?.turn_context_latency && (
                 <span
@@ -258,12 +352,40 @@ export function ChatTurnItem({
             </div>
           </div>
 
+          {/* Deterministic Data Coverage Notices */}
+          {resp.coverage_notices && resp.coverage_notices.length > 0 && (
+            <div
+              id={`coverage-notices-${turn.id}`}
+              className="mb-3 space-y-1.5"
+              aria-label="Filing Coverage Notices"
+            >
+              {resp.coverage_notices.map((notice, idx) => (
+                <div
+                  key={`${turn.id}-notice-${notice.code}-${idx}`}
+                  className={`px-2.5 py-1.5 text-[11.5px] leading-snug border flex items-start gap-2 ${
+                    notice.severity === 'warning'
+                      ? 'badge-amber'
+                      : 'surface-subtle border-hairline text-ink-secondary'
+                  }`}
+                >
+                  {notice.severity === 'warning' ? (
+                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                  ) : (
+                    <Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-bb-cyan" />
+                  )}
+                  <span className="font-sans">{notice.message}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* Deterministic Variance Table */}
           {resp.variance_reports.length > 0 && (
             <VarianceTableCard
               turnId={turn.id}
               reports={resp.variance_reports}
               onInspectFilingSection={onInspectFilingSection}
+              onInspectXbrlFact={onInspectXbrlFact}
             />
           )}
 
@@ -275,6 +397,7 @@ export function ChatTurnItem({
               totalFlags={resp.material_variance_summary?.total_flags}
               citations={resp.citations}
               onSelectCitation={(token) => onSelectInlineCitation(token, resp.citations)}
+              onInspectXbrlFact={onInspectXbrlFact}
             />
           )}
 
@@ -296,7 +419,38 @@ export function ChatTurnItem({
             onSelectCitation={(token) =>
               onSelectInlineCitation(token, resp.citations)
             }
+            onSelectXbrlCitation={
+              onSelectXbrlCitation
+                ? (token) => onSelectXbrlCitation(token, turn)
+                : undefined
+            }
           />
+
+          {/* Interactive Suggested Follow-Up Chips (Clarification / Out-of-Corpus) */}
+          {resp.suggested_followups && resp.suggested_followups.length > 0 && (
+            <div
+              id={`suggested-followups-${turn.id}`}
+              className="mt-3 pt-2.5 border-t border-hairline"
+            >
+              <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-ink-muted tabular-nums-mono mb-1.5">
+                <Sparkles className="w-3 h-3 text-bb-amber" />
+                <span>Try a grounded follow-up query:</span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {resp.suggested_followups.map((suggestion, idx) => (
+                  <button
+                    key={`${turn.id}-sug-${idx}`}
+                    id={`btn-followup-${turn.id}-${idx}`}
+                    type="button"
+                    onClick={() => onSelectFollowup?.(suggestion)}
+                    className="px-2 py-1 text-[11px] font-sans text-left btn-terminal-key hover:border-[var(--bb-amber)] cursor-pointer transition-colors"
+                  >
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           {showCommentInput && (
             <div className="mt-3 pt-2.5 border-t border-hairline flex items-center gap-2 tabular-nums-mono">

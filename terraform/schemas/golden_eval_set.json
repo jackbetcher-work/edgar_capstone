@@ -9,7 +9,7 @@
     "name": "category",
     "type": "STRING",
     "mode": "REQUIRED",
-    "description": "single_company_longitudinal | multi_company_peer_comparison | thematic_shift | safety_red_team"
+    "description": "single_company_longitudinal | multi_company_peer_comparison | thematic_shift | anomaly_explanation | out_of_corpus_and_clarification | safety_red_team"
   },
   {
     "name": "query",
@@ -68,6 +68,44 @@
       {"name": "fiscal_year", "type": "INTEGER", "mode": "NULLABLE"},
       {"name": "section_id", "type": "STRING", "mode": "NULLABLE", "description": "item_1a | item_7"}
     ]
+  },
+  {
+    "name": "expected_deltas",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "description": "Deterministic year-over-year disclosure wording deltas expected for thematic items",
+    "fields": [
+      {"name": "ticker", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "prior_fiscal_year", "type": "INTEGER", "mode": "REQUIRED"},
+      {"name": "current_fiscal_year", "type": "INTEGER", "mode": "REQUIRED"},
+      {"name": "change_type", "type": "STRING", "mode": "REQUIRED", "description": "added | removed | modified"},
+      {"name": "keyword_hint", "type": "STRING", "mode": "NULLABLE"}
+    ]
+  },
+  {
+    "name": "expected_flags",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "description": "Deterministic material-variance anomaly flags expected for anomaly items",
+    "fields": [
+      {"name": "ticker", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "fiscal_year", "type": "INTEGER", "mode": "REQUIRED"},
+      {"name": "metric", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "rule", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "flag_id", "type": "STRING", "mode": "NULLABLE"}
+    ]
+  },
+  {
+    "name": "expected_status",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Expected API status (success | blocked | clarification | out_of_corpus)"
+  },
+  {
+    "name": "expected_coverage_notice_codes",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Deterministic coverage notice codes expected in response coverage_notices"
   },
   {
     "name": "expected_chunk_ids",

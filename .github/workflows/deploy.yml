@@ -94,7 +94,7 @@ jobs:
           EDGAR_TELEMETRY_BACKEND: local
           EDGAR_FEEDBACK_BACKEND: local
         run: |
-          pytest -v --tb=short
+          pytest -v --tb=short --cov=edgar_capstone --cov-report=term-missing --cov-fail-under=80
 
       - name: Set up Node.js 22
         uses: actions/setup-node@v4
@@ -131,7 +131,7 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
-          token_format: access_token
+          create_credentials_file: true
 
       - name: Retrieve build-time configuration from Google Cloud Secret Manager
         id: secrets
@@ -162,9 +162,11 @@ jobs:
             --tag "${IMAGE_LATEST}" \
             .
           docker run --rm --entrypoint test "${IMAGE_TAG}" -f /app/frontend/dist/index.html
-          # Container smoke test: /health + data_backend block and the UI at /. The live
-          # BigQuery read (--live-data) runs in Cloud Build, where the container gets ADC.
+          # Container smoke test with live BigQuery check using WIF credentials file mounted read-only.
+          ADC_DIR="$(dirname "${GOOGLE_APPLICATION_CREDENTIALS}")"
           docker run --rm \
+            -v "${ADC_DIR}:${ADC_DIR}:ro" \
+            -e GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS}" \
             -e GCP_PROJECT_ID="${{ env.GCP_PROJECT_ID }}" \
             -e GOOGLE_CLOUD_PROJECT="${{ env.GCP_PROJECT_ID }}" \
             -e GOOGLE_CLOUD_LOCATION="${{ env.GCP_REGION }}" \
@@ -174,17 +176,62 @@ jobs:
             -e EDGAR_FEEDBACK_BACKEND=local \
             --entrypoint python \
             "${IMAGE_TAG}" \
-            -m scripts.container_smoke_test --in-process
+            -m scripts.container_smoke_test --in-process --live-data
           docker push "${IMAGE_TAG}"
           docker push "${IMAGE_LATEST}"
           echo "image_uri=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
+
+  # ============================================================================
+  # Stage 2.5: Eval Gate — Live golden regression gates (main deploy only)
+  # ============================================================================
+  eval:
+    name: Eval Stage - Live Golden Regression Gates
+    needs: build
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install project and eval dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
+
+      - name: Run live golden evaluation regression gates
+        env:
+          EDGAR_TEST_PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
+          GCP_PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
+          GOOGLE_CLOUD_PROJECT: ${{ env.GCP_PROJECT_ID }}
+          GOOGLE_CLOUD_LOCATION: ${{ env.GCP_REGION }}
+          GOOGLE_GENAI_USE_VERTEXAI: "true"
+          EDGAR_GEMINI_LOCATION: global
+          EDGAR_TELEMETRY_BACKEND: local
+          EDGAR_FEEDBACK_BACKEND: local
+        run: |
+          python scripts/run_evals.py --write-bigquery --project-id "${{ env.GCP_PROJECT_ID }}"
 
   # ============================================================================
   # Stage 3: Deploy — Secret Manager integration & Google Cloud Run deployment
   # ============================================================================
   deploy:
     name: Deploy Stage - Google Cloud Run with Secret Manager
-    needs: build
+    needs:
+      - build
+      - eval
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -229,6 +276,8 @@ jobs:
             EDGAR_FLASH_MODEL=gemini-3.5-flash
             EDGAR_MODEL_ARMOR_MODE=gcp
             MODEL_ARMOR_TEMPLATE_ID=sec-edgar-analyst-armor
+            SDP_INSPECT_TEMPLATE_ID=sec-edgar-sdp-inspect
+            SDP_DEIDENTIFY_TEMPLATE_ID=sec-edgar-sdp-deidentify
             EDGAR_PROMPT_STORE_BACKEND=auto
             RUNTIME_SERVICE_ACCOUNT=${{ env.RUNTIME_SERVICE_ACCOUNT }}
             CLOUD_IDENTITY_DOMAIN=${{ env.CLOUD_IDENTITY_DOMAIN }}

@@ -355,9 +355,10 @@ def test_sdp_deidentification_redacts_pii_without_corrupting_sec_identifiers() -
     """Verify PII is redacted in prompts before RAG and memory while SEC identifiers stay intact."""
     get_conversation_memory_manager().reset()
 
-    # SEC accession numbers and EDGAR URLs must not be flagged as PII. (Service-account emails
-    # are not asserted here: the live template's basic SDP config redacts them as EMAIL_ADDRESS.)
+    # SEC accession numbers, EDGAR URLs, and GCP service-account emails must stay intact
+    # (exempted via the live `sec_edgar_sdp_inspect` EMAIL_ADDRESS exclusion ruleSet).
     clean_sec_text = (
+        "Service account sec-analyst-sa@iron-radio-514217-q7.iam.gserviceaccount.com queried "
         "Accession 0001045810-26-000012 filed at https://www.sec.gov/Archives/edgar/data/1045810"
     )
     svc = ModelArmorGuardrailService()
@@ -448,12 +449,11 @@ def test_financial_projection_and_mnpi_filters_block_prompts_and_synthesized_lea
     get_conversation_memory_manager().reset()
     leaky_llm = _CountingStreamingLlm(
         response_text=report_json(
-            headline="NVDA Analysis",
-            key_metrics=[("NVDA", "revenue")],
-            notes=(
+            headline=(
                 "Based on momentum, we issue a Strong Buy rating with a 12-month price target "
                 "of $260 and forecast FY2028 revenue of $380B."
             ),
+            key_metrics=[("NVDA", "revenue")],
         )
     )
     leaked_turn = run_conversational_rag_turn(

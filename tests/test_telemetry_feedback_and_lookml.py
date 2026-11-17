@@ -354,6 +354,9 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
         http_client=httpx.Client(transport=httpx.MockTransport(_bq_transport)),
         credentials=_FakeGcpCredentials(),
     )
+    from edgar_capstone.agents.react_loop import flush_pending_evaluations
+
+    flush_pending_evaluations(timeout=15.0)
     configure_telemetry_stores(telemetry_sink=sink)
 
     with caplog.at_level(logging.INFO, logger="edgar_capstone.cloud_logging_sink"):
@@ -366,6 +369,7 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
             end_year=2026,
             session_id="sess-bq-stream-1",
             user_id="analyst@fde-workspace.corp",
+            skip_background_judge=True,
         )
         turn_2 = run_conversational_rag_turn(
             query="Compare AAPL and MSFT operating margin drivers from FY2024 to FY2025.",
@@ -374,6 +378,7 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
             end_year=2025,
             session_id="sess-bq-stream-1",
             user_id="analyst@fde-workspace.corp",
+            skip_background_judge=True,
         )
         assert turn_1["status"] == "success" and turn_2["status"] == "success"
         assert turn_1["execution_mode"] == "live_adk"

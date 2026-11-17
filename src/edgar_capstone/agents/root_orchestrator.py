@@ -46,6 +46,8 @@ QueryIntentType = Literal[
     "multi_company_peer_comparison",
     "thematic_trend_tracking",
     "chunk_health_monitoring",
+    "clarification_needed",
+    "out_of_corpus",
 ]
 
 ROOT_ORCHESTRATOR_INSTRUCTION: str = load_agent_prompt("root_orchestrator")

@@ -1,4 +1,8 @@
-import type { GroundedCitation, MaterialVarianceFlag } from '../types/edgar'
+import type {
+  GroundedCitation,
+  MaterialVarianceFlag,
+  XbrlFactSelection,
+} from '../types/edgar'
 import type { ParsedInlineCitationToken } from '../utils/formatters'
 import { citationToken } from '../utils/citationTokens'
 
@@ -8,6 +12,7 @@ interface MaterialFlagsCardProps {
   totalFlags?: number
   citations: GroundedCitation[]
   onSelectCitation: (token: ParsedInlineCitationToken) => void
+  onInspectXbrlFact?: (fact: XbrlFactSelection) => void
 }
 
 const RULE_LABELS: Record<MaterialVarianceFlag['rule'], string> = {
@@ -49,6 +54,7 @@ export function MaterialFlagsCard({
   totalFlags,
   citations,
   onSelectCitation,
+  onInspectXbrlFact,
 }: MaterialFlagsCardProps) {
   if (!flags || flags.length === 0) return null
   const byId = new Map(citations.map((c) => [c.chunk_id, c]))
@@ -101,14 +107,29 @@ export function MaterialFlagsCard({
                     </span>
                   </td>
                   <td className="py-1.5 px-2.5 whitespace-nowrap">
-                    <span className="font-bold text-bb-yellow">{flag.ticker}</span>{' '}
-                    <span className="text-ink-muted text-[10px]">
-                      {flag.prior_fiscal_year ? `FY${String(flag.prior_fiscal_year).slice(-2)}→` : ''}
-                      FY{String(flag.fiscal_year).slice(-2)}
-                    </span>
+                    <div>
+                      <span className="font-bold text-bb-yellow">{flag.ticker}</span>{' '}
+                      <span className="text-ink-muted text-[10px]">
+                        {flag.prior_fiscal_year ? `FY${String(flag.prior_fiscal_year).slice(-2)}→` : ''}
+                        FY{String(flag.fiscal_year).slice(-2)}
+                      </span>
+                    </div>
+                    {flag.source.period_of_report && (
+                      <div className="text-[9.5px] text-ink-muted">
+                        {flag.source.period_of_report}
+                      </div>
+                    )}
                   </td>
                   <td className="py-1.5 px-2.5 text-ink-primary">
-                    {METRIC_LABELS[flag.metric]}
+                    <div>{METRIC_LABELS[flag.metric]}</div>
+                    {flag.source.xbrl_concept && (
+                      <div
+                        className="text-[9.5px] text-ink-muted truncate max-w-[160px]"
+                        title={`${flag.source.xbrl_concept}${flag.source.accession_number ? ` · acc:${flag.source.accession_number}` : ''}`}
+                      >
+                        {flag.source.xbrl_concept}
+                      </div>
+                    )}
                   </td>
                   <td className="py-1.5 px-2.5 text-ink-secondary text-[10px]">
                     {RULE_LABELS[flag.rule]}
@@ -121,31 +142,70 @@ export function MaterialFlagsCard({
                     {formatFlagValue(flag)}
                   </td>
                   <td className="py-1.5 px-2.5 text-right whitespace-nowrap">
-                    {expCit ? (
-                      <button
-                        id={`btn-flag-explanation-${turnId}-${flag.flag_id}`}
-                        type="button"
-                        onClick={() => onSelectCitation(citationToken(expCit))}
-                        className="text-bb-cyan hover:underline text-[10px] font-semibold uppercase cursor-pointer"
-                        title={flag.explanation?.excerpt}
-                      >
-                        [MD&amp;A WHY]
-                      </button>
-                    ) : flag.source.sec_filing_url ? (
-                      <a
-                        href={flag.source.sec_filing_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-ink-muted hover:text-ink-primary text-[10px]"
-                        title={`${flag.source.accession_number}${
-                          flag.source.xbrl_concept ? ` · ${flag.source.xbrl_concept}` : ''
-                        }`}
-                      >
-                        [10-K]
-                      </a>
-                    ) : (
-                      <span className="text-ink-muted">—</span>
-                    )}
+                    <div className="inline-flex items-center gap-1.5 justify-end">
+                      {onInspectXbrlFact &&
+                        (flag.source.accession_number || flag.source.xbrl_concept) && (
+                          <button
+                            id={`btn-flag-xbrl-${turnId}-${flag.flag_id}`}
+                            type="button"
+                            onClick={() =>
+                              onInspectXbrlFact({
+                                title: `${flag.ticker} ${METRIC_LABELS[flag.metric]} (${RULE_LABELS[flag.rule]})`,
+                                ticker: flag.ticker,
+                                companyName: flag.company_name,
+                                fiscalYear: flag.fiscal_year,
+                                priorFiscalYear: flag.prior_fiscal_year,
+                                metricLabel: METRIC_LABELS[flag.metric],
+                                deltaFormatted: formatFlagValue(flag),
+                                periodOfReport: flag.source.period_of_report,
+                                priorPeriodOfReport:
+                                  flag.source.prior_period_of_report,
+                                accessionNumber: flag.source.accession_number,
+                                priorAccessionNumber:
+                                  flag.source.prior_accession_number,
+                                xbrlConcept: flag.source.xbrl_concept,
+                                priorXbrlConcept:
+                                  flag.source.prior_xbrl_concept ?? null,
+                                denominatorXbrlConcept:
+                                  flag.source.denominator_xbrl_concept ?? null,
+                                priorDenominatorXbrlConcept:
+                                  flag.source.prior_denominator_xbrl_concept ?? null,
+                                secFilingUrl: flag.source.sec_filing_url,
+                                priorSecFilingUrl: flag.source.prior_sec_filing_url,
+                              })
+                            }
+                            className="text-bb-amber hover:underline text-[10px] font-semibold uppercase cursor-pointer"
+                            title={`Inspect XBRL provenance (${flag.source.accession_number})`}
+                          >
+                            [XBRL]
+                          </button>
+                        )}
+                      {expCit ? (
+                        <button
+                          id={`btn-flag-explanation-${turnId}-${flag.flag_id}`}
+                          type="button"
+                          onClick={() => onSelectCitation(citationToken(expCit))}
+                          className="text-bb-cyan hover:underline text-[10px] font-semibold uppercase cursor-pointer"
+                          title={flag.explanation?.excerpt}
+                        >
+                          [MD&amp;A WHY]
+                        </button>
+                      ) : flag.source.sec_filing_url ? (
+                        <a
+                          href={flag.source.sec_filing_url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-ink-muted hover:text-ink-primary text-[10px]"
+                          title={`${flag.source.accession_number}${
+                            flag.source.xbrl_concept ? ` · ${flag.source.xbrl_concept}` : ''
+                          }`}
+                        >
+                          [10-K]
+                        </a>
+                      ) : (
+                        <span className="text-ink-muted">—</span>
+                      )}
+                    </div>
                   </td>
                 </tr>
               )

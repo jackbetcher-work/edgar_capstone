@@ -109,8 +109,21 @@ const CHAT_RESPONSE = {
   },
   answer_markdown: [
     '### Peer Comparison',
-    `- NVIDIA revenue grew **+254.45%** from FY2024 to FY2026 [NVDA FY2026 | Item 7 MD&A | NVDA_2026_item_7_0002](${NVDA_FILING_URL})`,
+    `- NVIDIA revenue grew **+254.45%** from FY2024 to FY2026 [NVDA FY2026 | XBRL us-gaap:Revenues | acc:0001045810-26-000021](${NVDA_FILING_URL}) [NVDA FY2026 | Item 7 MD&A | NVDA_2026_item_7_0002](${NVDA_FILING_URL})`,
   ].join('\n'),
+  coverage_notices: [
+    {
+      code: 'fiscal_calendar_alignment',
+      severity: 'info',
+      message: 'Fiscal year-ends differ across peers: NVDA (Jan 2026) vs AAPL (Sep 2025).',
+    },
+  ],
+  sector_coverage: {
+    gics_sector: 'Information Technology',
+    total_sector_companies: 76,
+    companies_analyzed: 76,
+    companies_with_matches: 58,
+  },
   variance_reports: [
     {
       ticker: 'NVDA',
@@ -121,6 +134,16 @@ const CHAT_RESPONSE = {
       start_year: 2024,
       end_year: 2026,
       currency: 'USD',
+      period_end_dates: { '2024': '2024-01-28', '2026': '2026-01-25' },
+      filing_dates: { '2024': '2024-02-21', '2026': '2026-02-25' },
+      accession_numbers: {
+        '2024': '0001045810-24-000029',
+        '2026': '0001045810-26-000021',
+      },
+      metric_provenance: {
+        '2024': { revenue: 'us-gaap:Revenues' },
+        '2026': { revenue: 'us-gaap:Revenues' },
+      },
       revenue_variance: {
         metric_name: 'revenue',
         start_year: 2024,
@@ -131,6 +154,12 @@ const CHAT_RESPONSE = {
         percentage_delta: 254.45,
         cagr_pct: 88.27,
         direction: 'increase',
+        start_period_of_report: '2024-01-28',
+        end_period_of_report: '2026-01-25',
+        start_accession_number: '0001045810-24-000029',
+        end_accession_number: '0001045810-26-000021',
+        start_xbrl_concept: 'us-gaap:Revenues',
+        end_xbrl_concept: 'us-gaap:Revenues',
       },
       operating_income_variance: {
         metric_name: 'operating_income',
@@ -219,12 +248,45 @@ const json = (body: unknown, status = 200) =>
     headers: { 'Content-Type': 'application/json' },
   })
 
+const sse = (events: Array<{ event: string; data: unknown }>) => {
+  const encoder = new TextEncoder()
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const item of events) {
+        const frame = `event: ${item.event}\ndata: ${JSON.stringify(item.data)}\n\n`
+        controller.enqueue(encoder.encode(frame))
+      }
+      controller.close()
+    },
+  })
+  return new Response(stream, {
+    status: 200,
+    headers: { 'Content-Type': 'text/event-stream' },
+  })
+}
+
 function mockBackend(overrides: RouteOverrides = {}) {
   return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input) => {
     const url = typeof input === 'string' ? input : input.toString()
     if (url === '/api/v1/auth/config') return json(AUTH_CONFIG_OPEN)
     if (url === '/api/v1/companies') {
       return overrides.companies ? overrides.companies() : json(COMPANIES_CATALOG)
+    }
+    if (url === '/api/v1/chat/stream') {
+      return overrides.chat
+        ? overrides.chat()
+        : sse([
+            {
+              event: 'progress',
+              data: {
+                stage: 'sector_map',
+                message: '28/76 Information Technology companies analyzed (batch 2/6)',
+                meta: { companies_analyzed: 28, total_companies: 76 },
+                elapsed_ms: 420,
+              },
+            },
+            { event: 'result', data: CHAT_RESPONSE },
+          ])
     }
     if (url === '/api/v1/chat') {
       return overrides.chat ? overrides.chat() : json(CHAT_RESPONSE)
@@ -287,16 +349,27 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
     })
 
     expect(
-      fetchSpy.mock.calls.some(([input]) => String(input) === '/api/v1/chat')
+      fetchSpy.mock.calls.some(([input]) => String(input) === '/api/v1/chat/stream')
     ).toBe(true)
 
-    // Deterministic Variance Table rendered from the backend payload
+    // Coverage notice & sector coverage pill rendered
+    expect(screen.getByText(/Fiscal year-ends differ across peers/i)).toBeTruthy()
+    expect(screen.getByText(/76\/76 Information Technology ISSUERS/i)).toBeTruthy()
+
+    // Inline XBRL citation chip opens XBRL Fact Provenance tab
+    const xbrlChip = await screen.findByTitle(/Inspect XBRL fact NVDA FY2026/i)
+    fireEvent.click(xbrlChip)
+    expect(await screen.findByText(/SEC XBRL NUMERIC PROVENANCE/i)).toBeTruthy()
+    expect(screen.getByText('0001045810-26-000021')).toBeTruthy()
+
+    // Deterministic Variance Table rendered from the backend payload with period-end dates
     expect(
       screen.getByText(/Deterministic Variance Calculation Engine/i)
     ).toBeTruthy()
+    expect(screen.getByText(/Jan 2024 → Jan 2026/i)).toBeTruthy()
     expect(screen.getAllByText(/\+254\.45%/i).length).toBeGreaterThan(0)
 
-    // Inline citation chip rendered and interactive
+    // Inline text citation chip rendered and interactive
     const inlineChips = await screen.findAllByTitle(/Inspect NVDA FY2026/i)
     expect(inlineChips.length).toBeGreaterThan(0)
     fireEvent.click(inlineChips[0])
@@ -408,5 +481,69 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
     const sectionAlert = await screen.findByText(/Section not found in corpus/)
     expect(sectionAlert.textContent).toContain('HTTP 404')
     expect(screen.queryByText(/UNITED STATES SEC · FORM 10-K/i)).toBeNull()
+  })
+
+  it('renders clarification card with clickable follow-up chips and proper projection block badge', async () => {
+    let callCount = 0
+    mockBackend({
+      chat: () => {
+        callCount += 1
+        if (callCount === 1) {
+          return sse([
+            {
+              event: 'result',
+              data: {
+                ...CHAT_RESPONSE,
+                status: 'clarification',
+                intent: 'clarification_needed',
+                answer_markdown:
+                  '### Clarification Needed\n\nPlease specify which S&P 500 company or GICS sector you want to analyze.',
+                variance_reports: [],
+                citations: [],
+                suggested_followups: [
+                  'Compare NVDA vs AAPL revenue FY2024 to FY2026',
+                ],
+                coverage_notices: [],
+                sector_coverage: null,
+              },
+            },
+          ])
+        }
+        return sse([
+          {
+            event: 'result',
+            data: {
+              ...CHAT_RESPONSE,
+              status: 'blocked',
+              model_armor_blocked: true,
+              intent: 'projection_compliance_block',
+              answer_markdown:
+                '### Forecast Blocked\n\nHistorical audited SEC 10-K analysis only.',
+              variance_reports: [],
+              citations: [],
+              suggested_followups: [],
+              coverage_notices: [],
+              sector_coverage: null,
+            },
+          },
+        ])
+      },
+    })
+    render(<App />)
+
+    const cmdInput = await screen.findByLabelText(
+      /Ask a natural language financial or SEC 10-K question/i
+    )
+    fireEvent.change(cmdInput, { target: { value: 'How did revenue change?' } })
+    fireEvent.click(screen.getByRole('button', { name: /^<GO>$/ }))
+
+    expect(await screen.findByText('CLARIFY')).toBeTruthy()
+    const chip = await screen.findByRole('button', {
+      name: 'Compare NVDA vs AAPL revenue FY2024 to FY2026',
+    })
+    fireEvent.click(chip)
+
+    expect(await screen.findByText('PROJECTION BLOCK')).toBeTruthy()
+    expect(screen.getByText(/Projection Compliance Guardrail/i)).toBeTruthy()
   })
 })

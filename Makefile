@@ -88,9 +88,9 @@ format: ## Auto-fix Python lint issues and apply ruff formatting + terraform fmt
 
 check: lint test ## Run every CI gate locally (lint + format checks, secret scan, pytest, vitest)
 
-test: ## Run backend (secret scan + pytest against live GCP) and frontend (lint + vitest) checks
+test: ## Run backend (secret scan + pytest with >=80% coverage against live GCP) and frontend (lint + vitest) checks
 	$(PYTHON) scripts/verify_no_secrets.py --repo-root .
-	$(LIVE_TEST_ENV) $(PYTHON) -m pytest -q
+	$(LIVE_TEST_ENV) $(PYTHON) -m pytest -q --cov=edgar_capstone --cov-report=term-missing --cov-fail-under=80
 	cd frontend && npm run lint && npm test
 
 eval-all: ## Run the golden eval regression gates on live Gemini + GCP data (EVAL_WRITE_BQ=true)

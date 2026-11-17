@@ -220,8 +220,6 @@ def test_gcp_tool_config_and_status_metadata_resolution(
         "BIGQUERY_DATASET_ID",
         "VERTEX_AI_SEARCH_ENGINE_ID",
         "VERTEX_AI_SEARCH_DATASTORE_ID",
-        "VERTEX_VECTOR_SEARCH_ENDPOINT_ID",
-        "VERTEX_VECTOR_SEARCH_PSC_ADDRESS",
         "VERTEX_EMBEDDING_DIMENSIONS",
         "SEC_CORPUS_BUCKET",
     ):
@@ -235,14 +233,13 @@ def test_gcp_tool_config_and_status_metadata_resolution(
     assert meta["data_backend"] == "gcp"
     assert meta["project_id"] == default_cfg.project_id
     assert meta["bigquery"]["financial_metrics_table"] == "financial_metrics"
-    assert meta["vertex_vector_search"]["private_service_connect"] is False
+    assert meta["hybrid_retrieval_backends"] == ["bigquery_vector_search", "vertex_ai_search"]
+    assert "vertex_vector_search" not in meta
     for removed in ("live_gcp_active", "strict_gcp", "data_backend_mode"):
         assert removed not in meta
 
     monkeypatch.setenv("BIGQUERY_DATASET_ID", "sec_edgar_staging")
     monkeypatch.setenv("VERTEX_AI_SEARCH_ENGINE_ID", "engine-x")
-    monkeypatch.setenv("VERTEX_VECTOR_SEARCH_ENDPOINT_ID", "987654321")
-    monkeypatch.setenv("VERTEX_VECTOR_SEARCH_PSC_ADDRESS", "10.20.0.5")
     monkeypatch.setenv("VERTEX_EMBEDDING_DIMENSIONS", "256")
     env_cfg = GcpToolConfig.from_env()
     assert env_cfg.bq_dataset_id == "sec_edgar_staging"
@@ -250,8 +247,7 @@ def test_gcp_tool_config_and_status_metadata_resolution(
     assert env_cfg.embedding_dimensions == 256
     env_meta = get_gcp_adapters_status_metadata()
     assert env_meta["bigquery"]["dataset_id"] == "sec_edgar_staging"
-    assert env_meta["vertex_vector_search"]["endpoint_id"] == "987654321"
-    assert env_meta["vertex_vector_search"]["private_service_connect"] is True
+    assert env_meta["vertex_ai_search"]["engine_id"] == "engine-x"
 
     # An injected adapter bundle's config is what the status metadata reports.
     configure_gcp_tool_adapters(
@@ -640,8 +636,8 @@ def test_bigquery_adapter_all_looker_explores() -> None:
     assert len(executed_sql) == 3
 
 
-def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -> None:
-    """Verify `search_10k_chunks_rag` hits Vertex Embeddings, Vector Search (`findNeighbors`), Discovery Engine (`:search`), and BigQuery (`VECTOR_SEARCH` + hydration)."""
+def test_hybrid_rag_fuses_bigquery_vector_search_and_vertex_ai_search() -> None:
+    """Verify `search_10k_chunks_rag` runs Vertex Embeddings + BigQuery VECTOR_SEARCH in parallel with Vertex AI Search (`:search`) and caches servingConfig fallback."""
     hit_log: list[str] = []
     q_vec = _mock_embedding_values("China export controls H20 Blackwell GPU")
 
@@ -659,93 +655,7 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
                 json={"predictions": [{"embeddings": {"values": q_vec}}]},
             )
 
-        # 2. Vertex AI Vector Search endpoint auto-discovery
-        if request.method == "GET" and url.endswith("/indexEndpoints"):
-            hit_log.append("vvs_list_endpoints")
-            return httpx.Response(
-                200,
-                json={
-                    "indexEndpoints": [
-                        {
-                            "name": "projects/iron-radio-514217-q7/locations/us-central1/indexEndpoints/987654321",
-                            "displayName": "sec-edgar-10k-chunks-endpoint",
-                            "publicEndpointDomainName": "12345.us-central1-999.vdb.vertexai.goog",
-                            "deployedIndexes": [{"id": "deployed_sec_10k_chunks_v1"}],
-                        }
-                    ]
-                },
-            )
-
-        # 3. Vertex AI Vector Search `:findNeighbors` on public domain
-        if ":findNeighbors" in url:
-            hit_log.append("vvs_find_neighbors")
-            assert "12345.us-central1-999.vdb.vertexai.goog" in url
-            assert body["deployedIndexId"] == "deployed_sec_10k_chunks_v1"
-            dp_query = body["queries"][0]["datapoint"]
-            restrict_map = {r["namespace"]: r["allowList"] for r in dp_query["restricts"]}
-            assert restrict_map["ticker"] == ["NVDA"]
-            assert restrict_map["gics_sector"] == ["Information Technology"]
-            assert restrict_map["section_id"] == ["item_1a"]
-            num_ops = {nr["op"]: nr["valueInt"] for nr in dp_query["numericRestricts"]}
-            assert num_ops == {"GREATER_EQUAL": 2024, "LESS_EQUAL": 2026}
-            return httpx.Response(
-                200,
-                json={
-                    "nearestNeighbors": [
-                        {
-                            "id": "rag_query",
-                            "neighbors": [
-                                {
-                                    "datapoint": {
-                                        "datapointId": "NVDA_2026_item_1a_0000",
-                                        "restricts": [
-                                            {
-                                                "namespace": "gics_sector",
-                                                "allowList": ["Information Technology"],
-                                            }
-                                        ],
-                                        "embeddingMetadata": {
-                                            "profile_id": "NVDA_2026",
-                                            "ticker": "NVDA",
-                                            "company_name": "NVIDIA CORP",
-                                            "fiscal_year": 2026,
-                                            "section_id": "item_1a",
-                                            "section_title": "Item 1A. Risk Factors — Export Controls",
-                                            "sec_filing_url": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026.htm",
-                                            "unstructured_gcs_uri": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md",
-                                        },
-                                    },
-                                    "distance": 0.12,
-                                },
-                                {
-                                    "datapoint": {
-                                        "datapointId": "NVDA_2025_item_1a_0002",
-                                        "restricts": [
-                                            {
-                                                "namespace": "gics_sector",
-                                                "allowList": ["Information Technology"],
-                                            }
-                                        ],
-                                        "embeddingMetadata": {
-                                            "profile_id": "NVDA_2025",
-                                            "ticker": "NVDA",
-                                            "company_name": "NVIDIA CORP",
-                                            "fiscal_year": 2025,
-                                            "section_id": "item_1a",
-                                            "section_title": "Item 1A. Risk Factors — International Trade",
-                                            "sec_filing_url": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2025.htm",
-                                            "unstructured_gcs_uri": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2025_10k.md",
-                                        },
-                                    },
-                                    "distance": 0.22,
-                                },
-                            ],
-                        }
-                    ]
-                },
-            )
-
-        # 4. Vertex AI Search / Discovery Engine (simulate 404 on engine -> automatic fallback to datastore!)
+        # 2. Vertex AI Search / Discovery Engine (simulate 404 on engine -> cached fallback to datastore!)
         if "discoveryengine.googleapis.com" in url:
             if "/engines/sec-edgar-10k-hybrid-search/" in url:
                 hit_log.append("vais_engine_404")
@@ -783,14 +693,6 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
                                                 "relevanceScore": 0.94,
                                             }
                                         ],
-                                        "snippets": [
-                                            {
-                                                "snippet": (
-                                                    "<b>Item 1A Risk Factors:</b> Foundry wafer capacity and "
-                                                    "CoWoS packaging constraints may limit H200 supply."
-                                                )
-                                            }
-                                        ],
                                     },
                                 }
                             }
@@ -798,7 +700,7 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
                     },
                 )
 
-        # 5. BigQuery VECTOR_SEARCH + chunk hydration by ID
+        # 3. BigQuery VECTOR_SEARCH (returns two chunks with full text and metadata)
         if "bigquery.googleapis.com" in url:
             sql = body["query"]
             chunk_fields = [
@@ -814,6 +716,9 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
                 {"name": "chunk_text", "type": "STRING"},
                 {"name": "sec_filing_url", "type": "STRING"},
                 {"name": "unstructured_gcs_uri", "type": "STRING"},
+                {"name": "period_of_report", "type": "STRING"},
+                {"name": "filing_date", "type": "STRING"},
+                {"name": "accession_number", "type": "STRING"},
             ]
             if "VECTOR_SEARCH" in sql:
                 hit_log.append("bq_vector_search")
@@ -849,20 +754,12 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
                                     {
                                         "v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"
                                     },
+                                    {"v": "2026-01-25"},
+                                    {"v": "2026-02-25"},
+                                    {"v": "0001045810-26-000021"},
                                     {"v": "0.10"},
                                 ]
-                            }
-                        ],
-                    },
-                )
-            if "WHERE chunk_id IN UNNEST(@chunk_ids)" in sql:
-                hit_log.append("bq_hydrate_chunks")
-                return httpx.Response(
-                    200,
-                    json={
-                        "jobComplete": True,
-                        "schema": {"fields": chunk_fields},
-                        "rows": [
+                            },
                             {
                                 "f": [
                                     {"v": "NVDA_2025_item_1a_0002"},
@@ -886,8 +783,12 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
                                     {
                                         "v": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2025_10k.md"
                                     },
+                                    {"v": "2025-01-26"},
+                                    {"v": "2025-02-26"},
+                                    {"v": "0001045810-25-000023"},
+                                    {"v": "0.19"},
                                 ]
-                            }
+                            },
                         ],
                     },
                 )
@@ -916,30 +817,41 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
     )
 
     assert res["status"] == "success"
-    assert res["citation_count"] == 3
-    # Top hit should be NVDA_2026_item_1a_0000 (boosted by RRF across Vector Search + BigQuery + Discovery Engine!)
+    assert res["citation_count"] >= 2
     assert res["citations"][0]["chunk_id"] == "NVDA_2026_item_1a_0000"
+    assert res["citations"][0]["period_of_report"] == "2026-01-25"
+    assert res["citations"][0]["accession_number"] == "0001045810-26-000021"
     assert "Blackwell" in res["citations"][0]["excerpt"]
-    # Second canonical chunk hydrated from BigQuery for Vector Search neighbor ID
     chunk_ids = {c["chunk_id"] for c in res["citations"]}
     assert "NVDA_2025_item_1a_0002" in chunk_ids
 
-    assert hit_log == [
+    # Parallel execution: compare sets rather than fixed sequential order
+    assert set(hit_log) == {
         "vertex_embeddings",
-        "vvs_list_endpoints",
-        "vvs_find_neighbors",
         "vais_engine_404",
         "vais_datastore_search",
         "bq_vector_search",
-        "bq_hydrate_chunks",
-    ]
+    }
     assert set(ctx.state["gcp_backend_calls"][0]["services_hit"]) == {
         "vertex_ai_embeddings",
-        "vertex_vector_search",
         "vertex_ai_search",
         "bigquery_vector_search",
-        "bigquery_chunk_hydration",
     }
+
+    # Second search reuses the cached Discovery Engine datastore URL (no repeated 404!)
+    hit_log.clear()
+    res2 = search_10k_chunks_rag(
+        query="China export controls licensing fees",
+        tickers="NVDA",
+        gics_sector="information technology",
+        section_id="item_1a",
+        start_year=2024,
+        end_year=2026,
+        top_k=5,
+    )
+    assert res2["status"] == "success"
+    assert "vais_engine_404" not in hit_log
+    assert "vais_datastore_search" in hit_log
 
 
 def test_context_cache_miss_loads_from_bigquery_and_gcs_and_queries_cached_section() -> None:
@@ -1312,11 +1224,7 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
         return httpx.Response(404, text=f"Unhandled URL: {url}")
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    cfg = GcpToolConfig(
-        vvs_endpoint_id="987654321",
-        vvs_public_domain="12345.us-central1-999.vdb.vertexai.goog",
-        vvs_deployed_index_id="deployed_sec_10k_chunks_v1",
-    )
+    cfg = GcpToolConfig()
     configure_gcp_tool_adapters(
         GcpToolAdapters(cfg, http_client=client, credentials=_FakeGcpCredentials())
     )
@@ -1332,7 +1240,10 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
 
     report = stream_res.session_state["financial_analyst_report"]
     assert report["headline"] == "NVDA Live GCP Grounded Analysis"
-    assert report["findings"][0]["chunk_ids"] == ["NVDA_2026_item_7_0001"]
+    assert report["findings"][0]["chunk_ids"][0] in {
+        "NVDA_2026_item_7_0001",
+        "NVDA_2026_item_7_vais_0000",
+    }
     # The callback fact-check verifies the structured claims and renders deterministic figures
     assert "+254.45%" in stream_res.session_state["structured_report_markdown"]
     assert {fc["name"] for fc in stream_res.function_calls} == {
@@ -1342,7 +1253,6 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
     assert gcp_services_contacted == {
         "bigquery",
         "vertex_ai_embeddings",
-        "vertex_vector_search",
         "vertex_ai_search",
     }
     assert stream_res.session_state["fact_check_report"]["passed"] is True
@@ -1424,81 +1334,108 @@ def test_http_429_rate_limit_retries_and_missing_credentials_error() -> None:
     assert attempts == attempts_before  # no request is sent without a bearer token
 
 
-def test_vector_search_adapter_queries_private_service_connect_over_grpc() -> None:
-    """With a PSC address, the adapter uses the SDK's private match() (gRPC on <ip>:10000)."""
-    from edgar_capstone.agents.tools import GcpToolConfig, VertexVectorSearchAdapter
+def test_bigquery_vector_search_sector_top_per_ticker() -> None:
+    """Single-query BigQuery ML.DISTANCE + QUALIFY returns top chunks per issuer-year for sector map-reduce."""
+    from edgar_capstone.agents.tools import BigQueryAdapter, GcpToolConfig
 
-    calls: dict[str, Any] = {}
+    captured_sql: list[str] = []
+    captured_params: list[list[dict[str, Any]]] = []
 
-    class _FakePscEndpoint:
-        private_service_connect_ip_address: str | None = None
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured_sql.append(body["query"])
+        captured_params.append(body.get("queryParameters") or [])
+        return httpx.Response(
+            200,
+            json={
+                "jobComplete": True,
+                "schema": {
+                    "fields": [
+                        {"name": "chunk_id", "type": "STRING"},
+                        {"name": "profile_id", "type": "STRING"},
+                        {"name": "ticker", "type": "STRING"},
+                        {"name": "company_name", "type": "STRING"},
+                        {"name": "gics_sector", "type": "STRING"},
+                        {"name": "fiscal_year", "type": "INTEGER"},
+                        {"name": "section_id", "type": "STRING"},
+                        {"name": "section_title", "type": "STRING"},
+                        {"name": "chunk_index", "type": "INTEGER"},
+                        {"name": "chunk_text", "type": "STRING"},
+                        {"name": "sec_filing_url", "type": "STRING"},
+                        {"name": "unstructured_gcs_uri", "type": "STRING"},
+                        {"name": "period_of_report", "type": "STRING"},
+                        {"name": "filing_date", "type": "STRING"},
+                        {"name": "accession_number", "type": "STRING"},
+                        {"name": "distance", "type": "FLOAT"},
+                    ]
+                },
+                "rows": [
+                    {
+                        "f": [
+                            {"v": "NVDA_2026_item_1a_0003"},
+                            {"v": "NVDA_2026"},
+                            {"v": "NVDA"},
+                            {"v": "NVIDIA CORP"},
+                            {"v": "Information Technology"},
+                            {"v": "2026"},
+                            {"v": "item_1a"},
+                            {"v": "Item 1A. Risk Factors"},
+                            {"v": "3"},
+                            {"v": "Generative AI and export control risks expanded in FY2026."},
+                            {"v": "https://www.sec.gov/nvda2026.htm"},
+                            {"v": "gs://bucket/nvda/2026.md"},
+                            {"v": "2026-01-25"},
+                            {"v": "2026-02-25"},
+                            {"v": "0001045810-26-000021"},
+                            {"v": "0.14"},
+                        ]
+                    },
+                    {
+                        "f": [
+                            {"v": "AAPL_2025_item_1a_0001"},
+                            {"v": "AAPL_2025"},
+                            {"v": "AAPL"},
+                            {"v": "Apple Inc."},
+                            {"v": "Information Technology"},
+                            {"v": "2025"},
+                            {"v": "item_1a"},
+                            {"v": "Item 1A. Risk Factors"},
+                            {"v": "1"},
+                            {
+                                "v": "Generative AI features introduce regulatory and reputational risk."
+                            },
+                            {"v": "https://www.sec.gov/aapl2025.htm"},
+                            {"v": "gs://bucket/aapl/2025.md"},
+                            {"v": "2025-09-27"},
+                            {"v": "2025-10-31"},
+                            {"v": "0000320193-25-000079"},
+                            {"v": "0.18"},
+                        ]
+                    },
+                ],
+            },
+        )
 
-        def match(self, **kwargs: Any) -> list[list[Any]]:
-            calls["match"] = kwargs
-            calls["ip"] = self.private_service_connect_ip_address
-            return [
-                [
-                    SimpleNamespace(id="NVDA_2026_item_7_0003", distance=0.12),
-                    SimpleNamespace(id="", distance=0.5),
-                ]
-            ]
-
-    def _factory(name: str) -> _FakePscEndpoint:
-        calls["endpoint_name"] = name
-        return _FakePscEndpoint()
-
-    cfg = GcpToolConfig(
-        project_id="iron-radio-514217-q7",
-        location="us-central1",
-        vvs_endpoint_id="555",
-        vvs_deployed_index_id="deployed_sec_10k_chunks_v1",
-        vvs_psc_address="10.20.0.5",
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    bq = BigQueryAdapter(
+        GcpToolConfig(project_id="iron-radio-514217-q7"),
+        http_client=client,
+        credentials=_FakeGcpCredentials(),
     )
-    adapter = VertexVectorSearchAdapter(cfg, credentials=_FakeGcpCredentials())
-    adapter._psc_endpoint_factory = _factory
-
-    hits = adapter.find_neighbors(
-        [0.1] * 8,
-        tickers={"NVDA"},
+    rows = bq.vector_search_sector_top_per_ticker(
+        query_embedding=[0.1] * 8,
         gics_sector="information technology",
-        section_id="item_7",
+        section_id="item_1a",
         start_year=2024,
         end_year=2026,
-        neighbor_count=5,
+        per_company_year=2,
     )
-
-    assert calls["endpoint_name"] == (
-        "projects/iron-radio-514217-q7/locations/us-central1/indexEndpoints/555"
-    )
-    assert calls["ip"] == "10.20.0.5"
-    m = calls["match"]
-    assert m["deployed_index_id"] == "deployed_sec_10k_chunks_v1"
-    assert m["num_neighbors"] == 5
-    assert {(ns.name, tuple(ns.allow_tokens)) for ns in m["filter"]} == {
-        ("ticker", ("NVDA",)),
-        ("gics_sector", ("Information Technology",)),
-        ("section_id", ("item_7",)),
-    }
-    assert [(n.name, n.value_int, n.op) for n in m["numeric_filter"]] == [
-        ("fiscal_year", 2024, "GREATER_EQUAL"),
-        ("fiscal_year", 2026, "LESS_EQUAL"),
-    ]
-    # IDs and distances only; chunk text is hydrated from BigQuery later
-    assert hits == [
-        {
-            "chunk_id": "NVDA_2026_item_7_0003",
-            "profile_id": None,
-            "ticker": None,
-            "company_name": None,
-            "gics_sector": None,
-            "fiscal_year": None,
-            "section_id": None,
-            "section_title": None,
-            "chunk_text": None,
-            "sec_filing_url": None,
-            "unstructured_gcs_uri": None,
-            "distance": 0.12,
-            "similarity": 0.88,
-            "source_backend": "vertex_vector_search_psc",
-        }
-    ]
+    assert len(captured_sql) == 1
+    assert "ML.DISTANCE" in captured_sql[0]
+    assert "QUALIFY ROW_NUMBER() OVER (" in captured_sql[0]
+    assert "PARTITION BY ticker, fiscal_year" in captured_sql[0]
+    assert len(rows) == 2
+    assert rows[0]["ticker"] == "NVDA"
+    assert rows[0]["period_of_report"] == "2026-01-25"
+    assert rows[0]["accession_number"] == "0001045810-26-000021"
+    assert rows[1]["ticker"] == "AAPL"

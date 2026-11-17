@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import contextvars
 import re
+import threading
 import time
 from collections import defaultdict
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
@@ -25,6 +29,7 @@ from edgar_capstone.agents.live_runtime import get_live_runtime_status_metadata
 from edgar_capstone.agents.material_variances import (
     attach_flag_explanations,
     flag_material_variances,
+    flag_material_variances_from_cached_profiles,
 )
 from edgar_capstone.agents.prompt_store import get_prompt_store_status_metadata
 from edgar_capstone.agents.react_loop import StructuredReActExecutor
@@ -32,13 +37,23 @@ from edgar_capstone.agents.root_orchestrator import (
     RootOrchestrator,
     classify_query_intent,
 )
+from edgar_capstone.agents.scope_validation import (
+    MAX_CORPUS_YEAR,
+    MIN_CORPUS_YEAR,
+    SECTOR_ALIASES,
+    EntityCatalog,
+    build_coverage_notices,
+    extract_removed_tickers,
+    is_additive_followup,
+    validate_query_scope_and_coverage,
+)
+from edgar_capstone.agents.sector_map_reduce import run_sector_thematic_map_reduce
 from edgar_capstone.agents.tools import (
     _parse_ticker_list,
     _profile_to_metric_record,
     calculate_period_variances,
     get_active_gcp_tool_adapters,
     get_context_cache_runtime_stats,
-    load_cached_10k_section,
     query_looker_financial_explore,
     search_10k_chunks_rag,
 )
@@ -56,85 +71,63 @@ from edgar_capstone.security.model_armor import (
 from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 from edgar_capstone.telemetry import get_telemetry_sink
 
-_COMPANY_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\bnvidia\b|\bnvda\b", re.IGNORECASE), "NVDA"),
-    (re.compile(r"\bapple\b|\baapl\b", re.IGNORECASE), "AAPL"),
-    (re.compile(r"\bmicrosoft\b|\bmsft\b", re.IGNORECASE), "MSFT"),
-    (re.compile(r"\bbroadcom\b|\bavgo\b", re.IGNORECASE), "AVGO"),
-    (re.compile(r"\bsalesforce\b|\bcrm\b", re.IGNORECASE), "CRM"),
-    (re.compile(r"\balphabet\b|\bgoogle\b|\bgoogl\b", re.IGNORECASE), "GOOGL"),
-    (re.compile(r"\bmeta\s+platforms\b|\bmeta\b|\bfacebook\b", re.IGNORECASE), "META"),
-    (re.compile(r"\bamazon\b|\bamzn\b|\baws\b", re.IGNORECASE), "AMZN"),
-    (re.compile(r"\btesla\b|\btsla\b", re.IGNORECASE), "TSLA"),
-    (re.compile(r"\bwalmart\b|\bwmt\b", re.IGNORECASE), "WMT"),
-    (re.compile(r"\bprocter\s*(?:&|and)?\s*gamble\b|\bpg\b", re.IGNORECASE), "PG"),
-    (re.compile(r"\bjpmorgan\b|\bjp\s+morgan\b|\bjpm\b", re.IGNORECASE), "JPM"),
-    (re.compile(r"\bvisa\b", re.IGNORECASE), "V"),
-    (re.compile(r"\bunitedhealth\b|\bunh\b", re.IGNORECASE), "UNH"),
-    (re.compile(r"\beli\s+lilly\b|\blilly\b|\blly\b", re.IGNORECASE), "LLY"),
-    (re.compile(r"\bjohnson\s*(?:&|and)?\s*johnson\b|\bjnj\b", re.IGNORECASE), "JNJ"),
-    (re.compile(r"\bexxon\s*mobil\b|\bexxon\b|\bxom\b", re.IGNORECASE), "XOM"),
-    (re.compile(r"\bcaterpillar\b|\bcat\b", re.IGNORECASE), "CAT"),
-)
-
-_SECTOR_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
-    (
-        re.compile(
-            r"\binformation\s+technology\b|\btech\s+companies\b|\btech\s+sector\b|\bsemiconductors?\b",
-            re.IGNORECASE,
-        ),
-        "Information Technology",
-    ),
-    (
-        re.compile(r"\bhealth\s*care\b|\bpharma(?:ceuticals?)?\b|\bbiotech\b", re.IGNORECASE),
-        "Health Care",
-    ),
-    (
-        re.compile(r"\bfinancials\b|\bfinancial\s+sector\b|\bbanking\b|\bbanks\b", re.IGNORECASE),
-        "Financials",
-    ),
-    (
-        re.compile(r"\bcommunication\s+services\b", re.IGNORECASE),
-        "Communication Services",
-    ),
-    (
-        re.compile(r"\bconsumer\s+discretionary\b", re.IGNORECASE),
-        "Consumer Discretionary",
-    ),
-    (
-        re.compile(r"\bconsumer\s+staples\b", re.IGNORECASE),
-        "Consumer Staples",
-    ),
-    (
-        re.compile(r"\benergy\s+sector\b|\boil\s+and\s+gas\b", re.IGNORECASE),
-        "Energy",
-    ),
-    (
-        re.compile(r"\bindustrials\b|\bindustrial\s+sector\b", re.IGNORECASE),
-        "Industrials",
-    ),
-)
-
 _YEAR_MENTION_RE = re.compile(r"\b(?:FY\s*)?(202[0-6])\b", re.IGNORECASE)
 _ITEM_1A_ONLY_RE = re.compile(r"\b(?:item\s*1a|risk\s+factors?)\b", re.IGNORECASE)
 _ITEM_7_ONLY_RE = re.compile(r"\b(?:item\s*7|md&a|management'?s\s+discussion)\b", re.IGNORECASE)
 
-
 _COMPANY_CATALOG_TTL_SECONDS = 600.0
-_company_catalog_cache: tuple[float, list[Any]] | None = None
+_CATALOG_LOCK = threading.Lock()
+_company_catalog_cache: tuple[float, list[Any], EntityCatalog] | None = None
+
+ProgressCallback = Callable[[str, str, dict[str, Any] | None], None]
 
 
 def _load_all_profiles_from_bigquery() -> list[Any]:
     """All company-year profiles from BigQuery `financial_metrics` (cached for 10 minutes)."""
     global _company_catalog_cache
     now = time.monotonic()
-    if _company_catalog_cache and now - _company_catalog_cache[0] < _COMPANY_CATALOG_TTL_SECONDS:
-        return _company_catalog_cache[1]
+    with _CATALOG_LOCK:
+        if (
+            _company_catalog_cache
+            and now - _company_catalog_cache[0] < _COMPANY_CATALOG_TTL_SECONDS
+        ):
+            return _company_catalog_cache[1]
     profiles = get_active_gcp_tool_adapters().bigquery.fetch_profiles(
         tickers=set(), start_year=1900, end_year=2100
     )
-    _company_catalog_cache = (now, profiles)
+    catalog = EntityCatalog(profiles)
+    with _CATALOG_LOCK:
+        _company_catalog_cache = (time.monotonic(), profiles, catalog)
     return profiles
+
+
+def _get_entity_catalog(*, allow_fetch: bool = True) -> tuple[EntityCatalog, list[Any]]:
+    """Return `(EntityCatalog, profiles)` from the 10-minute cache, loading once if allowed."""
+    global _company_catalog_cache
+    now = time.monotonic()
+    with _CATALOG_LOCK:
+        if (
+            _company_catalog_cache
+            and now - _company_catalog_cache[0] < _COMPANY_CATALOG_TTL_SECONDS
+        ):
+            return _company_catalog_cache[2], _company_catalog_cache[1]
+    if not allow_fetch:
+        return EntityCatalog([]), []
+    try:
+        profiles = _load_all_profiles_from_bigquery()
+        with _CATALOG_LOCK:
+            if _company_catalog_cache is not None:
+                return _company_catalog_cache[2], _company_catalog_cache[1]
+        return EntityCatalog(profiles), profiles
+    except Exception:
+        return EntityCatalog([]), []
+
+
+def reset_company_catalog_cache() -> None:
+    """Clear the cached BigQuery profile/entity catalog (used by tests)."""
+    global _company_catalog_cache
+    with _CATALOG_LOCK:
+        _company_catalog_cache = None
 
 
 def list_curated_companies() -> dict[str, Any]:
@@ -165,12 +158,16 @@ def list_curated_companies() -> dict[str, Any]:
                 "gics_sub_industry": latest.gics_sub_industry,
                 "fiscal_years": [p.fiscal_year for p in t_profiles],
                 "latest_fiscal_year": latest.fiscal_year,
+                "latest_period_of_report": latest.period_of_report or None,
+                "latest_filing_date": latest.filing_date or None,
+                "latest_accession_number": latest.accession_number or None,
                 "latest_revenue": latest.revenue,
                 "latest_operating_income": latest.operating_income,
                 "latest_net_income": latest.net_income,
                 "latest_research_and_development": latest.research_and_development,
                 "latest_operating_margin_pct": latest_rec.operating_margin_pct,
                 "latest_net_margin_pct": latest_rec.net_margin_pct,
+                "latest_metric_provenance": latest.metric_provenance.model_dump(mode="json"),
                 "sec_filing_url": latest.sec_filing_url,
             }
         )
@@ -179,8 +176,8 @@ def list_curated_companies() -> dict[str, Any]:
         "status": "success",
         "company_count": len(companies),
         "total_profiles": len(profiles),
-        "min_year": min(all_years) if all_years else 2020,
-        "max_year": max(all_years) if all_years else 2026,
+        "min_year": min(all_years) if all_years else MIN_CORPUS_YEAR,
+        "max_year": max(all_years) if all_years else MAX_CORPUS_YEAR,
         "gics_sectors": sorted(sectors),
         "companies": companies,
     }
@@ -195,30 +192,55 @@ def resolve_query_scope(
     start_year: int = 2024,
     end_year: int = 2026,
     memory_context: dict[str, Any] | None = None,
+    *,
+    catalog: EntityCatalog | None = None,
 ) -> dict[str, Any]:
-    """Combine explicit UI filter selections, natural-language detection, and session memory recall."""
-    explicit_tickers = sorted(_parse_ticker_list(tickers))
-    detected_tickers: list[str] = []
-    for pattern, symbol in _COMPANY_ALIASES:
-        if pattern.search(query) and symbol not in detected_tickers:
-            detected_tickers.append(symbol)
-    # Exact uppercase standalone 'V' check
-    if re.search(r"(?<![A-Za-z0-9\-])V(?![A-Za-z0-9\-])", query) and "V" not in detected_tickers:
-        detected_tickers.append("V")
+    """Combine explicit UI filter selections, full-catalog NL detection, and multi-turn memory."""
+    if catalog is None:
+        catalog, _ = _get_entity_catalog(allow_fetch=True)
 
-    effective_tickers = explicit_tickers if explicit_tickers else detected_tickers
+    explicit_tickers = sorted(_parse_ticker_list(tickers))
+    detected_tickers, unknown_entities = catalog.detect_tickers_in_query(query)
+
+    prior_tickers: list[str] = []
+    has_prior_mem = (
+        isinstance(memory_context, dict)
+        and bool(memory_context.get("has_prior_memory"))
+        and bool(memory_context.get("remembered_tickers"))
+    )
+    if has_prior_mem:
+        prior_tickers = [str(t) for t in memory_context["remembered_tickers"]]  # type: ignore[index]
+
     memory_inherited = False
+    removed_tickers = extract_removed_tickers(query, catalog) if has_prior_mem else []
+
+    if explicit_tickers:
+        effective_tickers = explicit_tickers
+    elif removed_tickers and prior_tickers:
+        # e.g. "remove Apple" / "without AAPL"
+        effective_tickers = [t for t in prior_tickers if t not in removed_tickers]
+        memory_inherited = True
+    elif detected_tickers and prior_tickers and is_additive_followup(query):
+        # e.g. "now add Microsoft" / "compare with AMD" -> MERGE into prior session tickers
+        merged = list(prior_tickers)
+        for tk in detected_tickers:
+            if tk not in merged:
+                merged.append(tk)
+        effective_tickers = merged
+        memory_inherited = True
+    else:
+        effective_tickers = detected_tickers
 
     effective_sector = gics_sector
     if not effective_sector or effective_sector.strip().upper() in ("ALL", "*"):
         effective_sector = "ALL"
         if not effective_tickers:
-            for pattern, sec_name in _SECTOR_ALIASES:
+            for pattern, sec_name in SECTOR_ALIASES:
                 if pattern.search(query):
                     effective_sector = sec_name
                     break
 
-    # Multi-turn follow-up entity recall from session memory when user asks a contextual follow-up
+    # Multi-turn follow-up entity recall when user omits company/sector ("those margins?", "just FY2025")
     broad_corpus_query = bool(
         re.search(
             r"\b(?:across\s+all|chunk\s+health|embedding\s+coverage|vector\s+(?:db|database)\s+health)\b",
@@ -230,12 +252,18 @@ def resolve_query_scope(
         not effective_tickers
         and effective_sector == "ALL"
         and not broad_corpus_query
-        and isinstance(memory_context, dict)
-        and memory_context.get("has_prior_memory")
-        and memory_context.get("remembered_tickers")
+        and not unknown_entities
+        and has_prior_mem
     ):
-        effective_tickers = list(memory_context["remembered_tickers"])
+        effective_tickers = list(prior_tickers)
         memory_inherited = True
+
+    # Filter out any invalid explicit tickers ONLY from valid_tickers while keeping unknown_entities
+    valid_tickers = (
+        [t for t in effective_tickers if catalog.contains_ticker(t)]
+        if catalog.tickers
+        else list(effective_tickers)
+    )
 
     effective_section = section_id
     if not effective_section or effective_section.strip().upper() in ("ALL", "*"):
@@ -258,10 +286,12 @@ def resolve_query_scope(
         elif re.search(r"\bsince\s+(?:FY\s*)?202[0-6]\b", query, re.IGNORECASE):
             eff_start = mentioned_years[0]
             eff_end = max(end_year, mentioned_years[0])
+        elif re.search(r"\b(?:just|only)\s+(?:FY\s*)?202[0-6]\b", query, re.IGNORECASE):
+            eff_start = mentioned_years[0]
+            eff_end = mentioned_years[0]
         elif start_year == 2024 and end_year == 2026:
-            # Single fiscal year focus while preserving YoY comparison baseline when helpful
             yr = mentioned_years[0]
-            eff_start = max(2020, yr - 1)
+            eff_start = max(MIN_CORPUS_YEAR, yr - 1)
             eff_end = yr
     elif (
         memory_inherited
@@ -278,13 +308,15 @@ def resolve_query_scope(
         eff_start, eff_end = eff_end, eff_start
 
     return {
-        "tickers": effective_tickers,
-        "tickers_csv": ",".join(effective_tickers) if effective_tickers else "ALL",
+        "tickers": valid_tickers,
+        "tickers_csv": ",".join(valid_tickers) if valid_tickers else "ALL",
         "gics_sector": effective_sector,
         "section_id": effective_section,
         "start_year": eff_start,
         "end_year": eff_end,
         "memory_inherited": memory_inherited,
+        "explicit_tickers": explicit_tickers,
+        "unknown_entities": unknown_entities,
     }
 
 
@@ -298,72 +330,113 @@ def _retrieve_balanced_citations(
     end_year: int,
     top_k: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Run hybrid RAG search while ensuring multi-company or multi-year comparisons have balanced coverage."""
+    """Run hybrid RAG searches in parallel while guaranteeing multi-ticker AND boundary-year balance."""
     tickers_csv = ",".join(tickers) if tickers else "ALL"
-    primary = search_10k_chunks_rag(
-        query=query,
-        tickers=tickers_csv,
-        gics_sector=gics_sector,
-        section_id=section_id,
-        start_year=start_year,
-        end_year=end_year,
-        top_k=max(top_k, 10),
-    )
-    merged_by_id: dict[str, dict[str, Any]] = {}
-    candidates_searched = int(primary.get("candidates_searched") or 0)
 
-    for cit in primary.get("citations") or []:
-        merged_by_id[cit["chunk_id"]] = cit
-
-    # Ensure every explicitly compared ticker has at least 2 grounded citations when available
-    if len(tickers) > 1:
-        per_ticker_k = max(2, top_k // len(tickers))
-        for sym in tickers[:4]:
-            sub = search_10k_chunks_rag(
-                query=query,
-                tickers=sym,
-                gics_sector="ALL",
-                section_id=section_id,
-                start_year=start_year,
-                end_year=end_year,
-                top_k=per_ticker_k,
-            )
-            for cit in sub.get("citations") or []:
-                merged_by_id.setdefault(cit["chunk_id"], cit)
-
-    # For longitudinal / thematic tracking across multiple years, ensure boundary years are represented
-    elif end_year > start_year:
-        for boundary_year in (start_year, end_year):
-            sub_yr = search_10k_chunks_rag(
+    tasks: list[tuple[str, Callable[[], dict[str, Any]]]] = [
+        (
+            "primary",
+            lambda: search_10k_chunks_rag(
                 query=query,
                 tickers=tickers_csv,
                 gics_sector=gics_sector,
                 section_id=section_id,
-                start_year=boundary_year,
-                end_year=boundary_year,
-                top_k=3,
-            )
-            for cit in sub_yr.get("citations") or []:
-                merged_by_id.setdefault(cit["chunk_id"], cit)
+                start_year=start_year,
+                end_year=end_year,
+                top_k=max(top_k, 10),
+            ),
+        )
+    ]
 
-    # Sort while preserving diversity across tickers and fiscal years
+    if len(tickers) > 1:
+        per_ticker_k = max(2, top_k // len(tickers))
+        for sym in tickers[:4]:
+            tasks.append(
+                (
+                    f"ticker:{sym}",
+                    lambda s=sym, k=per_ticker_k: search_10k_chunks_rag(
+                        query=query,
+                        tickers=s,
+                        gics_sector="ALL",
+                        section_id=section_id,
+                        start_year=start_year,
+                        end_year=end_year,
+                        top_k=k,
+                    ),
+                )
+            )
+    elif end_year > start_year:
+        for boundary_year in (start_year, end_year):
+            tasks.append(
+                (
+                    f"year:{boundary_year}",
+                    lambda yr=boundary_year: search_10k_chunks_rag(
+                        query=query,
+                        tickers=tickers_csv,
+                        gics_sector=gics_sector,
+                        section_id=section_id,
+                        start_year=yr,
+                        end_year=yr,
+                        top_k=3,
+                    ),
+                )
+            )
+
+    results_by_tag: dict[str, dict[str, Any]] = {}
+    if len(tasks) == 1:
+        tag, fn = tasks[0]
+        results_by_tag[tag] = fn()
+    else:
+        with ThreadPoolExecutor(max_workers=min(5, len(tasks))) as pool:
+            futs = [(tag, pool.submit(contextvars.copy_context().run, fn)) for tag, fn in tasks]
+            for tag, fut in futs:
+                results_by_tag[tag] = fut.result()
+
+    primary = results_by_tag["primary"]
+    merged_by_id: dict[str, dict[str, Any]] = {}
+    candidates_searched = int(primary.get("candidates_searched") or 0)
+    for cit in primary.get("citations") or []:
+        merged_by_id[cit["chunk_id"]] = cit
+
+    for tag, sub in results_by_tag.items():
+        if tag == "primary":
+            continue
+        for cit in sub.get("citations") or []:
+            merged_by_id.setdefault(cit["chunk_id"], cit)
+
     all_cits = sorted(
         merged_by_id.values(),
         key=lambda c: float(c.get("score") or 0.0),
         reverse=True,
     )
 
+    # Balance across tickers for multi-company peer comparisons
     if len(tickers) > 1 and len(all_cits) > top_k:
         selected: list[dict[str, Any]] = []
         used_ids: set[str] = set()
-        # First pass: top 2 per ticker
         for sym in tickers:
             sym_hits = [c for c in all_cits if c["ticker"] == sym][:2]
             for hit in sym_hits:
                 if hit["chunk_id"] not in used_ids and len(selected) < top_k:
                     selected.append(hit)
                     used_ids.add(hit["chunk_id"])
-        # Fill remaining slots by hybrid relevance score
+        for hit in all_cits:
+            if hit["chunk_id"] not in used_ids and len(selected) < top_k:
+                selected.append(hit)
+                used_ids.add(hit["chunk_id"])
+        return selected, candidates_searched
+
+    # Balance boundary fiscal years (start_year and end_year) for single-company longitudinal
+    # queries so FY2024 filings are never crowded out by FY2025/FY2026 filings (fixes MSFT FY2024!).
+    if len(tickers) <= 1 and end_year > start_year and len(all_cits) > top_k:
+        selected = []
+        used_ids = set()
+        for boundary_year in (start_year, end_year):
+            yr_hits = [c for c in all_cits if int(c.get("fiscal_year") or 0) == boundary_year][:2]
+            for hit in yr_hits:
+                if hit["chunk_id"] not in used_ids and len(selected) < top_k:
+                    selected.append(hit)
+                    used_ids.add(hit["chunk_id"])
         for hit in all_cits:
             if hit["chunk_id"] not in used_ids and len(selected) < top_k:
                 selected.append(hit)
@@ -371,6 +444,113 @@ def _retrieve_balanced_citations(
         return selected, candidates_searched
 
     return all_cits[:top_k], candidates_searched
+
+
+def _early_return_response(
+    *,
+    status: str,
+    intent: str,
+    title: str,
+    message: str,
+    scope: dict[str, Any],
+    prompt_decision: GuardrailDecision,
+    memory_ctx: dict[str, Any],
+    agent_trace: list[dict[str, Any]],
+    identities_used_by_agent: dict[str, dict[str, str]],
+    turn_start: float,
+    session_id: str | None,
+    user_id: str,
+    coverage_notices: list[dict[str, Any]],
+    suggested_followups: list[str],
+    reason: str | None,
+) -> dict[str, Any]:
+    """Build a structured clarification or out-of-corpus response without running LLM synthesis."""
+    suggestions_md = ""
+    if suggested_followups:
+        bullets = "\n".join(f"- *{s}*" for s in suggested_followups)
+        suggestions_md = f"\n\n**Try one of these queries:**\n{bullets}"
+    answer_markdown = f"### {title}\n\n{message}{suggestions_md}\n"
+    total_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
+    sess_tel = get_telemetry_sink().record_session_turn_telemetry(
+        session_id=session_id,
+        user_id=user_id,
+        intent=intent,
+        execution_mode=status,
+        status_outcome=status,
+        tickers_analyzed=list(scope.get("tickers") or []),
+        gics_sector=str(scope.get("gics_sector") or "ALL"),
+        start_year=int(scope.get("start_year") or 2024),
+        end_year=int(scope.get("end_year") or 2026),
+        report_generated=False,
+        variance_reports_count=0,
+        citations_count=0,
+        agent_trace=agent_trace,
+        turn_latency_records=[],
+        total_latency_ms=total_ms,
+        fact_check_passed=True,
+    )
+    return {
+        "status": status,
+        "model_armor_blocked": False,
+        "model_armor": {
+            "prompt_inspection": prompt_decision.to_audit_dict(),
+            "response_inspection": None,
+        },
+        "execution_mode": status,
+        "adk_runtime": get_live_runtime_status_metadata(),
+        "structured_report": None,
+        "report_verification": None,
+        "prompt_store": get_prompt_store_status_metadata(),
+        "intent": intent,
+        "orchestrator": RootOrchestrator.name,
+        "resolved_scope": scope,
+        "answer_markdown": answer_markdown,
+        "answer_verified": True,
+        "clarification_reason": reason,
+        "suggested_followups": suggested_followups,
+        "coverage_notices": coverage_notices,
+        "sector_coverage": None,
+        "missing_tickers": [],
+        "variance_reports": [],
+        "sector_benchmarks": [],
+        "material_variance_flags": [],
+        "material_variance_summary": None,
+        "disclosure_deltas": None,
+        "citations": [],
+        "candidates_searched": 0,
+        "context_cache": None,
+        "fact_check": {
+            "passed": True,
+            "checked_metrics_count": 0,
+            "matched_citations_count": 0,
+            "has_required_citations": True,
+            "discrepancies": [],
+            "model_latency_ms": total_ms,
+        },
+        "evaluation": None,
+        "react_execution": {
+            "strategy": "scope_validation_gate",
+            "execution_mode": status,
+            "iterations": 0,
+            "steps": [],
+            "variance_evaluations": [],
+            "cached_10k_explanations": [],
+        },
+        "context_and_memory": {
+            "models": get_model_strategy_metadata(),
+            "session_memory": memory_ctx,
+            "turn_context_latency": None,
+            "model_call_records": [],
+            "global_context_latency": (
+                get_context_latency_tracker().summarize().model_dump(mode="json")
+            ),
+            "context_cache_runtime": get_context_cache_runtime_stats(),
+            "session_telemetry": sess_tel["row"],
+        },
+        "agent_trace": agent_trace,
+        "agent_identities_used": list(identities_used_by_agent.values()),
+        "total_latency_ms": total_ms,
+    }
 
 
 @traced(
@@ -398,11 +578,19 @@ def run_conversational_rag_turn(
     user_id: str = "analyst",
     reasoning_llm: BaseLlm | None = None,
     judge_llm: BaseLlm | None = None,
+    map_llm: BaseLlm | None = None,
+    run_judge_sync: bool = False,
+    skip_background_judge: bool = False,
+    on_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """Execute a full source-grounded Hybrid RAG conversational turn with ADK Runner / ReAct loop & fact-checking."""
+    """Execute a full source-grounded Hybrid RAG conversational turn with ADK Runner & streaming progress."""
     turn_start = time.perf_counter()
     agent_trace: list[dict[str, Any]] = []
     identities_used_by_agent: dict[str, dict[str, str]] = {}
+
+    def _emit(stage: str, message: str, meta: dict[str, Any] | None = None) -> None:
+        if on_progress is not None:
+            on_progress(stage, message, meta)
 
     def _track_agent_identity(claims: VerifiedAgentS2SClaims) -> None:
         if claims.agent_name not in identities_used_by_agent:
@@ -412,8 +600,10 @@ def run_conversational_rag_turn(
                 "spiffe_id": claims.spiffe_id,
             }
 
+    _emit("starting", "Checking safety guardrails and session memory...", None)
+
     memory_mgr = get_conversation_memory_manager()
-    memory_ctx = memory_mgr.recall_session_context(session_id)
+    memory_ctx = memory_mgr.recall_session_context(session_id, user_id=user_id)
 
     # Step 0: Managed Google Cloud Model Armor, Cloud SDP/DLP & Financial Projection Guardrails
     t0 = time.perf_counter()
@@ -491,6 +681,9 @@ def run_conversational_rag_turn(
                 "### Request Blocked by Managed Model Armor & SEC Compliance Guardrails\n\n"
                 f"{prompt_decision.block_message}"
             ),
+            "coverage_notices": [],
+            "suggested_followups": [],
+            "sector_coverage": None,
             "variance_reports": [],
             "citations": [],
             "context_cache": None,
@@ -546,7 +739,7 @@ def run_conversational_rag_turn(
             }
         )
 
-    # Step 1: Scope Resolution, Session Memory Recall & RootOrchestrator Intent Routing
+    # Step 1: Scope Resolution, Full S&P 500 Catalog Validation, Session Memory Recall & Routing
     t1 = time.perf_counter()
     route_claims = authorize_agent_tool_invocation(
         agent_name=RootOrchestrator.name,
@@ -554,6 +747,7 @@ def run_conversational_rag_turn(
         caller=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
     )
     _track_agent_identity(route_claims)
+    catalog, all_profiles = _get_entity_catalog(allow_fetch=True)
     scope = resolve_query_scope(
         query=query,
         tickers=tickers,
@@ -562,14 +756,79 @@ def run_conversational_rag_turn(
         start_year=start_year,
         end_year=end_year,
         memory_context=memory_ctx,
+        catalog=catalog,
     )
-    intent = classify_query_intent(query, tickers=scope["tickers"] or None)
+
+    validation = validate_query_scope_and_coverage(
+        query=query,
+        scope=scope,
+        explicit_tickers=list(scope.get("explicit_tickers") or []),
+        unknown_entities=list(scope.get("unknown_entities") or []),
+        catalog=catalog,
+        memory_context=memory_ctx,
+    )
+    pre_notices: list[dict[str, Any]] = list(validation.get("pre_notices") or [])
+
+    if validation["action"] in ("clarification", "out_of_corpus"):
+        is_clarification = validation["action"] == "clarification"
+        early_status = "clarification" if is_clarification else "out_of_corpus"
+        early_intent = "clarification_needed" if is_clarification else "out_of_corpus"
+        early_title = (
+            "Clarification Needed"
+            if is_clarification
+            else "Outside Curated SEC 10-K Corpus Coverage"
+        )
+        route_ms = round((time.perf_counter() - t1) * 1000.0, 2)
+        agent_trace.append(
+            {
+                "step": len(agent_trace) + 1,
+                "agent": RootOrchestrator.name,
+                "model_used": resolve_model_for_task("orchestration"),
+                "agent_service_account": route_claims.service_account_email,
+                "spiffe_id": route_claims.spiffe_id,
+                "s2s_target_service": route_claims.target_service,
+                "s2s_verified": True,
+                "tool": "validate_query_scope_and_coverage",
+                "status": early_status,
+                "duration_ms": route_ms,
+                "summary": (
+                    f"Scope validation returned '{early_intent}' "
+                    f"(reason={validation.get('reason')})."
+                ),
+            }
+        )
+        _emit("scope_validation", early_title, {"action": early_status})
+        return _early_return_response(
+            status=early_status,
+            intent=early_intent,
+            title=early_title,
+            message=str(validation["message"]),
+            scope={
+                k: v for k, v in scope.items() if k not in ("explicit_tickers", "unknown_entities")
+            },
+            prompt_decision=prompt_decision,
+            memory_ctx=memory_ctx,
+            agent_trace=agent_trace,
+            identities_used_by_agent=identities_used_by_agent,
+            turn_start=turn_start,
+            session_id=session_id,
+            user_id=user_id,
+            coverage_notices=pre_notices,
+            suggested_followups=list(validation.get("suggested_followups") or []),
+            reason=validation.get("reason"),
+        )
+
+    # Clean internal keys from returned scope payload
+    public_scope = {
+        k: v for k, v in scope.items() if k not in ("explicit_tickers", "unknown_entities")
+    }
+    intent = classify_query_intent(query, tickers=public_scope["tickers"] or None)
     orchestrator_model = resolve_model_for_task("orchestration")
     route_ms = round((time.perf_counter() - t1) * 1000.0, 2)
-    mem_suffix = " (recalled from session memory)" if scope.get("memory_inherited") else ""
+    mem_suffix = " (recalled from session memory)" if public_scope.get("memory_inherited") else ""
     agent_trace.append(
         {
-            "step": 1,
+            "step": len(agent_trace) + 1,
             "agent": RootOrchestrator.name,
             "model_used": orchestrator_model,
             "agent_service_account": route_claims.service_account_email,
@@ -580,269 +839,128 @@ def run_conversational_rag_turn(
             "status": "completed",
             "duration_ms": route_ms,
             "summary": (
-                f"Routed to '{intent}' ({orchestrator_model}) · Tickers: {scope['tickers_csv']}{mem_suffix} · "
-                f"Sector: {scope['gics_sector']} · Section: {scope['section_id']} · "
-                f"FY{scope['start_year']}–FY{scope['end_year']}"
+                f"Routed to '{intent}' ({orchestrator_model}) · Tickers: {public_scope['tickers_csv']}{mem_suffix} · "
+                f"Sector: {public_scope['gics_sector']} · Section: {public_scope['section_id']} · "
+                f"FY{public_scope['start_year']}–FY{public_scope['end_year']}"
             ),
         }
     )
 
-    # Step 2: Deterministic Calculation Engine / Looker Semantic Layer (RootOrchestrator -> FinancialAnalystAgent S2S hop)
-    t2 = time.perf_counter()
+    is_sector_wide_thematic = (
+        intent == "thematic_trend_tracking"
+        and not public_scope["tickers"]
+        and public_scope["gics_sector"] not in ("ALL", "", None)
+    )
+    _emit(
+        "scope_resolved",
+        (
+            f"Scoped to {public_scope['gics_sector']} sector (FY{public_scope['start_year']}–FY{public_scope['end_year']})"
+            if is_sector_wide_thematic
+            else f"Scoped to {public_scope['tickers_csv']} (FY{public_scope['start_year']}–FY{public_scope['end_year']})"
+        ),
+        {
+            "intent": intent,
+            "tickers": public_scope["tickers"],
+            "gics_sector": public_scope["gics_sector"],
+            "sector_map_reduce": is_sector_wide_thematic,
+        },
+    )
+
+    # Step 2 & Step 3: Parallel Retrieval (Variances / Benchmarks + Hybrid RAG / Sector Map-Reduce + Flags + Deltas)
     authorize_agent_s2s_hop(
         caller_agent=RootOrchestrator.name,
         callee_agent="FinancialAnalystAgent",
     )
     variance_reports: list[dict[str, Any]] = []
+    missing_tickers: list[str] = []
     sector_benchmarks: list[dict[str, Any]] = []
     chunk_health: dict[str, Any] | None = None
     calculated_variances_map: dict[str, Any] = {}
+    citations: list[dict[str, Any]] = []
+    candidates_searched = 0
+    material_flags: list[dict[str, Any]] = []
+    material_flags_summary: dict[str, Any] | None = None
+    disclosure_deltas: dict[str, Any] | None = None
+    sector_coverage: dict[str, Any] | None = None
+    sector_map_summaries: dict[str, Any] | None = None
 
-    if intent == "chunk_health_monitoring":
-        calc_claims = authorize_agent_tool_invocation(
-            agent_name="FinancialAnalystAgent",
-            tool_name="query_looker_financial_explore",
-            caller=RootOrchestrator.name,
-        )
-        _track_agent_identity(calc_claims)
-        health_res = query_looker_financial_explore(
-            explore_name="chunk_health",
-            tickers=scope["tickers_csv"],
-            gics_sector=scope["gics_sector"],
-            start_year=scope["start_year"],
-            end_year=scope["end_year"],
-        )
-        if health_res.get("status") == "success":
-            chunk_health = health_res
-        calc_ms = round((time.perf_counter() - t2) * 1000.0, 2)
-        agent_trace.append(
-            {
-                "step": 2,
-                "agent": "FinancialAnalystAgent",
-                "agent_service_account": calc_claims.service_account_email,
-                "spiffe_id": calc_claims.spiffe_id,
-                "s2s_target_service": calc_claims.target_service,
-                "s2s_verified": True,
-                "tool": "query_looker_financial_explore(chunk_health)",
-                "status": "completed",
-                "duration_ms": calc_ms,
-                "summary": (
-                    f"Verified vector index health: {health_res.get('health_status', 'UNKNOWN')} "
-                    f"({health_res.get('total_chunks', 0):,} chunks)."
-                ),
-            }
-        )
-    elif scope["tickers"]:
-        calc_claims = authorize_agent_tool_invocation(
-            agent_name="FinancialAnalystAgent",
-            tool_name="calculate_period_variances",
-            caller=RootOrchestrator.name,
-        )
-        _track_agent_identity(calc_claims)
-        var_res = calculate_period_variances(
-            tickers=scope["tickers_csv"],
-            start_year=scope["start_year"],
-            end_year=scope["end_year"],
-        )
-        if var_res.get("status") == "success":
-            variance_reports = list(var_res.get("variance_reports") or [])
-            for rep in variance_reports:
-                calculated_variances_map[
-                    f"{rep['ticker']}_{rep['start_year']}_{rep['end_year']}"
-                ] = rep
-        calc_ms = round((time.perf_counter() - t2) * 1000.0, 2)
-        agent_trace.append(
-            {
-                "step": 2,
-                "agent": "FinancialAnalystAgent",
-                "agent_service_account": calc_claims.service_account_email,
-                "spiffe_id": calc_claims.spiffe_id,
-                "s2s_target_service": calc_claims.target_service,
-                "s2s_verified": True,
-                "tool": "calculate_period_variances",
-                "status": "completed",
-                "duration_ms": calc_ms,
-                "summary": (
-                    f"Computed deterministic Revenue, Operating Income, Net Income, R&D, and margin bps variances "
-                    f"for {len(variance_reports)} issuer(s) ({scope['tickers_csv']})."
-                ),
-            }
-        )
-    else:
-        calc_claims = authorize_agent_tool_invocation(
-            agent_name="FinancialAnalystAgent",
-            tool_name="query_looker_financial_explore",
-            caller=RootOrchestrator.name,
-        )
-        _track_agent_identity(calc_claims)
-        bench_res = query_looker_financial_explore(
-            explore_name="sector_benchmarks",
-            tickers="ALL",
-            gics_sector=scope["gics_sector"],
-            start_year=scope["start_year"],
-            end_year=scope["end_year"],
-        )
-        if bench_res.get("status") == "success":
-            sector_benchmarks = list(bench_res.get("rows") or [])
-        calc_ms = round((time.perf_counter() - t2) * 1000.0, 2)
-        agent_trace.append(
-            {
-                "step": 2,
-                "agent": "FinancialAnalystAgent",
-                "agent_service_account": calc_claims.service_account_email,
-                "spiffe_id": calc_claims.spiffe_id,
-                "s2s_target_service": calc_claims.target_service,
-                "s2s_verified": True,
-                "tool": "query_looker_financial_explore(sector_benchmarks)",
-                "status": "completed",
-                "duration_ms": calc_ms,
-                "summary": (
-                    f"Retrieved {len(sector_benchmarks)} structured sector benchmark row(s) "
-                    f"for {scope['gics_sector']}."
-                ),
-            }
-        )
-
-    # Step 3: Metadata-Filtered Hybrid RAG Search (768-d Dense + Lexical Boost)
-    t3 = time.perf_counter()
     rag_claims = authorize_agent_tool_invocation(
         agent_name="FinancialAnalystAgent",
         tool_name="search_10k_chunks_rag",
         caller=RootOrchestrator.name,
     )
     _track_agent_identity(rag_claims)
-    citations, candidates_searched = _retrieve_balanced_citations(
-        query=query,
-        tickers=scope["tickers"],
-        gics_sector=scope["gics_sector"],
-        section_id=scope["section_id"],
-        start_year=scope["start_year"],
-        end_year=scope["end_year"],
-        top_k=top_k,
-    )
-    rag_ms = round((time.perf_counter() - t3) * 1000.0, 2)
-    agent_trace.append(
-        {
-            "step": 3,
-            "agent": "FinancialAnalystAgent",
-            "agent_service_account": rag_claims.service_account_email,
-            "spiffe_id": rag_claims.spiffe_id,
-            "s2s_target_service": rag_claims.target_service,
-            "s2s_verified": True,
-            "tool": "search_10k_chunks_rag",
-            "status": "completed",
-            "duration_ms": rag_ms,
-            "summary": (
-                f"Ranked {candidates_searched:,} metadata-filtered 10-K chunks (768-d cosine + lexical boost) "
-                f"→ top {len(citations)} grounded citations."
-            ),
-        }
-    )
 
-    # If user ran a broad query without naming specific tickers, compute variances for top cited issuers
-    if (
-        not variance_reports
-        and citations
-        and intent
-        in (
-            "longitudinal_single_company",
-            "multi_company_peer_comparison",
-        )
-    ):
-        inferred_tickers = []
-        for cit in citations:
-            if cit["ticker"] not in inferred_tickers:
-                inferred_tickers.append(cit["ticker"])
-            if len(inferred_tickers) >= 2:
-                break
-        if inferred_tickers:
-            authorize_agent_tool_invocation(
-                agent_name="FinancialAnalystAgent",
-                tool_name="calculate_period_variances",
-                caller=RootOrchestrator.name,
-            )
-            var_res = calculate_period_variances(
-                tickers=",".join(inferred_tickers),
-                start_year=scope["start_year"],
-                end_year=scope["end_year"],
-            )
-            if var_res.get("status") == "success":
-                variance_reports = list(var_res.get("variance_reports") or [])
-                for rep in variance_reports:
-                    calculated_variances_map[
-                        f"{rep['ticker']}_{rep['start_year']}_{rep['end_year']}"
-                    ] = rep
-
-    # Step 3b: Deterministic anomaly flags (explained with MD&A passages) and, for thematic
-    # questions, the Disclosure Delta pipeline (year-over-year wording changes). Both become
-    # cited grounding facts for synthesis.
-    material_flags: list[dict[str, Any]] = []
-    material_flags_summary: dict[str, Any] | None = None
-    if variance_reports and intent != "chunk_health_monitoring":
-        t_flags = time.perf_counter()
-        flag_claims = authorize_agent_tool_invocation(
+    if is_sector_wide_thematic:
+        # Gap 1: Full-sector batched map-reduce covering EVERY issuer in the GICS sector!
+        t_sec = time.perf_counter()
+        bench_claims = authorize_agent_tool_invocation(
             agent_name="FinancialAnalystAgent",
-            tool_name="flag_material_variances",
+            tool_name="query_looker_financial_explore",
             caller=RootOrchestrator.name,
         )
-        _track_agent_identity(flag_claims)
-        flag_res = flag_material_variances(
-            tickers=",".join(str(r["ticker"]) for r in variance_reports),
-            start_year=scope["start_year"],
-            end_year=scope["end_year"],
-        )
-        explained_count = 0
-        if flag_res.get("status") == "success":
-            material_flags, explanation_cits = attach_flag_explanations(
-                list(flag_res.get("flags") or []), max_flags=3
-            )
-            explained_count = len(explanation_cits)
-            merge_citations(citations, explanation_cits)
-            material_flags_summary = {
-                "total_flags": flag_res.get("total_flags", 0),
-                "returned_flags": flag_res.get("returned_flags", 0),
-                "high_severity_count": flag_res.get("high_severity_count", 0),
-                "explained_flags": explained_count,
-                "thresholds": flag_res.get("thresholds"),
-            }
-        agent_trace.append(
-            {
-                "step": len(agent_trace) + 1,
-                "agent": "FinancialAnalystAgent",
-                "agent_service_account": flag_claims.service_account_email,
-                "spiffe_id": flag_claims.spiffe_id,
-                "s2s_target_service": flag_claims.target_service,
-                "s2s_verified": True,
-                "tool": "flag_material_variances",
-                "status": "completed" if flag_res.get("status") == "success" else "warning",
-                "duration_ms": round((time.perf_counter() - t_flags) * 1000.0, 2),
-                "summary": (
-                    f"Flagged {flag_res.get('total_flags', 0)} material variance(s) "
-                    f"({flag_res.get('high_severity_count', 0)} high severity); attached MD&A "
-                    f"explanations to {explained_count}."
-                ),
-            }
-        )
-
-    disclosure_deltas: dict[str, Any] | None = None
-    if intent == "thematic_trend_tracking" and scope["end_year"] > scope["start_year"]:
-        t_deltas = time.perf_counter()
+        _track_agent_identity(bench_claims)
         delta_claims = authorize_agent_tool_invocation(
             agent_name="FinancialAnalystAgent",
             tool_name="compare_disclosures_across_years",
             caller=RootOrchestrator.name,
         )
         _track_agent_identity(delta_claims)
-        disclosure_deltas = compare_disclosures_across_years(
-            theme=query,
-            tickers=scope["tickers_csv"],
-            gics_sector=scope["gics_sector"],
-            section_id=scope["section_id"],
-            start_year=scope["start_year"],
-            end_year=scope["end_year"],
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_bench = pool.submit(
+                contextvars.copy_context().run,
+                query_looker_financial_explore,
+                explore_name="sector_benchmarks",
+                tickers="ALL",
+                gics_sector=public_scope["gics_sector"],
+                start_year=public_scope["start_year"],
+                end_year=public_scope["end_year"],
+            )
+            fut_mr = pool.submit(
+                contextvars.copy_context().run,
+                run_sector_thematic_map_reduce,
+                theme=query,
+                gics_sector=public_scope["gics_sector"],
+                section_id=public_scope["section_id"],
+                start_year=public_scope["start_year"],
+                end_year=public_scope["end_year"],
+                sector_profiles=all_profiles or None,
+                map_llm=map_llm,
+                on_progress=on_progress,
+            )
+            bench_res = fut_bench.result()
+            mr_res = fut_mr.result()
+
+        sec_ms = round((time.perf_counter() - t_sec) * 1000.0, 2)
+        if bench_res.get("status") == "success":
+            sector_benchmarks = list(bench_res.get("rows") or [])
+        sector_coverage = mr_res.get("sector_coverage")
+        sector_map_summaries = mr_res.get("sector_map_summaries")
+        disclosure_deltas = mr_res.get("disclosure_deltas")
+        citations = list(mr_res.get("citations") or [])
+        candidates_searched = int(
+            (sector_coverage or {}).get("total_chunks_evaluated") or len(citations)
         )
-        merge_citations(citations, disclosure_delta_citations(disclosure_deltas))
-        delta_summary = (disclosure_deltas or {}).get("summary") or {}
+
+        agent_trace.append(
+            {
+                "step": len(agent_trace) + 1,
+                "agent": "FinancialAnalystAgent",
+                "agent_service_account": bench_claims.service_account_email,
+                "spiffe_id": bench_claims.spiffe_id,
+                "s2s_target_service": bench_claims.target_service,
+                "s2s_verified": True,
+                "tool": "query_looker_financial_explore(sector_benchmarks)",
+                "status": "completed",
+                "duration_ms": sec_ms,
+                "summary": (
+                    f"Retrieved {len(sector_benchmarks)} structured sector benchmark row(s) "
+                    f"for {public_scope['gics_sector']}."
+                ),
+            }
+        )
+        cov = sector_coverage or {}
         agent_trace.append(
             {
                 "step": len(agent_trace) + 1,
@@ -851,24 +969,320 @@ def run_conversational_rag_turn(
                 "spiffe_id": delta_claims.spiffe_id,
                 "s2s_target_service": delta_claims.target_service,
                 "s2s_verified": True,
-                "tool": "compare_disclosures_across_years",
-                "status": (
-                    "completed"
-                    if (disclosure_deltas or {}).get("status") == "success"
-                    else "warning"
-                ),
-                "duration_ms": round((time.perf_counter() - t_deltas) * 1000.0, 2),
+                "tool": "sector_thematic_map_reduce",
+                "status": "completed",
+                "duration_ms": sec_ms,
                 "summary": (
-                    f"Compared theme disclosures for {delta_summary.get('companies_analyzed', 0)} "
-                    f"company(ies) across {delta_summary.get('year_pairs', 0)} year pair(s): "
-                    f"{delta_summary.get('added', 0)} added, {delta_summary.get('modified', 0)} "
-                    f"modified, {delta_summary.get('removed', 0)} removed."
+                    f"Full-sector batched map-reduce analyzed {cov.get('issuers_analyzed', 0)}/"
+                    f"{cov.get('issuers_in_sector', 0)} {public_scope['gics_sector']} issuers "
+                    f"({cov.get('total_chunks_evaluated', 0):,} passages in "
+                    f"{cov.get('batches_processed', 0)} parallel Flash batches) → "
+                    f"{len(citations)} traceable citations."
+                ),
+            }
+        )
+    else:
+        # Parallelize independent retrieval calls: (metrics/variances OR chunk_health OR benchmarks),
+        # balanced hybrid RAG citations, deterministic anomaly flags (+ MD&A explanations), and
+        # (for single/peer thematic queries) Disclosure Delta wording comparisons!
+        _emit("retrieving", "Fetching financial metrics and 10-K evidence in parallel...", None)
+        t_par = time.perf_counter()
+
+        calc_claims: VerifiedAgentS2SClaims | None = None
+        flag_claims: VerifiedAgentS2SClaims | None = None
+        delta_claims_opt: VerifiedAgentS2SClaims | None = None
+
+        if intent == "chunk_health_monitoring":
+            calc_claims = authorize_agent_tool_invocation(
+                agent_name="FinancialAnalystAgent",
+                tool_name="query_looker_financial_explore",
+                caller=RootOrchestrator.name,
+            )
+            _track_agent_identity(calc_claims)
+        elif public_scope["tickers"]:
+            calc_claims = authorize_agent_tool_invocation(
+                agent_name="FinancialAnalystAgent",
+                tool_name="calculate_period_variances",
+                caller=RootOrchestrator.name,
+            )
+            _track_agent_identity(calc_claims)
+            flag_claims = authorize_agent_tool_invocation(
+                agent_name="FinancialAnalystAgent",
+                tool_name="flag_material_variances",
+                caller=RootOrchestrator.name,
+            )
+            _track_agent_identity(flag_claims)
+        else:
+            calc_claims = authorize_agent_tool_invocation(
+                agent_name="FinancialAnalystAgent",
+                tool_name="query_looker_financial_explore",
+                caller=RootOrchestrator.name,
+            )
+            _track_agent_identity(calc_claims)
+
+        run_deltas = (
+            intent == "thematic_trend_tracking"
+            and public_scope["end_year"] > public_scope["start_year"]
+        )
+        if run_deltas:
+            delta_claims_opt = authorize_agent_tool_invocation(
+                agent_name="FinancialAnalystAgent",
+                tool_name="compare_disclosures_across_years",
+                caller=RootOrchestrator.name,
+            )
+            _track_agent_identity(delta_claims_opt)
+
+        def _run_structured_step() -> tuple[str, dict[str, Any], float]:
+            ts = time.perf_counter()
+            if intent == "chunk_health_monitoring":
+                res = query_looker_financial_explore(
+                    explore_name="chunk_health",
+                    tickers=public_scope["tickers_csv"],
+                    gics_sector=public_scope["gics_sector"],
+                    start_year=public_scope["start_year"],
+                    end_year=public_scope["end_year"],
+                )
+                return "chunk_health", res, round((time.perf_counter() - ts) * 1000.0, 2)
+            if public_scope["tickers"]:
+                res = calculate_period_variances(
+                    tickers=public_scope["tickers_csv"],
+                    start_year=public_scope["start_year"],
+                    end_year=public_scope["end_year"],
+                )
+                return "variances", res, round((time.perf_counter() - ts) * 1000.0, 2)
+            res = query_looker_financial_explore(
+                explore_name="sector_benchmarks",
+                tickers="ALL",
+                gics_sector=public_scope["gics_sector"],
+                start_year=public_scope["start_year"],
+                end_year=public_scope["end_year"],
+            )
+            return "benchmarks", res, round((time.perf_counter() - ts) * 1000.0, 2)
+
+        def _run_rag_step() -> tuple[list[dict[str, Any]], int, float]:
+            ts = time.perf_counter()
+            cits, cand = _retrieve_balanced_citations(
+                query=query,
+                tickers=public_scope["tickers"],
+                gics_sector=public_scope["gics_sector"],
+                section_id=public_scope["section_id"],
+                start_year=public_scope["start_year"],
+                end_year=public_scope["end_year"],
+                top_k=top_k,
+            )
+            return cits, cand, round((time.perf_counter() - ts) * 1000.0, 2)
+
+        def _run_flags_step() -> tuple[
+            dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], float
+        ]:
+            ts = time.perf_counter()
+            if all_profiles:
+                flag_res = flag_material_variances_from_cached_profiles(
+                    all_profiles,
+                    tickers=public_scope["tickers_csv"],
+                    start_year=public_scope["start_year"],
+                    end_year=public_scope["end_year"],
+                )
+            else:
+                flag_res = flag_material_variances(
+                    tickers=public_scope["tickers_csv"],
+                    start_year=public_scope["start_year"],
+                    end_year=public_scope["end_year"],
+                )
+            exp_flags: list[dict[str, Any]] = []
+            exp_cits: list[dict[str, Any]] = []
+            if flag_res.get("status") == "success":
+                exp_flags, exp_cits = attach_flag_explanations(
+                    list(flag_res.get("flags") or []), max_flags=3
+                )
+            return flag_res, exp_flags, exp_cits, round((time.perf_counter() - ts) * 1000.0, 2)
+
+        def _run_deltas_step() -> tuple[dict[str, Any], float]:
+            ts = time.perf_counter()
+            res = compare_disclosures_across_years(
+                theme=query,
+                tickers=public_scope["tickers_csv"],
+                gics_sector=public_scope["gics_sector"],
+                section_id=public_scope["section_id"],
+                start_year=public_scope["start_year"],
+                end_year=public_scope["end_year"],
+            )
+            return res, round((time.perf_counter() - ts) * 1000.0, 2)
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            fut_struct = pool.submit(contextvars.copy_context().run, _run_structured_step)
+            fut_rag = pool.submit(contextvars.copy_context().run, _run_rag_step)
+            fut_flags = (
+                pool.submit(contextvars.copy_context().run, _run_flags_step)
+                if (public_scope["tickers"] and intent != "chunk_health_monitoring")
+                else None
+            )
+            fut_deltas = (
+                pool.submit(contextvars.copy_context().run, _run_deltas_step)
+                if run_deltas
+                else None
+            )
+
+            struct_kind, struct_res, calc_ms = fut_struct.result()
+            citations, candidates_searched, rag_ms = fut_rag.result()
+            flags_out = fut_flags.result() if fut_flags is not None else None
+            deltas_out = fut_deltas.result() if fut_deltas is not None else None
+
+        if struct_kind == "chunk_health":
+            if struct_res.get("status") == "success":
+                chunk_health = struct_res
+            agent_trace.append(
+                {
+                    "step": len(agent_trace) + 1,
+                    "agent": "FinancialAnalystAgent",
+                    "agent_service_account": calc_claims.service_account_email,  # type: ignore[union-attr]
+                    "spiffe_id": calc_claims.spiffe_id,  # type: ignore[union-attr]
+                    "s2s_target_service": calc_claims.target_service,  # type: ignore[union-attr]
+                    "s2s_verified": True,
+                    "tool": "query_looker_financial_explore(chunk_health)",
+                    "status": "completed",
+                    "duration_ms": calc_ms,
+                    "summary": (
+                        f"Verified vector index health: {struct_res.get('health_status', 'UNKNOWN')} "
+                        f"({struct_res.get('total_chunks', 0):,} chunks)."
+                    ),
+                }
+            )
+        elif struct_kind == "variances":
+            if struct_res.get("status") == "success":
+                variance_reports = list(struct_res.get("variance_reports") or [])
+                missing_tickers = list(struct_res.get("missing_tickers") or [])
+                for rep in variance_reports:
+                    calculated_variances_map[
+                        f"{rep['ticker']}_{rep['start_year']}_{rep['end_year']}"
+                    ] = rep
+            agent_trace.append(
+                {
+                    "step": len(agent_trace) + 1,
+                    "agent": "FinancialAnalystAgent",
+                    "agent_service_account": calc_claims.service_account_email,  # type: ignore[union-attr]
+                    "spiffe_id": calc_claims.spiffe_id,  # type: ignore[union-attr]
+                    "s2s_target_service": calc_claims.target_service,  # type: ignore[union-attr]
+                    "s2s_verified": True,
+                    "tool": "calculate_period_variances",
+                    "status": "completed",
+                    "duration_ms": calc_ms,
+                    "summary": (
+                        f"Computed deterministic Revenue, Operating Income, Net Income, R&D, XBRL "
+                        f"provenance, and margin bps variances for {len(variance_reports)} issuer(s) "
+                        f"({public_scope['tickers_csv']})."
+                    ),
+                }
+            )
+        else:
+            if struct_res.get("status") == "success":
+                sector_benchmarks = list(struct_res.get("rows") or [])
+            agent_trace.append(
+                {
+                    "step": len(agent_trace) + 1,
+                    "agent": "FinancialAnalystAgent",
+                    "agent_service_account": calc_claims.service_account_email,  # type: ignore[union-attr]
+                    "spiffe_id": calc_claims.spiffe_id,  # type: ignore[union-attr]
+                    "s2s_target_service": calc_claims.target_service,  # type: ignore[union-attr]
+                    "s2s_verified": True,
+                    "tool": "query_looker_financial_explore(sector_benchmarks)",
+                    "status": "completed",
+                    "duration_ms": calc_ms,
+                    "summary": (
+                        f"Retrieved {len(sector_benchmarks)} structured sector benchmark row(s) "
+                        f"for {public_scope['gics_sector']}."
+                    ),
+                }
+            )
+
+        agent_trace.append(
+            {
+                "step": len(agent_trace) + 1,
+                "agent": "FinancialAnalystAgent",
+                "agent_service_account": rag_claims.service_account_email,
+                "spiffe_id": rag_claims.spiffe_id,
+                "s2s_target_service": rag_claims.target_service,
+                "s2s_verified": True,
+                "tool": "search_10k_chunks_rag",
+                "status": "completed",
+                "duration_ms": rag_ms,
+                "summary": (
+                    f"Ranked {candidates_searched:,} metadata-filtered 10-K chunks (BigQuery VECTOR_SEARCH + "
+                    f"Vertex AI Search) → top {len(citations)} grounded citations."
                 ),
             }
         )
 
+        if flags_out is not None and flag_claims is not None and variance_reports:
+            flag_res, material_flags, explanation_cits, flag_ms = flags_out
+            explained_count = len(explanation_cits)
+            merge_citations(citations, explanation_cits)
+            if flag_res.get("status") == "success":
+                material_flags_summary = {
+                    "total_flags": flag_res.get("total_flags", 0),
+                    "returned_flags": flag_res.get("returned_flags", 0),
+                    "high_severity_count": flag_res.get("high_severity_count", 0),
+                    "explained_flags": explained_count,
+                    "thresholds": flag_res.get("thresholds"),
+                }
+            agent_trace.append(
+                {
+                    "step": len(agent_trace) + 1,
+                    "agent": "FinancialAnalystAgent",
+                    "agent_service_account": flag_claims.service_account_email,
+                    "spiffe_id": flag_claims.spiffe_id,
+                    "s2s_target_service": flag_claims.target_service,
+                    "s2s_verified": True,
+                    "tool": "flag_material_variances",
+                    "status": "completed" if flag_res.get("status") == "success" else "warning",
+                    "duration_ms": flag_ms,
+                    "summary": (
+                        f"Flagged {flag_res.get('total_flags', 0)} material variance(s) "
+                        f"({flag_res.get('high_severity_count', 0)} high severity); attached MD&A "
+                        f"explanations to {explained_count}."
+                    ),
+                }
+            )
+
+        if deltas_out is not None and delta_claims_opt is not None:
+            disclosure_deltas, delta_ms = deltas_out
+            merge_citations(citations, disclosure_delta_citations(disclosure_deltas))
+            delta_summary = (disclosure_deltas or {}).get("summary") or {}
+            agent_trace.append(
+                {
+                    "step": len(agent_trace) + 1,
+                    "agent": "FinancialAnalystAgent",
+                    "agent_service_account": delta_claims_opt.service_account_email,
+                    "spiffe_id": delta_claims_opt.spiffe_id,
+                    "s2s_target_service": delta_claims_opt.target_service,
+                    "s2s_verified": True,
+                    "tool": "compare_disclosures_across_years",
+                    "status": (
+                        "completed"
+                        if (disclosure_deltas or {}).get("status") == "success"
+                        else "warning"
+                    ),
+                    "duration_ms": delta_ms,
+                    "summary": (
+                        f"Compared theme disclosures for {delta_summary.get('companies_analyzed', 0)} "
+                        f"company(ies) across {delta_summary.get('year_pairs', 0)} year pair(s): "
+                        f"{delta_summary.get('added', 0)} added, {delta_summary.get('modified', 0)} "
+                        f"modified, {delta_summary.get('removed', 0)} removed."
+                    ),
+                }
+            )
+        _ = time.perf_counter() - t_par
+
+    # Build deterministic coverage notices (missing FY2026 filings, fiscal calendar misalignment, etc.)
+    coverage_notices = build_coverage_notices(
+        variance_reports=variance_reports,
+        missing_tickers=missing_tickers,
+        query=query,
+        sector_coverage=sector_coverage,
+        pre_notices=pre_notices,
+    )
+
     # Step 4 & Step 5: Structured ReAct Execution Loop
-    # (1. Evaluate calculated variances -> 2. Query cached 10-K context for explanation -> 3. Format grounded output + Flash eval)
     last_cache_claims: VerifiedAgentS2SClaims | None = None
 
     def _on_cache_s2s_call(_ticker: str, _fy: int, _sec: str) -> None:
@@ -891,7 +1305,7 @@ def run_conversational_rag_turn(
     ).execute_post_retrieval_reasoning(
         query=query,
         intent=intent,
-        scope=scope,
+        scope=public_scope,
         variance_reports=variance_reports,
         citations=citations,
         sector_benchmarks=sector_benchmarks,
@@ -904,6 +1318,12 @@ def run_conversational_rag_turn(
         on_cache_s2s_call=_on_cache_s2s_call,
         material_variance_flags=material_flags,
         disclosure_deltas=disclosure_deltas,
+        coverage_notices=coverage_notices,
+        sector_map_summaries=sector_map_summaries,
+        prompt_already_verified=True,
+        run_judge_sync=run_judge_sync,
+        skip_background_judge=skip_background_judge,
+        on_progress=on_progress,
     )
 
     answer_markdown: str = react_result["answer_markdown"]
@@ -919,7 +1339,6 @@ def run_conversational_rag_turn(
     active_execution_mode: str = react_result["execution_mode"]
     adk_runtime_meta: dict[str, Any] = react_result["adk_runtime"]
 
-    # Record S2S-attested trace step for ReAct Step 1 (Evaluate Variances via FinancialAnalystAgent)
     eval_var_step = react_steps[0]
     agent_trace.append(
         {
@@ -940,7 +1359,6 @@ def run_conversational_rag_turn(
         }
     )
 
-    # Populate context_cache_info & S2S-attested trace step for ReAct Step 2 (Query Cached 10-K Context)
     context_cache_info: dict[str, Any] | None = None
     if cached_explanations and last_cache_claims is not None:
         primary_exp = cached_explanations[0]
@@ -977,59 +1395,9 @@ def run_conversational_rag_turn(
                 ),
             }
         )
-    elif citations:
-        t4 = time.perf_counter()
-        authorize_agent_s2s_hop(
-            caller_agent="FinancialAnalystAgent",
-            callee_agent="ContextCacheManager",
-        )
-        cache_claims = authorize_agent_tool_invocation(
-            agent_name="ContextCacheManager",
-            tool_name="load_cached_10k_section",
-            caller="FinancialAnalystAgent",
-        )
-        _track_agent_identity(cache_claims)
-        top_cit = citations[0]
-        cache_res = load_cached_10k_section(
-            ticker=top_cit["ticker"],
-            fiscal_year=int(top_cit["fiscal_year"]),
-            section_id=top_cit["section_id"],
-            max_chars=4000,
-        )
-        cache_ms = round((time.perf_counter() - t4) * 1000.0, 2)
-        if cache_res.get("status") == "success":
-            context_cache_info = {
-                "cache_key": cache_res["cache_key"],
-                "cache_hit": cache_res["cache_hit"],
-                "ticker": cache_res["ticker"],
-                "fiscal_year": cache_res["fiscal_year"],
-                "section_id": cache_res["section_id"],
-                "token_estimate": cache_res["token_estimate"],
-                "sec_filing_url": cache_res["sec_filing_url"],
-                "sections_queried_count": 1,
-                "cache_hits_count": 1 if cache_res["cache_hit"] else 0,
-                "total_section_tokens": cache_res["token_estimate"],
-                "lookup_latency_ms": cache_res.get("lookup_latency_ms", cache_ms),
-            }
-            agent_trace.append(
-                {
-                    "step": len(agent_trace) + 1,
-                    "agent": "ContextCacheManager",
-                    "agent_service_account": cache_claims.service_account_email,
-                    "spiffe_id": cache_claims.spiffe_id,
-                    "s2s_target_service": cache_claims.target_service,
-                    "s2s_verified": True,
-                    "tool": "load_cached_10k_section",
-                    "status": "completed",
-                    "duration_ms": cache_ms,
-                    "summary": (
-                        f"{'HIT' if cache_res['cache_hit'] else 'WARMED'} cached 10-K context "
-                        f"`{cache_res['cache_key']}` (~{cache_res['token_estimate']:,} tokens)."
-                    ),
-                }
-            )
 
-    # Post-Generation Numeric Fact-Check & Gemini 3.5 Flash Evaluation S2S Attestation
+    # Post-Generation Numeric Fact-Check S2S Attestation
+    _emit("verifying", "Verifying citations, XBRL provenance, and compliance guardrails...", None)
     t5 = time.perf_counter()
     s2s_broker = get_agent_s2s_broker()
     raw_fc_assertion = s2s_broker.mint_s2s_assertion(
@@ -1048,6 +1416,7 @@ def run_conversational_rag_turn(
     fc_ms = round((time.perf_counter() - t5) * 1000.0 + synth_step.duration_ms, 2)
 
     # Post-Generation Managed Model Armor, Cloud SDP & Projection Leak Filter
+    # Reuse the ADK callback inspection result when already checked, eliminating 2 redundant HTTP calls.
     t_resp_armor = time.perf_counter()
     if react_result.get("model_armor_response_blocked") is True:
         raw_plugin_dec = react_result.get("model_armor_response_decision") or {}
@@ -1070,21 +1439,31 @@ def run_conversational_rag_turn(
             s2s_service_account=str(raw_plugin_dec.get("s2s_service_account") or ""),
             s2s_spiffe_id=str(raw_plugin_dec.get("s2s_spiffe_id") or ""),
         )
+    elif react_result.get("adk_response_already_inspected") and isinstance(
+        react_result.get("adk_response_decision"), dict
+    ):
+        prev_dec = react_result["adk_response_decision"]
+        resp_decision = GuardrailDecision(
+            action=prev_dec.get("action") or "allowed",
+            blocked=bool(prev_dec.get("blocked", False)),
+            sdp_redacted=bool(prev_dec.get("sdp_redacted", False)),
+            projection_blocked=bool(prev_dec.get("projection_blocked", False)),
+            original_text=answer_markdown,
+            sanitized_text=answer_markdown,
+            matched_categories=tuple(prev_dec.get("matched_categories") or ()),
+            sdp_info_types=tuple(prev_dec.get("sdp_info_types") or ()),
+            block_message=str(prev_dec.get("block_message") or ""),
+            backend_used=str(prev_dec.get("backend_used") or "gcp_model_armor_v1"),
+            latency_ms=float(prev_dec.get("latency_ms") or 0.0),
+            s2s_service_account=str(prev_dec.get("s2s_service_account") or ""),
+            s2s_spiffe_id=str(prev_dec.get("s2s_spiffe_id") or ""),
+        )
     else:
         resp_decision = guardrail_svc.inspect_model_response(
             answer_markdown,
             caller_agent="FinancialAnalystAgent",
         )
-        raw_report_text = str(react_result.get("raw_structured_report_text") or "")
-        if not resp_decision.blocked and raw_report_text:
-            # Structured-report verification can drop unsupported sentences before rendering;
-            # a projection or MNPI leak in the raw model output must still be blocked & audited.
-            raw_decision = guardrail_svc.inspect_model_response(
-                raw_report_text,
-                caller_agent="FinancialAnalystAgent",
-            )
-            if raw_decision.blocked:
-                resp_decision = raw_decision
+
     if resp_decision.blocked:
         out_guard_claims = authorize_agent_s2s_hop(
             caller_agent="FinancialAnalystAgent",
@@ -1122,10 +1501,10 @@ def run_conversational_rag_turn(
             intent=resp_blocked_intent,
             execution_mode="guardrail_blocked",
             status_outcome="blocked",
-            tickers_analyzed=scope["tickers"],
-            gics_sector=scope["gics_sector"],
-            start_year=scope["start_year"],
-            end_year=scope["end_year"],
+            tickers_analyzed=public_scope["tickers"],
+            gics_sector=public_scope["gics_sector"],
+            start_year=public_scope["start_year"],
+            end_year=public_scope["end_year"],
             report_generated=False,
             variance_reports_count=len(variance_reports),
             citations_count=0,
@@ -1146,11 +1525,14 @@ def run_conversational_rag_turn(
             "prompt_store": get_prompt_store_status_metadata(),
             "intent": resp_blocked_intent,
             "orchestrator": RootOrchestrator.name,
-            "resolved_scope": scope,
+            "resolved_scope": public_scope,
             "answer_markdown": (
                 "### Response Withheld by Managed Model Armor & SEC Compliance Guardrails\n\n"
                 f"{resp_decision.block_message}"
             ),
+            "coverage_notices": coverage_notices,
+            "suggested_followups": [],
+            "sector_coverage": sector_coverage,
             "variance_reports": variance_reports,
             "citations": [],
             "context_cache": context_cache_info,
@@ -1182,7 +1564,7 @@ def run_conversational_rag_turn(
             "total_latency_ms": resp_blocked_ms,
         }
 
-    if resp_decision.sdp_redacted:
+    if resp_decision.sdp_redacted and resp_decision.sanitized_text != answer_markdown:
         answer_markdown = resp_decision.sanitized_text
         out_guard_claims = authorize_agent_s2s_hop(
             caller_agent="FinancialAnalystAgent",
@@ -1226,7 +1608,8 @@ def run_conversational_rag_turn(
             "status": "completed" if fact_check.passed else "warning",
             "duration_ms": fc_ms,
             "summary": (
-                f"Formatted grounded report (`{reasoning_model}`) & evaluated (`{evaluation_model}`: "
+                f"Formatted grounded report (`{reasoning_model}`) & verification "
+                f"(judge_mode={react_result.get('judge_mode', 'async_background')}, "
                 f"grade={eval_report.grade}, score={eval_report.overall_score:.2f}) · "
                 f"Verified {fact_check.checked_metrics_count} variance figure(s) & "
                 f"{fact_check.matched_citations_count} citation tag(s) · Passed: {fact_check.passed}."
@@ -1234,7 +1617,7 @@ def run_conversational_rag_turn(
         }
     )
 
-    # Persist turn into ConversationMemoryManager (with automatic Gemini 3.5 Flash compaction if over threshold)
+    # Persist turn into durable Firestore-backed ConversationMemoryManager (keyed by user_id + session_id)
     variance_highlights = [
         ev.material_findings[0] for ev in variance_evaluations if ev.material_findings
     ]
@@ -1243,10 +1626,10 @@ def run_conversational_rag_turn(
         user_id=user_id,
         query=query,
         intent=intent,
-        tickers=scope["tickers"],
-        gics_sector=scope["gics_sector"],
-        start_year=scope["start_year"],
-        end_year=scope["end_year"],
+        tickers=public_scope["tickers"],
+        gics_sector=public_scope["gics_sector"],
+        start_year=public_scope["start_year"],
+        end_year=public_scope["end_year"],
         variance_highlights=variance_highlights,
         cited_chunk_ids=[c["chunk_id"] for c in citations],
         cached_10k_keys=[e.cache_key for e in cached_explanations],
@@ -1256,7 +1639,7 @@ def run_conversational_rag_turn(
     total_latency_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
     analyzed_tickers = sorted(
         {
-            *(scope.get("tickers") or []),
+            *(public_scope.get("tickers") or []),
             *(r["ticker"] for r in variance_reports if r.get("ticker")),
             *(c["ticker"] for c in citations if c.get("ticker")),
         }
@@ -1268,9 +1651,9 @@ def run_conversational_rag_turn(
         execution_mode=active_execution_mode,
         status_outcome="success",
         tickers_analyzed=analyzed_tickers,
-        gics_sector=scope["gics_sector"],
-        start_year=scope["start_year"],
-        end_year=scope["end_year"],
+        gics_sector=public_scope["gics_sector"],
+        start_year=public_scope["start_year"],
+        end_year=public_scope["end_year"],
         report_generated=bool(react_result.get("answer_verified")),
         variance_reports_count=len(variance_reports),
         citations_count=len(citations),
@@ -1281,6 +1664,7 @@ def run_conversational_rag_turn(
         evaluation_grade=eval_report.grade,
         evaluation_score=eval_report.overall_score,
     )
+    _emit("complete", "Grounded report ready.", {"total_latency_ms": total_latency_ms})
     return {
         "status": "success",
         "model_armor_blocked": False,
@@ -1290,16 +1674,18 @@ def run_conversational_rag_turn(
         },
         "execution_mode": active_execution_mode,
         "adk_runtime": adk_runtime_meta,
-        # Verified structured answer (None when the live answer was free text or withheld)
         "structured_report": adk_runtime_meta.get("structured_report"),
         "report_verification": adk_runtime_meta.get("report_verification"),
         "prompt_store": get_prompt_store_status_metadata(),
         "intent": intent,
         "orchestrator": RootOrchestrator.name,
-        "resolved_scope": scope,
+        "resolved_scope": public_scope,
         "answer_markdown": answer_markdown,
-        # False when the live answer failed verification and its narrative was withheld
         "answer_verified": bool(react_result.get("answer_verified")),
+        "coverage_notices": coverage_notices,
+        "sector_coverage": sector_coverage,
+        "missing_tickers": missing_tickers,
+        "suggested_followups": [],
         "variance_reports": variance_reports,
         "sector_benchmarks": sector_benchmarks,
         "material_variance_flags": material_flags,
@@ -1314,6 +1700,7 @@ def run_conversational_rag_turn(
             "strategy": "structured_react_loop",
             "execution_mode": active_execution_mode,
             "observed_ttft_ms": adk_runtime_meta.get("observed_ttft_ms"),
+            "judge_mode": react_result.get("judge_mode", "async_background"),
             "iterations": len(react_steps),
             "steps": [s.model_dump(mode="json") for s in react_steps],
             "variance_evaluations": [v.model_dump(mode="json") for v in variance_evaluations],

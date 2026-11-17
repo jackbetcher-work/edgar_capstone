@@ -45,6 +45,46 @@ class MetricRecord(BaseModel):
     )
 
 
+class NumericCitation(BaseModel):
+    """Traceable SEC XBRL filing citation for a reported numeric value."""
+
+    ticker: str
+    fiscal_year: int
+    period_of_report: str | None = Field(
+        default=None, description="Fiscal period end date (YYYY-MM-DD)"
+    )
+    filing_date: str | None = Field(default=None, description="SEC 10-K filing date (YYYY-MM-DD)")
+    accession_number: str | None = Field(default=None, description="SEC EDGAR accession number")
+    sec_filing_url: str | None = Field(default=None, description="Direct SEC EDGAR filing URL")
+    metric: str = Field(..., description="Metric name (e.g., revenue, research_and_development)")
+    xbrl_concept: str | None = Field(
+        default=None, description="XBRL concept from metric_provenance (e.g., us-gaap:Revenues)"
+    )
+    value: float | None = Field(default=None, description="Reported numeric figure in USD")
+
+
+class CoverageNotice(BaseModel):
+    """Deterministic system notice documenting corpus coverage, missing years, or calendar drift."""
+
+    code: Literal[
+        "missing_fiscal_year",
+        "missing_ticker",
+        "fiscal_calendar_misalignment",
+        "missing_metric",
+        "unsupported_metric",
+        "unsupported_filing_type",
+        "out_of_range_year",
+        "non_sp500_issuer",
+        "sector_coverage_summary",
+        "partial_coverage",
+    ]
+    severity: Literal["info", "warning"] = "info"
+    message: str
+    tickers: list[str] = Field(default_factory=list)
+    missing_years: list[int] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
 class MetricVariance(BaseModel):
     """Deterministic period-over-period variance for a single financial metric."""
 
@@ -65,6 +105,34 @@ class MetricVariance(BaseModel):
         description="Compound Annual Growth Rate percentage across multi-year spans",
     )
     direction: Literal["increase", "decrease", "flat", "unavailable"] = "unavailable"
+    start_period_of_report: str | None = Field(
+        default=None, description="Fiscal period end date (YYYY-MM-DD) for start_year"
+    )
+    end_period_of_report: str | None = Field(
+        default=None, description="Fiscal period end date (YYYY-MM-DD) for end_year"
+    )
+    start_accession_number: str | None = Field(
+        default=None, description="SEC accession number for start_year 10-K"
+    )
+    end_accession_number: str | None = Field(
+        default=None, description="SEC accession number for end_year 10-K"
+    )
+    start_sec_filing_url: str | None = Field(
+        default=None, description="SEC EDGAR URL for start_year 10-K"
+    )
+    end_sec_filing_url: str | None = Field(
+        default=None, description="SEC EDGAR URL for end_year 10-K"
+    )
+    start_xbrl_concept: str | None = Field(
+        default=None, description="XBRL concept provenance for start_value"
+    )
+    end_xbrl_concept: str | None = Field(
+        default=None, description="XBRL concept provenance for end_value"
+    )
+    derived_from: list[NumericCitation] = Field(
+        default_factory=list,
+        description="Reported start and end XBRL inputs from which this variance was derived",
+    )
 
 
 class AnnualStepVariance(BaseModel):
@@ -72,6 +140,12 @@ class AnnualStepVariance(BaseModel):
 
     fiscal_year: int
     prev_fiscal_year: int | None = None
+    period_of_report: str | None = None
+    filing_date: str | None = None
+    accession_number: str | None = None
+    prior_period_of_report: str | None = None
+    prior_accession_number: str | None = None
+    prior_sec_filing_url: str | None = None
     revenue: float | None = None
     revenue_yoy_delta: float | None = None
     revenue_yoy_pct: float | None = None
@@ -84,6 +158,10 @@ class AnnualStepVariance(BaseModel):
     research_and_development: float | None = None
     research_and_development_yoy_delta: float | None = None
     research_and_development_yoy_pct: float | None = None
+    metric_provenance: dict[str, str | None] = Field(
+        default_factory=dict,
+        description="XBRL concept per reported metric for this fiscal year",
+    )
     sec_filing_url: str | None = None
 
 
@@ -97,6 +175,10 @@ class CompanyVarianceReport(BaseModel):
     gics_sub_industry: str
     start_year: int
     end_year: int
+    requested_start_year: int | None = None
+    requested_end_year: int | None = None
+    available_fiscal_years: list[int] = Field(default_factory=list)
+    missing_fiscal_years: list[int] = Field(default_factory=list)
     currency: str = "USD"
     revenue_variance: MetricVariance
     operating_income_variance: MetricVariance
@@ -122,6 +204,23 @@ class CompanyVarianceReport(BaseModel):
     annual_series: list[AnnualStepVariance] = Field(default_factory=list)
     source_urls: dict[int, str] = Field(
         default_factory=dict, description="Mapping of fiscal_year -> sec_filing_url"
+    )
+    period_end_dates: dict[int, str] = Field(
+        default_factory=dict, description="Mapping of fiscal_year -> period_of_report (YYYY-MM-DD)"
+    )
+    filing_dates: dict[int, str] = Field(
+        default_factory=dict, description="Mapping of fiscal_year -> filing_date (YYYY-MM-DD)"
+    )
+    accession_numbers: dict[int, str] = Field(
+        default_factory=dict, description="Mapping of fiscal_year -> SEC accession_number"
+    )
+    metric_provenance: dict[int, dict[str, str | None]] = Field(
+        default_factory=dict,
+        description="Mapping of fiscal_year -> {metric -> XBRL concept}",
+    )
+    derived_margin_inputs: dict[str, list[NumericCitation]] = Field(
+        default_factory=dict,
+        description="Reported numerator and revenue denominator XBRL inputs for margin/intensity deltas",
     )
 
 
@@ -156,6 +255,11 @@ class GroundedCitation(BaseModel):
     company_name: str = Field(..., description="Official company name")
     gics_sector: str = Field(..., description="GICS Sector")
     fiscal_year: int = Field(..., description="Reporting fiscal year")
+    period_of_report: str | None = Field(
+        default=None, description="Fiscal period end date (YYYY-MM-DD)"
+    )
+    filing_date: str | None = Field(default=None, description="SEC 10-K filing date (YYYY-MM-DD)")
+    accession_number: str | None = Field(default=None, description="SEC EDGAR accession number")
     section_id: Literal["item_1a", "item_7"] = Field(..., description="10-K section identifier")
     section_title: str = Field(..., description="Human-readable section & subsection breadcrumb")
     excerpt: str = Field(..., description="Grounded 10-K Markdown passage text")
@@ -432,6 +536,16 @@ class MaterialFlagSource(BaseModel):
     prior_accession_number: str | None = None
     prior_sec_filing_url: str | None = None
     prior_period_of_report: str | None = None
+    prior_xbrl_concept: str | None = Field(
+        default=None, description="XBRL concept the prior-year value was read from"
+    )
+    denominator_xbrl_concept: str | None = Field(
+        default=None,
+        description="Denominator XBRL concept (e.g. Revenue) for margin/intensity flags",
+    )
+    prior_denominator_xbrl_concept: str | None = Field(
+        default=None, description="Prior-year denominator XBRL concept for margin/intensity flags"
+    )
 
 
 class MaterialFlagExplanation(BaseModel):
@@ -555,8 +669,10 @@ class NarrativeEvaluationReport(BaseModel):
     overall_score: float = Field(default=1.0, ge=0.0, le=1.0)
     numeric_fidelity_score: float = Field(default=1.0, ge=0.0, le=1.0)
     citation_grounding_score: float = Field(default=1.0, ge=0.0, le=1.0)
+    citation_precision_score: float | None = Field(default=None, ge=0.0, le=1.0)
     explanation_quality_score: float = Field(default=1.0, ge=0.0, le=1.0)
     thematic_consistency_score: float = Field(default=1.0, ge=0.0, le=1.0)
+    unsupported_claims_count: int = Field(default=0, ge=0)
     rationale: str = ""
     context_tokens: int = 0
     context_latency_ms: float = 0.0
@@ -587,7 +703,7 @@ class CodingAssistanceReport(BaseModel):
 
 
 class AnalystMetricReference(BaseModel):
-    """A headline metric to display. Values are filled in from the deterministic engine."""
+    """A headline metric to display. Values and XBRL citations are filled in from the deterministic engine."""
 
     ticker: str = Field(
         ..., description="Ticker of a company in the variance payload, e.g. 'NVDA'."
@@ -596,14 +712,10 @@ class AnalystMetricReference(BaseModel):
         Field(
             ...,
             description=(
-                "Metric to show; its figures come from the deterministic engine. Use "
-                "'research_and_development' for R&D spend questions."
+                "Metric to show; its figures and XBRL citations come from the deterministic engine. "
+                "Use 'research_and_development' for R&D spend questions."
             ),
         )
-    )
-    note: str = Field(
-        default="",
-        description="Optional label of at most 12 words, e.g. 'fastest growth'. No figures.",
     )
 
 
@@ -637,7 +749,12 @@ class AnalystFinding(BaseModel):
 
 
 class AnalystReport(BaseModel):
-    """Structured, verifiable answer produced by FinancialAnalystAgent."""
+    """Structured, verifiable answer produced by FinancialAnalystAgent.
+
+    Every qualitative claim lives in `findings` with verbatim quote & chunk_id grounding;
+    uncited free-text notes are disallowed. System-generated coverage caveats and missing-year
+    notices are rendered deterministically outside the LLM schema.
+    """
 
     headline: str = Field(
         ...,
@@ -650,11 +767,4 @@ class AnalystReport(BaseModel):
     findings: list[AnalystFinding] = Field(
         default_factory=list,
         description="Up to 6 grounded findings, most important first.",
-    )
-    notes: str = Field(
-        default="",
-        description=(
-            "Other details worth sharing in at most 120 words: caveats, data gaps, how "
-            "disclosures changed. Not source-verified, so do not introduce new figures here."
-        ),
     )

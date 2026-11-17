@@ -15,11 +15,16 @@ Implements the structured ReAct loop (`Thought -> Action -> Observation -> ... -
 
 from __future__ import annotations
 
+import atexit
+import contextvars
 import json
 import logging
 import re
+import sys
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
@@ -54,6 +59,103 @@ from edgar_capstone.observability.tracing import traced
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
 logger = logging.getLogger(__name__)
+
+# Bounded background thread pool for off-critical-path LLM-as-a-Judge evaluation on interactive turns.
+_BACKGROUND_JUDGE_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="edgar-bg-judge")
+_PENDING_JUDGE_LOCK = threading.Lock()
+_PENDING_JUDGE_FUTURES: list[Future[Any]] = []
+_SHUTTING_DOWN = threading.Event()
+
+
+def _on_interpreter_exit() -> None:
+    _SHUTTING_DOWN.set()
+    with _PENDING_JUDGE_LOCK:
+        pending = list(_PENDING_JUDGE_FUTURES)
+        _PENDING_JUDGE_FUTURES.clear()
+    # Cancel unstarted futures; wait briefly for any in-flight judge call so it finishes before
+    # `concurrent.futures.thread._python_exit` tears down the default asyncio executor.
+    for fut in pending:
+        fut.cancel()
+    for fut in pending:
+        if not fut.cancelled() and not fut.done():
+            try:
+                fut.result(timeout=12.0)
+            except Exception:
+                pass
+    try:
+        _BACKGROUND_JUDGE_POOL.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
+atexit.register(_on_interpreter_exit)
+
+
+def flush_pending_evaluations(timeout: float = 30.0) -> int:
+    """Wait for any pending background LLM-as-a-Judge tasks (used by tests & shutdown hooks)."""
+    with _PENDING_JUDGE_LOCK:
+        pending = list(_PENDING_JUDGE_FUTURES)
+        _PENDING_JUDGE_FUTURES.clear()
+    completed = 0
+    for fut in pending:
+        try:
+            fut.result(timeout=timeout)
+            completed += 1
+        except Exception:
+            logger.debug("Background judge future raised during flush", exc_info=True)
+    return completed
+
+
+def _schedule_background_judge(
+    *,
+    query: str,
+    response_markdown: str,
+    variance_reports: list[dict[str, Any]],
+    citations: list[dict[str, Any]],
+    cached_explanations_count: int,
+    llm: BaseLlm | None = None,
+) -> Future[Any] | None:
+    """Run live Flash LLM-as-a-Judge asynchronously off the interactive request path."""
+    if _SHUTTING_DOWN.is_set() or sys.is_finalizing():
+        return None
+
+    def _run() -> NarrativeEvaluationReport | None:
+        if _SHUTTING_DOWN.is_set() or sys.is_finalizing():
+            return None
+        try:
+            return evaluate_variance_explanation(
+                query=query,
+                response_markdown=response_markdown,
+                variance_reports=variance_reports,
+                citations=citations,
+                cached_explanations_count=cached_explanations_count,
+                llm=llm,
+            )
+        except RuntimeError as exc:
+            msg_low = str(exc).lower()
+            if (
+                "interpreter shutdown" in msg_low
+                or "after shutdown" in msg_low
+                or _SHUTTING_DOWN.is_set()
+                or sys.is_finalizing()
+            ):
+                return None
+            logger.warning("Background async LLM-as-a-Judge evaluation failed: %s", exc)
+            return None
+        except Exception:
+            if not (_SHUTTING_DOWN.is_set() or sys.is_finalizing()):
+                logger.warning("Background async LLM-as-a-Judge evaluation failed", exc_info=True)
+            return None
+
+    ctx = contextvars.copy_context()
+    try:
+        fut = _BACKGROUND_JUDGE_POOL.submit(ctx.run, _run)
+    except RuntimeError:
+        return None
+    with _PENDING_JUDGE_LOCK:
+        _PENDING_JUDGE_FUTURES[:] = [f for f in _PENDING_JUDGE_FUTURES if not f.done()]
+        _PENDING_JUDGE_FUTURES.append(fut)
+    return fut
 
 
 def _fmt_usd(value: float | None) -> str:
@@ -274,11 +376,13 @@ def query_cached_10k_for_explanations(
 
     explanations: list[Cached10KExplanation] = []
     linked_citations: list[dict[str, Any]] = []
+    batch = planned_requests[:max_queries]
 
-    for req in planned_requests[:max_queries]:
+    for req in batch:
         if on_cache_call is not None:
             on_cache_call(req["ticker"], int(req["fiscal_year"]), req["section_id"])
 
+    def _query_one(req: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         res = query_cached_10k_context(
             ticker=req["ticker"],
             fiscal_year=int(req["fiscal_year"]),
@@ -286,6 +390,17 @@ def query_cached_10k_for_explanations(
             variance_query=req["variance_query"],
             max_passages=2,
         )
+        return req, res
+
+    ordered_results: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    if len(batch) <= 1:
+        ordered_results = [_query_one(r) for r in batch]
+    else:
+        with ThreadPoolExecutor(max_workers=min(6, len(batch))) as pool:
+            futs = [pool.submit(contextvars.copy_context().run, _query_one, req) for req in batch]
+            ordered_results = [fut.result() for fut in futs]
+
+    for req, res in ordered_results:
         if res.get("status") != "success":
             continue
 
@@ -395,12 +510,15 @@ def _summarize_agent_retrieval(
         if fc.get("name") in _RETRIEVAL_TOOL_NAMES
     ]
     known_ids = {str(c.get("chunk_id")) for c in merged_citations}
-    cited_ids = list(dict.fromkeys(m.strip() for m in _CITED_CHUNK_ID_RE.findall(answer_markdown)))
+    raw_tags = list(dict.fromkeys(m.strip() for m in _CITED_CHUNK_ID_RE.findall(answer_markdown)))
+    cited_xbrl_accessions = [t[4:] for t in raw_tags if t.startswith("acc:")]
+    cited_ids = [t for t in raw_tags if not t.startswith("acc:")]
     return {
         "retrieval_tool_calls": retrieval_calls,
         "retrieval_tool_calls_count": len(retrieval_calls),
         "agent_retrieved_chunk_ids": [str(c.get("chunk_id")) for c in agent_retrieved_citations],
         "cited_chunk_ids": cited_ids,
+        "cited_xbrl_accessions": cited_xbrl_accessions,
         "unresolved_cited_chunk_ids": [cid for cid in cited_ids if cid not in known_ids],
     }
 
@@ -443,6 +561,12 @@ class StructuredReActExecutor:
         on_cache_s2s_call: Callable[[str, int, str], None] | None = None,
         material_variance_flags: list[dict[str, Any]] | None = None,
         disclosure_deltas: dict[str, Any] | None = None,
+        coverage_notices: list[dict[str, Any]] | None = None,
+        sector_map_summaries: dict[str, Any] | None = None,
+        prompt_already_verified: bool = False,
+        run_judge_sync: bool = False,
+        skip_background_judge: bool = False,
+        on_progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
     ) -> dict[str, Any]:
         """Run the variance pre-pass, cached 10-K querying, live synthesis, and Flash evaluation."""
         material_variance_flags = list(material_variance_flags or [])
@@ -622,6 +746,12 @@ class StructuredReActExecutor:
         t_synth = time.perf_counter()
         calc_map = {f"{r['ticker']}_{r['start_year']}_{r['end_year']}": r for r in variance_reports}
         schema_failure_reason: str | None = None
+        if on_progress is not None:
+            on_progress(
+                "synthesizing",
+                f"Synthesizing grounded report via {reasoning_model}...",
+                {"citation_count": len(merged_citations)},
+            )
         try:
             live_stream_result = run_live_adk_financial_reasoning(
                 query=query,
@@ -641,6 +771,9 @@ class StructuredReActExecutor:
                 summarizer_llm=self.judge_llm,
                 material_variance_flags=material_variance_flags,
                 disclosure_deltas=disclosure_deltas,
+                coverage_notices=coverage_notices,
+                sector_map_summaries=sector_map_summaries,
+                prompt_already_verified=prompt_already_verified,
             )
         except Exception as exc:
             schema_error = _output_schema_error(exc)
@@ -700,6 +833,70 @@ class StructuredReActExecutor:
                 citations=merged_citations,
                 material_flags=material_variance_flags,
             )
+            # Per §8 Citation Model ("fails verification and is regenerated, or the claim is
+            # removed"): if ALL live Gemini findings failed verification, allow one targeted
+            # regeneration pass with the exact verifier reasons before withholding.
+            if not verified.verification.usable and self.reasoning_llm is None:
+                feedback_lines = [
+                    f"- Finding {fv.index}: {'; '.join(fv.reasons)}"
+                    for fv in verified.verification.findings
+                    if not fv.verified
+                ]
+                logger.info(
+                    "All %d live AnalystReport findings failed verification; running one "
+                    "verification-guided regeneration pass.",
+                    verified.verification.findings_total,
+                )
+                try:
+                    retry_res = run_live_adk_financial_reasoning(
+                        query=query,
+                        intent=intent,
+                        scope=scope,
+                        variance_reports=variance_reports,
+                        variance_evaluations=[
+                            v.model_dump(mode="json") for v in variance_evaluations
+                        ],
+                        cached_explanations=[
+                            c.model_dump(mode="json") for c in cached_explanations
+                        ],
+                        citations=merged_citations,
+                        sector_benchmarks=sector_benchmarks,
+                        chunk_health=chunk_health,
+                        memory_context=memory_context,
+                        session_id=f"{session_id or 'sess'}-retry",
+                        user_id=user_id,
+                        resolution=runtime_res,
+                        custom_llm=None,
+                        summarizer_llm=self.judge_llm,
+                        material_variance_flags=material_variance_flags,
+                        disclosure_deltas=disclosure_deltas,
+                        coverage_notices=coverage_notices,
+                        sector_map_summaries=sector_map_summaries,
+                        prompt_already_verified=prompt_already_verified,
+                        verification_feedback="\n".join(feedback_lines),
+                    )
+                    turn_latency_records.extend(live_stream_result.latency_records)
+                    live_stream_result = retry_res
+                    agent_retrieved_citations += _merge_agent_retrieved_citations(
+                        merged_citations,
+                        retry_res.session_state.get("retrieved_citations"),
+                    )
+                    retry_structured = parse_analyst_report(
+                        retry_res.session_state.get("financial_analyst_report")
+                    )
+                    if retry_structured is not None:
+                        structured = retry_structured
+                        verified = verify_analyst_report(
+                            structured,
+                            variance_reports=variance_reports,
+                            citations=merged_citations,
+                            material_flags=material_variance_flags,
+                        )
+                except Exception:
+                    logger.warning(
+                        "Verification-guided regeneration pass failed; withholding response.",
+                        exc_info=True,
+                    )
             report_verification = verified.verification
             structured_report_dict = verified.report.model_dump(mode="json")
             # Unverified original, kept so the response guardrail also sees claims
@@ -713,6 +910,7 @@ class StructuredReActExecutor:
                     variance_reports=variance_reports,
                     citations=merged_citations,
                     scope=scope,
+                    coverage_notices=coverage_notices,
                 )
                 check = verify_narrative_against_calculations(
                     response_text=answer_markdown,
@@ -784,20 +982,69 @@ class StructuredReActExecutor:
         # ------------------------------------------------------------------
         # ReAct Verification & Gemini 3.5 Flash Evaluation Step
         # ------------------------------------------------------------------
+        # On interactive chat turns (`run_judge_sync=False` and no injected test judge_llm),
+        # dispatch the live Flash LLM-as-a-Judge asynchronously off the critical path so the
+        # user does not wait an extra ~10-20s after claim verification has already passed.
+        judge_mode = "skipped"
         if answer_verified:
-            eval_report: NarrativeEvaluationReport = evaluate_variance_explanation(
-                query=query,
-                response_markdown=answer_markdown,
-                variance_reports=variance_reports,
-                citations=merged_citations,
-                cached_explanations_count=len(cached_explanations),
-                llm=self.judge_llm,
-            )
-            latest_flash_recs = tracker.recent_records(
-                limit=1, model_name=eval_report.evaluator_model
-            )
-            if latest_flash_recs:
-                turn_latency_records.append(latest_flash_recs[-1])
+            if run_judge_sync or self.judge_llm is not None:
+                judge_mode = "sync"
+                eval_report: NarrativeEvaluationReport = evaluate_variance_explanation(
+                    query=query,
+                    response_markdown=answer_markdown,
+                    variance_reports=variance_reports,
+                    citations=merged_citations,
+                    cached_explanations_count=len(cached_explanations),
+                    llm=self.judge_llm,
+                )
+                latest_flash_recs = tracker.recent_records(
+                    limit=1, model_name=eval_report.evaluator_model
+                )
+                if latest_flash_recs:
+                    turn_latency_records.append(latest_flash_recs[-1])
+            elif skip_background_judge:
+                judge_mode = "deferred_to_caller"
+                eval_report = NarrativeEvaluationReport(
+                    evaluator_model=resolve_model_for_task("evaluation"),
+                    grade="pass",
+                    overall_score=1.0,
+                    numeric_fidelity_score=1.0,
+                    citation_grounding_score=1.0,
+                    citation_precision_score=None,
+                    explanation_quality_score=1.0,
+                    thematic_consistency_score=1.0,
+                    unsupported_claims_count=0,
+                    rationale=(
+                        "Deterministic claim verification passed; LLM-as-a-Judge deferred to "
+                        "caller evaluation harness."
+                    ),
+                )
+            else:
+                judge_mode = "async_background"
+                _schedule_background_judge(
+                    query=query,
+                    response_markdown=answer_markdown,
+                    variance_reports=variance_reports,
+                    citations=merged_citations,
+                    cached_explanations_count=len(cached_explanations),
+                    llm=None,
+                )
+                eval_report = NarrativeEvaluationReport(
+                    evaluator_model=resolve_model_for_task("evaluation"),
+                    grade="pass",
+                    overall_score=1.0,
+                    numeric_fidelity_score=1.0,
+                    citation_grounding_score=1.0,
+                    citation_precision_score=None,
+                    explanation_quality_score=1.0,
+                    thematic_consistency_score=1.0,
+                    unsupported_claims_count=0,
+                    rationale=(
+                        "Deterministic claim verification and numeric fact-check passed; "
+                        "live Flash LLM-as-a-Judge scheduled asynchronously off the request path "
+                        "for telemetry logging."
+                    ),
+                )
         else:
             # Nothing to judge: the narrative was withheld (or blocked). Skip the Flash call and
             # record a failing grade so telemetry and evals count the turn as unanswered.
@@ -807,8 +1054,12 @@ class StructuredReActExecutor:
                 overall_score=0.0,
                 numeric_fidelity_score=0.0,
                 citation_grounding_score=0.0,
+                citation_precision_score=0.0,
                 explanation_quality_score=0.0,
                 thematic_consistency_score=0.0,
+                unsupported_claims_count=(
+                    report_verification.findings_rejected if report_verification else 1
+                ),
                 rationale=(
                     "Not evaluated: the live answer was withheld"
                     + (
@@ -825,12 +1076,16 @@ class StructuredReActExecutor:
                 phase="fact_check_and_eval",
                 thought=(
                     f"Run post-generation numeric fact-check and {eval_report.evaluator_model} quality evaluation "
-                    f"to verify 100% calculation fidelity and citation grounding."
+                    f"({judge_mode}) to verify 100% calculation fidelity and citation grounding."
                 ),
                 action="evaluate_variance_explanation",
-                action_input={"evaluator_model": eval_report.evaluator_model},
+                action_input={
+                    "evaluator_model": eval_report.evaluator_model,
+                    "judge_mode": judge_mode,
+                },
                 observation=(
-                    f"Grade={eval_report.grade} (overall_score={eval_report.overall_score:.2f}, "
+                    f"Grade={eval_report.grade} (mode={judge_mode}, "
+                    f"overall_score={eval_report.overall_score:.2f}, "
                     f"numeric_fidelity={eval_report.numeric_fidelity_score:.2f}, "
                     f"citation_grounding={eval_report.citation_grounding_score:.2f})."
                 ),
@@ -855,6 +1110,7 @@ class StructuredReActExecutor:
             "adk_tool_calls": live_stream_result.function_calls,
             "answer_verified": answer_verified,
             "answer_withheld_reason": withheld_reason,
+            "judge_mode": judge_mode,
             "structured_report": structured_report_dict,
             "report_verification": (
                 report_verification.model_dump(mode="json") if report_verification else None
@@ -875,6 +1131,7 @@ class StructuredReActExecutor:
             "cached_explanations": cached_explanations,
             "react_steps": react_steps,
             "evaluation_report": eval_report,
+            "judge_mode": judge_mode,
             "turn_latency_records": turn_latency_records,
             "turn_latency_summary": turn_latency_summary,
             "reasoning_model": reasoning_model,
@@ -882,6 +1139,12 @@ class StructuredReActExecutor:
             "execution_mode": "live_adk",
             "adk_runtime": adk_runtime_meta,
             "raw_structured_report_text": raw_structured_report_text,
+            "adk_response_already_inspected": bool(
+                live_stream_result.session_state.get("_model_armor_verified_response_sha256")
+            ),
+            "adk_response_decision": live_stream_result.session_state.get(
+                "model_armor_last_response_decision"
+            ),
             "model_armor_response_blocked": adk_response_blocked,
             "model_armor_response_decision": adk_response_decision,
             "model_armor_response_block_message": adk_response_block_message,

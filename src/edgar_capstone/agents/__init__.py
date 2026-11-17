@@ -8,6 +8,9 @@ from edgar_capstone.agents.callbacks import (
     before_tool_agent_identity_callback,
     verify_narrative_against_calculations,
 )
+from edgar_capstone.agents.chat_engine import (
+    reset_company_catalog_cache,
+)
 from edgar_capstone.agents.context_cache_agent import (
     CONTEXT_CACHE_AGENT_INSTRUCTION,
     ContextCacheAgent,
@@ -98,6 +101,7 @@ from edgar_capstone.agents.prompt_store import (
 from edgar_capstone.agents.react_loop import (
     StructuredReActExecutor,
     evaluate_calculated_variances,
+    flush_pending_evaluations,
     query_cached_10k_for_explanations,
 )
 from edgar_capstone.agents.resilience import (
@@ -121,6 +125,7 @@ from edgar_capstone.agents.schemas import (
     CompanyVarianceReport,
     ContextBreakdown,
     ContextLatencySummary,
+    CoverageNotice,
     FactCheckVerification,
     GroundedCitation,
     LookerExploreQuery,
@@ -129,9 +134,13 @@ from edgar_capstone.agents.schemas import (
     ModelContextLatencyRecord,
     ModelTaskCategory,
     NarrativeEvaluationReport,
+    NumericCitation,
     ReActPhaseType,
     ReActStep,
     VarianceEvaluationItem,
+)
+from edgar_capstone.agents.sector_map_reduce import (
+    run_sector_thematic_map_reduce,
 )
 from edgar_capstone.agents.tools import (
     BigQueryAdapter,
@@ -147,7 +156,6 @@ from edgar_capstone.agents.tools import (
     QueryCached10KTool,
     VarianceCalculationTool,
     VertexAISearchAdapter,
-    VertexVectorSearchAdapter,
     calculate_period_variances,
     configure_gcp_tool_adapters,
     fetch_financial_metrics,
@@ -230,7 +238,8 @@ __all__ = [
     "VersionedPromptStore",
     "VertexAISearchAdapter",
     "VertexPromptStoreBackend",
-    "VertexVectorSearchAdapter",
+    "CoverageNotice",
+    "NumericCitation",
     "after_agent_memory_callback",
     "after_model_fact_check_callback",
     "attribute_context_latency",
@@ -256,6 +265,7 @@ __all__ = [
     "extract_llm_request_context_breakdown",
     "fetch_financial_metrics",
     "financial_analyst_agent",
+    "flush_pending_evaluations",
     "generate_financial_coding_assistance",
     "get_active_gcp_tool_adapters",
     "get_context_cache_runtime_stats",
@@ -275,6 +285,7 @@ __all__ = [
     "query_cached_10k_for_explanations",
     "query_looker_financial_explore",
     "reconcile_breakdown_with_usage_metadata",
+    "reset_company_catalog_cache",
     "reset_gcp_tool_adapters",
     "reset_prompt_store",
     "resolve_live_adk_runtime",
@@ -291,6 +302,7 @@ __all__ = [
     "run_live_adk_narrative_evaluation_async",
     "run_live_root_orchestrator_turn",
     "run_live_root_orchestrator_turn_async",
+    "run_sector_thematic_map_reduce",
     "search_10k_chunks_rag",
     "verify_narrative_against_calculations",
     "with_tool_resilience",

@@ -5,6 +5,8 @@ Import-light on purpose: nothing here imports `edgar_capstone.agents` at module 
 
 from edgar_capstone.evals.golden import (
     DEFAULT_GOLDEN_DATASET_PATH,
+    ExpectedDelta,
+    ExpectedFlag,
     ExpectedSection,
     ExpectedVariance,
     GoldenDatasetError,
@@ -25,6 +27,8 @@ __all__ = [
     "DEFAULT_GOLDEN_DATASET_PATH",
     "EvalRunReport",
     "EvalThresholds",
+    "ExpectedDelta",
+    "ExpectedFlag",
     "ExpectedSection",
     "ExpectedVariance",
     "GoldenDatasetError",

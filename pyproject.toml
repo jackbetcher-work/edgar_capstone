@@ -13,8 +13,6 @@ dependencies = [
     "fastapi>=0.110.0",
     "google-adk>=2.0.0",
     "google-auth>=2.28.0",
-    # Vector Search Private Service Connect queries (gRPC MatchService on <psc-ip>:10000)
-    "google-cloud-aiplatform>=1.70.0",
     "google-cloud-storage>=2.16.0",
     "google-genai>=1.0.0",
     "httpx>=0.25.0",
@@ -35,6 +33,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "pytest-cov>=5.0.0",
     "ruff==0.17.4",
 ]
 

@@ -27,13 +27,17 @@ GoldenCategory = Literal[
     "single_company_longitudinal",
     "multi_company_peer_comparison",
     "thematic_shift",
+    "anomaly_explanation",
+    "out_of_corpus_and_clarification",
     "safety_red_team",
 ]
 CORE_CATEGORIES: tuple[str, ...] = (
     "single_company_longitudinal",
     "multi_company_peer_comparison",
     "thematic_shift",
+    "anomaly_explanation",
 )
+SCOPE_CATEGORY = "out_of_corpus_and_clarification"
 SAFETY_CATEGORY = "safety_red_team"
 
 MetricName = Literal["revenue", "operating_income", "net_income", "research_and_development"]
@@ -49,7 +53,11 @@ QueryIntent = Literal[
     "multi_company_peer_comparison",
     "thematic_trend_tracking",
     "chunk_health_monitoring",
+    "clarification_needed",
+    "out_of_corpus",
 ]
+ExpectedStatusType = Literal["success", "blocked", "clarification", "out_of_corpus"]
+DeltaChangeType = Literal["added", "removed", "modified"]
 BlockType = Literal["prompt_safety", "projection_compliance"]
 SectionId = Literal["item_1a", "item_7"]
 
@@ -111,6 +119,52 @@ class ExpectedSection(BaseModel):
         )
 
 
+class ExpectedDelta(BaseModel):
+    """One deterministic year-over-year disclosure wording delta expected for a thematic item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: str
+    prior_fiscal_year: int
+    current_fiscal_year: int
+    change_type: DeltaChangeType
+    keyword_hint: str | None = None
+
+    @field_validator("ticker")
+    @classmethod
+    def _upper_ticker(cls, v: str) -> str:
+        return v.strip().upper().replace(".", "-")
+
+    @property
+    def label(self) -> str:
+        hint = f" ({self.keyword_hint})" if self.keyword_hint else ""
+        return (
+            f"{self.ticker} FY{self.prior_fiscal_year}->FY{self.current_fiscal_year} "
+            f"{self.change_type}{hint}"
+        )
+
+
+class ExpectedFlag(BaseModel):
+    """One deterministic material-variance anomaly flag expected for an anomaly item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ticker: str
+    fiscal_year: int
+    metric: str
+    rule: str
+    flag_id: str | None = None
+
+    @field_validator("ticker")
+    @classmethod
+    def _upper_ticker(cls, v: str) -> str:
+        return v.strip().upper().replace(".", "-")
+
+    @property
+    def label(self) -> str:
+        return self.flag_id or f"{self.ticker}_{self.fiscal_year}_{self.metric}_{self.rule}"
+
+
 class RequestFilters(BaseModel):
     """Explicit UI filter values sent with the query (defaults mirror the Terminal UI)."""
 
@@ -138,6 +192,10 @@ class GoldenEvalItem(BaseModel):
     expected_intent: QueryIntent | None = None
     expected_variances: list[ExpectedVariance] = Field(default_factory=list)
     expected_sections: list[ExpectedSection] = Field(default_factory=list)
+    expected_deltas: list[ExpectedDelta] = Field(default_factory=list)
+    expected_flags: list[ExpectedFlag] = Field(default_factory=list)
+    expected_status: ExpectedStatusType | None = None
+    expected_coverage_notice_codes: list[str] = Field(default_factory=list)
     # Exact chunk IDs are corpus-specific; they are only scored against the hydrated / GCP
     # corpus (CI synthesizes chunks from the financials manifest, which renumbers them).
     expected_chunk_ids: list[str] = Field(default_factory=list)
@@ -169,6 +227,23 @@ class GoldenEvalItem(BaseModel):
 
         if self.expect_blocked:
             raise ValueError(f"{self.id}: only safety_red_team items may set expect_blocked")
+
+        if self.category == SCOPE_CATEGORY:
+            if self.expected_status is None:
+                raise ValueError(
+                    f"{self.id}: out_of_corpus_and_clarification items must set expected_status"
+                )
+            if self.expected_status == "success":
+                if not self.reference_explanation.strip():
+                    raise ValueError(
+                        f"{self.id}: reference_explanation is required when expected_status='success'"
+                    )
+                if not self.fiscal_years:
+                    raise ValueError(
+                        f"{self.id}: fiscal_years is required when expected_status='success'"
+                    )
+            return self
+
         if not self.reference_explanation.strip():
             raise ValueError(f"{self.id}: reference_explanation is required for scored items")
         if not self.fiscal_years:
@@ -185,6 +260,17 @@ class GoldenEvalItem(BaseModel):
     @property
     def is_safety(self) -> bool:
         return self.category == SAFETY_CATEGORY
+
+    @property
+    def is_scope_early_exit(self) -> bool:
+        return self.category == SCOPE_CATEGORY and self.expected_status in (
+            "clarification",
+            "out_of_corpus",
+        )
+
+    @property
+    def is_scored_rag(self) -> bool:
+        return not self.is_safety and not self.is_scope_early_exit
 
     @property
     def start_year(self) -> int | None:
@@ -250,13 +336,14 @@ def validate_golden_dataset(
     scored = sum(counts[c] for c in CORE_CATEGORIES)
     if scored < min_scored_items:
         problems.append(f"only {scored} scored items; need at least {min_scored_items}")
-    for cat in (*CORE_CATEGORIES, SAFETY_CATEGORY):
+    required_cats = (*CORE_CATEGORIES, SCOPE_CATEGORY, SAFETY_CATEGORY)
+    for cat in required_cats:
         if counts[cat] == 0:
             problems.append(f"no items for category {cat!r}")
 
     if problems:
         raise GoldenDatasetError("Golden dataset failed validation: " + "; ".join(problems))
-    return {cat: counts[cat] for cat in (*CORE_CATEGORIES, SAFETY_CATEGORY)}
+    return {cat: counts[cat] for cat in required_cats}
 
 
 def dataset_fingerprint(items: list[GoldenEvalItem]) -> str:

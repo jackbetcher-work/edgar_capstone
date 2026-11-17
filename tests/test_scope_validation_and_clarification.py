@@ -1,0 +1,304 @@
+"""Unit tests for dynamic 501-company entity resolution, scope validation, clarification, and coverage notices."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from edgar_capstone.agents.chat_engine import resolve_query_scope
+from edgar_capstone.agents.scope_validation import (
+    SECTOR_ALIASES,
+    EntityCatalog,
+    build_coverage_notices,
+    extract_removed_tickers,
+    is_additive_followup,
+    validate_query_scope_and_coverage,
+)
+
+
+def _sample_profiles() -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(
+            ticker="NVDA", company_name="NVIDIA CORP", gics_sector="Information Technology"
+        ),
+        SimpleNamespace(
+            ticker="AAPL", company_name="Apple Inc.", gics_sector="Information Technology"
+        ),
+        SimpleNamespace(
+            ticker="MSFT",
+            company_name="Microsoft Corporation",
+            gics_sector="Information Technology",
+        ),
+        SimpleNamespace(
+            ticker="COST",
+            company_name="Costco Wholesale Corporation",
+            gics_sector="Consumer Staples",
+        ),
+        SimpleNamespace(
+            ticker="DUK", company_name="Duke Energy Corporation", gics_sector="Utilities"
+        ),
+        SimpleNamespace(ticker="PLD", company_name="Prologis, Inc.", gics_sector="Real Estate"),
+        SimpleNamespace(ticker="LIN", company_name="Linde plc", gics_sector="Materials"),
+        SimpleNamespace(
+            ticker="ALL", company_name="The Allstate Corporation", gics_sector="Financials"
+        ),
+        SimpleNamespace(
+            ticker="ON",
+            company_name="ON Semiconductor Corporation",
+            gics_sector="Information Technology",
+        ),
+    ]
+
+
+def test_entity_catalog_resolves_tickers_names_and_ignores_ambiguous_words() -> None:
+    catalog = EntityCatalog(_sample_profiles())
+    assert catalog.contains_ticker("NVDA") is True
+    assert catalog.contains_ticker("COST") is True
+    assert catalog.contains_ticker("RIVN") is False
+
+    # Resolves company names and tickers beyond any hardcoded mega-cap list (e.g., Costco, Prologis, Duke Energy)
+    found, unknown = catalog.detect_tickers_in_query("Compare Costco and Prologis revenue growth")
+    assert set(found) == {"COST", "PLD"}
+    assert unknown == []
+
+    # Ambiguous English words like "all" or "on" or "cost" must NOT trigger false ticker matches
+    found2, unknown2 = catalog.detect_tickers_in_query(
+        "What impact did cost pressures have on all companies?"
+    )
+    assert found2 == []
+    assert unknown2 == []
+
+    # Non-S&P 500 entities are flagged as unknown
+    found3, unknown3 = catalog.detect_tickers_in_query("Compare Rivian and NVIDIA revenue")
+    assert "NVDA" in found3
+    assert any("rivian" in u.lower() for u in unknown3)
+
+    # Lowercase "shop", "spot", "snow" must NOT false-positive as non-S&P 500 tickers
+    _, unknown4 = catalog.detect_tickers_in_query(
+        "Did NVDA spot pricing and snow storms affect shop deliveries?"
+    )
+    assert unknown4 == []
+
+
+def test_all_11_gics_sectors_supported_in_sector_aliases() -> None:
+    expected_sectors = {
+        "Information Technology",
+        "Health Care",
+        "Financials",
+        "Energy",
+        "Industrials",
+        "Consumer Discretionary",
+        "Consumer Staples",
+        "Communication Services",
+        "Utilities",
+        "Real Estate",
+        "Materials",
+    }
+    assert expected_sectors <= {sector for _, sector in SECTOR_ALIASES}
+
+    catalog = EntityCatalog(_sample_profiles())
+    for phrase, expected in (
+        ("utilities", "Utilities"),
+        ("real estate", "Real Estate"),
+        ("materials", "Materials"),
+    ):
+        scope = resolve_query_scope(
+            query=f"How did risk factors evolve across {phrase} companies from 2024 to 2025?",
+            catalog=catalog,
+        )
+        assert scope["gics_sector"] == expected
+
+
+def test_additive_and_subtractive_followup_scope_resolution() -> None:
+    catalog = EntityCatalog(_sample_profiles())
+    prior_mem = {
+        "has_prior_memory": True,
+        "remembered_tickers": ["NVDA", "AAPL"],
+        "last_start_year": 2024,
+        "last_end_year": 2026,
+        "last_gics_sector": "ALL",
+    }
+
+    assert is_additive_followup("Now add Microsoft to the comparison") is True
+    assert is_additive_followup("Compare Microsoft and NVIDIA") is False
+
+    merged = resolve_query_scope(
+        query="Now add Microsoft to that comparison",
+        memory_context=prior_mem,
+        catalog=catalog,
+    )
+    assert set(merged["tickers"]) == {"NVDA", "AAPL", "MSFT"}
+    assert merged["memory_inherited"] is True
+
+    removed = extract_removed_tickers("Drop Apple from this analysis", catalog)
+    assert removed == ["AAPL"]
+
+    sub_scope = resolve_query_scope(
+        query="Remove Apple and keep comparing",
+        memory_context=prior_mem,
+        catalog=catalog,
+    )
+    assert sub_scope["tickers"] == ["NVDA"]
+
+
+def test_validate_scope_catches_out_of_corpus_and_clarification_without_false_positives() -> None:
+    catalog = EntityCatalog(_sample_profiles())
+
+    # 1. Non-S&P 500 company
+    s1 = resolve_query_scope(
+        query="How did Stripe revenue change from 2024 to 2025?", catalog=catalog
+    )
+    v1 = validate_query_scope_and_coverage(
+        query="How did Stripe revenue change from 2024 to 2025?",
+        scope=s1,
+        explicit_tickers=s1.get("explicit_tickers", []),
+        unknown_entities=s1.get("unknown_entities", []),
+        catalog=catalog,
+        memory_context={"has_prior_memory": False},
+    )
+    assert v1["action"] == "out_of_corpus"
+    assert v1["reason"] == "non_sp500_issuer"
+    assert len(v1["suggested_followups"]) >= 1
+
+    # 2. Unsupported filing type (10-Q)
+    s2 = resolve_query_scope(query="Summarize NVDA Q3 2025 10-Q earnings", catalog=catalog)
+    v2 = validate_query_scope_and_coverage(
+        query="Summarize NVDA Q3 2025 10-Q earnings",
+        scope=s2,
+        explicit_tickers=s2.get("explicit_tickers", []),
+        unknown_entities=s2.get("unknown_entities", []),
+        catalog=catalog,
+        memory_context={"has_prior_memory": False},
+    )
+    assert v2["action"] == "out_of_corpus"
+    assert v2["reason"] == "unsupported_filing_type"
+
+    # 3. Unsupported metric (EBITDA / EPS)
+    s3 = resolve_query_scope(
+        query="What was NVDA adjusted EBITDA and EPS in 2025?", catalog=catalog
+    )
+    v3 = validate_query_scope_and_coverage(
+        query="What was NVDA adjusted EBITDA and EPS in 2025?",
+        scope=s3,
+        explicit_tickers=s3.get("explicit_tickers", []),
+        unknown_entities=s3.get("unknown_entities", []),
+        catalog=catalog,
+        memory_context={"has_prior_memory": False},
+    )
+    assert v3["action"] == "out_of_corpus"
+    assert v3["reason"] == "unsupported_metric"
+
+    # 4. "gross margin" MUST proceed (discussed in MD&A!)
+    s4 = resolve_query_scope(
+        query="What drove NVIDIA's gross margin and revenue expansion from 2024 to 2026?",
+        catalog=catalog,
+    )
+    v4 = validate_query_scope_and_coverage(
+        query="What drove NVIDIA's gross margin and revenue expansion from 2024 to 2026?",
+        scope=s4,
+        explicit_tickers=s4.get("explicit_tickers", []),
+        unknown_entities=s4.get("unknown_entities", []),
+        catalog=catalog,
+        memory_context={"has_prior_memory": False},
+    )
+    assert v4["action"] == "proceed"
+
+    # 5. Out-of-range year (<2020)
+    s5 = resolve_query_scope(query="How did Apple revenue grow from 2015 to 2018?", catalog=catalog)
+    v5 = validate_query_scope_and_coverage(
+        query="How did Apple revenue grow from 2015 to 2018?",
+        scope=s5,
+        explicit_tickers=s5.get("explicit_tickers", []),
+        unknown_entities=s5.get("unknown_entities", []),
+        catalog=catalog,
+        memory_context={"has_prior_memory": False},
+    )
+    assert v5["action"] == "out_of_corpus"
+    assert v5["reason"] == "out_of_range_year"
+
+    # 6. Ambiguous query with no ticker or sector triggers clarification (never silent NVDA fallback!)
+    s6 = resolve_query_scope(query="How did revenue change?", catalog=catalog)
+    v6 = validate_query_scope_and_coverage(
+        query="How did revenue change?",
+        scope=s6,
+        explicit_tickers=[],
+        unknown_entities=[],
+        catalog=catalog,
+        memory_context={"has_prior_memory": False},
+    )
+    assert v6["action"] == "clarification"
+    assert v6["reason"] == "ambiguous_scope"
+    assert len(v6["suggested_followups"]) >= 2
+
+
+def test_build_coverage_notices_covers_missing_fy2026_calendar_misalignment_and_rd() -> None:
+    notices = build_coverage_notices(
+        variance_reports=[
+            {
+                "ticker": "NVDA",
+                "company_name": "NVIDIA CORP",
+                "start_year": 2024,
+                "end_year": 2026,
+                "available_fiscal_years": [2024, 2025, 2026],
+                "missing_fiscal_years": [],
+                "period_end_dates": {"2024": "2024-01-28", "2026": "2026-01-25"},
+                "research_and_development_variance": {"start_value": 8.6e9, "end_value": 18.5e9},
+            },
+            {
+                "ticker": "META",
+                "company_name": "Meta Platforms, Inc.",
+                "start_year": 2024,
+                "end_year": 2025,
+                "available_fiscal_years": [2024, 2025],
+                "missing_fiscal_years": [2026],
+                "period_end_dates": {"2024": "2024-12-31", "2025": "2025-12-31"},
+                "research_and_development_variance": None,
+            },
+        ],
+        missing_tickers=["FAKE"],
+        query="Compare NVDA and META R&D expense from 2024 to 2026",
+        sector_coverage={
+            "gics_sector": "Information Technology",
+            "total_sector_companies": 76,
+            "companies_analyzed": 76,
+            "companies_with_matches": 58,
+            "batches_executed": 6,
+        },
+    )
+    codes = {n["code"] for n in notices}
+    assert "missing_ticker" in codes
+    assert "missing_fiscal_year" in codes
+    assert "fiscal_calendar_misalignment" in codes
+    assert "sector_coverage_summary" in codes
+    fy_msg = next(n["message"] for n in notices if n["code"] == "missing_fiscal_year")
+    assert "Q1 2027" in fy_msg
+
+
+def test_dual_class_cik_deduplication_prefers_canonical_ticker() -> None:
+    profiles = [
+        *_sample_profiles(),
+        SimpleNamespace(
+            ticker="GOOG",
+            cik="0001652044",
+            company_name="Alphabet Inc.",
+            gics_sector="Communication Services",
+        ),
+        SimpleNamespace(
+            ticker="GOOGL",
+            cik="0001652044",
+            company_name="Alphabet Inc.",
+            gics_sector="Communication Services",
+        ),
+    ]
+    catalog = EntityCatalog(profiles)
+
+    # Natural-language "Alphabet" must resolve to canonical GOOGL only (never duplicating GOOG)
+    found, unknown = catalog.detect_tickers_in_query(
+        "Compare Microsoft and Alphabet on revenue and R&D from 2024 to 2025."
+    )
+    assert set(found) == {"MSFT", "GOOGL"}
+    assert "GOOG" not in found
+    assert unknown == []
+
+    # Explicit ticker GOOG still resolves when explicitly requested
+    found_explicit, _ = catalog.detect_tickers_in_query("Compare MSFT and GOOG revenue in 2025")
+    assert set(found_explicit) == {"MSFT", "GOOG"}

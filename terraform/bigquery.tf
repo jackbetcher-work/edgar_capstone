@@ -257,6 +257,7 @@ resource "google_bigquery_table" "v_financial_variances_yoy" {
           operating_income,
           net_income,
           research_and_development,
+          metric_provenance,
           LAG(fiscal_year) OVER (PARTITION BY ticker ORDER BY fiscal_year) AS prev_fiscal_year,
           LAG(revenue) OVER (PARTITION BY ticker ORDER BY fiscal_year) AS prev_revenue,
           LAG(operating_income) OVER (PARTITION BY ticker ORDER BY fiscal_year) AS prev_operating_income,
@@ -265,7 +266,7 @@ resource "google_bigquery_table" "v_financial_variances_yoy" {
           unstructured_gcs_uri,
           structured_gcs_uri,
           sec_filing_url
-        FROM `${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.financial_metrics_ext.table_id}`
+        FROM `${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.financial_metrics.table_id}`
       )
       SELECT
         profile_id,
@@ -280,6 +281,7 @@ resource "google_bigquery_table" "v_financial_variances_yoy" {
         filing_date,
         accession_number,
         currency,
+        metric_provenance,
         revenue,
         prev_revenue,
         IF(prev_fiscal_year = fiscal_year - 1, revenue - prev_revenue, NULL) AS revenue_yoy_delta,
@@ -367,7 +369,7 @@ resource "google_bigquery_table" "v_filing_chunk_coverage" {
           WHEN COALESCE(c.item_1a_chunks, 0) = 0 OR COALESCE(c.item_7_chunks, 0) = 0 THEN 'PARTIAL_SECTIONS'
           ELSE 'HEALTHY'
         END AS filing_chunk_status
-      FROM `${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.financial_metrics_ext.table_id}` AS f
+      FROM `${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.financial_metrics.table_id}` AS f
       LEFT JOIN chunk_rollup AS c
         ON f.profile_id = c.profile_id
     SQL
@@ -392,7 +394,7 @@ resource "google_bigquery_table" "v_chunk_health_metrics" {
         SELECT
           COALESCE(gics_sector, 'Unknown') AS gics_sector,
           COUNT(DISTINCT profile_id) AS expected_profiles
-        FROM `${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.financial_metrics_ext.table_id}`
+        FROM `${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.financial_metrics.table_id}`
         GROUP BY 1
       ),
       total_expected AS (

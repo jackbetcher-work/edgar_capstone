@@ -66,6 +66,7 @@ describe('Grounding fact cards', () => {
       },
     }
     const onSelect = vi.fn()
+    const onInspectXbrl = vi.fn()
     render(
       <MaterialFlagsCard
         turnId="t1"
@@ -73,11 +74,21 @@ describe('Grounding fact cards', () => {
         totalFlags={4}
         citations={[citation('NVDA_2025_item_7_0004', 2025, 'item_7')]}
         onSelectCitation={onSelect}
+        onInspectXbrlFact={onInspectXbrl}
       />
     )
     expect(screen.getByText('Material Variance Flags')).toBeTruthy()
     expect(screen.getByText('+114.20%')).toBeTruthy()
     expect(screen.getByText(/1 OF 4/)).toBeTruthy()
+    expect(screen.getByText('2025-01-26')).toBeTruthy()
+    expect(screen.getByText('us-gaap:Revenues')).toBeTruthy()
+    fireEvent.click(screen.getByText('[XBRL]'))
+    expect(onInspectXbrl).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accessionNumber: '0001045810-25-000023',
+        xbrlConcept: 'us-gaap:Revenues',
+      })
+    )
     fireEvent.click(screen.getByText('[MD&A WHY]'))
     expect(onSelect).toHaveBeenCalledWith(
       expect.objectContaining({ chunkId: 'NVDA_2025_item_7_0004', fiscalYear: 2025 })

@@ -464,6 +464,70 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
               ]
             }
           }
+        },
+
+        # Row 5: API Request Latency (p50 / p95 / p99 from structured access logs)
+        {
+          xPos   = 0
+          yPos   = 16
+          width  = 12
+          height = 4
+          widget = {
+            title = "API Request Latency Distribution (p50 / p95 / p99 ms)"
+            xyChart = {
+              dataSets = [
+                {
+                  legendTemplate = "p50 {{metric.label.http_route}}"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"logging.googleapis.com/user/sec_edgar/api_request_latencies\" resource.type=\"cloud_run_revision\" resource.labels.service_name=\"${var.cloud_run_service_name}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_50"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.http_route"]
+                      }
+                    }
+                  }
+                },
+                {
+                  legendTemplate = "p95 {{metric.label.http_route}}"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"logging.googleapis.com/user/sec_edgar/api_request_latencies\" resource.type=\"cloud_run_revision\" resource.labels.service_name=\"${var.cloud_run_service_name}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_95"
+                        crossSeriesReducer = "REDUCE_MAX"
+                        groupByFields      = ["metric.label.http_route"]
+                      }
+                    }
+                  }
+                },
+                {
+                  legendTemplate = "p99 {{metric.label.http_route}}"
+                  plotType       = "LINE"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"logging.googleapis.com/user/sec_edgar/api_request_latencies\" resource.type=\"cloud_run_revision\" resource.labels.service_name=\"${var.cloud_run_service_name}\""
+                      aggregation = {
+                        alignmentPeriod    = "300s"
+                        perSeriesAligner   = "ALIGN_PERCENTILE_99"
+                        crossSeriesReducer = "REDUCE_MAX"
+                        groupByFields      = ["metric.label.http_route"]
+                      }
+                    }
+                  }
+                }
+              ]
+              yAxis = {
+                label = "Latency (ms)"
+                scale = "LINEAR"
+              }
+            }
+          }
         }
       ]
     }
@@ -476,5 +540,6 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
     google_monitoring_metric_descriptor.total_chunks,
     google_monitoring_metric_descriptor.token_count_mean,
     google_monitoring_metric_descriptor.anomaly_chunk_count,
+    google_logging_metric.api_request_latencies,
   ]
 }

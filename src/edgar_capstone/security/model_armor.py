@@ -967,10 +967,21 @@ class ModelArmorClient:
     ) -> None:
         self.config = config or ModelArmorConfig.from_env()
         self._http_client = http_client
+        self._pooled_http_client: httpx.Client | None = None
         self._credentials = credentials
         self._iam_credentials_client = iam_credentials_client
         self._sdk_client = sdk_client
         self._emulator_client = httpx.Client(transport=LocalModelArmorEmulatorTransport())
+
+    def _get_live_http_client(self) -> httpx.Client:
+        if self._http_client is not None:
+            return self._http_client
+        if self._pooled_http_client is None or self._pooled_http_client.is_closed:
+            self._pooled_http_client = httpx.Client(
+                timeout=self.config.timeout_seconds,
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
+            )
+        return self._pooled_http_client
 
     def _should_use_live_gcp(self) -> bool:
         if self.config.mode == "disabled":
@@ -1035,11 +1046,8 @@ class ModelArmorClient:
                 # DLP API rejects such calls; bill them to the configured project explicitly.
                 "x-goog-user-project": self.config.project_id,
             }
-            if self._http_client is not None:
-                resp = self._http_client.post(url, headers=headers, json=payload)
-            else:
-                with httpx.Client(timeout=self.config.timeout_seconds) as client:
-                    resp = client.post(url, headers=headers, json=payload)
+            client = self._get_live_http_client()
+            resp = client.post(url, headers=headers, json=payload)
             _raise_for_security_http_status(resp, service_label)
             return resp.json(), "gcp_model_armor_v1"
         except (RateLimitExceededError, UpstreamTimeoutError):
@@ -1152,7 +1160,30 @@ class ModelArmorClient:
             "item": {"value": text},
             "inspectConfig": {
                 "infoTypes": info_type_objs,
-                "minLikelihood": "POSSIBLE",
+                "minLikelihood": "LIKELY",
+                "ruleSet": [
+                    {
+                        "infoTypes": [{"name": "EMAIL_ADDRESS"}],
+                        "rules": [
+                            {
+                                "exclusionRule": {
+                                    "matchingType": "MATCHING_TYPE_FULL_MATCH",
+                                    "regex": {
+                                        "pattern": r".*@.*\.iam\.gserviceaccount\.com$",
+                                    },
+                                }
+                            },
+                            {
+                                "exclusionRule": {
+                                    "matchingType": "MATCHING_TYPE_FULL_MATCH",
+                                    "regex": {
+                                        "pattern": r".*@(sec\.gov|.*\.googleapis\.com)$",
+                                    },
+                                }
+                            },
+                        ],
+                    }
+                ],
             },
             "deidentifyConfig": {
                 "infoTypeTransformations": {
@@ -1769,9 +1800,7 @@ def schema_safe_block_text(original_text: str, block_message: str) -> str:
     """
     stripped = (original_text or "").strip()
     if stripped.startswith("{") and '"headline"' in stripped:
-        return json.dumps(
-            {"headline": block_message, "key_metrics": [], "findings": [], "notes": ""}
-        )
+        return json.dumps({"headline": block_message, "key_metrics": [], "findings": []})
     return block_message
 
 
@@ -1799,10 +1828,12 @@ class ModelArmorSafetyPlugin(BasePlugin):
         name: str = "ModelArmorSafetyPlugin",
         guardrail: ModelArmorGuardrailService | None = None,
         inspect_tool_outputs: bool | None = None,
+        pre_verified_prompt_hashes: set[str] | frozenset[str] | None = None,
     ) -> None:
         super().__init__(name=name)
         self._guardrail = guardrail
         self._inspect_tool_outputs = inspect_tool_outputs
+        self._pre_verified_prompt_hashes = frozenset(pre_verified_prompt_hashes or ())
 
     @property
     def guardrail(self) -> ModelArmorGuardrailService:
@@ -1820,6 +1851,12 @@ class ModelArmorSafetyPlugin(BasePlugin):
             return None
 
         state = invocation_context.session.state
+        text_hash = _sha256_text(text)
+        if state.get(_VERIFIED_PROMPT_HASH_KEY) == text_hash or (
+            text_hash in self._pre_verified_prompt_hashes
+        ):
+            state[_VERIFIED_PROMPT_HASH_KEY] = text_hash
+            return None
         decision = self.guardrail.inspect_user_prompt(
             text,
             caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,

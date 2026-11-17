@@ -255,6 +255,9 @@ def chunk_row_to_citation(row: dict[str, Any], score: float = 0.0) -> dict[str, 
         company_name=str(row.get("company_name") or row["ticker"]),
         gics_sector=str(row.get("gics_sector") or "Unknown"),
         fiscal_year=int(row["fiscal_year"]),
+        period_of_report=str(row.get("period_of_report") or "") or None,
+        filing_date=str(row.get("filing_date") or "") or None,
+        accession_number=str(row.get("accession_number") or "") or None,
         section_id=section_id,  # type: ignore[arg-type]
         section_title=str(row.get("section_title") or _SECTION_TITLES[section_id]),
         excerpt=str(row.get("chunk_text") or row.get("excerpt") or ""),
@@ -511,6 +514,7 @@ def _section_chunks(ticker: str, fiscal_year: int, section_id: str) -> list[dict
         ticker=ticker.upper().replace(".", "-"),
         fiscal_year=int(fiscal_year),
         section_id=section_id,
+        include_embedding=False,
     )
 
 

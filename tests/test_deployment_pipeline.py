@@ -44,9 +44,9 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert permissions.get("id-token") == "write"
     assert permissions.get("contents") == "read"
 
-    # Must be composed of the test, build, and deploy stages
+    # Must be composed of the test, build, eval, and deploy stages
     jobs = workflow.get("jobs", {})
-    assert list(jobs.keys()) == ["test", "build", "deploy"]
+    assert list(jobs.keys()) == ["test", "build", "eval", "deploy"]
 
     # Stage 1: test (backend + frontend lint, unit tests, and production bundle build)
     test_job = jobs["test"]
@@ -55,6 +55,7 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     test_steps_str = json.dumps(test_job["steps"])
     assert "verify_no_secrets.py" in test_steps_str
     assert "pytest" in test_steps_str
+    assert "--cov-fail-under=80" in test_steps_str
 
     # pytest reads live GCP data, so keyless WIF auth must run before it with the live env.
     test_step_names = [step.get("name", "") for step in test_job["steps"]]
@@ -92,7 +93,7 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     build_job = jobs["build"]
     assert build_job.get("needs") == "test"
     # Cloud Build is the primary deploy path; GitHub Actions deploys only when opted in
-    for gated_job in (jobs["build"], jobs["deploy"]):
+    for gated_job in (jobs["build"], jobs["eval"], jobs["deploy"]):
         assert "refs/heads/main" in gated_job["if"]
         assert "vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'" in gated_job["if"]
     build_uses = [step.get("uses", "") for step in build_job["steps"]]
@@ -101,12 +102,18 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     build_steps_str = json.dumps(build_job["steps"])
     assert "docker build" in build_steps_str
     assert "/app/frontend/dist/index.html" in build_steps_str
-    assert "-m scripts.container_smoke_test --in-process" in build_steps_str
+    assert "-m scripts.container_smoke_test --in-process --live-data" in build_steps_str
     assert "docker push" in build_steps_str
 
-    # Stage 3: deploy (depends on build, uses keyless WIF + Secret Manager + Cloud Run)
+    # Stage 2.5: eval (depends on build, runs live golden eval regression gates before deploy)
+    eval_job = jobs["eval"]
+    assert eval_job.get("needs") == "build"
+    eval_steps_str = json.dumps(eval_job["steps"])
+    assert "scripts/run_evals.py --write-bigquery" in eval_steps_str
+
+    # Stage 3: deploy (depends on build and eval, uses keyless WIF + Secret Manager + Cloud Run)
     deploy_job = jobs["deploy"]
-    assert deploy_job.get("needs") == "build"
+    assert deploy_job.get("needs") == ["build", "eval"]
     deploy_uses = [step.get("uses", "") for step in deploy_job["steps"]]
     assert any("google-github-actions/auth@" in u for u in deploy_uses)
     assert any("google-github-actions/get-secretmanager-secrets@" in u for u in deploy_uses)
@@ -124,6 +131,8 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     deploy_env_vars = deploy_cloudrun_step["with"]["env_vars"]
     assert "GOOGLE_GENAI_USE_VERTEXAI=true" in deploy_env_vars
     assert "EDGAR_GEMINI_LOCATION=global" in deploy_env_vars
+    assert "SDP_INSPECT_TEMPLATE_ID=sec-edgar-sdp-inspect" in deploy_env_vars
+    assert "SDP_DEIDENTIFY_TEMPLATE_ID=sec-edgar-sdp-deidentify" in deploy_env_vars
     for removed in ("EDGAR_EXECUTION_MODE", "EDGAR_DATA_BACKEND"):
         assert removed not in raw_text
 
@@ -150,7 +159,7 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     steps = cb.get("steps", [])
     step_ids = [s.get("id") for s in steps]
     gate_ids = ["lint-python", "lint-terraform", "frontend", "test"]
-    assert step_ids == [*gate_ids, "build", "deploy"]
+    assert step_ids == [*gate_ids, "build", "eval", "deploy"]
 
     # Quality gates start immediately and run in parallel
     steps_by_id = {s["id"]: s for s in steps}
@@ -170,6 +179,7 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     test_cmd = " ".join(steps_by_id["test"]["args"])
     assert "verify_no_secrets.py" in test_cmd
     assert "pytest" in test_cmd
+    assert "--cov-fail-under=80" in test_cmd
     # pytest reads live GCP with the build SA's ADC; telemetry/feedback stay in memory.
     test_env = set(steps_by_id["test"]["env"])
     assert {
@@ -196,8 +206,14 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     assert "--network=cloudbuild" in build_cmd
     assert "-m scripts.container_smoke_test --in-process --live-data" in build_cmd
 
+    eval_step = steps_by_id["eval"]
+    assert eval_step["waitFor"] == ["build"]
+    eval_cmd = " ".join(eval_step["args"])
+    assert "scripts/run_evals.py --write-bigquery" in eval_cmd
+    assert eval_cmd.index('"${_PIPELINE_MODE}" != "deploy"') < eval_cmd.index("run_evals.py")
+
     deploy_step = steps_by_id["deploy"]
-    assert deploy_step["waitFor"] == ["build"]
+    assert deploy_step["waitFor"] == ["build", "eval"]
     assert set(deploy_step["secretEnv"]) == {
         "SEC_EDGAR_USER_AGENT",
         "GEMINI_API_KEY",
@@ -207,6 +223,8 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     assert "--set-secrets=" in deploy_cmd
     assert "GOOGLE_GENAI_USE_VERTEXAI=true" in deploy_cmd
     assert "EDGAR_GEMINI_LOCATION=${_GEMINI_LOCATION}" in deploy_cmd
+    assert "SDP_INSPECT_TEMPLATE_ID=sec-edgar-sdp-inspect" in deploy_cmd
+    assert "SDP_DEIDENTIFY_TEMPLATE_ID=sec-edgar-sdp-deidentify" in deploy_cmd
     for removed in ("EDGAR_EXECUTION_MODE", "EDGAR_DATA_BACKEND", "--expect-corpus"):
         assert removed not in cb_path.read_text(encoding="utf-8")
 

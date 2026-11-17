@@ -20,11 +20,13 @@ grounded explanation of each anomaly.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import math
 import os
 import statistics
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -130,11 +132,24 @@ def _norm_ticker(ticker: str) -> str:
 
 
 def _source(
-    curr: FinancialDataProfile, prev: FinancialDataProfile | None, metric: str | None
+    curr: FinancialDataProfile,
+    prev: FinancialDataProfile | None,
+    metric: str | None,
+    *,
+    denominator_metric: str | None = None,
 ) -> MaterialFlagSource:
-    concept = None
-    if metric:
-        concept = getattr(curr.metric_provenance, metric, None)
+    concept = getattr(curr.metric_provenance, metric, None) if metric else None
+    prior_concept = (
+        getattr(prev.metric_provenance, metric, None) if (metric and prev is not None) else None
+    )
+    denom_concept = (
+        getattr(curr.metric_provenance, denominator_metric, None) if denominator_metric else None
+    )
+    prior_denom_concept = (
+        getattr(prev.metric_provenance, denominator_metric, None)
+        if (denominator_metric and prev is not None)
+        else None
+    )
     return MaterialFlagSource(
         accession_number=curr.accession_number,
         sec_filing_url=curr.sec_filing_url,
@@ -143,6 +158,9 @@ def _source(
         prior_accession_number=prev.accession_number if prev else None,
         prior_sec_filing_url=prev.sec_filing_url if prev else None,
         prior_period_of_report=prev.period_of_report if prev else None,
+        prior_xbrl_concept=str(prior_concept) if prior_concept else None,
+        denominator_xbrl_concept=str(denom_concept) if denom_concept else None,
+        prior_denominator_xbrl_concept=str(prior_denom_concept) if prior_denom_concept else None,
     )
 
 
@@ -328,7 +346,7 @@ def compute_material_variance_flags(
                             f"{ticker} FY{fy} {label.lower()} gross margin cost of revenue "
                             "operating expenses drivers"
                         ),
-                        source=_source(curr, prev, numerator),
+                        source=_source(curr, prev, numerator, denominator_metric="revenue"),
                     )
                 )
 
@@ -454,16 +472,32 @@ def _load_profiles(
     profiles = adapters.bigquery.fetch_profiles(
         tickers=ticker_filter, start_year=start_year - 1, end_year=end_year
     )
+    sectors = sorted({p.gics_sector for p in profiles if p.gics_sector})
     sector_profiles: list[FinancialDataProfile] = []
-    for sector in sorted({p.gics_sector for p in profiles if p.gics_sector}):
+    if len(sectors) == 1:
         sector_profiles.extend(
             adapters.bigquery.fetch_profiles(
                 tickers=set(),
                 start_year=start_year - 1,
                 end_year=end_year,
-                gics_sector=sector,
+                gics_sector=sectors[0],
             )
         )
+    elif len(sectors) > 1:
+        with ThreadPoolExecutor(max_workers=min(4, len(sectors))) as pool:
+            futs = [
+                pool.submit(
+                    contextvars.copy_context().run,
+                    adapters.bigquery.fetch_profiles,
+                    tickers=set(),
+                    start_year=start_year - 1,
+                    end_year=end_year,
+                    gics_sector=sector,
+                )
+                for sector in sectors
+            ]
+            for fut in futs:
+                sector_profiles.extend(fut.result())
     _record_gcp_backend_invocation(
         tool_context,
         tool_name="flag_material_variances",
@@ -471,6 +505,40 @@ def _load_profiles(
         services_hit=["bigquery"],
     )
     return profiles, sector_profiles
+
+
+def flag_material_variances_from_cached_profiles(
+    all_profiles: list[FinancialDataProfile],
+    *,
+    tickers: str,
+    start_year: int,
+    end_year: int,
+) -> dict[str, Any]:
+    """Compute material variance flags from an already-fetched profile catalog (0 BigQuery RPCs)."""
+    ticker_filter = _parse_ticker_list(tickers)
+    if not ticker_filter:
+        return {
+            "status": "error",
+            "message": "Please specify at least one ticker symbol (e.g., 'NVDA' or 'NVDA,AAPL').",
+        }
+    if start_year > end_year:
+        start_year, end_year = end_year, start_year
+    lo, hi = int(start_year) - 1, int(end_year)
+    in_window = [p for p in all_profiles if lo <= p.fiscal_year <= hi]
+    company_profiles = [p for p in in_window if _norm_ticker(p.ticker) in ticker_filter]
+    sectors = {str(p.gics_sector or "").lower() for p in company_profiles if p.gics_sector}
+    sector_profiles = [p for p in in_window if str(p.gics_sector or "").lower() in sectors]
+    result = compute_material_variance_flags(
+        company_profiles,
+        tickers=ticker_filter,
+        start_year=int(start_year),
+        end_year=int(end_year),
+        thresholds=MaterialityThresholds.from_env(),
+        sector_profiles=sector_profiles,
+    )
+    found = {_norm_ticker(p.ticker) for p in company_profiles}
+    result["missing_tickers"] = sorted(ticker_filter - found)
+    return result
 
 
 @with_tool_resilience(tool_name="flag_material_variances")
@@ -530,30 +598,35 @@ def attach_flag_explanations(
     *,
     max_flags: int = 3,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Retrieve an MD&A passage explaining each of the top flags (one per company-year).
+    """Retrieve an MD&A passage explaining each of the top flags (one per company-year) in parallel.
 
     Only passages located in a specific filing chunk are attached. Returns
     ``(flags, citations)``; the flags list is updated in place with an ``explanation`` entry.
     """
-    citations: list[dict[str, Any]] = []
+    selected: list[dict[str, Any]] = []
     seen_keys: set[tuple[str, int]] = set()
-    explained = 0
     for flag in flags:
-        if explained >= max_flags:
+        if len(selected) >= max_flags:
             break
         key = (str(flag["ticker"]), int(flag["fiscal_year"]))
         if key in seen_keys:
             continue
         seen_keys.add(key)
+        selected.append(flag)
+
+    if not selected:
+        return flags, []
+
+    def _fetch_one(flag: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
         res = query_cached_10k_context(
-            ticker=key[0],
-            fiscal_year=key[1],
+            ticker=str(flag["ticker"]),
+            fiscal_year=int(flag["fiscal_year"]),
             section_id="item_7",
             variance_query=str(flag.get("explanation_query") or flag["description"]),
             max_passages=2,
         )
         if res.get("status") != "success":
-            continue
+            return flag, None
         by_id = {str(c["chunk_id"]): c for c in res.get("matched_citations") or []}
         passage = next(
             (
@@ -564,7 +637,7 @@ def attach_flag_explanations(
             None,
         )
         if passage is None:
-            continue
+            return flag, None
         cit = by_id[str(passage["chunk_id"])]
         flag["explanation"] = MaterialFlagExplanation(
             chunk_id=str(cit["chunk_id"]),
@@ -573,8 +646,22 @@ def attach_flag_explanations(
             excerpt=clean_excerpt(str(passage.get("text") or ""), 420),
             sec_filing_url=str(cit.get("sec_filing_url") or ""),
         ).model_dump(mode="json")
-        citations.append(cit)
-        explained += 1
+        return flag, cit
+
+    citations: list[dict[str, Any]] = []
+    if len(selected) == 1:
+        _, cit = _fetch_one(selected[0])
+        if cit is not None:
+            citations.append(cit)
+    else:
+        with ThreadPoolExecutor(max_workers=min(4, len(selected))) as pool:
+            futs = [
+                pool.submit(contextvars.copy_context().run, _fetch_one, flag) for flag in selected
+            ]
+            for fut in futs:
+                _, cit = fut.result()
+                if cit is not None:
+                    citations.append(cit)
     return flags, citations
 
 

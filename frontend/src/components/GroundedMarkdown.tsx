@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import {
   splitTextByInlineCitations,
   type ParsedInlineCitationToken,
+  type ParsedInlineXbrlToken,
 } from '../utils/formatters'
 
 interface GroundedMarkdownProps {
@@ -9,6 +10,7 @@ interface GroundedMarkdownProps {
   markdown: string
   activeChunkId: string | null
   onSelectCitation: (token: ParsedInlineCitationToken) => void
+  onSelectXbrlCitation?: (token: ParsedInlineXbrlToken) => void
 }
 
 function renderFormattedInlineText(text: string, keyPrefix: string): ReactNode[] {
@@ -59,7 +61,8 @@ function renderLineWithCitations(
   turnId: string,
   lineIdx: number,
   activeChunkId: string | null,
-  onSelectCitation: (token: ParsedInlineCitationToken) => void
+  onSelectCitation: (token: ParsedInlineCitationToken) => void,
+  onSelectXbrlCitation?: (token: ParsedInlineXbrlToken) => void
 ): ReactNode[] {
   const segments = splitTextByInlineCitations(line)
   const nodes: ReactNode[] = []
@@ -68,6 +71,31 @@ function renderLineWithCitations(
     if (seg.type === 'text') {
       nodes.push(
         ...renderFormattedInlineText(seg.value, `${turnId}-l${lineIdx}-s${segIdx}`)
+      )
+    } else if (seg.type === 'xbrl') {
+      const { token } = seg
+      const shortConcept = token.xbrlConcept.includes(':')
+        ? token.xbrlConcept.split(':')[1]
+        : token.xbrlConcept
+      nodes.push(
+        <button
+          key={`${turnId}-xbrl-${lineIdx}-${segIdx}-${token.accessionNumber}`}
+          id={`inline-xbrl-${turnId}-${lineIdx}-${segIdx}`}
+          type="button"
+          onClick={() => {
+            if (onSelectXbrlCitation) {
+              onSelectXbrlCitation(token)
+            } else if (token.url) {
+              window.open(token.url, '_blank', 'noreferrer')
+            }
+          }}
+          className="inline-flex items-center gap-0.5 mx-0.5 px-1 py-0.2 text-[10px] tabular-nums-mono badge-accent hover:underline cursor-pointer align-baseline"
+          title={`Inspect XBRL fact ${token.ticker} FY${token.fiscalYear} · ${token.xbrlConcept} · acc:${token.accessionNumber}`}
+        >
+          <span>
+            [{token.ticker} FY{String(token.fiscalYear).slice(-2)} · XBRL {shortConcept}]
+          </span>
+        </button>
       )
     } else {
       const { token } = seg
@@ -100,6 +128,7 @@ export function GroundedMarkdown({
   markdown,
   activeChunkId,
   onSelectCitation,
+  onSelectXbrlCitation,
 }: GroundedMarkdownProps) {
   const rawLines = markdown.split('\n')
   const blocks: ReactNode[] = []
@@ -122,7 +151,8 @@ export function GroundedMarkdown({
               turnId,
               item.idx,
               activeChunkId,
-              onSelectCitation
+              onSelectCitation,
+              onSelectXbrlCitation
             )}
           </li>
         ))}
@@ -135,6 +165,32 @@ export function GroundedMarkdown({
     const trimmed = rawLine.trim()
     if (!trimmed) {
       flushBullets(idx)
+      return
+    }
+
+    if (trimmed.startsWith('> ')) {
+      flushBullets(idx)
+      const body = trimmed.slice(2)
+      const isWarning = body.toLowerCase().includes('warning')
+      blocks.push(
+        <blockquote
+          key={`${turnId}-bq-${idx}`}
+          className={`my-1.5 px-2.5 py-1.5 text-[11.5px] leading-relaxed border-l-2 surface-subtle ${
+            isWarning
+              ? 'border-l-[var(--bb-amber)] text-ink-primary'
+              : 'border-l-[var(--bb-cyan)] text-ink-secondary'
+          }`}
+        >
+          {renderLineWithCitations(
+            body,
+            turnId,
+            idx,
+            activeChunkId,
+            onSelectCitation,
+            onSelectXbrlCitation
+          )}
+        </blockquote>
+      )
       return
     }
 
@@ -180,7 +236,8 @@ export function GroundedMarkdown({
           turnId,
           idx,
           activeChunkId,
-          onSelectCitation
+          onSelectCitation,
+          onSelectXbrlCitation
         )}
       </p>
     )

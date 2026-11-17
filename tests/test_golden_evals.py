@@ -18,6 +18,8 @@ import pytest
 from edgar_capstone.evals.bigquery_io import EvalBigQueryClient, load_schema_fields
 from edgar_capstone.evals.golden import (
     CORE_CATEGORIES,
+    ExpectedDelta,
+    ExpectedFlag,
     ExpectedSection,
     ExpectedVariance,
     GoldenDatasetError,
@@ -32,11 +34,19 @@ from edgar_capstone.evals.golden import (
 from edgar_capstone.evals.metrics import (
     cited_chunk_ids,
     cited_sources,
+    cited_xbrl_tags,
+    score_anomaly_flags,
     score_citation_coverage,
     score_grounding,
+    score_metadata_filter_correctness,
     score_numeric_agreement,
+    score_numeric_citation_coverage,
+    score_retrieval_precision_at_10,
     score_routing,
     score_safety,
+    score_scope_or_coverage,
+    score_unsupported_claims,
+    score_wording_delta_accuracy,
 )
 from edgar_capstone.evals.runner import (
     EvalThresholds,
@@ -89,7 +99,10 @@ def _response(**overrides: Any) -> dict[str, Any]:
     answer = (
         "### NVIDIA revenue expanded on Data Center demand.\n\n"
         "#### Key Metrics (deterministic engine)\n"
-        "- **NVIDIA CORP (NVDA) · Revenue:** $100.00 (FY2024) → $250.00 (FY2026), **+150.00%**\n\n"
+        "- **NVIDIA CORP (NVDA) · Revenue:** $100.00 (FY2024 (2024-01-28)) → "
+        "$250.00 (FY2026 (2026-01-25)), **+150.00%** "
+        f"[NVDA FY2024 | XBRL us-gaap:Revenues | acc:0001045810-24-000029]({_SEC_URL}) "
+        f"[NVDA FY2026 | XBRL us-gaap:Revenues | acc:0001045810-26-000021]({_SEC_URL})\n\n"
         "#### Findings\n"
         "- Data Center demand drove growth. "
         f"[NVDA FY2026 | Item 7. MD&A — Recent Developments | NVDA_2026_item_7_0001]({_SEC_URL})\n"
@@ -111,11 +124,21 @@ def _response(**overrides: Any) -> dict[str, Any]:
         },
         "answer_markdown": answer,
         "answer_verified": True,
+        "report_verification": {"usable": True, "unsupported_claims_count": 0},
+        "coverage_notices": [],
         "variance_reports": [
             {
                 "ticker": "NVDA",
                 "start_year": 2024,
                 "end_year": 2026,
+                "accession_numbers": {
+                    "2024": "0001045810-24-000029",
+                    "2026": "0001045810-26-000021",
+                },
+                "metric_provenance": {
+                    "2024": {"revenue": "us-gaap:Revenues"},
+                    "2026": {"revenue": "us-gaap:Revenues"},
+                },
                 "revenue_variance": {
                     "metric_name": "revenue",
                     "start_year": 2024,
@@ -125,6 +148,10 @@ def _response(**overrides: Any) -> dict[str, Any]:
                     "absolute_delta": 150.0,
                     "percentage_delta": 150.0,
                     "direction": "increase",
+                    "start_accession_number": "0001045810-24-000029",
+                    "end_accession_number": "0001045810-26-000021",
+                    "start_xbrl_concept": "us-gaap:Revenues",
+                    "end_xbrl_concept": "us-gaap:Revenues",
                 },
             }
         ],
@@ -134,18 +161,24 @@ def _response(**overrides: Any) -> dict[str, Any]:
                 "ticker": "NVDA",
                 "fiscal_year": 2026,
                 "section_id": "item_7",
+                "excerpt": "Data Center demand drove record revenue growth across Hopper and Blackwell.",
+                "score": 0.92,
             },
             {
                 "chunk_id": "NVDA_2024_item_1a_0003",
                 "ticker": "NVDA",
                 "fiscal_year": 2024,
                 "section_id": "item_1a",
+                "excerpt": "Supply chain constraints and export control risks persisted in FY2024.",
+                "score": 0.87,
             },
             {
                 "chunk_id": "NVDA_2025_item_7_0002",
                 "ticker": "NVDA",
                 "fiscal_year": 2025,
                 "section_id": "item_7",
+                "excerpt": "Operating income expanded significantly in FY2025 on AI compute demand.",
+                "score": 0.85,
             },
         ],
         "fact_check": {"passed": True, "has_required_citations": True, "discrepancies": []},
@@ -175,9 +208,22 @@ def _response(**overrides: Any) -> dict[str, Any]:
 
 def test_golden_dataset_meets_coverage_requirements(golden_items: list[GoldenEvalItem]) -> None:
     counts = validate_golden_dataset(golden_items)
-    assert sum(counts[c] for c in CORE_CATEGORIES) >= 20
-    assert all(counts[c] >= 3 for c in CORE_CATEGORIES)
+    assert sum(counts[c] for c in CORE_CATEGORIES) >= 30
+    assert counts["single_company_longitudinal"] >= 8
+    assert counts["multi_company_peer_comparison"] >= 8
+    assert counts["thematic_shift"] >= 8
+    assert counts["anomaly_explanation"] >= 4
+    assert counts["out_of_corpus_and_clarification"] >= 5
     assert counts["safety_red_team"] >= 4
+    # Peer comparison must include R&D comparisons, thematic items must carry expected_deltas
+    assert any(
+        ev.metric == "research_and_development"
+        for i in golden_items
+        if i.category == "multi_company_peer_comparison"
+        for ev in i.expected_variances
+    )
+    assert sum(len(i.expected_deltas) for i in golden_items) >= 10
+    assert sum(len(i.expected_flags) for i in golden_items) >= 8
     # Thematic shift must include the AI-risk wording use case from the reference spec.
     assert any("ai" in i.tags or "generative_ai" in i.tags or "AI" in i.query for i in golden_items)
 
@@ -186,6 +232,10 @@ def test_golden_expected_variances_are_fully_populated(golden_items: list[Golden
     for item in golden_items:
         if item.is_safety:
             assert item.expected_block_type is not None, item.id
+            continue
+        if item.is_scope_early_exit:
+            assert item.expected_status in ("clarification", "out_of_corpus"), item.id
+            assert item.expected_intent is not None, item.id
             continue
         assert item.expected_intent is not None, item.id
         assert item.expected_sections, f"{item.id} has no grounding expectations"
@@ -251,6 +301,8 @@ def test_golden_eval_set_schema_matches_model() -> None:
     assert _names(fields) == set(GoldenEvalItem.model_fields) | {"dataset_version", "loaded_at"}
     assert _nested(fields, "expected_variances") == set(ExpectedVariance.model_fields)
     assert _nested(fields, "expected_sections") == set(ExpectedSection.model_fields)
+    assert _nested(fields, "expected_deltas") == set(ExpectedDelta.model_fields)
+    assert _nested(fields, "expected_flags") == set(ExpectedFlag.model_fields)
     assert _nested(fields, "filters") == set(RequestFilters.model_fields)
 
 
@@ -384,11 +436,133 @@ def _perfect_judge(**_: Any) -> dict[str, Any]:
     return {
         "numeric_fidelity_score": 1.0,
         "citation_grounding_score": 1.0,
+        "citation_precision_score": 1.0,
         "explanation_quality_score": 0.9,
         "thematic_consistency_score": 0.8,
+        "unsupported_claims_count": 0,
         "grade": "pass",
         "evaluator_model": "gemini-3.5-flash",
     }
+
+
+def test_new_phase6_scorers_numeric_xbrl_filters_precision_deltas_flags_scope() -> None:
+    """Pure unit tests for numeric XBRL citations, metadata filters, precision@10, deltas, flags, unsupported claims, and scope checks."""
+    item = _scored_item()
+    resp = _response()
+    assert len(cited_xbrl_tags(resp["answer_markdown"])) == 2
+    assert score_numeric_citation_coverage(item, resp) == (True, [])
+    missing_xbrl = _response(
+        variance_reports=[{"ticker": "NVDA", "revenue_variance": {}}],
+        answer_markdown="#### Key Metrics (deterministic engine)\n- Revenue: $100 -> $250",
+    )
+    ok_num, num_reasons = score_numeric_citation_coverage(item, missing_xbrl)
+    assert ok_num is False and len(num_reasons) >= 2
+
+    ok_flt, flt_ratio, flt_reasons = score_metadata_filter_correctness(item, resp)
+    assert (ok_flt, flt_ratio, flt_reasons) == (True, 1.0, [])
+    leaked_resp = _response(
+        citations=[
+            *resp["citations"],
+            {
+                "chunk_id": "AAPL_2022_item_7_0001",
+                "ticker": "AAPL",
+                "fiscal_year": 2022,
+                "section_id": "item_7",
+            },
+        ]
+    )
+    ok_flt2, flt_ratio2, flt_reasons2 = score_metadata_filter_correctness(item, leaked_resp)
+    assert ok_flt2 is False and flt_ratio2 == 0.75 and "AAPL" in flt_reasons2[0]
+
+    assert score_retrieval_precision_at_10(item, resp) == 1.0
+    assert score_retrieval_precision_at_10(item, leaked_resp) == 0.75
+
+    delta_item = _scored_item(
+        expected_deltas=[
+            {
+                "ticker": "NVDA",
+                "prior_fiscal_year": 2024,
+                "current_fiscal_year": 2025,
+                "change_type": "modified",
+                "keyword_hint": "export",
+            }
+        ]
+    )
+    delta_resp = _response(
+        disclosure_deltas={
+            "companies": [
+                {
+                    "ticker": "NVDA",
+                    "year_pairs": [
+                        {
+                            "prior_fiscal_year": 2024,
+                            "current_fiscal_year": 2025,
+                            "counts": {"modified": 1},
+                            "deltas": [
+                                {
+                                    "ticker": "NVDA",
+                                    "change_type": "modified",
+                                    "added_phrases": ["expanded export control rules"],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    assert score_wording_delta_accuracy(delta_item, delta_resp) == (1, 1, [])
+    assert score_wording_delta_accuracy(delta_item, _response())[0] == 0
+
+    flag_item = _scored_item(
+        expected_flags=[
+            {
+                "ticker": "NVDA",
+                "fiscal_year": 2024,
+                "metric": "operating_income",
+                "rule": "yoy_change",
+                "flag_id": "NVDA_2024_operating_income_yoy_change",
+            }
+        ]
+    )
+    flag_resp = _response(
+        material_variance_flags=[
+            {
+                "flag_id": "NVDA_2024_operating_income_yoy_change",
+                "ticker": "NVDA",
+                "fiscal_year": 2024,
+                "metric": "operating_income",
+                "rule": "yoy_change",
+            }
+        ]
+    )
+    assert score_anomaly_flags(flag_item, flag_resp) == (1, 1, [])
+    assert score_anomaly_flags(flag_item, _response())[0] == 0
+
+    assert score_unsupported_claims(resp) == (0, [])
+    bad_notes = _response(answer_markdown="### Title\n\n#### Notes (not source-verified)\nOops")
+    assert score_unsupported_claims(bad_notes)[0] == 1
+
+    scope_item = GoldenEvalItem(
+        id="oos_rivian_unit",
+        category="out_of_corpus_and_clarification",
+        query="How did Rivian revenue grow?",
+        expected_intent="out_of_corpus",
+        expected_status="out_of_corpus",
+        expected_coverage_notice_codes=["non_sp500_issuer"],
+    )
+    ok_s, _ = score_scope_or_coverage(
+        scope_item,
+        {
+            "status": "out_of_corpus",
+            "intent": "out_of_corpus",
+            "suggested_followups": ["Try Tesla instead"],
+            "coverage_notices": [{"code": "non_sp500_issuer"}],
+            "citations": [],
+        },
+    )
+    assert ok_s is True
+    assert score_scope_or_coverage(scope_item, {"status": "success"})[0] is False
 
 
 def test_gates_fail_below_threshold_and_always_gate_ttft() -> None:
@@ -396,21 +570,36 @@ def test_gates_fail_below_threshold_and_always_gate_ttft() -> None:
     metrics = {
         "numeric_agreement": 1.0,
         "citation_coverage": 1.0,
+        "numeric_citation_coverage": 1.0,
         "grounding_recall": 0.90,
+        "metadata_filter_correctness": 1.0,
+        "retrieval_precision_at_10": 0.95,
+        "wording_delta_accuracy": 0.95,
+        "anomaly_flag_recall": 1.0,
+        "scope_and_coverage_accuracy": 1.0,
         "routing_accuracy": 1.0,
         "judge_faithfulness": 0.9,
+        "judge_citation_precision": 0.95,
         "judge_explanation_quality": 0.8,
         "judge_thematic_consistency": 0.8,
+        "unsupported_claims_total": 0,
         "safety_compliance": 1.0,
         "p95_ttft_ms": None,
     }
     gates = {g.name: g for g in evaluate_gates(metrics, thresholds)}
     assert gates["grounding_recall"].passed is False
     assert gates["numeric_agreement"].passed is True
+    assert gates["unsupported_claims_total"].passed is True
+    assert gates["unsupported_claims_total"].comparator == "<="
     assert not any(g.skipped for g in gates.values())
     # No TTFT captured is a failure, not a skip
     assert gates["p95_ttft_ms"].passed is False
     assert gates["p95_ttft_ms"].detail == "no streaming TTFT captured"
+
+    bad_unsup = {
+        g.name: g for g in evaluate_gates(metrics | {"unsupported_claims_total": 2}, thresholds)
+    }
+    assert bad_unsup["unsupported_claims_total"].passed is False
 
     ok = {g.name: g for g in evaluate_gates(metrics | {"p95_ttft_ms": 2100.0}, thresholds)}
     assert ok["p95_ttft_ms"].passed is True and ok["p95_ttft_ms"].comparator == "<="

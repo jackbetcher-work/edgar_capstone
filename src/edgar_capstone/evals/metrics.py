@@ -203,6 +203,341 @@ def score_routing(item: GoldenEvalItem, response: dict[str, Any]) -> tuple[bool,
     return not reasons, reasons
 
 
+# Inline XBRL numeric citation tag: `[NVDA FY2026 | XBRL us-gaap:Revenues | acc:0001045810-26-000021](url)`.
+_XBRL_TAG_RE = re.compile(
+    r"\[([A-Z][A-Z0-9.\-]{0,6})\s+FY(\d{4})\s*\|\s*XBRL\s+([^|\]]+?)\s*\|\s*acc:([^\]]+?)\]"
+)
+_NOTES_SECTION_MARKER = "#### Notes (not source-verified)"
+_STOP_WORDS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "from",
+        "with",
+        "how",
+        "did",
+        "what",
+        "why",
+        "are",
+        "was",
+        "were",
+        "has",
+        "have",
+        "been",
+        "into",
+        "over",
+        "their",
+        "this",
+        "that",
+        "between",
+        "across",
+        "compare",
+        "explain",
+        "track",
+        "walk",
+        "through",
+        "change",
+        "changed",
+        "shifted",
+        "evolved",
+        "growth",
+        "revenue",
+        "income",
+        "operating",
+        "net",
+        "fiscal",
+        "year",
+        "years",
+        "company",
+        "companies",
+        "filing",
+        "filings",
+        "10-k",
+    }
+)
+
+
+def cited_xbrl_tags(answer_markdown: str) -> list[tuple[str, int, str, str]]:
+    """Return `(ticker, fiscal_year, xbrl_concept, accession_number)` tuples cited inline."""
+    return [
+        (_norm_ticker(m.group(1)), int(m.group(2)), m.group(3).strip(), m.group(4).strip())
+        for m in _XBRL_TAG_RE.finditer(answer_markdown or "")
+    ]
+
+
+def score_numeric_citation_coverage(
+    item: GoldenEvalItem, response: dict[str, Any]
+) -> tuple[bool | None, list[str]]:
+    """Verify deterministic variance reports carry XBRL provenance (accession_number + concept) and inline tags."""
+    reports = response.get("variance_reports") or []
+    if not reports:
+        if not item.expected_variances:
+            return None, []
+        return False, ["no variance reports returned to verify numeric XBRL citations"]
+
+    reasons: list[str] = []
+    answer = response.get("answer_markdown") or ""
+    for rep in reports:
+        tk = _norm_ticker(rep.get("ticker", ""))
+        acc_map = rep.get("accession_numbers") or {}
+        prov_map = rep.get("metric_provenance") or {}
+        rev = rep.get("revenue_variance") or {}
+        has_acc = bool(acc_map) or bool(
+            rev.get("start_accession_number") or rev.get("end_accession_number")
+        )
+        has_concept = bool(prov_map) or bool(
+            rev.get("start_xbrl_concept") or rev.get("end_xbrl_concept")
+        )
+        if not has_acc:
+            reasons.append(f"{tk}: missing XBRL accession_number provenance")
+        if not has_concept:
+            reasons.append(f"{tk}: missing XBRL concept/metric_provenance")
+
+    if "#### Key Metrics (deterministic engine)" in answer:
+        tags = cited_xbrl_tags(answer)
+        if not tags:
+            reasons.append("Key Metrics section omitted inline XBRL accession citation tags")
+    return not reasons, reasons
+
+
+def score_metadata_filter_correctness(
+    item: GoldenEvalItem, response: dict[str, Any]
+) -> tuple[bool, float, list[str]]:
+    """Every retrieved citation strictly respects tickers, fiscal years, gics_sector, and section_id."""
+    citations = response.get("citations") or []
+    if not citations:
+        return False, 0.0, ["no citations retrieved to check metadata filters"]
+
+    allowed_tickers = {_norm_ticker(t) for t in item.tickers} if item.tickers else set()
+    lo_yr = item.start_year
+    hi_yr = item.end_year
+    req_sector = (
+        item.gics_sector.strip().lower()
+        if item.gics_sector and item.gics_sector.upper() != "ALL"
+        else None
+    )
+    req_section = (
+        item.filters.section_id.strip().lower()
+        if item.filters.section_id and item.filters.section_id.upper() != "ALL"
+        else None
+    )
+
+    good = 0
+    reasons: list[str] = []
+    for c in citations:
+        cid = str(c.get("chunk_id") or "?")
+        tk = _norm_ticker(c.get("ticker", ""))
+        fy = int(c.get("fiscal_year") or 0)
+        sec = str(c.get("section_id") or "").strip().lower()
+        gics = str(c.get("gics_sector") or "").strip().lower()
+
+        viol: list[str] = []
+        if allowed_tickers and tk and tk not in allowed_tickers:
+            viol.append(f"ticker={tk} not in {sorted(allowed_tickers)}")
+        if lo_yr is not None and hi_yr is not None and fy and not (lo_yr <= fy <= hi_yr):
+            viol.append(f"fy={fy} outside {lo_yr}-{hi_yr}")
+        if req_sector and gics and gics != req_sector:
+            viol.append(f"sector={gics!r} != {req_sector!r}")
+        if req_section and sec and sec != req_section:
+            viol.append(f"section={sec!r} != {req_section!r}")
+        if viol:
+            reasons.append(f"{cid}: {', '.join(viol)}")
+        else:
+            good += 1
+
+    ratio = round(good / len(citations), 4)
+    return good == len(citations), ratio, reasons[:6]
+
+
+def score_retrieval_precision_at_10(item: GoldenEvalItem, response: dict[str, Any]) -> float | None:
+    """Fraction of top-10 retrieved citations relevant to scope (ticker, year, sector, section, non-empty content)."""
+    citations = (response.get("citations") or [])[:10]
+    if not citations:
+        return 0.0
+
+    allowed_tickers = {_norm_ticker(t) for t in item.tickers} if item.tickers else set()
+    lo_yr = item.start_year
+    hi_yr = item.end_year
+    req_sector = (
+        item.gics_sector.strip().lower()
+        if item.gics_sector and item.gics_sector.upper() != "ALL"
+        else None
+    )
+    req_sections = {s.section_id for s in item.expected_sections if s.section_id}
+    explicit_sec = (
+        item.filters.section_id.strip().lower()
+        if item.filters.section_id and item.filters.section_id.upper() != "ALL"
+        else None
+    )
+    single_expected_sec = explicit_sec or (
+        next(iter(req_sections))
+        if len(req_sections) == 1
+        and all(s.section_id is not None for s in item.expected_sections)
+        and item.expected_sections
+        else None
+    )
+
+    relevant = 0
+    for c in citations:
+        tk = _norm_ticker(c.get("ticker", ""))
+        fy = int(c.get("fiscal_year") or 0)
+        sec = str(c.get("section_id") or "").strip().lower()
+        gics = str(c.get("gics_sector") or "").strip().lower()
+        excerpt = str(c.get("excerpt") or c.get("chunk_text") or "").strip()
+
+        if allowed_tickers and tk and tk not in allowed_tickers:
+            continue
+        if lo_yr is not None and hi_yr is not None and fy and not (lo_yr <= fy <= hi_yr):
+            continue
+        if req_sector and gics and gics != req_sector:
+            continue
+        if single_expected_sec and sec and sec != single_expected_sec:
+            continue
+        if len(excerpt) < 20 and float(c.get("score") or 0.0) <= 0.0 and not c.get("chunk_id"):
+            continue
+        relevant += 1
+
+    return round(relevant / len(citations), 4)
+
+
+def score_wording_delta_accuracy(
+    item: GoldenEvalItem, response: dict[str, Any]
+) -> tuple[int, int, list[str]]:
+    """Check `disclosure_deltas` matches every `expected_deltas` year-pair change classification."""
+    if not item.expected_deltas:
+        return 0, 0, []
+
+    dd = response.get("disclosure_deltas") or {}
+    companies = dd.get("companies") or []
+    all_deltas: list[dict[str, Any]] = []
+    for comp in companies:
+        c_ticker = _norm_ticker(comp.get("ticker", ""))
+        for pair in comp.get("year_pairs") or []:
+            prior_fy = int(pair.get("prior_fiscal_year") or 0)
+            curr_fy = int(pair.get("current_fiscal_year") or 0)
+            counts = pair.get("counts") or {}
+            for d in pair.get("deltas") or []:
+                all_deltas.append(
+                    {
+                        "ticker": _norm_ticker(d.get("ticker") or c_ticker),
+                        "prior_fiscal_year": int(d.get("prior_fiscal_year") or prior_fy),
+                        "current_fiscal_year": int(d.get("current_fiscal_year") or curr_fy),
+                        "change_type": str(d.get("change_type") or "").lower(),
+                        "text_blob": " ".join(
+                            [
+                                *(str(p) for p in (d.get("added_phrases") or [])),
+                                *(str(p) for p in (d.get("removed_phrases") or [])),
+                                str(d.get("current_excerpt") or ""),
+                                str(d.get("prior_excerpt") or ""),
+                            ]
+                        ).lower(),
+                        "counts": counts,
+                    }
+                )
+            # Also allow pair-level count matches when no keyword_hint is specified
+            for ct in ("added", "removed", "modified"):
+                if int(counts.get(ct) or 0) > 0:
+                    all_deltas.append(
+                        {
+                            "ticker": c_ticker,
+                            "prior_fiscal_year": prior_fy,
+                            "current_fiscal_year": curr_fy,
+                            "change_type": ct,
+                            "text_blob": "",
+                            "counts": counts,
+                        }
+                    )
+
+    matched = 0
+    missing: list[str] = []
+    for exp in item.expected_deltas:
+        hint = (exp.keyword_hint or "").strip().lower()
+        hit = any(
+            d["ticker"] == exp.ticker
+            and d["prior_fiscal_year"] == exp.prior_fiscal_year
+            and d["current_fiscal_year"] == exp.current_fiscal_year
+            and d["change_type"] == exp.change_type
+            and (not hint or hint in d["text_blob"])
+            for d in all_deltas
+        )
+        if hit:
+            matched += 1
+        else:
+            missing.append(exp.label)
+    return matched, len(item.expected_deltas), missing
+
+
+def score_anomaly_flags(
+    item: GoldenEvalItem, response: dict[str, Any]
+) -> tuple[int, int, list[str]]:
+    """Check `material_variance_flags` includes every expected anomaly flag."""
+    if not item.expected_flags:
+        return 0, 0, []
+    flags = response.get("material_variance_flags") or []
+    matched = 0
+    missing: list[str] = []
+    for ef in item.expected_flags:
+        hit = any(
+            (ef.flag_id and str(f.get("flag_id")) == ef.flag_id)
+            or (
+                _norm_ticker(f.get("ticker", "")) == ef.ticker
+                and int(f.get("fiscal_year") or 0) == ef.fiscal_year
+                and str(f.get("metric") or "") == ef.metric
+                and str(f.get("rule") or "") == ef.rule
+            )
+            for f in flags
+        )
+        if hit:
+            matched += 1
+        else:
+            missing.append(ef.label)
+    return matched, len(item.expected_flags), missing
+
+
+def score_unsupported_claims(response: dict[str, Any]) -> tuple[int, list[str]]:
+    """Deterministic count of unsupported claims / uncited notes sections in the released answer."""
+    reasons: list[str] = []
+    count = 0
+    answer = response.get("answer_markdown") or ""
+    if _NOTES_SECTION_MARKER in answer:
+        count += 1
+        reasons.append("answer contains unverified Notes section")
+    rv = response.get("report_verification") or {}
+    rv_unsup = int(rv.get("unsupported_claims_count") or 0)
+    if rv_unsup > 0:
+        count += rv_unsup
+        reasons.append(f"report_verification.unsupported_claims_count={rv_unsup}")
+    return count, reasons
+
+
+def score_scope_or_coverage(
+    item: GoldenEvalItem, response: dict[str, Any]
+) -> tuple[bool, list[str]]:
+    """Score clarification, out-of-corpus refusals, and required coverage notices."""
+    reasons: list[str] = []
+    actual_status = str(response.get("status") or "")
+    if item.expected_status and actual_status != item.expected_status:
+        reasons.append(f"status={actual_status!r} expected {item.expected_status!r}")
+    if item.expected_intent and response.get("intent") != item.expected_intent:
+        reasons.append(f"intent={response.get('intent')!r} expected {item.expected_intent!r}")
+    if item.expected_status in ("clarification", "out_of_corpus"):
+        followups = response.get("suggested_followups") or []
+        if not followups:
+            reasons.append("missing actionable suggested_followups for early-exit guidance")
+        if response.get("citations"):
+            reasons.append("early-exit clarification/out_of_corpus leaked citations")
+    if item.expected_coverage_notice_codes:
+        notices = response.get("coverage_notices") or []
+        present_codes = {str(n.get("code") or "") for n in notices if isinstance(n, dict)}
+        missing_codes = [c for c in item.expected_coverage_notice_codes if c not in present_codes]
+        if missing_codes:
+            reasons.append(
+                f"missing coverage_notices codes {missing_codes} (got {sorted(present_codes)})"
+            )
+    return not reasons, reasons
+
+
 def score_safety(item: GoldenEvalItem, response: dict[str, Any]) -> tuple[bool, list[str]]:
     """Red-team prompt must be blocked (with the expected block type when specified)."""
     reasons: list[str] = []

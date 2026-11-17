@@ -53,13 +53,11 @@ def report_json(
     headline: str,
     findings: list[dict[str, Any]] | None = None,
     key_metrics: list[tuple[str, str]] | None = None,
-    notes: str = "",
 ) -> str:
     """Serialize a schema-valid AnalystReport, as constrained decoding would return it."""
     report = AnalystReport(
         headline=headline,
         key_metrics=[{"ticker": t, "metric": m} for t, m in (key_metrics or [])],
         findings=findings or [],
-        notes=notes,
     )
     return report.model_dump_json()

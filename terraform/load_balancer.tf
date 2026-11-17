@@ -65,8 +65,9 @@ resource "google_compute_ssl_policy" "sec_edgar_tls" {
 
   project = var.project_id
   name    = "${var.cloud_run_service_name}-tls-policy"
-  # RESTRICTED + TLS 1.2 minimum. Google front ends negotiate TLS 1.3 with clients that
-  # support it, but LB SSL policies can't set a 1.3-only minimum.
+  # RESTRICTED + TLS_1_2 is the strictest minimum supported by GCP Compute Engine SSL policies
+  # (hashicorp/google 6.x rejects TLS_1_3). Google front ends automatically negotiate TLS 1.3
+  # with clients that support it.
   profile         = "RESTRICTED"
   min_tls_version = "TLS_1_2"
 }

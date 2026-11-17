@@ -553,6 +553,7 @@ def test_structured_react_executor_live_peer_comparison() -> None:
         chunk_health=None,
         memory_tokens=48,
         memory_prep_latency_ms=0.8,
+        run_judge_sync=True,
     )
     assert out["execution_mode"] == "live_adk"
     assert out["reasoning_model"] == "gemini-3.8-flash"
@@ -634,14 +635,15 @@ def test_conversation_memory_token_threshold_compaction() -> None:
         answer_markdown="Second detailed grounded synthesis paragraph " * 12,
     )
     assert res2["compaction_triggered"] is True
+    assert res2["compaction_method"] == "deterministic_digest"
     assert res2["compaction_count"] == 1
     recalled = compact_mgr.recall_session_context("compact-sess")
     assert "[Compacted Prior Context]:" in recalled["memory_summary_text"]
     assert "T1(NVDA FY2024-2026)" in recalled["memory_summary_text"]
 
+    # Deterministic string-digest compaction MUST NOT fabricate synthetic LLM billing records
     after_flash_records = tracker.recent_records(limit=200, model_name="gemini-3.5-flash")
-    assert len(after_flash_records) > before_flash_count
-    assert any(r.task_category == "context_compaction" for r in after_flash_records)
+    assert len(after_flash_records) == before_flash_count
 
 
 def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
@@ -679,8 +681,10 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
     assert turn1["react_execution"]["iterations"] >= 4
     assert len(turn1["react_execution"]["cached_10k_explanations"]) >= 1
     assert _is_model(turn1["evaluation"]["evaluator_model"], "gemini-3.5-flash")
+    assert turn1["react_execution"]["judge_mode"] == "async_background"
     assert turn1["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
-    assert turn1["context_and_memory"]["turn_context_latency"]["total_calls"] >= 2
+    # Interactive HTTP turn keeps live LLM-as-a-Judge off the critical path (>= 1 analyst call)
+    assert turn1["context_and_memory"]["turn_context_latency"]["total_calls"] >= 1
     assert isinstance(turn1["answer_verified"], bool)
 
     # Turn 2 omits the company ("those margins") and inherits NVDA from session memory

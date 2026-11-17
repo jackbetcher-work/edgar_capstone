@@ -6,6 +6,9 @@ export type QueryIntentType =
   | 'thematic_trend_tracking'
   | 'chunk_health_monitoring'
   | 'safety_guardrail_block'
+  | 'projection_compliance_block'
+  | 'clarification_needed'
+  | 'out_of_corpus'
 
 export interface CompanySummary {
   ticker: string
@@ -37,6 +40,44 @@ export interface CompaniesCatalogResponse {
   companies: CompanySummary[]
 }
 
+export interface NumericCitation {
+  ticker: string
+  fiscal_year: number
+  metric: string
+  value?: number | null
+  unit?: string
+  period_of_report?: string | null
+  filing_date?: string | null
+  accession_number?: string | null
+  xbrl_concept?: string | null
+  sec_filing_url?: string | null
+  derived_from?: NumericCitation[]
+}
+
+export interface CoverageNotice {
+  code: string
+  severity: 'info' | 'warning'
+  message: string
+  tickers?: string[]
+  missing_fiscal_years?: number[]
+}
+
+export interface SectorCoverageMetadata {
+  gics_sector?: string
+  total_sector_companies?: number
+  companies_analyzed?: number
+  companies_with_matches?: number
+  chunks_analyzed?: number
+  batches_executed?: number
+  batches_succeeded?: number
+  batch_size?: number
+  theme_terms?: string[]
+  section_id?: string
+  start_year?: number
+  end_year?: number
+  map_model?: string
+}
+
 export interface MetricVariance {
   metric_name: 'revenue' | 'operating_income' | 'net_income' | 'research_and_development'
   start_year: number
@@ -47,11 +88,27 @@ export interface MetricVariance {
   percentage_delta: number | null
   cagr_pct: number | null
   direction: 'increase' | 'decrease' | 'flat' | 'unavailable'
+  start_period_of_report?: string | null
+  end_period_of_report?: string | null
+  start_accession_number?: string | null
+  end_accession_number?: string | null
+  start_sec_filing_url?: string | null
+  end_sec_filing_url?: string | null
+  start_xbrl_concept?: string | null
+  end_xbrl_concept?: string | null
+  derived_from?: NumericCitation[]
 }
 
 export interface AnnualStepVariance {
   fiscal_year: number
   prev_fiscal_year: number | null
+  period_of_report?: string | null
+  filing_date?: string | null
+  accession_number?: string | null
+  prior_period_of_report?: string | null
+  prior_accession_number?: string | null
+  prior_sec_filing_url?: string | null
+  metric_provenance?: Record<string, string | null> | null
   revenue: number | null
   revenue_yoy_delta: number | null
   revenue_yoy_pct: number | null
@@ -75,6 +132,10 @@ export interface CompanyVarianceReport {
   gics_sub_industry: string
   start_year: number
   end_year: number
+  requested_start_year?: number | null
+  requested_end_year?: number | null
+  available_fiscal_years?: number[]
+  missing_fiscal_years?: number[]
   currency: string
   revenue_variance: MetricVariance
   operating_income_variance: MetricVariance
@@ -86,6 +147,11 @@ export interface CompanyVarianceReport {
   rd_intensity_bps_delta?: number | null
   annual_series: AnnualStepVariance[]
   source_urls: Record<string, string>
+  period_end_dates?: Record<string, string>
+  filing_dates?: Record<string, string>
+  accession_numbers?: Record<string, string>
+  metric_provenance?: Record<string, Record<string, string | null>>
+  derived_margin_inputs?: Record<string, NumericCitation[]>
 }
 
 export interface SectorBenchmarkRow {
@@ -113,6 +179,9 @@ export interface GroundedCitation {
   sec_filing_url: string
   unstructured_gcs_uri: string
   score: number
+  period_of_report?: string | null
+  filing_date?: string | null
+  accession_number?: string | null
 }
 
 export interface FactCheckVerification {
@@ -247,6 +316,9 @@ export interface MaterialVarianceFlag {
     prior_accession_number: string | null
     prior_sec_filing_url: string | null
     prior_period_of_report: string | null
+    prior_xbrl_concept?: string | null
+    denominator_xbrl_concept?: string | null
+    prior_denominator_xbrl_concept?: string | null
   }
   explanation: {
     chunk_id: string
@@ -324,8 +396,15 @@ export interface DisclosureDeltaResult {
   citations?: GroundedCitation[]
 }
 
+export interface ChatProgressEvent {
+  stage: string
+  message: string
+  meta?: Record<string, unknown> | null
+  elapsed_ms?: number
+}
+
 export interface ChatTurnResponse {
-  status: 'success' | 'blocked' | 'error'
+  status: 'success' | 'blocked' | 'clarification' | 'out_of_corpus' | 'error'
   model_armor_blocked: boolean
   intent: QueryIntentType
   orchestrator: string
@@ -333,6 +412,18 @@ export interface ChatTurnResponse {
   answer_markdown: string
   /** False when the live answer failed verification and its narrative was withheld. */
   answer_verified?: boolean
+  clarification_reason?: string | null
+  suggested_followups?: string[]
+  coverage_notices?: CoverageNotice[]
+  sector_coverage?: SectorCoverageMetadata | null
+  missing_tickers?: string[]
+  structured_report?: Record<string, unknown> | null
+  report_verification?: {
+    passed?: boolean
+    findings_verified?: number
+    findings_rejected?: number
+    unsupported_claims_count?: number
+  } | null
   variance_reports: CompanyVarianceReport[]
   sector_benchmarks?: SectorBenchmarkRow[]
   material_variance_flags?: MaterialVarianceFlag[]
@@ -346,6 +437,8 @@ export interface ChatTurnResponse {
   react_execution?: {
     strategy: string
     iterations: number
+    judge_mode?: string
+    observed_ttft_ms?: number | null
     steps: ReActStepMetadata[]
   }
   context_and_memory?: {
@@ -391,6 +484,29 @@ export interface SearchScopeFilters {
   topK: number
 }
 
+export interface XbrlFactSelection {
+  title: string
+  ticker: string
+  companyName?: string
+  fiscalYear: number
+  priorFiscalYear?: number | null
+  metricLabel: string
+  valueFormatted?: string
+  deltaFormatted?: string
+  periodOfReport?: string | null
+  priorPeriodOfReport?: string | null
+  filingDate?: string | null
+  accessionNumber?: string | null
+  priorAccessionNumber?: string | null
+  xbrlConcept?: string | null
+  priorXbrlConcept?: string | null
+  denominatorXbrlConcept?: string | null
+  priorDenominatorXbrlConcept?: string | null
+  secFilingUrl?: string | null
+  priorSecFilingUrl?: string | null
+  derivedFrom?: NumericCitation[]
+}
+
 export interface ConversationTurn {
   id: string
   createdAt: string
@@ -398,6 +514,10 @@ export interface ConversationTurn {
   appliedFilters: SearchScopeFilters
   response: ChatTurnResponse | null
   isLoading: boolean
+  progressStage?: string
+  progressMessage?: string
+  progressMeta?: Record<string, unknown> | null
+  progressElapsedMs?: number
   errorMessage?: string
   feedbackRating?: 'up' | 'down'
   feedbackComment?: string

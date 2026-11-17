@@ -21,7 +21,7 @@ import {
   logoutAuthenticatedSession,
 } from './services/authService'
 import {
-  executeConversationalRagQuery,
+  executeConversationalRagQueryStream,
   fetchCached10kSection,
   fetchCompaniesCatalog,
   postAnalystFeedback,
@@ -35,8 +35,12 @@ import type {
   ConversationTurn,
   GroundedCitation,
   SearchScopeFilters,
+  XbrlFactSelection,
 } from './types/edgar'
-import type { ParsedInlineCitationToken } from './utils/formatters'
+import type {
+  ParsedInlineCitationToken,
+  ParsedInlineXbrlToken,
+} from './utils/formatters'
 
 const DEFAULT_FILTERS: SearchScopeFilters = {
   selectedTickers: [],
@@ -73,9 +77,11 @@ export function App() {
 
   // Split-pane 10-K Source Viewer state
   const [isSourcePaneOpen, setIsSourcePaneOpen] = useState<boolean>(true)
-  const [sourceTab, setSourceTab] = useState<'citations' | 'document'>(
+  const [sourceTab, setSourceTab] = useState<'citations' | 'document' | 'xbrl'>(
     'citations'
   )
+  const [selectedXbrlFact, setSelectedXbrlFact] =
+    useState<XbrlFactSelection | null>(null)
   const [activeCitations, setActiveCitations] = useState<GroundedCitation[]>([])
   const [activeChunkId, setActiveChunkId] = useState<string | null>(null)
   const [cachedSection, setCachedSection] =
@@ -285,6 +291,7 @@ export function App() {
     setTurns([])
     setActiveCitations([])
     setActiveChunkId(null)
+    setSelectedXbrlFact(null)
     setCachedSection(null)
     setSectionError(null)
     setHighlightedExcerpt(null)
@@ -332,7 +339,25 @@ export function App() {
     scrollToLatestTurn()
 
     try {
-      const resp = await executeConversationalRagQuery(trimmed, snapshotFilters)
+      const resp = await executeConversationalRagQueryStream(
+        trimmed,
+        snapshotFilters,
+        (progress) => {
+          setTurns((prev) =>
+            prev.map((t) =>
+              t.id === turnId
+                ? {
+                    ...t,
+                    progressStage: progress.stage,
+                    progressMessage: progress.message,
+                    progressMeta: progress.meta ?? null,
+                    progressElapsedMs: progress.elapsed_ms,
+                  }
+                : t
+            )
+          )
+        }
+      )
 
       setTurns((prev) =>
         prev.map((t) =>
@@ -376,6 +401,38 @@ export function App() {
     }
     setFilters(mergedScope)
     void runQuery(preset.query, mergedScope)
+  }
+
+  const handleInspectXbrlFact = (fact: XbrlFactSelection) => {
+    setSelectedXbrlFact(fact)
+    setSourceTab('xbrl')
+    setIsSourcePaneOpen(true)
+  }
+
+  const handleSelectInlineXbrlCitation = (
+    token: ParsedInlineXbrlToken,
+    turn: ConversationTurn
+  ) => {
+    const reports = turn.response?.variance_reports ?? []
+    const matchedRep = reports.find(
+      (r) => r.ticker.toUpperCase() === token.ticker.toUpperCase()
+    )
+    const fyKey = String(token.fiscalYear)
+    const period = matchedRep?.period_end_dates?.[fyKey] ?? null
+    const filingDate = matchedRep?.filing_dates?.[fyKey] ?? null
+    const fact: XbrlFactSelection = {
+      title: `${token.ticker} FY${token.fiscalYear} · ${token.xbrlConcept}`,
+      ticker: token.ticker,
+      companyName: matchedRep?.company_name,
+      fiscalYear: token.fiscalYear,
+      metricLabel: token.xbrlConcept,
+      periodOfReport: period,
+      filingDate,
+      accessionNumber: token.accessionNumber,
+      xbrlConcept: token.xbrlConcept,
+      secFilingUrl: token.url || matchedRep?.source_urls?.[fyKey] || null,
+    }
+    handleInspectXbrlFact(fact)
   }
 
   const handleSelectInlineCitation = (
@@ -464,6 +521,7 @@ export function App() {
     setTurns([])
     setActiveCitations([])
     setActiveChunkId(null)
+    setSelectedXbrlFact(null)
     setHighlightedExcerpt(null)
     setPromptInput('')
   }
@@ -533,6 +591,15 @@ export function App() {
                         turn={turn}
                         activeChunkId={activeChunkId}
                         onSelectInlineCitation={handleSelectInlineCitation}
+                        onSelectXbrlCitation={handleSelectInlineXbrlCitation}
+                        onInspectXbrlFact={handleInspectXbrlFact}
+                        onSelectFollowup={(suggestedQuery) => {
+                          void runQuery(suggestedQuery, {
+                            ...filters,
+                            selectedTickers: [],
+                            gicsSector: 'ALL',
+                          })
+                        }}
                         onFocusTurnCitations={(cits) => {
                           setActiveCitations(cits)
                           setActiveChunkId(cits[0]?.chunk_id ?? null)
@@ -571,6 +638,7 @@ export function App() {
                   onSelectChunkId={setActiveChunkId}
                   activeTab={sourceTab}
                   onChangeTab={setSourceTab}
+                  selectedXbrlFact={selectedXbrlFact}
                   cachedSection={cachedSection}
                   isLoadingSection={isLoadingSection}
                   sectionError={sectionError}
