@@ -187,15 +187,14 @@ Outstanding work needed to meet the reference specification. Section numbers (§
 | 7 | Golden dataset coverage | §10 | P1 | Partial | Add peer, thematic, anomaly, and out-of-corpus items; analyst review. |
 | 8 | Missing evaluation gates | §5, §10 | P1 | Not started | Add citation precision, retrieval precision@10, filter correctness, and wording-delta gates. |
 | 9 | Coverage and eval gates in CI | §9, §10 | P1 | Not started | Add `pytest-cov` (>80%) and `make eval-all` as deploy gates. |
-| 10 | Analyst model differs from spec | §6 | P2 | Decision needed | Get Gemini 2.5 Pro access or update the spec to `gemini-3.8-flash`. |
-| 11 | Cloud Build triggers | §9 | P2 | Not applied | Apply with `enable_cloudbuild_trigger = true`. |
-| 12 | Vector Search index deployment | §8 · T1 | P2 | Not applied | Run a full `terraform apply` to deploy the index to its PSC endpoint. |
-| 13 | VPC Service Controls enforcement | §9 | P2 | Blocked | Needs an org-delegated Access Context Manager policy. |
-| 14 | Live observability verification | §5, §11 | P2 | Not verified | Confirm one end-to-end `/api/v1/chat` trace in Cloud Trace. |
-| 15 | TLS 1.3 in transit | §9 | P2 | Gap | Raise the minimum TLS version or relax the spec. |
-| 16 | Chat-turn latency on live retrieval | §5 · B1 | P1 | Gap | Cut the ~105 s turn and 4.3 s TTFT toward the 3.0 s target (parallel retrieval, fewer embedding calls, judge off the critical path). |
-| 17 | CI access to live GCP | §9 | P1 | Not applied | Apply `terraform/ci_live_test_access.tf` so the CI service accounts can run the live test suite. |
-| 18 | Model Armor template redacts service-account emails | §9 | P2 | Gap | Exempt `*.iam.gserviceaccount.com` in the Model Armor SDP template. |
+| 10 | Cloud Build triggers | §9 | P2 | Not applied | Apply with `enable_cloudbuild_trigger = true`. |
+| 11 | Vector Search index deployment | §8 · T1 | P2 | Not applied | Run a full `terraform apply` to deploy the index to its PSC endpoint. |
+| 12 | VPC Service Controls enforcement | §9 | P2 | Blocked | Needs an org-delegated Access Context Manager policy. |
+| 13 | Live observability verification | §5, §11 | P2 | Not verified | Confirm one end-to-end `/api/v1/chat` trace in Cloud Trace. |
+| 14 | TLS 1.3 in transit | §9 | P2 | Gap | Raise the minimum TLS version or relax the spec. |
+| 15 | Chat-turn latency on live retrieval | §5 · B1 | P1 | Gap | Cut the ~105 s turn and 4.3 s TTFT toward the 3.0 s target (parallel retrieval, fewer embedding calls, judge off the critical path). |
+| 16 | CI access to live GCP | §9 | P1 | Not applied | Apply `terraform/ci_live_test_access.tf` so the CI service accounts can run the live test suite. |
+| 17 | Model Armor template redacts service-account emails | §9 | P2 | Gap | Exempt `*.iam.gserviceaccount.com` in the Model Armor SDP template. |
 
 ---
 
@@ -319,17 +318,7 @@ Outstanding work needed to meet the reference specification. Section numbers (§
 
 **Done when:** CI fails if coverage drops below 80% or any eval gate regresses, and every deploy has a matching `eval_results` row.
 
-### 10. Analyst Model Differs from Spec *(§6)*
-
-**Requirement:** Gemini 2.5 Pro for financial reasoning.
-
-**Gap:** `RootOrchestrator` and `FinancialAnalystAgent` run on `gemini-3.8-flash` (`EDGAR_ANALYST_MODEL`) because Gemini 2.5 Pro returns HTTP 404 in `iron-radio-514217-q7`.
-
-**Next actions:** Either request Gemini 2.5 Pro access for the project, or update §6 of the reference to name `gemini-3.8-flash` and re-baseline cost and latency.
-
-**Done when:** The spec and the runtime name the same model.
-
-### 11. Cloud Build Triggers *(§9 CI/CD)*
+### 10. Cloud Build Triggers *(§9 CI/CD)*
 
 **Requirement:** Cloud Build deploys automatically on successful merges.
 
@@ -339,7 +328,7 @@ Outstanding work needed to meet the reference specification. Section numbers (§
 
 **Done when:** A merge to `main` runs `cloudbuild.yaml` in deploy mode and a pull request runs it in verify mode.
 
-### 12. Vector Search Index Deployment *(§8 Retrieval Strategy · T1)*
+### 11. Vector Search Index Deployment *(§8 Retrieval Strategy · T1)*
 
 **Requirement:** Vector search over `filing_chunks` embeddings is part of hybrid retrieval.
 
@@ -349,7 +338,7 @@ Outstanding work needed to meet the reference specification. Section numbers (§
 
 **Done when:** Live hybrid search returns neighbors from the deployed Vector Search index over PSC.
 
-### 13. VPC Service Controls Enforcement *(§9 Data Protection)*
+### 12. VPC Service Controls Enforcement *(§9 Data Protection)*
 
 **Requirement:** A strict service perimeter locks down Vertex AI, Cloud Run, GCS, and BigQuery.
 
@@ -359,7 +348,7 @@ Outstanding work needed to meet the reference specification. Section numbers (§
 
 **Done when:** The perimeter is enforced with no unexpected violations.
 
-### 14. Live Observability Verification *(§5 Observability, §11)*
+### 13. Live Observability Verification *(§5 Observability, §11)*
 
 **Requirement:** End-to-end tracing through OpenTelemetry and Cloud Trace, structured logs correlated by trace ID, and BigQuery telemetry joinable to traces.
 
@@ -372,7 +361,7 @@ Outstanding work needed to meet the reference specification. Section numbers (§
 
 **Done when:** One `/api/v1/chat` request shows a single trace with nested FastAPI, ReAct, tool, and model spans; its logs are grouped under that trace; and its BigQuery telemetry rows carry the same `trace_id`.
 
-### 15. TLS 1.3 in Transit *(§9 Data Protection)*
+### 14. TLS 1.3 in Transit *(§9 Data Protection)*
 
 **Requirement:** 100% of data is encrypted in transit using TLS 1.3.
 
@@ -382,7 +371,7 @@ Outstanding work needed to meet the reference specification. Section numbers (§
 
 **Done when:** The spec and the deployed TLS policy agree.
 
-### 16. Chat-Turn Latency on Live Retrieval *(§5 Latency · B1)*
+### 15. Chat-Turn Latency on Live Retrieval *(§5 Latency · B1)*
 
 **Requirement:** p95 TTFT ≤ 3.0 s for single- and peer-company queries.
 
@@ -396,11 +385,11 @@ Outstanding work needed to meet the reference specification. Section numbers (§
 1. Run the independent retrieval steps (hybrid search, variance flags, section ranking) concurrently.
 2. Use the `filing_chunks` embeddings already stored in BigQuery for section ranking instead of re-embedding paragraphs.
 3. Move the LLM-as-a-Judge call off the request path (score asynchronously and write to telemetry).
-4. Deploy the Vector Search index (gap 12) so hybrid search stops waiting on fallbacks.
+4. Deploy the Vector Search index (gap 11) so hybrid search stops waiting on fallbacks.
 
 **Done when:** `make eval-all` reports p95 TTFT ≤ 3,000 ms and a typical turn completes in well under 30 s.
 
-### 17. CI Access to Live GCP *(§9 CI/CD)*
+### 16. CI Access to Live GCP *(§9 CI/CD)*
 
 **Requirement:** The test suite runs against live GCP data and live Gemini in Cloud Build and GitHub Actions.
 
@@ -410,7 +399,7 @@ Outstanding work needed to meet the reference specification. Section numbers (§
 
 **Done when:** A PR build runs the full live test suite green.
 
-### 18. Model Armor Template Redacts Service-Account Emails *(§9 Data Protection)*
+### 17. Model Armor Template Redacts Service-Account Emails *(§9 Data Protection)*
 
 **Requirement:** PII is redacted from prompts and responses; service-account identifiers used in operational answers stay intact.
 

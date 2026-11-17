@@ -3,7 +3,7 @@
 Implements:
 1. Dual-Model Specialization Strategy:
    - `gemini-3.8-flash` (`EDGAR_ANALYST_MODEL`): Complex financial reasoning, multi-period variance synthesis,
-     and ReAct orchestration. (The reference spec names Gemini 2.5 Pro, which this project cannot access.)
+     and ReAct orchestration.
    - `gemini-3.5-flash`: Coding assistance, LLM-as-a-Judge evaluation tasks, and context compaction summarization.
 2. Context-Induced Latency Tracking:
    - Decomposes every model call into context preparation latency, context prefill latency (cached vs. uncached),
@@ -203,9 +203,11 @@ def _get_profile_for_model(model_name: str) -> ModelPerformanceProfile:
     for known in MODEL_PROFILES:  # versioned ids, e.g. "gemini-3.8-flash-001"
         if norm.startswith(known):
             return MODEL_PROFILES[known]
-    if "flash" in norm:
-        return MODEL_PROFILES["gemini-3.5-flash"]
-    return MODEL_PROFILES["gemini-2.5-pro"]
+    # No silent default: pricing and latency telemetry for an unlisted model would be wrong.
+    raise ValueError(
+        f"No performance/pricing profile for model {model_name!r}. Add it to MODEL_PROFILES "
+        f"in context_memory.py (known models: {', '.join(sorted(MODEL_PROFILES))})."
+    )
 
 
 def get_model_strategy_metadata() -> dict[str, Any]:

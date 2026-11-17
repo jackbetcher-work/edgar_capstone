@@ -769,6 +769,11 @@ def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
     assert _get_profile_for_model("publishers/google/models/gemini-3.8-flash-001") is prof
     assert _get_profile_for_model("gemini-3.5-flash").model_name == "gemini-3.5-flash"
     assert _get_profile_for_model("gemini-2.5-pro").model_name == "gemini-2.5-pro"
+    # No silent pricing fallback for unlisted models (previously defaulted to Gemini 2.5 Pro).
+    with pytest.raises(ValueError, match="No performance/pricing profile"):
+        _get_profile_for_model("gemini-unlisted-model")
+    with pytest.raises(ValueError):
+        _get_profile_for_model("some-other-flash")
 
     ctx = SimpleNamespace(state={})
     analyst_text = make_adk_instruction_provider("financial_analyst")(ctx)

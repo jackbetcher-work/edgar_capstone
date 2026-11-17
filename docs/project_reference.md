@@ -96,7 +96,7 @@ Supported query types (routing intents): `longitudinal_single_company`, `multi_c
 - **Runtime:** Python 3.11+ / FastAPI
 - **Frontend:** React 18+ / TypeScript / Tailwind CSS (Vite)
 - **Orchestration:** Google ADK / AGY SDK
-- **Models:** Gemini 2.5 Pro (for financial reasoning), Gemini 3.5 Flash (for coding and evals)
+- **Models:** `gemini-3.8-flash` for financial reasoning and orchestration (`RootOrchestrator`, `FinancialAnalystAgent`), served from the Vertex AI `global` endpoint; `gemini-3.5-flash` for evaluation (LLM-as-a-Judge), coding assistance, and context compaction. Both are configurable (`EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`).
 - **Infrastructure:** Google Cloud Run, Cloud Storage, Gemini Enterprise Agent Platform (Vertex AI Search, Vector Search, Context Caching), BigQuery, Secret Manager, VPC Service Controls, OpenTelemetry, Cloud Trace
 - **IaC / Packaging:** Terraform, Docker
 - **CI/CD:** Cloud Build
@@ -122,7 +122,7 @@ graph TD
         FA -->|6. Full Section Context| CM[Context Cache Manager]
         CM --> VACC[Vertex AI Context Cache]
         CM -->|Fetch If Miss| GCS[Cloud Storage - SEC Corpus]
-        FA -->|7. Grounded Synthesis| GEM[Gemini 2.5 Pro]
+        FA -->|7. Grounded Synthesis| GEM[gemini-3.8-flash]
         GEM --> CV[Citation and Fact Verifier]
     end
     CV -->|8. Narrative + Citations + Variance Tables| FE
