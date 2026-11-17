@@ -37,6 +37,9 @@ tfplan
 crash.log
 crash.*.log
 
+# Temporary Workload Identity Federation credentials written by google-github-actions/auth
+gha-creds-*.json
+
 # OS / IDE files
 .DS_Store
 .idea/

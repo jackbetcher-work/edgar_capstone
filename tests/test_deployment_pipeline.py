@@ -104,6 +104,17 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert "/app/frontend/dist/index.html" in build_steps_str
     assert "-m scripts.container_smoke_test --in-process --live-data" in build_steps_str
     assert "docker push" in build_steps_str
+    build_image_step = next(s for s in build_job["steps"] if s.get("id") == "build_image")
+    build_run = build_image_step["run"]
+    assert '--user "$(id -u):$(id -g)"' in build_run
+    assert "-e HOME=/tmp" in build_run
+    assert (
+        'test -n "${GOOGLE_APPLICATION_CREDENTIALS}" && test -f "${GOOGLE_APPLICATION_CREDENTIALS}"'
+        in build_run
+    )
+    assert '-v "${GOOGLE_APPLICATION_CREDENTIALS}:/tmp/adc.json:ro"' in build_run
+    assert "-e GOOGLE_APPLICATION_CREDENTIALS=/tmp/adc.json" in build_run
+    assert "ADC_DIR" not in build_run
 
     # Stage 2.5: eval (depends on build, runs live golden eval regression gates before deploy)
     eval_job = jobs["eval"]

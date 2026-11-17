@@ -19,7 +19,6 @@ from edgar_capstone.agents.callbacks import (
 from edgar_capstone.agents.context_memory import (
     FINANCIAL_REASONING_MODEL,
     after_agent_memory_callback,
-    low_thinking_config_for_model,
 )
 from edgar_capstone.agents.disclosure_deltas import DisclosureDeltaTool
 from edgar_capstone.agents.material_variances import AnomalyFlagTool
@@ -61,15 +60,9 @@ def create_financial_analyst_agent(
     instead of issuing a real function call, so retrieval never ran. The ReAct structure
     lives in the system prompt and the deterministic pre-pass instead.
     """
-    base_thinking = low_thinking_config_for_model(model)
-    if base_thinking is not None:
-        thinking_cfg = genai_types.ThinkingConfig(
-            include_thoughts=True,
-            thinking_level=base_thinking.thinking_level,
-            thinking_budget=base_thinking.thinking_budget,
-        )
-    else:
-        thinking_cfg = genai_types.ThinkingConfig(include_thoughts=True)
+    # Keep default native thinking effort (`include_thoughts=True`, no forced low thinking level)
+    # so FinancialAnalystAgent preserves full analytical reasoning quality on complex filings.
+    thinking_cfg = genai_types.ThinkingConfig(include_thoughts=True)
 
     return Agent(
         name=name,

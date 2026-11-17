@@ -156,9 +156,12 @@ def test_dockerfile_dockerignore_and_makefile_ship_no_corpus() -> None:
     assert runtime_stage.index("COPY --from=builder") < runtime_stage.index("USER appuser")
 
     dockerignore = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
-    for pattern in ("data", "evals", "tests", ".env", "*credentials*.json"):
+    for pattern in ("data", "evals", "tests", ".env", "*credentials*.json", "gha-creds-*.json"):
         assert pattern in dockerignore
     assert not any("HYDRATION" in line for line in dockerignore)
+
+    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "gha-creds-*.json" in gitignore
 
     makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
     for target in ("smoke:", "docker-build:", "docker-smoke:"):

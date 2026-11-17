@@ -15,6 +15,8 @@ ADC_FILE ?= $(HOME)/.config/gcloud/application_default_credentials.json
 # SMOKE_LIVE_DATA=true makes the smoke tests also read live BigQuery data (needs ADC).
 SMOKE_LIVE_DATA ?= false
 SMOKE_ARGS := $(if $(filter true 1 yes,$(SMOKE_LIVE_DATA)),--live-data,)
+# On native Linux, ADC files are mode 0600 owned by the host user; match UID/GID inside the container.
+DOCKER_ADC_USER := $(if $(filter Linux,$(shell uname -s)),--user $$(id -u):$$(id -g) -e HOME=/tmp,)
 
 # Live GCP project / Vertex AI settings. There is no offline mode: the backend, the test
 # suite, and the evals read BigQuery / Vertex AI Search / GCS and call Gemini on Vertex AI.
@@ -124,7 +126,7 @@ docker-smoke: docker-build ## Run the image and smoke-test /health + UI over HTT
 	@if [ -n "$(SMOKE_ARGS)" ]; then test -f "$(ADC_FILE)" || { echo "Missing ADC file $(ADC_FILE); run 'gcloud auth application-default login'"; exit 1; }; fi
 	@$(DOCKER) rm -f $(SMOKE_CONTAINER) >/dev/null 2>&1 || true
 	$(DOCKER) run -d --name $(SMOKE_CONTAINER) -p $(SMOKE_PORT):8080 $(DOCKER_LIVE_TEST_ENV) \
-		$(if $(SMOKE_ARGS),-e GOOGLE_APPLICATION_CREDENTIALS=/tmp/keys/adc.json -v "$(ADC_FILE)":/tmp/keys/adc.json:ro,) \
+		$(if $(SMOKE_ARGS),$(DOCKER_ADC_USER) -e GOOGLE_APPLICATION_CREDENTIALS=/tmp/keys/adc.json -v "$(ADC_FILE)":/tmp/keys/adc.json:ro,) \
 		$(IMAGE)
 	@status=0; \
 	$(PYTHON) scripts/container_smoke_test.py --base-url http://127.0.0.1:$(SMOKE_PORT) --wait-seconds 90 $(SMOKE_ARGS) || status=$$?; \
