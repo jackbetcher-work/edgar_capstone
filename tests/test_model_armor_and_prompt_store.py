@@ -724,3 +724,55 @@ def test_health_endpoint_and_terraform_model_armor_provisioning() -> None:
     iam_tf = (REPO_ROOT / "terraform" / "iam.tf").read_text(encoding="utf-8")
     assert '"roles/modelarmor.user"' in iam_tf
     assert '"roles/dlp.user"' in iam_tf
+
+
+def test_dlp_deidentify_payload_uses_primitive_transformation_and_allows_10k_project_queries() -> (
+    None
+):
+    """Verify Cloud DLP `deidentifyConfig` schema and non-projection 10-K queries."""
+    captured_dlp_payloads: list[dict] = []
+
+    def _dlp_handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content.decode("utf-8"))
+        if ":deidentify" in str(req.url):
+            captured_dlp_payloads.append(body)
+            return httpx.Response(
+                200,
+                json={
+                    "item": {"value": body["item"]["value"]},
+                    "overview": {"transformationSummaries": []},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "sanitizationResult": {
+                    "filterMatchState": "NO_MATCH_FOUND",
+                    "filterResults": {},
+                }
+            },
+        )
+
+    mock_creds = MagicMock()
+    mock_creds.valid = True
+    mock_creds.token = "valid-adc-token"
+
+    svc = configure_model_armor_guardrail(
+        config=ModelArmorConfig(
+            mode="gcp",
+            sdp_inspect_template_id="sec-edgar-sdp-inspect",
+            sdp_deidentify_template_id="sec-edgar-sdp-deidentify",
+        ),
+        http_client=httpx.Client(transport=httpx.MockTransport(_dlp_handler)),
+        credentials=mock_creds,
+    )
+
+    decision = svc.inspect_user_prompt(
+        "What did Microsoft's FY2026 10-K disclose about its datacenter project in 2027?"
+    )
+    assert decision.blocked is False
+    assert len(captured_dlp_payloads) == 1
+    tx = captured_dlp_payloads[0]["deidentifyConfig"]["infoTypeTransformations"]["transformations"][0]
+    assert "primitiveTransformation" in tx
+    assert "replaceWithInfoTypeConfig" in tx["primitiveTransformation"]
+    assert "replaceWithInfoTypeConfig" not in tx

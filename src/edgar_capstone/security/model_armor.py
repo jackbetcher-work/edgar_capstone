@@ -175,7 +175,6 @@ def _load_guardrail_policy_dict() -> dict[str, Any]:
             "predicts",
             "prediction",
             "predictions",
-            "project",
             "projection",
             "projections",
             "projected",
@@ -377,13 +376,32 @@ class ProjectionFilterResult:
     reason: str = ""
 
 
+def _contains_token_sequence(words: list[str], phrase_tokens: list[str]) -> bool:
+    """Return True if `phrase_tokens` appears as a contiguous slice inside `words`."""
+    k = len(phrase_tokens)
+    if k == 0 or k > len(words):
+        return False
+    first = phrase_tokens[0]
+    for idx in range(len(words) - k + 1):
+        if words[idx] == first and words[idx : idx + k] == phrase_tokens:
+            return True
+    return False
+
+
 class FinancialProjectionFilter:
     """Detects ungrounded forward-looking financial projections, target prices, and MNPI leaks."""
 
     @staticmethod
     def _extract_query_segment_if_structured_prompt(text: str) -> str:
         """If `text` is an internal ADK synthesis/eval prompt, scope projection checks to the user query."""
-        for header in ("## Analyst Query\n", "### Analyst Query\n"):
+        for header in (
+            "## Analyst Query\n",
+            "### Analyst Query\n",
+            "## User Query\n",
+            "### User Query\n",
+            "## Query\n",
+            "### Query\n",
+        ):
             pos = text.find(header)
             if pos != -1:
                 after = text[pos + len(header) :]
@@ -401,13 +419,28 @@ class FinancialProjectionFilter:
             return ProjectionFilterResult(matched=False)
 
         policy = _load_guardrail_policy_dict()
-        full_lowered = " ".join(text.lower().split())
+        target_text = (
+            self._extract_query_segment_if_structured_prompt(text) if stage == "prompt" else text
+        )
+        lowered = " ".join(target_text.lower().split())
+        words = _normalize_words(target_text)
         matched_rules: list[str] = []
 
-        # 1. Confidential / Non-Public MNPI markers (checked across full text)
+        # 1. Confidential / Non-Public MNPI markers (scoped to target_text; allow 10-K policy disclosures in responses)
+        is_10k_policy_disclosure = stage == "response" and any(
+            term in lowered
+            for term in ("insider trading", "item 10", "item 408", "10b5-1", "code of ethics")
+        )
         for marker in policy.get("mnpi_markers", []):
             marker_norm = str(marker).strip().lower()
-            if marker_norm and marker_norm in full_lowered:
+            if not marker_norm:
+                continue
+            if is_10k_policy_disclosure and marker_norm in (
+                "material non-public information",
+                "material nonpublic information",
+            ):
+                continue
+            if marker_norm in lowered:
                 matched_rules.append(f"mnpi:{marker_norm}")
         if matched_rules:
             return ProjectionFilterResult(
@@ -420,34 +453,45 @@ class FinancialProjectionFilter:
                 ),
             )
 
-        target_text = (
-            self._extract_query_segment_if_structured_prompt(text) if stage == "prompt" else text
-        )
-        lowered = " ".join(target_text.lower().split())
-        words = _normalize_words(target_text)
-
-        # 2. Explicit stock price targets, buy/sell ratings, or ungrounded prediction phrases
+        # 2. Explicit stock price targets, buy/sell ratings, or ungrounded prediction phrases (word-boundary)
         for phrase in policy.get("projection_phrases", []):
             phrase_norm = str(phrase).strip().lower()
-            if phrase_norm and phrase_norm in lowered:
+            phrase_tokens = _normalize_words(phrase_norm)
+            if phrase_tokens and _contains_token_sequence(words, phrase_tokens):
                 matched_rules.append(f"projection_phrase:{phrase_norm}")
 
         # 3. Future fiscal-year projections beyond the verified 10-K filing window (FY2027+)
-        # Require local token proximity (<= 8 words) between a forecast term and future year
-        future_years = {str(y).strip() for y in policy.get("future_fiscal_years", [])}
-        future_year_tokens = future_years.union({f"fy{y}" for y in future_years})
-        proj_terms = {str(t).strip().lower() for t in policy.get("projection_verbs_and_nouns", [])}
+        # Require local token proximity (<= 8 words) between a forecast term and future year,
+        # and avoid blocking explicit refusal statements in model responses.
+        is_refusal_response = stage == "response" and any(
+            ref in lowered
+            for ref in (
+                "cannot forecast",
+                "cannot predict",
+                "cannot project",
+                "unable to forecast",
+                "unable to predict",
+                "unable to project",
+                "restricted to verified historical",
+            )
+        )
+        if not is_refusal_response:
+            future_years = {str(y).strip() for y in policy.get("future_fiscal_years", [])}
+            future_year_tokens = future_years.union({f"fy{y}" for y in future_years})
+            proj_terms = {
+                str(t).strip().lower() for t in policy.get("projection_verbs_and_nouns", [])
+            }
 
-        year_positions = [(i, tok) for i, tok in enumerate(words) if tok in future_year_tokens]
-        proj_positions = [(i, tok) for i, tok in enumerate(words) if tok in proj_terms]
-        for y_idx, y_tok in year_positions:
-            for p_idx, p_tok in proj_positions:
-                if abs(y_idx - p_idx) <= 8:
-                    clean_yr = y_tok[2:] if y_tok.startswith("fy") else y_tok
-                    matched_rules.append(f"future_period_projection:FY{clean_yr}+{p_tok}")
+            year_positions = [(i, tok) for i, tok in enumerate(words) if tok in future_year_tokens]
+            proj_positions = [(i, tok) for i, tok in enumerate(words) if tok in proj_terms]
+            for y_idx, y_tok in year_positions:
+                for p_idx, p_tok in proj_positions:
+                    if abs(y_idx - p_idx) <= 8:
+                        clean_yr = y_tok[2:] if y_tok.startswith("fy") else y_tok
+                        matched_rules.append(f"future_period_projection:FY{clean_yr}+{p_tok}")
+                        break
+                if any(r.startswith("future_period_projection:") for r in matched_rules):
                     break
-            if any(r.startswith("future_period_projection:") for r in matched_rules):
-                break
 
         if matched_rules:
             return ProjectionFilterResult(
@@ -1110,7 +1154,9 @@ class ModelArmorClient:
                 "minLikelihood": "POSSIBLE",
             },
             "deidentifyConfig": {
-                "infoTypeTransformations": {"transformations": [{"replaceWithInfoTypeConfig": {}}]}
+                "infoTypeTransformations": {
+                    "transformations": [{"primitiveTransformation": {"replaceWithInfoTypeConfig": {}}}]
+                }
             },
         }
         if self.config.sdp_inspect_template_id:
@@ -1531,11 +1577,31 @@ class ModelArmorGuardrailService:
             working_text = ma_summary.sdp_deidentified_text
 
         if self.config.enable_cloud_dlp_api and not sdp_triggered:
-            dlp_matched, dlp_types, dlp_text = self.client.inspect_and_deidentify_sdp(working_text)
-            if dlp_matched:
-                sdp_triggered = True
-                sdp_types.update(dlp_types)
-                working_text = dlp_text
+            try:
+                dlp_matched, dlp_types, dlp_text = self.client.inspect_and_deidentify_sdp(
+                    working_text
+                )
+                if dlp_matched:
+                    sdp_triggered = True
+                    sdp_types.update(dlp_types)
+                    working_text = dlp_text
+            except Exception as exc:
+                logger.warning("Cloud SDP deidentify check failed on response: %s", exc)
+                if self.config.fail_closed and self.config.mode in ("gcp", "live"):
+                    return GuardrailDecision(
+                        action="blocked",
+                        blocked=True,
+                        sdp_redacted=False,
+                        projection_blocked=False,
+                        original_text=text,
+                        sanitized_text="",
+                        matched_categories=("sdp_response_unavailable_fail_closed",),
+                        block_message=str(policy["blocked_response_message"]),
+                        backend_used=ma_summary.backend_used,
+                        latency_ms=round((time.perf_counter() - start) * 1000.0, 2),
+                        s2s_service_account=sa_email,
+                        s2s_spiffe_id=spiffe_id,
+                    )
 
         if sdp_triggered:
             sorted_types = tuple(sorted(sdp_types))

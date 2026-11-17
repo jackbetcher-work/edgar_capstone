@@ -11,7 +11,7 @@ resource "google_data_loss_prevention_inspect_template" "sec_edgar_sdp_inspect" 
   description  = "Inspects prompts and synthesized 10-K reports for PII, credentials, confidential MNPI, and ungrounded financial projection markers."
 
   inspect_config {
-    min_likelihood = "POSSIBLE"
+    min_likelihood = "LIKELY"
 
     info_types {
       name = "US_SOCIAL_SECURITY_NUMBER"
@@ -106,7 +106,7 @@ resource "google_model_armor_template" "sec_edgar_analyst_armor" {
   filter_config {
     pi_and_jailbreak_filter_settings {
       filter_enforcement = "ENABLED"
-      confidence_level   = "LOW_AND_ABOVE"
+      confidence_level   = "MEDIUM_AND_ABOVE"
     }
 
     malicious_uri_filter_settings {
