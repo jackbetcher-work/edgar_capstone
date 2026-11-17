@@ -357,7 +357,8 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     configure_telemetry_stores(telemetry_sink=sink)
 
     with caplog.at_level(logging.INFO, logger="edgar_capstone.cloud_logging_sink"):
-        # 1.Conversational RAG multi-turn execution streams both LLM call telemetry and session telemetry
+        # 1. Two live conversational RAG turns (live Gemini + live GCP data) on one session stream
+        #    both LLM call telemetry and session telemetry into the (mocked) BigQuery sink
         turn_1 = run_conversational_rag_turn(
             query="Analyze NVDA FY2024 to FY2026 revenue and operating income variances.",
             tickers="NVDA",
@@ -365,7 +366,6 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
             end_year=2026,
             session_id="sess-bq-stream-1",
             user_id="analyst@fde-workspace.corp",
-            execution_mode="deterministic",
         )
         turn_2 = run_conversational_rag_turn(
             query="Compare AAPL and MSFT operating margin drivers from FY2024 to FY2025.",
@@ -374,8 +374,9 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
             end_year=2025,
             session_id="sess-bq-stream-1",
             user_id="analyst@fde-workspace.corp",
-            execution_mode="deterministic",
         )
+        assert turn_1["status"] == "success" and turn_2["status"] == "success"
+        assert turn_1["execution_mode"] == "live_adk"
 
         # 2. Security / 10-K access audit log streaming
         record_security_audit_event(
@@ -403,12 +404,16 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     assert sess_row_1["session_id"] == "sess-bq-stream-1"
     assert sess_row_1["session_cumulative_turns"] == 1
     assert sess_row_1["tickers_analyzed"] == ["NVDA"]
-    assert sess_row_1["report_generated"] is True
+    # A report counts as generated only when the live answer passed verification
+    assert sess_row_1["report_generated"] is bool(turn_1["answer_verified"])
+    assert sess_row_1["execution_mode"] == "live_adk"
     assert len(sess_row_1["tool_invocations"]) >= 2
 
     assert sess_row_2["session_cumulative_turns"] == 2
     assert sess_row_2["session_cumulative_companies_count"] == 3  # NVDA, AAPL, MSFT
-    assert sess_row_2["session_cumulative_reports_count"] == 2
+    assert sess_row_2["session_cumulative_reports_count"] == sum(
+        bool(t["answer_verified"]) for t in (turn_1, turn_2)
+    )
     assert turn_1["context_and_memory"]["session_telemetry"]["turn_index"] == 1
     assert turn_2["context_and_memory"]["session_telemetry"]["turn_index"] == 2
 
@@ -792,7 +797,7 @@ def test_lookml_catalog_views_models_and_dashboards_validity(
     assert "telemetry_sink" in health_json
     assert "feedback_store" in health_json
 
-    # Trigger a deterministic chat turn so LLM, session, and audit buffers have live records
+    # One live chat turn so the LLM, session, and audit buffers have real records to explore
     chat_resp = client.post(
         "/api/v1/chat",
         headers=headers,
@@ -802,10 +807,10 @@ def test_lookml_catalog_views_models_and_dashboards_validity(
             "start_year": 2024,
             "end_year": 2025,
             "session_id": "sess-explore-check",
-            "execution_mode": "deterministic",
         },
     )
     assert chat_resp.status_code == 200
+    assert chat_resp.json()["status"] == "success"
 
     cat_resp = client.get("/api/v1/looker/catalog", headers=headers)
     assert cat_resp.status_code == 200
@@ -828,15 +833,19 @@ def test_lookml_catalog_views_models_and_dashboards_validity(
     assert sess_json["event_count"] == 1
     assert sess_json["summary"]["distinct_companies_analyzed"] == ["MSFT", "NVDA"]
 
-    # Coding assistant LookML generation references `sec_edgar_analytics`
+    # Live CodingAssistantAgent LookML generation targets the BigQuery dataset
     coding_report = generate_financial_coding_assistance(
         prompt="Create a LookML view and explore for YoY revenue variance and telemetry cost.",
         language="lookml",
         tickers="NVDA,MSFT",
-        execution_mode="deterministic",
     )
-    assert "v_financial_variances_yoy.view.lkml" in coding_report.code
-    assert "sec_edgar_analytics" in coding_report.explanation
+    assert coding_report.language == "lookml"
+    assert coding_report.task_category == "coding_assistance"
+    assert coding_report.code.strip() and coding_report.explanation.strip()
+    lookml = coding_report.code.lower()
+    assert "view" in lookml and ("dimension" in lookml or "measure" in lookml)
+    assert "sec_edgar" in lookml
+    assert coding_report.total_latency_ms > 0
 
 
 # ---------------------------------------------------------------------------
@@ -876,7 +885,7 @@ def test_terraform_telemetry_firestore_and_schema_parity() -> None:
         session_id="s1",
         user_id="u1",
         intent="variance_explanation",
-        execution_mode="deterministic",
+        execution_mode="live_adk",
         status_outcome="success",
         tickers_analyzed=["NVDA"],
         gics_sector="Information Technology",

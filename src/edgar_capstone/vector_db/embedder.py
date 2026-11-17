@@ -1,23 +1,24 @@
-"""Dense vector embedding generation for SEC 10-K RAG chunks (Vertex AI & deterministic)."""
+"""Dense vector embedding generation for SEC 10-K RAG chunks via Vertex AI `text-embedding-005`.
+
+There is no offline or synthetic embedding backend: ingestion always calls Vertex AI and
+fails loudly when it is unavailable, so every stored vector is a real model embedding.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
-import math
 import random
-import re
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import google.auth
 import httpx
-import numpy as np
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from edgar_capstone.vector_db.models import FilingChunk
@@ -29,9 +30,8 @@ DEFAULT_EMBEDDING_DIMENSIONS = 768
 # text-embedding-005 accepts at most 20,000 input tokens per request. SEC Markdown
 # averages ~4 characters per token, so 60,000 characters leaves comfortable headroom.
 DEFAULT_MAX_BATCH_CHARS = 60_000
-# Decimal places kept for Vertex AI embeddings in manifests (matches deterministic mode).
+# Decimal places kept for Vertex AI embeddings in manifests.
 EMBEDDING_ROUND_DECIMALS = 6
-_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
 
 
 class _BatchTooLargeError(RuntimeError):
@@ -41,48 +41,6 @@ class _BatchTooLargeError(RuntimeError):
 def _retry_backoff_seconds(attempt: int) -> float:
     """Exponential backoff with jitter, capped at 30 seconds."""
     return min(30.0, 1.5 * (2 ** (attempt - 1))) * (0.75 + random.random() * 0.5)
-
-
-def generate_deterministic_embedding(
-    text: str,
-    *,
-    dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
-) -> list[float]:
-    """Generate a unit-normalized deterministic feature-hashed embedding vector.
-
-    Uses signed unigram and bigram feature hashing so passages sharing financial
-    and risk terminology exhibit positive cosine similarity in offline/local tests.
-    """
-    if dimensions <= 0:
-        raise ValueError(f"dimensions must be positive, got {dimensions}")
-
-    tokens = _TOKEN_RE.findall(text.lower())
-    vec = np.zeros(dimensions, dtype=np.float64)
-
-    if not tokens:
-        digest = hashlib.blake2b(text.encode("utf-8"), digest_size=32).digest()
-        idx = int.from_bytes(digest[:4], "little") % dimensions
-        vec[idx] = 1.0
-        return [round(float(x), 6) for x in vec]
-
-    features: list[str] = list(tokens)
-    if len(tokens) > 1:
-        features.extend(f"{tokens[i]}_{tokens[i + 1]}" for i in range(len(tokens) - 1))
-
-    for feat in features:
-        h = hashlib.blake2b(feat.encode("utf-8"), digest_size=8).digest()
-        val = int.from_bytes(h, "little")
-        bucket = val % dimensions
-        sign = 1.0 if ((val >> 32) & 1) == 0 else -1.0
-        vec[bucket] += sign
-
-    norm = float(np.linalg.norm(vec))
-    if norm > 0.0 and math.isfinite(norm):
-        vec = vec / norm
-    else:
-        vec[0] = 1.0
-
-    return [round(float(x), 6) for x in vec]
 
 
 class VertexAIEmbedder:
@@ -366,7 +324,6 @@ def populate_chunk_embeddings(
     location: str = "us-central1",
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
-    backend: Literal["vertex_ai", "deterministic", "auto"] = "auto",
     batch_size: int = 50,
     existing_embeddings: dict[str, tuple[str, list[float]]] | None = None,
     vertex_embedder: VertexAIEmbedder | None = None,
@@ -374,7 +331,11 @@ def populate_chunk_embeddings(
     max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
     checkpoint_path: Path | None = None,
 ) -> tuple[list[FilingChunk], str]:
-    """Populate `embedding` on each `FilingChunk` and return `(chunks, resolved_backend)`.
+    """Populate `embedding` on each `FilingChunk` with Vertex AI and return `(chunks, source)`.
+
+    `source` is `"vertex_ai"` when any vector was freshly generated or resumed from the
+    Vertex AI checkpoint, or `"cached"` when every vector was reused from a prior manifest.
+    Any Vertex AI failure propagates to the caller; there is no synthetic fallback.
 
     If `existing_embeddings` is provided (mapping `chunk_id -> (sha256_text, embedding)`),
     unchanged chunks with valid dimension embeddings are reused without recomputation.
@@ -384,10 +345,10 @@ def populate_chunk_embeddings(
     reused, so an interrupted run resumes instead of re-embedding everything.
     """
     if not chunks:
-        return [], backend if backend != "auto" else "deterministic"
+        return [], "vertex_ai"
 
     checkpointed: dict[str, tuple[str, list[float]]] = {}
-    if checkpoint_path is not None and backend in ("vertex_ai", "auto"):
+    if checkpoint_path is not None:
         checkpointed = load_embedding_checkpoint(
             checkpoint_path, model_name=model_name, dimensions=dimensions
         )
@@ -423,98 +384,78 @@ def populate_chunk_embeddings(
         logger.info("Reused all %d cached chunk embeddings.", len(chunks))
         return chunks, "vertex_ai" if reused_from_checkpoint == len(chunks) else "cached"
 
-    resolved_backend = backend
-    if backend in ("vertex_ai", "auto"):
-        embedder = vertex_embedder or VertexAIEmbedder(
-            project_id=project_id,
-            location=location,
-            model_name=model_name,
-            dimensions=dimensions,
-            batch_size=batch_size,
-            max_retries=6,
-            max_batch_chars=max_batch_chars,
-            max_workers=max_workers,
-        )
-        texts = [chunks[i].chunk_text for i in to_embed_indices]
-        titles = [
-            f"{chunks[i].ticker} FY{chunks[i].fiscal_year} 10-K {chunks[i].section_title}"
-            for i in to_embed_indices
-        ]
-        total = len(texts)
-        progress = {"done": 0, "next_log": 0.0, "started": time.monotonic()}
-        ckpt_fh = None
-        if checkpoint_path is not None:
-            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-            ckpt_fh = checkpoint_path.open("a", encoding="utf-8")
+    embedder = vertex_embedder or VertexAIEmbedder(
+        project_id=project_id,
+        location=location,
+        model_name=model_name,
+        dimensions=dimensions,
+        batch_size=batch_size,
+        max_retries=6,
+        max_batch_chars=max_batch_chars,
+        max_workers=max_workers,
+    )
+    texts = [chunks[i].chunk_text for i in to_embed_indices]
+    titles = [
+        f"{chunks[i].ticker} FY{chunks[i].fiscal_year} 10-K {chunks[i].section_title}"
+        for i in to_embed_indices
+    ]
+    total = len(texts)
+    progress = {"done": 0, "next_log": 0.0, "started": time.monotonic()}
+    ckpt_fh = None
+    if checkpoint_path is not None:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        ckpt_fh = checkpoint_path.open("a", encoding="utf-8")
 
-        def on_batch_complete(start: int, end: int, vecs: list[list[float]]) -> None:
-            for offset, vec in enumerate(vecs):
-                i = to_embed_indices[start + offset]
-                rounded = [round(v, EMBEDDING_ROUND_DECIMALS) for v in vec]
-                chunks[i].embedding = rounded
-                chunks[i].embedding_model = model_name
-                if ckpt_fh is not None:
-                    ckpt_fh.write(
-                        json.dumps(
-                            {
-                                "chunk_id": chunks[i].chunk_id,
-                                "text_sha256": hashes[i],
-                                "model": model_name,
-                                "embedding": rounded,
-                            }
-                        )
-                        + "\n"
+    def on_batch_complete(start: int, end: int, vecs: list[list[float]]) -> None:
+        for offset, vec in enumerate(vecs):
+            i = to_embed_indices[start + offset]
+            rounded = [round(v, EMBEDDING_ROUND_DECIMALS) for v in vec]
+            chunks[i].embedding = rounded
+            chunks[i].embedding_model = model_name
+            if ckpt_fh is not None:
+                ckpt_fh.write(
+                    json.dumps(
+                        {
+                            "chunk_id": chunks[i].chunk_id,
+                            "text_sha256": hashes[i],
+                            "model": model_name,
+                            "embedding": rounded,
+                        }
                     )
-            if ckpt_fh is not None:
-                ckpt_fh.flush()
-            progress["done"] += end - start
-            now = time.monotonic()
-            if now >= progress["next_log"] or progress["done"] == total:
-                elapsed = max(now - progress["started"], 1e-6)
-                rate = progress["done"] / elapsed
-                eta = (total - progress["done"]) / rate if rate > 0 else float("inf")
-                logger.info(
-                    "Vertex AI embeddings: %d/%d (%.1f%%) | %.0f chunks/s | ETA %.0fs",
-                    progress["done"],
-                    total,
-                    100.0 * progress["done"] / total,
-                    rate,
-                    eta,
+                    + "\n"
                 )
-                progress["next_log"] = now + 30.0
-
-        try:
+        if ckpt_fh is not None:
+            ckpt_fh.flush()
+        progress["done"] += end - start
+        now = time.monotonic()
+        if now >= progress["next_log"] or progress["done"] == total:
+            elapsed = max(now - progress["started"], 1e-6)
+            rate = progress["done"] / elapsed
+            eta = (total - progress["done"]) / rate if rate > 0 else float("inf")
             logger.info(
-                "Embedding %d chunks with Vertex AI %s (%d reused from checkpoint)...",
+                "Vertex AI embeddings: %d/%d (%.1f%%) | %.0f chunks/s | ETA %.0fs",
+                progress["done"],
                 total,
-                model_name,
-                reused_from_checkpoint,
+                100.0 * progress["done"] / total,
+                rate,
+                eta,
             )
-            embedder.embed_texts(
-                texts,
-                task_type="RETRIEVAL_DOCUMENT",
-                titles=titles,
-                on_batch_complete=on_batch_complete,
-            )
-            return chunks, "vertex_ai"
-        except Exception as exc:
-            if backend == "vertex_ai":
-                raise
-            logger.warning(
-                "Vertex AI live embedding unavailable (%s); falling back to deterministic %d-d embeddings.",
-                exc,
-                dimensions,
-            )
-            resolved_backend = "deterministic"
-        finally:
-            if ckpt_fh is not None:
-                ckpt_fh.close()
+            progress["next_log"] = now + 30.0
 
-    for i in to_embed_indices:
-        chunks[i].embedding = generate_deterministic_embedding(
-            chunks[i].chunk_text,
-            dimensions=dimensions,
+    try:
+        logger.info(
+            "Embedding %d chunks with Vertex AI %s (%d reused from checkpoint)...",
+            total,
+            model_name,
+            reused_from_checkpoint,
         )
-        chunks[i].embedding_model = model_name
-
-    return chunks, resolved_backend
+        embedder.embed_texts(
+            texts,
+            task_type="RETRIEVAL_DOCUMENT",
+            titles=titles,
+            on_batch_complete=on_batch_complete,
+        )
+    finally:
+        if ckpt_fh is not None:
+            ckpt_fh.close()
+    return chunks, "vertex_ai"

@@ -7,9 +7,9 @@ Implements:
    plus structured Cloud Logging JSON emission for `google_logging_project_sink` durability.
 2. Persistent user feedback storage (`analyst_feedback`) backed by Google Cloud Firestore Native
    REST v1 (`documents` & `:runQuery`) with ADC IAM authentication (`roles/datastore.user`).
-3. Dual-mode (`auto` | `gcp` | `local`) dispatch so live Cloud Run deployments stream directly
-   to BigQuery & Firestore while offline CI/pytest runs execute deterministically with zero
-   external credentials.
+3. Sink selection (`auto` | `gcp` | `local`): Cloud Run streams to BigQuery & Firestore, while
+   `local` keeps telemetry and feedback in memory so test and developer runs don't write to the
+   production telemetry tables. (These are write-only sinks; no answer data is read from them.)
 4. LookML semantic layer catalog introspection over `looker/` models, views, explores, and dashboards.
 """
 
@@ -82,13 +82,11 @@ def _validate_bq_id(value: str, label: str) -> str:
     return cleaned
 
 
-def _resolve_backend_mode(raw_mode: str, exec_mode: str) -> TelemetryBackendMode:
+def _resolve_backend_mode(raw_mode: str) -> TelemetryBackendMode:
     norm = raw_mode.strip().lower()
     if norm in ("gcp", "live", "firestore", "bigquery"):
         return "gcp"
-    if norm in ("local", "deterministic", "memory"):
-        return "local"
-    if exec_mode == "deterministic":
+    if norm in ("local", "memory"):
         return "local"
     return "auto"
 
@@ -112,16 +110,11 @@ class TelemetryConfig:
 
     @classmethod
     def from_env(cls) -> TelemetryConfig:
-        exec_mode = os.environ.get("EDGAR_EXECUTION_MODE", "auto").strip().lower()
-        raw_telemetry = (
-            os.environ.get("EDGAR_TELEMETRY_BACKEND")
-            or os.environ.get("EDGAR_DATA_BACKEND")
-            or "auto"
-        )
+        raw_telemetry = os.environ.get("EDGAR_TELEMETRY_BACKEND") or "auto"
         raw_feedback = os.environ.get("EDGAR_FEEDBACK_BACKEND") or raw_telemetry
 
-        telemetry_backend = _resolve_backend_mode(raw_telemetry, exec_mode)
-        feedback_backend = _resolve_backend_mode(raw_feedback, exec_mode)
+        telemetry_backend = _resolve_backend_mode(raw_telemetry)
+        feedback_backend = _resolve_backend_mode(raw_feedback)
 
         auto_signals = (
             os.environ.get("EDGAR_USE_GCP_TELEMETRY", "").strip().lower() in _TRUTHY_ENV_VALUES
@@ -130,7 +123,6 @@ class TelemetryConfig:
             or bool(os.environ.get("BIGQUERY_DATASET_ID", "").strip())
             or bool(os.environ.get("FIRESTORE_DATABASE_ID", "").strip())
             or bool(os.environ.get("FIRESTORE_FEEDBACK_COLLECTION", "").strip())
-            or exec_mode == "live"
             or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in _TRUTHY_ENV_VALUES
         )
 

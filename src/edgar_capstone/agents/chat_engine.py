@@ -10,13 +10,22 @@ from typing import Any
 from google.adk.models.base_llm import BaseLlm
 
 from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
+from edgar_capstone.agents.citations import merge_citations
 from edgar_capstone.agents.context_memory import (
     get_context_latency_tracker,
     get_conversation_memory_manager,
     get_model_strategy_metadata,
     resolve_model_for_task,
 )
+from edgar_capstone.agents.disclosure_deltas import (
+    compare_disclosures_across_years,
+    disclosure_delta_citations,
+)
 from edgar_capstone.agents.live_runtime import get_live_runtime_status_metadata
+from edgar_capstone.agents.material_variances import (
+    attach_flag_explanations,
+    flag_material_variances,
+)
 from edgar_capstone.agents.prompt_store import get_prompt_store_status_metadata
 from edgar_capstone.agents.react_loop import StructuredReActExecutor
 from edgar_capstone.agents.root_orchestrator import (
@@ -24,11 +33,10 @@ from edgar_capstone.agents.root_orchestrator import (
     classify_query_intent,
 )
 from edgar_capstone.agents.tools import (
-    _get_dataset_dir,
-    _load_all_profiles_cached,
     _parse_ticker_list,
     _profile_to_metric_record,
     calculate_period_variances,
+    get_active_gcp_tool_adapters,
     get_context_cache_runtime_stats,
     load_cached_10k_section,
     query_looker_financial_explore,
@@ -112,47 +120,26 @@ _ITEM_1A_ONLY_RE = re.compile(r"\b(?:item\s*1a|risk\s+factors?)\b", re.IGNORECAS
 _ITEM_7_ONLY_RE = re.compile(r"\b(?:item\s*7|md&a|management'?s\s+discussion)\b", re.IGNORECASE)
 
 
-def _format_usd_compact(value: float | None) -> str:
-    """Format raw USD figure into crisp institutional notation (e.g., $215.94B, $842.10M)."""
-    if value is None:
-        return "N/A"
-    sign = "-" if value < 0 else ""
-    abs_v = abs(value)
-    if abs_v >= 1_000_000_000:
-        return f"{sign}${abs_v / 1_000_000_000:,.2f}B"
-    if abs_v >= 1_000_000:
-        return f"{sign}${abs_v / 1_000_000:,.2f}M"
-    return f"{sign}${abs_v:,.0f}"
+_COMPANY_CATALOG_TTL_SECONDS = 600.0
+_company_catalog_cache: tuple[float, list[Any]] | None = None
 
 
-def _format_signed_pct(value: float | None) -> str:
-    if value is None:
-        return "N/A"
-    sign = "+" if value > 0 else ""
-    return f"{sign}{value:.2f}%"
-
-
-def _format_signed_bps(value: float | None) -> str:
-    if value is None:
-        return "N/A"
-    sign = "+" if value > 0 else ""
-    return f"{sign}{value:.1f} bps"
-
-
-def _clean_10k_excerpt(text: str, max_len: int = 340) -> str:
-    """Clean escaped Markdown punctuation from 10-K excerpts for crisp analyst synthesis."""
-    cleaned = re.sub(r"\\([.\-(),&])", r"\1", text)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if len(cleaned) <= max_len:
-        return cleaned
-    clipped = cleaned[:max_len].rsplit(" ", 1)[0]
-    return f"{clipped}..."
+def _load_all_profiles_from_bigquery() -> list[Any]:
+    """All company-year profiles from BigQuery `financial_metrics` (cached for 10 minutes)."""
+    global _company_catalog_cache
+    now = time.monotonic()
+    if _company_catalog_cache and now - _company_catalog_cache[0] < _COMPANY_CATALOG_TTL_SECONDS:
+        return _company_catalog_cache[1]
+    profiles = get_active_gcp_tool_adapters().bigquery.fetch_profiles(
+        tickers=set(), start_year=1900, end_year=2100
+    )
+    _company_catalog_cache = (now, profiles)
+    return profiles
 
 
 def list_curated_companies() -> dict[str, Any]:
-    """Return all curated S&P 500 companies, sectors, and fiscal year bounds in the local corpus."""
-    dataset_dir = _get_dataset_dir()
-    profiles = _load_all_profiles_cached(str(dataset_dir))
+    """Return all curated S&P 500 companies, sectors, and fiscal year bounds from BigQuery."""
+    profiles = _load_all_profiles_from_bigquery()
 
     by_ticker: dict[str, list[Any]] = defaultdict(list)
     sectors: set[str] = set()
@@ -386,184 +373,6 @@ def _retrieve_balanced_citations(
     return all_cits[:top_k], candidates_searched
 
 
-def _format_inline_citation(cit: dict[str, Any]) -> str:
-    """Format an exact canonical inline citation tag linked to the SEC EDGAR archive URL."""
-    ticker = cit["ticker"]
-    fy = cit["fiscal_year"]
-    sec_label = "Item 1A Risk Factors" if cit["section_id"] == "item_1a" else "Item 7 MD&A"
-    chunk_id = cit["chunk_id"]
-    url = cit.get("sec_filing_url") or "#source-viewer"
-    return f"[{ticker} FY{fy} | {sec_label} | {chunk_id}]({url})"
-
-
-def _synthesize_grounded_report(
-    *,
-    query: str,
-    intent: str,
-    scope: dict[str, Any],
-    variance_reports: list[dict[str, Any]],
-    citations: list[dict[str, Any]],
-    sector_benchmarks: list[dict[str, Any]],
-    chunk_health: dict[str, Any] | None,
-) -> str:
-    """Synthesize a 100% deterministic, source-grounded Markdown report with inline 10-K citations."""
-    lines: list[str] = []
-
-    if intent == "chunk_health_monitoring" and chunk_health:
-        lines.append("### Vector Corpus & Hybrid Index Diagnostics")
-        lines.append(
-            f"- **Corpus Status:** `{chunk_health.get('health_status', 'HEALTHY')}` "
-            f"(Health Score: **{chunk_health.get('health_score', 1.0)}**)"
-        )
-        lines.append(
-            f"- **Indexed 10-K Chunks:** **{chunk_health.get('total_chunks', 0):,}** "
-            f"across 768-dimensional embeddings (`embedding_coverage_ratio`: "
-            f"**{float(chunk_health.get('embedding_coverage_ratio') or 1.0) * 100:.1f}%**)"
-        )
-        by_sec = chunk_health.get("by_section") or {}
-        if by_sec:
-            lines.append(
-                f"- **Section Distribution:** Item 1A Risk Factors (`{by_sec.get('item_1a', 0):,}` chunks) · "
-                f"Item 7 MD&A (`{by_sec.get('item_7', 0):,}` chunks)"
-            )
-        if citations:
-            lines.append("\n### Sample Retrieved Grounding Passages")
-            for cit in citations[:3]:
-                lines.append(
-                    f"- **{_clean_10k_excerpt(cit['excerpt'], 240)}** {_format_inline_citation(cit)}"
-                )
-        return "\n".join(lines)
-
-    # 1. Executive Synthesis Header
-    if intent == "multi_company_peer_comparison" and len(variance_reports) >= 2:
-        names = ", ".join(f"**{r['company_name']} ({r['ticker']})**" for r in variance_reports)
-        lines.append("### Multi-Company Variance & Filing Synthesis")
-        lines.append(
-            f"Deterministic multi-period analysis comparing {names} across **FY{scope['start_year']}–FY{scope['end_year']}**, "
-            f"grounded in SEC Form 10-K Item 7 (MD&A) and Item 1A (Risk Factors) disclosures."
-        )
-    elif variance_reports:
-        rep0 = variance_reports[0]
-        lines.append(
-            f"### {rep0['company_name']} ({rep0['ticker']}) — FY{rep0['start_year']}–FY{rep0['end_year']} Grounded Variance Synthesis"
-        )
-        lines.append(
-            f"Period-over-period financial performance and SEC Form 10-K narrative drivers for **{rep0['company_name']}** "
-            f"(`CIK {rep0['cik']}` · *{rep0['gics_sector']} — {rep0['gics_sub_industry']}*)."
-        )
-    else:
-        sector_desc = (
-            f"**{scope['gics_sector']}**"
-            if scope["gics_sector"] != "ALL"
-            else "**S&P 500 Curated Corpus**"
-        )
-        lines.append(
-            f"### Longitudinal 10-K Thematic Synthesis ({sector_desc}, FY{scope['start_year']}–FY{scope['end_year']})"
-        )
-        lines.append(
-            f"Cross-filing hybrid retrieval combining 768-d semantic similarity and lexical keyword matching "
-            f'for query: *"{query.strip()}"*.'
-        )
-
-    # 2. Deterministic Quantitative Findings (100% agreement with calculation engine)
-    if variance_reports:
-        lines.append("\n### Deterministic Period-over-Period Metrics")
-        for rep in variance_reports:
-            rev = rep["revenue_variance"]
-            op = rep["operating_income_variance"]
-            ni = rep["net_income_variance"]
-            fy_s, fy_e = rep["start_year"], rep["end_year"]
-
-            cits_for_ticker = [c for c in citations if c["ticker"] == rep["ticker"]]
-            primary_cit_tag = (
-                f" {_format_inline_citation(cits_for_ticker[0])}" if cits_for_ticker else ""
-            )
-
-            cagr_clause = (
-                f" ({_format_signed_pct(rev.get('cagr_pct'))} CAGR)"
-                if rev.get("cagr_pct") is not None and fy_e > fy_s
-                else ""
-            )
-            lines.append(
-                f"- **{rep['ticker']} (FY{fy_s} → FY{fy_e}):** "
-                f"Revenue moved from **{_format_usd_compact(rev.get('start_value'))}** to "
-                f"**{_format_usd_compact(rev.get('end_value'))}** "
-                f"(**{_format_signed_pct(rev.get('percentage_delta'))}**, "
-                f"Δ **{_format_usd_compact(rev.get('absolute_delta'))}**{cagr_clause}); "
-                f"Operating Income moved **{_format_signed_pct(op.get('percentage_delta'))}** to "
-                f"**{_format_usd_compact(op.get('end_value'))}** "
-                f"(Operating Margin **{_format_signed_bps(rep.get('operating_margin_bps_delta'))}**); "
-                f"Net Income moved **{_format_signed_pct(ni.get('percentage_delta'))}** to "
-                f"**{_format_usd_compact(ni.get('end_value'))}** "
-                f"(Net Margin **{_format_signed_bps(rep.get('net_margin_bps_delta'))}**).{primary_cit_tag}"
-            )
-            rd = rep.get("research_and_development_variance") or {}
-            if rd.get("start_value") is not None and rd.get("end_value") is not None:
-                lines.append(
-                    f"  - *R&D expense:* **{_format_usd_compact(rd.get('start_value'))}** → "
-                    f"**{_format_usd_compact(rd.get('end_value'))}** "
-                    f"(**{_format_signed_pct(rd.get('percentage_delta'))}**, "
-                    f"Δ **{_format_usd_compact(rd.get('absolute_delta'))}**; R&D intensity "
-                    f"**{_format_signed_bps(rep.get('rd_intensity_bps_delta'))}**)."
-                )
-
-    elif sector_benchmarks:
-        lines.append("\n### Sector Quantitative Benchmarks")
-        for bench in sector_benchmarks[-3:]:
-            lines.append(
-                f"- **{bench['gics_sector']} (FY{bench['fiscal_year']} · {bench['company_count']} issuers):** "
-                f"Aggregate Revenue **{_format_usd_compact(bench.get('total_sector_revenue'))}**, "
-                f"Operating Income **{_format_usd_compact(bench.get('total_sector_operating_income'))}**, "
-                f"Net Income **{_format_usd_compact(bench.get('total_sector_net_income'))}**."
-            )
-
-    # 3. Grounded 10-K Narrative Drivers & Thematic Shifts
-    if citations:
-        if intent == "thematic_trend_tracking":
-            lines.append("\n### Longitudinal Disclosure Evolution Across Fiscal Periods")
-            by_year: dict[int, list[dict[str, Any]]] = defaultdict(list)
-            for cit in citations:
-                by_year[int(cit["fiscal_year"])].append(cit)
-            for fy in sorted(by_year.keys()):
-                yr_cits = by_year[fy][:3]
-                lines.append(f"#### Fiscal Year {fy} Filing Disclosures")
-                for cit in yr_cits:
-                    sec_title = cit.get("section_title") or cit["section_id"].upper()
-                    lines.append(
-                        f"- **{cit['company_name']} ({cit['ticker']}) — {sec_title}:** "
-                        f'"{_clean_10k_excerpt(cit["excerpt"], 290)}" {_format_inline_citation(cit)}'
-                    )
-        else:
-            item7_cits = [c for c in citations if c["section_id"] == "item_7"]
-            item1a_cits = [c for c in citations if c["section_id"] == "item_1a"]
-
-            if item7_cits:
-                lines.append("\n### Item 7 (MD&A) Operational & Financial Drivers")
-                for cit in item7_cits[:4]:
-                    sec_title = cit.get("section_title") or "Item 7. MD&A"
-                    lines.append(
-                        f"- **{cit['ticker']} FY{cit['fiscal_year']} ({sec_title}):** "
-                        f'"{_clean_10k_excerpt(cit["excerpt"], 300)}" {_format_inline_citation(cit)}'
-                    )
-
-            if item1a_cits:
-                lines.append("\n### Item 1A Risk Factor Disclosures & Headwinds")
-                for cit in item1a_cits[:4]:
-                    sec_title = cit.get("section_title") or "Item 1A. Risk Factors"
-                    lines.append(
-                        f"- **{cit['ticker']} FY{cit['fiscal_year']} ({sec_title}):** "
-                        f'"{_clean_10k_excerpt(cit["excerpt"], 300)}" {_format_inline_citation(cit)}'
-                    )
-    else:
-        lines.append(
-            "\n### Grounding Status\n"
-            "No 10-K filing passages matched the current filter combination. "
-            "Widen the fiscal period range or reset the GICS sector / section filter to inspect broader disclosures."
-        )
-
-    return "\n".join(lines)
-
-
 @traced(
     "chat.rag_turn",
     record_args=(
@@ -574,7 +383,6 @@ def _synthesize_grounded_report(
         "end_year",
         "top_k",
         "session_id",
-        "execution_mode",
     ),
 )
 def run_conversational_rag_turn(
@@ -588,7 +396,6 @@ def run_conversational_rag_turn(
     top_k: int = 8,
     session_id: str | None = None,
     user_id: str = "analyst",
-    execution_mode: str | None = None,
     reasoning_llm: BaseLlm | None = None,
     judge_llm: BaseLlm | None = None,
 ) -> dict[str, Any]:
@@ -966,6 +773,100 @@ def run_conversational_rag_turn(
                         f"{rep['ticker']}_{rep['start_year']}_{rep['end_year']}"
                     ] = rep
 
+    # Step 3b: Deterministic anomaly flags (explained with MD&A passages) and, for thematic
+    # questions, the Disclosure Delta pipeline (year-over-year wording changes). Both become
+    # cited grounding facts for synthesis.
+    material_flags: list[dict[str, Any]] = []
+    material_flags_summary: dict[str, Any] | None = None
+    if variance_reports and intent != "chunk_health_monitoring":
+        t_flags = time.perf_counter()
+        flag_claims = authorize_agent_tool_invocation(
+            agent_name="FinancialAnalystAgent",
+            tool_name="flag_material_variances",
+            caller=RootOrchestrator.name,
+        )
+        _track_agent_identity(flag_claims)
+        flag_res = flag_material_variances(
+            tickers=",".join(str(r["ticker"]) for r in variance_reports),
+            start_year=scope["start_year"],
+            end_year=scope["end_year"],
+        )
+        explained_count = 0
+        if flag_res.get("status") == "success":
+            material_flags, explanation_cits = attach_flag_explanations(
+                list(flag_res.get("flags") or []), max_flags=3
+            )
+            explained_count = len(explanation_cits)
+            merge_citations(citations, explanation_cits)
+            material_flags_summary = {
+                "total_flags": flag_res.get("total_flags", 0),
+                "returned_flags": flag_res.get("returned_flags", 0),
+                "high_severity_count": flag_res.get("high_severity_count", 0),
+                "explained_flags": explained_count,
+                "thresholds": flag_res.get("thresholds"),
+            }
+        agent_trace.append(
+            {
+                "step": len(agent_trace) + 1,
+                "agent": "FinancialAnalystAgent",
+                "agent_service_account": flag_claims.service_account_email,
+                "spiffe_id": flag_claims.spiffe_id,
+                "s2s_target_service": flag_claims.target_service,
+                "s2s_verified": True,
+                "tool": "flag_material_variances",
+                "status": "completed" if flag_res.get("status") == "success" else "warning",
+                "duration_ms": round((time.perf_counter() - t_flags) * 1000.0, 2),
+                "summary": (
+                    f"Flagged {flag_res.get('total_flags', 0)} material variance(s) "
+                    f"({flag_res.get('high_severity_count', 0)} high severity); attached MD&A "
+                    f"explanations to {explained_count}."
+                ),
+            }
+        )
+
+    disclosure_deltas: dict[str, Any] | None = None
+    if intent == "thematic_trend_tracking" and scope["end_year"] > scope["start_year"]:
+        t_deltas = time.perf_counter()
+        delta_claims = authorize_agent_tool_invocation(
+            agent_name="FinancialAnalystAgent",
+            tool_name="compare_disclosures_across_years",
+            caller=RootOrchestrator.name,
+        )
+        _track_agent_identity(delta_claims)
+        disclosure_deltas = compare_disclosures_across_years(
+            theme=query,
+            tickers=scope["tickers_csv"],
+            gics_sector=scope["gics_sector"],
+            section_id=scope["section_id"],
+            start_year=scope["start_year"],
+            end_year=scope["end_year"],
+        )
+        merge_citations(citations, disclosure_delta_citations(disclosure_deltas))
+        delta_summary = (disclosure_deltas or {}).get("summary") or {}
+        agent_trace.append(
+            {
+                "step": len(agent_trace) + 1,
+                "agent": "FinancialAnalystAgent",
+                "agent_service_account": delta_claims.service_account_email,
+                "spiffe_id": delta_claims.spiffe_id,
+                "s2s_target_service": delta_claims.target_service,
+                "s2s_verified": True,
+                "tool": "compare_disclosures_across_years",
+                "status": (
+                    "completed"
+                    if (disclosure_deltas or {}).get("status") == "success"
+                    else "warning"
+                ),
+                "duration_ms": round((time.perf_counter() - t_deltas) * 1000.0, 2),
+                "summary": (
+                    f"Compared theme disclosures for {delta_summary.get('companies_analyzed', 0)} "
+                    f"company(ies) across {delta_summary.get('year_pairs', 0)} year pair(s): "
+                    f"{delta_summary.get('added', 0)} added, {delta_summary.get('modified', 0)} "
+                    f"modified, {delta_summary.get('removed', 0)} removed."
+                ),
+            }
+        )
+
     # Step 4 & Step 5: Structured ReAct Execution Loop
     # (1. Evaluate calculated variances -> 2. Query cached 10-K context for explanation -> 3. Format grounded output + Flash eval)
     last_cache_claims: VerifiedAgentS2SClaims | None = None
@@ -985,7 +886,6 @@ def run_conversational_rag_turn(
         last_cache_claims = c_claims
 
     react_result = StructuredReActExecutor(
-        execution_mode=execution_mode,
         reasoning_llm=reasoning_llm,
         judge_llm=judge_llm,
     ).execute_post_retrieval_reasoning(
@@ -1002,6 +902,8 @@ def run_conversational_rag_turn(
         session_id=session_id,
         user_id=user_id,
         on_cache_s2s_call=_on_cache_s2s_call,
+        material_variance_flags=material_flags,
+        disclosure_deltas=disclosure_deltas,
     )
 
     answer_markdown: str = react_result["answer_markdown"]
@@ -1369,7 +1271,7 @@ def run_conversational_rag_turn(
         gics_sector=scope["gics_sector"],
         start_year=scope["start_year"],
         end_year=scope["end_year"],
-        report_generated=bool(answer_markdown.strip()),
+        report_generated=bool(react_result.get("answer_verified")),
         variance_reports_count=len(variance_reports),
         citations_count=len(citations),
         agent_trace=agent_trace,
@@ -1388,7 +1290,7 @@ def run_conversational_rag_turn(
         },
         "execution_mode": active_execution_mode,
         "adk_runtime": adk_runtime_meta,
-        # Verified structured answer (None for deterministic or legacy free-text synthesis)
+        # Verified structured answer (None when the live answer was free text or withheld)
         "structured_report": adk_runtime_meta.get("structured_report"),
         "report_verification": adk_runtime_meta.get("report_verification"),
         "prompt_store": get_prompt_store_status_metadata(),
@@ -1396,8 +1298,13 @@ def run_conversational_rag_turn(
         "orchestrator": RootOrchestrator.name,
         "resolved_scope": scope,
         "answer_markdown": answer_markdown,
+        # False when the live answer failed verification and its narrative was withheld
+        "answer_verified": bool(react_result.get("answer_verified")),
         "variance_reports": variance_reports,
         "sector_benchmarks": sector_benchmarks,
+        "material_variance_flags": material_flags,
+        "material_variance_summary": material_flags_summary,
+        "disclosure_deltas": disclosure_deltas,
         "citations": citations,
         "candidates_searched": candidates_searched,
         "context_cache": context_cache_info,

@@ -20,6 +20,8 @@ from edgar_capstone.agents.context_memory import (
     FINANCIAL_REASONING_MODEL,
     after_agent_memory_callback,
 )
+from edgar_capstone.agents.disclosure_deltas import DisclosureDeltaTool
+from edgar_capstone.agents.material_variances import AnomalyFlagTool
 from edgar_capstone.agents.prompt_store import (
     load_agent_prompt,
     make_adk_instruction_provider,
@@ -35,7 +37,7 @@ from edgar_capstone.agents.tools import (
 
 DEFAULT_ANALYST_MODEL = os.environ.get("EDGAR_ANALYST_MODEL", FINANCIAL_REASONING_MODEL)
 
-# The analyst follows the registry's `latest` prompt (v2: targeted 10-K retrieval) rather than
+# The analyst follows the registry's `latest` prompt (v4: anomaly flags + disclosure deltas) rather than
 # the store-wide default version used by the other agents.
 DEFAULT_ANALYST_PROMPT_VERSION = "latest"
 
@@ -73,6 +75,7 @@ def create_financial_analyst_agent(
         ),
         tools=[
             VarianceCalculationTool,
+            AnomalyFlagTool,
             MetricFetchTool,
             LookerQueryTool,
             # Targeted retrieval only: ranked passages and hybrid search, each returning
@@ -80,6 +83,8 @@ def create_financial_analyst_agent(
             # ContextCacheAgent and the source-viewer API, not the synthesis agent.
             HybridSearchTool,
             QueryCached10KTool,
+            # Deterministic year-over-year wording comparison with both-year chunk_ids.
+            DisclosureDeltaTool,
         ],
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.1,

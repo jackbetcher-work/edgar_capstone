@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Recompute the numeric fields of `expected_variances` in the golden dataset from the local,
-deterministic calculation engine (`calculate_period_variances` over the curated manifest).
+"""Recompute the numeric fields of `expected_variances` in the golden dataset from the
+deterministic calculation engine (`calculate_period_variances` over BigQuery `financial_metrics`).
 
 Use this to bootstrap new items: write the query, tickers, fiscal_years, and which metrics to
 check, leave the numbers null, then run this script and REVIEW THE DIFF. Running it to make a
@@ -15,8 +15,6 @@ from __future__ import annotations
 import argparse
 import sys
 
-from edgar_capstone.evals.runner import configure_eval_environment
-
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
@@ -24,7 +22,6 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--check", action="store_true", help="Report drift without rewriting.")
     args = p.parse_args(argv)
 
-    configure_eval_environment("deterministic")
     from edgar_capstone.evals.golden import (
         DEFAULT_GOLDEN_DATASET_PATH,
         dump_golden_dataset,

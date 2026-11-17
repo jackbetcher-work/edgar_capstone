@@ -75,7 +75,24 @@ jobs:
           terraform -chdir=terraform init -backend=false -input=false -no-color
           terraform -chdir=terraform validate -no-color
 
-      - name: Run automated pytest suite
+      # The suite reads live BigQuery / Vertex AI Search / GCS data and calls Vertex AI
+      # (embeddings, Gemini, Model Armor), so authenticate with keyless WIF first.
+      - name: Authenticate to Google Cloud via Workload Identity Federation
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
+
+      - name: Run automated pytest suite against live GCP
+        env:
+          EDGAR_TEST_PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
+          GOOGLE_CLOUD_PROJECT: ${{ env.GCP_PROJECT_ID }}
+          GOOGLE_CLOUD_LOCATION: ${{ env.GCP_REGION }}
+          GOOGLE_GENAI_USE_VERTEXAI: "true"
+          EDGAR_GEMINI_LOCATION: global
+          EDGAR_TELEMETRY_BACKEND: local
+          EDGAR_FEEDBACK_BACKEND: local
         run: |
           pytest -v --tb=short
 
@@ -145,17 +162,19 @@ jobs:
             --tag "${IMAGE_LATEST}" \
             .
           docker run --rm --entrypoint test "${IMAGE_TAG}" -f /app/frontend/dist/index.html
-          # Offline container corpus packaging smoke test (no BigQuery / Vertex / GCS access)
+          # Container smoke test: /health + data_backend block and the UI at /. The live
+          # BigQuery read (--live-data) runs in Cloud Build, where the container gets ADC.
           docker run --rm \
-            -e EDGAR_EXECUTION_MODE=deterministic \
-            -e EDGAR_DATA_BACKEND=local \
+            -e GCP_PROJECT_ID="${{ env.GCP_PROJECT_ID }}" \
+            -e GOOGLE_CLOUD_PROJECT="${{ env.GCP_PROJECT_ID }}" \
+            -e GOOGLE_CLOUD_LOCATION="${{ env.GCP_REGION }}" \
+            -e GOOGLE_GENAI_USE_VERTEXAI=true \
+            -e EDGAR_GEMINI_LOCATION=global \
             -e EDGAR_TELEMETRY_BACKEND=local \
             -e EDGAR_FEEDBACK_BACKEND=local \
-            -e EDGAR_PROMPT_STORE_BACKEND=local \
-            -e EDGAR_MODEL_ARMOR_MODE=disabled \
             --entrypoint python \
             "${IMAGE_TAG}" \
-            scripts/container_smoke_test.py --in-process --expect-corpus baked
+            -m scripts.container_smoke_test --in-process
           docker push "${IMAGE_TAG}"
           docker push "${IMAGE_LATEST}"
           echo "image_uri=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
@@ -205,7 +224,6 @@ jobs:
             GCP_REGION=${{ env.GCP_REGION }}
             GOOGLE_CLOUD_LOCATION=${{ env.GCP_REGION }}
             GOOGLE_GENAI_USE_VERTEXAI=true
-            EDGAR_EXECUTION_MODE=auto
             EDGAR_ANALYST_MODEL=gemini-3.8-flash
             EDGAR_GEMINI_LOCATION=global
             EDGAR_FLASH_MODEL=gemini-3.5-flash

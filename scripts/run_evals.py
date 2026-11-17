@@ -2,8 +2,7 @@
 """Run the golden eval regression suite (`make eval-all`).
 
 Examples:
-    python scripts/run_evals.py                              # deterministic, offline (CI gate)
-    python scripts/run_evals.py --mode live                  # Gemini + Flash judge on Vertex AI
+    python scripts/run_evals.py                              # live Gemini + Flash judge, live GCP data
     python scripts/run_evals.py --only nvda_longitudinal_fy24_fy26 --only safety_prompt_injection
     python scripts/run_evals.py --dataset bigquery           # read sec_edgar.golden_eval_set
     python scripts/run_evals.py --write-bigquery             # stream the run to sec_edgar.eval_results
@@ -31,7 +30,6 @@ from edgar_capstone.evals.golden import (
 from edgar_capstone.evals.runner import (
     DEFAULT_THRESHOLDS_PATH,
     EvalThresholds,
-    configure_eval_environment,
     format_report,
     run_golden_evals,
     write_report_json,
@@ -40,12 +38,6 @@ from edgar_capstone.evals.runner import (
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument(
-        "--mode",
-        choices=("deterministic", "live"),
-        default=os.environ.get("EVAL_MODE", "deterministic"),
-        help="deterministic (offline, default) or live (Gemini/Vertex AI).",
-    )
     p.add_argument(
         "--dataset",
         default=str(DEFAULT_GOLDEN_DATASET_PATH.relative_to(REPO_ROOT)),
@@ -69,7 +61,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    configure_eval_environment(args.mode)
 
     from edgar_capstone.evals.bigquery_io import EvalBigQueryClient, EvalBigQueryError
 
@@ -104,13 +95,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print(
-        f"Running {len(selected)}/{len(items)} golden items in {args.mode} mode "
+        f"Running {len(selected)}/{len(items)} golden items live "
         f"(dataset: {source}; categories: {json.dumps(counts)})",
         flush=True,
     )
     report = run_golden_evals(
         selected,
-        mode=args.mode,
         thresholds=thresholds,
         dataset_source=source,
         progress=None if args.quiet else (lambda line: print(line, flush=True)),

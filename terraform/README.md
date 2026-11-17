@@ -123,7 +123,8 @@ terraform apply
 
 # 3. Populate curated SEC 10-K filings & vector DB manifests into the Terraform-managed bucket and BigQuery
 ../.venv/bin/python ../scripts/build_sec_dataset.py --sp500 --no-create-bucket
-../.venv/bin/python ../scripts/build_vector_db.py --embedding-backend vertex_ai
+# (Embeddings always come from Vertex AI text-embedding-005; the build fails if it is unavailable)
+../.venv/bin/python ../scripts/build_vector_db.py
 # (Already-built artifacts: publish without re-embedding)
 ../.venv/bin/python ../scripts/build_vector_db.py --upload-only
 

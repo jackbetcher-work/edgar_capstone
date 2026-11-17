@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""Offline smoke test for the packaged SEC EDGAR Analyst container (or any running instance).
+"""Smoke test for the packaged SEC EDGAR Analyst container (or any running instance).
 
-Verifies that the corpus packaged into (or hydrated inside) the image is discoverable
-and that the core deterministic APIs work without BigQuery / Vertex AI Search access:
+The image carries no SEC corpus: every data request reads live GCP (BigQuery `sec_edgar`,
+Vertex AI Search, Vertex AI embeddings, GCS). The default checks therefore need no GCP
+access and verify only that the image starts and is wired correctly:
 
-  1. `GET  /health`                      -> service up, corpus layout reported
-  2. `POST /api/v1/auth/sso/dev-token`   -> local Workspace/Okta dev JWT (non-strict mode)
-  3. `GET  /api/v1/companies`            -> curated issuers resolved from the baked manifest
-  4. `POST /api/v1/variances`            -> deterministic period-over-period math
-  5. `POST /api/v1/search`               -> metadata-filtered hybrid RAG citations
-  6. `GET  /api/v1/section`              -> cached Item 7 MD&A section text
+  1. `GET /health` -> HTTP 200, `status == "ok"`, and a `data_backend` block naming the
+     live GCP project, BigQuery dataset, and corpus bucket.
+  2. `GET /`       -> the compiled Terminal UI (`frontend/dist/index.html`).
+
+`--live-data` adds one live read, for runs that have Application Default Credentials:
+
+  3. `POST /api/v1/auth/sso/dev-token` + `GET /api/v1/companies` -> issuers served from
+     BigQuery `sec_edgar.financial_metrics`.
 
 Examples:
   # Against a running container (`make docker-smoke` does this for you)
   python scripts/container_smoke_test.py --base-url http://127.0.0.1:8080 --wait-seconds 60
 
-  # Inside the image without networking (used by Cloud Build after `docker build`)
-  docker run --rm -e EDGAR_DATA_BACKEND=local --entrypoint python IMAGE \\
-      scripts/container_smoke_test.py --in-process --expect-corpus baked
+  # Inside the image, in-process (Cloud Build / GitHub Actions after `docker build`)
+  docker run --rm --entrypoint python IMAGE -m scripts.container_smoke_test --in-process
 
-  # Assert the real chunks manifest + 10-K Markdown were hydrated from GCS
-  python scripts/container_smoke_test.py --expect-corpus hydrated
+  # Also read live BigQuery data (needs ADC, e.g. `--network=cloudbuild` in Cloud Build)
+  python scripts/container_smoke_test.py --in-process --live-data
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
 try:
     # Prefer the installed package (the container's /opt/venv site-packages, exactly what
-    # uvicorn imports) so in-process checks exercise the same path resolution as production.
+    # uvicorn imports) so in-process checks exercise the same code as production.
     import edgar_capstone  # noqa: F401
 except ImportError:
     if SRC_DIR.is_dir() and str(SRC_DIR) not in sys.path:
@@ -45,7 +47,7 @@ except ImportError:
 
 import httpx  # noqa: E402
 
-EXPECT_CHOICES = ("any", "baked", "hydrated")
+REQUIRED_DATA_BACKEND_KEYS = ("project_id", "bigquery", "vertex_ai_search", "gcs_corpus_bucket")
 
 
 class SmokeTestFailure(AssertionError):
@@ -84,121 +86,75 @@ def wait_for_health(client: Any, wait_seconds: float) -> dict[str, Any]:
         time.sleep(1.0)
 
 
-def run_smoke_checks(
-    client: Any,
-    *,
-    expect_corpus: str = "any",
-    wait_seconds: float = 0.0,
-) -> dict[str, Any]:
-    """Execute the smoke checks against an httpx-compatible client and return a report."""
-    if expect_corpus not in EXPECT_CHOICES:
-        raise ValueError(f"expect_corpus must be one of {EXPECT_CHOICES}")
-
-    report: dict[str, Any] = {"expect_corpus": expect_corpus, "checks": {}}
-
+def check_health(client: Any, *, wait_seconds: float = 0.0) -> dict[str, Any]:
+    """Assert `/health` is ok and reports the live GCP `data_backend` configuration."""
     health = wait_for_health(client, wait_seconds)
     _require(health.get("status") == "ok", f"/health status is {health.get('status')!r}")
-    corpus = health.get("corpus") or {}
-    _require(bool(corpus), "/health is missing the 'corpus' packaging block")
-    report["corpus"] = {
-        k: corpus.get(k)
-        for k in (
-            "dataset_dir",
-            "profile_source",
-            "chunk_source",
-            "section_source",
-        )
+    backend = health.get("data_backend")
+    _require(isinstance(backend, dict) and bool(backend), "/health is missing 'data_backend'")
+    missing = [key for key in REQUIRED_DATA_BACKEND_KEYS if not backend.get(key)]
+    _require(not missing, f"/health data_backend is missing {missing}: {backend}")
+    bigquery = backend.get("bigquery") or {}
+    _require(bool(bigquery.get("dataset_id")), "/health data_backend.bigquery has no dataset_id")
+    return {
+        "data_backend": backend.get("data_backend"),
+        "project_id": backend.get("project_id"),
+        "bigquery_dataset": bigquery.get("dataset_id"),
+        "gcs_corpus_bucket": backend.get("gcs_corpus_bucket"),
     }
-    report["corpus"]["hydration_status"] = (
-        (corpus.get("hydration") or {}).get("last_result") or {}
-    ).get("status")
-    if expect_corpus in ("baked", "hydrated"):
-        _require(
-            corpus.get("profile_source") != "missing",
-            f"No curated financial profiles found in {corpus.get('dataset_dir')}",
-        )
-    if expect_corpus == "hydrated":
-        _require(
-            corpus.get("chunk_source") == "chunks_manifest",
-            "Expected hydrated manifests/bigquery_filing_chunks.jsonl but chunks are synthesized",
-        )
-        _require(
-            corpus.get("section_source") == "markdown_files",
-            "Expected hydrated unstructured/*.md 10-K Markdown but sections are synthesized",
-        )
-    report["checks"]["health"] = "ok"
 
+
+def check_ui(client: Any) -> dict[str, Any]:
+    """Assert `/` serves the compiled single-page Terminal UI."""
+    resp = client.get("/")
+    _require(resp.status_code == 200, f"GET / returned HTTP {resp.status_code}: {resp.text[:200]}")
+    content_type = resp.headers.get("content-type", "")
+    _require("text/html" in content_type, f"GET / content-type is {content_type!r}, not HTML")
+    body = resp.text
+    _require(
+        '<div id="root"' in body and "<script" in body,
+        "GET / did not return the compiled Terminal UI index.html",
+    )
+    return {"content_type": content_type, "bytes": len(body)}
+
+
+def check_live_data(client: Any) -> dict[str, Any]:
+    """Read the live issuer catalog from BigQuery through the authenticated API."""
     token_payload = _json(
         client.post("/api/v1/auth/sso/dev-token", json={}),
         "POST /api/v1/auth/sso/dev-token",
     )
     token = token_payload.get("access_token")
     _require(bool(token), "dev-token response did not include an access_token")
-    headers = {"Authorization": f"Bearer {token}"}
-    report["checks"]["dev_token"] = "ok"
-
-    companies = _json(client.get("/api/v1/companies", headers=headers), "GET /api/v1/companies")
+    companies = _json(
+        client.get("/api/v1/companies", headers={"Authorization": f"Bearer {token}"}),
+        "GET /api/v1/companies",
+    )
     company_list = companies.get("companies") or []
     _require(
-        companies.get("company_count", 0) > 0 and company_list, "No curated companies resolved"
+        companies.get("company_count", 0) > 0 and bool(company_list),
+        f"GET /api/v1/companies returned no live issuers: {json.dumps(companies)[:400]}",
     )
-    target = next((c for c in company_list if c.get("ticker") == "NVDA"), company_list[0])
-    ticker = str(target["ticker"])
-    years = sorted(int(y) for y in target.get("fiscal_years") or [])
-    _require(bool(years), f"{ticker} has no fiscal years")
-    end_year = years[-1]
-    start_year = years[-2] if len(years) > 1 else end_year
-    report["checks"]["companies"] = {
+    return {
         "company_count": companies.get("company_count"),
-        "probe_ticker": ticker,
+        "sample_tickers": [c.get("ticker") for c in company_list[:5]],
     }
 
-    variances = _json(
-        client.post(
-            "/api/v1/variances",
-            json={"tickers": ticker, "start_year": start_year, "end_year": end_year},
-            headers=headers,
-        ),
-        "POST /api/v1/variances",
-    )
-    _require(variances.get("status") == "success", f"variances status={variances.get('status')!r}")
-    report["checks"]["variances"] = "ok"
 
-    search = _json(
-        client.post(
-            "/api/v1/search",
-            json={
-                "query": "risk factors revenue growth outlook",
-                "tickers": ticker,
-                "start_year": start_year,
-                "end_year": end_year,
-                "top_k": 3,
-            },
-            headers=headers,
-        ),
-        "POST /api/v1/search",
-    )
-    _require(search.get("status") == "success", f"search status={search.get('status')!r}")
-    _require(search.get("citation_count", 0) > 0, f"search returned no citations for {ticker}")
-    report["checks"]["search"] = {"citation_count": search.get("citation_count")}
-
-    section = _json(
-        client.get(
-            "/api/v1/section",
-            params={
-                "ticker": ticker,
-                "fiscal_year": end_year,
-                "section_id": "item_7",
-                "max_chars": 2000,
-            },
-            headers=headers,
-        ),
-        "GET /api/v1/section",
-    )
-    _require(section.get("status") == "success", f"section status={section.get('status')!r}")
-    _require(bool(str(section.get("content") or "").strip()), "section content is empty")
-    report["checks"]["section"] = {"ticker": ticker, "fiscal_year": end_year}
-
+def run_smoke_checks(
+    client: Any,
+    *,
+    wait_seconds: float = 0.0,
+    check_frontend: bool = True,
+    live_data: bool = False,
+) -> dict[str, Any]:
+    """Execute the smoke checks against an httpx-compatible client and return a report."""
+    report: dict[str, Any] = {"checks": {}}
+    report["checks"]["health"] = check_health(client, wait_seconds=wait_seconds)
+    if check_frontend:
+        report["checks"]["ui"] = check_ui(client)
+    if live_data:
+        report["checks"]["live_companies"] = check_live_data(client)
     report["status"] = "passed"
     return report
 
@@ -209,7 +165,7 @@ def _build_client(args: argparse.Namespace) -> AbstractContextManager[Any]:
 
         from edgar_capstone.server import app
 
-        # Entering the TestClient context runs the FastAPI lifespan (incl. corpus hydration).
+        # Entering the TestClient context runs the FastAPI lifespan.
         return TestClient(app)
     return nullcontext(httpx.Client(base_url=args.base_url.rstrip("/"), timeout=args.timeout))
 
@@ -223,13 +179,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Exercise the FastAPI app in-process via TestClient instead of over HTTP.",
     )
     parser.add_argument(
-        "--expect-corpus",
-        choices=EXPECT_CHOICES,
-        default="baked",
+        "--live-data",
+        action="store_true",
         help=(
-            "'baked' requires curated financial profiles; 'hydrated' additionally requires "
-            "the real chunks manifest and 10-K Markdown; 'any' skips corpus assertions."
+            "Also read the live issuer catalog from BigQuery (needs GCP Application Default "
+            "Credentials with read access to the sec_edgar dataset)."
         ),
+    )
+    parser.add_argument(
+        "--skip-ui",
+        action="store_true",
+        help="Skip the GET / Terminal UI check (e.g. a source checkout without frontend/dist).",
     )
     parser.add_argument(
         "--wait-seconds", type=float, default=0.0, help="Seconds to wait for /health."
@@ -246,8 +206,9 @@ def main(argv: list[str] | None = None) -> int:
         with _build_client(args) as client:
             report = run_smoke_checks(
                 client,
-                expect_corpus=args.expect_corpus,
                 wait_seconds=args.wait_seconds,
+                check_frontend=not args.skip_ui,
+                live_data=args.live_data,
             )
             if not args.in_process:
                 client.close()

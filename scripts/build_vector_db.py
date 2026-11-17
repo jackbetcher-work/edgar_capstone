@@ -14,7 +14,7 @@ Produces:
        -> custom.googleapis.com/sec_edgar/chunk_health/*
 
 Examples:
-  # Local staging (chunk + embed all 114 filings + compute chunk health report)
+  # Stage locally without publishing (chunks are still embedded live with Vertex AI)
   .venv/bin/python scripts/build_vector_db.py --local-only
 
   # End-to-end cloud population (Vertex AI embeddings -> GCS -> BigQuery -> Cloud Monitoring)
@@ -144,12 +144,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Output embedding vector dimensionality.",
     )
     parser.add_argument(
-        "--embedding-backend",
-        choices=("auto", "vertex_ai", "deterministic"),
-        default="auto",
-        help="Embedding generation backend ('auto' uses Vertex AI when online, deterministic locally).",
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
         default=50,
@@ -201,7 +195,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--local-only",
         action="store_true",
-        help="Stage JSONL manifests and chunk health report locally without calling GCS/BQ/Monitoring.",
+        help=(
+            "Stage JSONL manifests and the chunk health report locally without publishing to "
+            "GCS/BigQuery/Cloud Monitoring. Embeddings still come from Vertex AI."
+        ),
     )
     parser.add_argument(
         "--upload-only",
@@ -209,7 +206,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "Skip chunking/embedding and only publish already-staged vector DB artifacts "
             "(bigquery_filing_chunks.jsonl, chunks_embeddings.json, chunk health report, catalog) "
-            "to GCS so containers can hydrate them via EDGAR_CORPUS_HYDRATION."
+            "to GCS."
         ),
     )
     parser.add_argument(
@@ -276,7 +273,6 @@ def main(argv: list[str] | None = None) -> int:
         end_year=args.end_year,
         embedding_model=args.embedding_model,
         embedding_dimensions=args.embedding_dimensions,
-        embedding_backend=args.embedding_backend,
         embedding_batch_size=args.batch_size,
         embedding_max_batch_chars=args.max_batch_chars,
         embedding_max_workers=args.embedding_workers,
@@ -306,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"GCS Corpus Bucket : gs://{summary.bucket_name}/")
     print(
         f"Embedding Config  : {summary.embedding_model} ({summary.embedding_dimensions}-d, "
-        f"backend={summary.embedding_backend})"
+        f"source={summary.embedding_backend})"
     )
     print(
         f"Filings Indexed   : {health.total_profiles_indexed}/{health.total_profiles_expected} "

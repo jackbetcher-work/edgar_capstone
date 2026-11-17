@@ -1,9 +1,19 @@
-"""Unit and ADK Runner integration tests for live GCP tool adapters (BigQuery, Vertex AI Search, Vector Search, & GCS)."""
+"""Request/response wiring tests for the live GCP tool adapters (BigQuery, Vertex AI Search,
+Vector Search, Vertex AI embeddings, and GCS).
+
+These tests inject `httpx.MockTransport` clients so they can assert the exact REST payloads the
+adapters send and how they map each API's response shape into tool results. They exercise the
+adapter plumbing, not the data: data-dependent tests read live GCP elsewhere in the suite.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import math
+import os
+import re
 import urllib.parse
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
@@ -37,8 +47,22 @@ from edgar_capstone.agents import (
 )
 from edgar_capstone.agents.tools import _SESSION_10K_CONTEXT_CACHE
 from edgar_capstone.dataset.extractor import format_combined_10k_markdown
-from edgar_capstone.vector_db.embedder import generate_deterministic_embedding
 from tests.structured_report_helpers import finding_from_citation, report_json
+
+_EMBEDDING_DIMS = 768
+
+
+def _mock_embedding_values(text: str) -> list[float]:
+    """Hashed bag-of-words unit vector used as the mocked `text-embedding-005:predict` payload.
+
+    Texts sharing words get a positive cosine similarity, which is all the ranking code needs
+    from the mocked response.
+    """
+    vec = [0.0] * _EMBEDDING_DIMS
+    for token in re.findall(r"[a-z0-9]+", text.lower()):
+        vec[int(hashlib.sha256(token.encode()).hexdigest(), 16) % _EMBEDDING_DIMS] += 1.0
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
 
 
 class _FakeGcpCredentials:
@@ -191,50 +215,55 @@ def _cleanup_gcp_adapter_registry() -> Any:
 def test_gcp_tool_config_and_status_metadata_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify `GcpToolConfig.from_env()` and `get_gcp_adapters_status_metadata()` across modes."""
+    """`GcpToolConfig.from_env()` reads the resource env vars; status metadata is always `gcp`."""
     for key in (
-        "EDGAR_DATA_BACKEND",
-        "EDGAR_EXECUTION_MODE",
-        "EDGAR_USE_GCP_TOOLS",
-        "K_SERVICE",
         "BIGQUERY_DATASET_ID",
         "VERTEX_AI_SEARCH_ENGINE_ID",
         "VERTEX_AI_SEARCH_DATASTORE_ID",
         "VERTEX_VECTOR_SEARCH_ENDPOINT_ID",
-        "GOOGLE_GENAI_USE_VERTEXAI",
+        "VERTEX_VECTOR_SEARCH_PSC_ADDRESS",
+        "VERTEX_EMBEDDING_DIMENSIONS",
+        "SEC_CORPUS_BUCKET",
     ):
         monkeypatch.delenv(key, raising=False)
 
-    # 1. Default offline auto mode -> local corpus (live_gcp_active=False)
     default_cfg = GcpToolConfig.from_env()
-    assert default_cfg.data_backend == "auto"
-    assert default_cfg.gcp_auto_triggered is False
+    assert default_cfg.project_id == os.environ["GCP_PROJECT_ID"]
+    assert default_cfg.bq_dataset_id == "sec_edgar"
+    assert default_cfg.embedding_dimensions == 768
     meta = get_gcp_adapters_status_metadata()
-    assert meta["live_gcp_active"] is False
-    assert meta["strict_gcp"] is False
+    assert meta["data_backend"] == "gcp"
+    assert meta["project_id"] == default_cfg.project_id
+    assert meta["bigquery"]["financial_metrics_table"] == "financial_metrics"
+    assert meta["vertex_vector_search"]["private_service_connect"] is False
+    for removed in ("live_gcp_active", "strict_gcp", "data_backend_mode"):
+        assert removed not in meta
 
-    # 2. Cloud Run environment (`K_SERVICE` + `BIGQUERY_DATASET_ID`) activates live GCP in auto mode
-    monkeypatch.setenv("K_SERVICE", "sec-edgar-analyst")
-    monkeypatch.setenv("BIGQUERY_DATASET_ID", "sec_edgar")
-    cloud_cfg = GcpToolConfig.from_env()
-    assert cloud_cfg.data_backend == "auto"
-    assert cloud_cfg.gcp_auto_triggered is True
-    cloud_meta = get_gcp_adapters_status_metadata()
-    assert cloud_meta["live_gcp_active"] is True
-    assert cloud_meta["strict_gcp"] is False
+    monkeypatch.setenv("BIGQUERY_DATASET_ID", "sec_edgar_staging")
+    monkeypatch.setenv("VERTEX_AI_SEARCH_ENGINE_ID", "engine-x")
+    monkeypatch.setenv("VERTEX_VECTOR_SEARCH_ENDPOINT_ID", "987654321")
+    monkeypatch.setenv("VERTEX_VECTOR_SEARCH_PSC_ADDRESS", "10.20.0.5")
+    monkeypatch.setenv("VERTEX_EMBEDDING_DIMENSIONS", "256")
+    env_cfg = GcpToolConfig.from_env()
+    assert env_cfg.bq_dataset_id == "sec_edgar_staging"
+    assert env_cfg.vais_engine_id == "engine-x"
+    assert env_cfg.embedding_dimensions == 256
+    env_meta = get_gcp_adapters_status_metadata()
+    assert env_meta["bigquery"]["dataset_id"] == "sec_edgar_staging"
+    assert env_meta["vertex_vector_search"]["endpoint_id"] == "987654321"
+    assert env_meta["vertex_vector_search"]["private_service_connect"] is True
 
-    # 3. Explicit `EDGAR_DATA_BACKEND=gcp` enables strict GCP mode
-    monkeypatch.setenv("EDGAR_DATA_BACKEND", "gcp")
-    strict_meta = get_gcp_adapters_status_metadata()
-    assert strict_meta["data_backend_mode"] == "gcp"
-    assert strict_meta["live_gcp_active"] is True
-    assert strict_meta["strict_gcp"] is True
-
-    # 4. Explicit `EDGAR_DATA_BACKEND=local` overrides Cloud Run signals
-    monkeypatch.setenv("EDGAR_DATA_BACKEND", "local")
-    local_meta = get_gcp_adapters_status_metadata()
-    assert local_meta["data_backend_mode"] == "local"
-    assert local_meta["live_gcp_active"] is False
+    # An injected adapter bundle's config is what the status metadata reports.
+    configure_gcp_tool_adapters(
+        GcpToolAdapters(
+            GcpToolConfig(project_id="injected-project", bq_dataset_id="injected_ds"),
+            credentials=_FakeGcpCredentials(),
+        )
+    )
+    injected_meta = get_gcp_adapters_status_metadata()
+    assert injected_meta["data_backend"] == "gcp"
+    assert injected_meta["project_id"] == "injected-project"
+    assert injected_meta["bigquery"]["dataset_id"] == "injected_ds"
 
 
 def test_bigquery_adapter_metrics_variances_and_job_polling() -> None:
@@ -310,7 +339,7 @@ def test_bigquery_adapter_metrics_variances_and_job_polling() -> None:
         return httpx.Response(404, text="Unexpected endpoint")
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
-    cfg = GcpToolConfig(data_backend="gcp", project_id="iron-radio-514217-q7")
+    cfg = GcpToolConfig(project_id="iron-radio-514217-q7")
     configure_gcp_tool_adapters(
         GcpToolAdapters(cfg, http_client=client, credentials=_FakeGcpCredentials())
     )
@@ -567,7 +596,7 @@ def test_bigquery_adapter_all_looker_explores() -> None:
     client = httpx.Client(transport=httpx.MockTransport(handler))
     configure_gcp_tool_adapters(
         GcpToolAdapters(
-            GcpToolConfig(data_backend="gcp"),
+            GcpToolConfig(),
             http_client=client,
             credentials=_FakeGcpCredentials(),
         )
@@ -614,7 +643,7 @@ def test_bigquery_adapter_all_looker_explores() -> None:
 def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -> None:
     """Verify `search_10k_chunks_rag` hits Vertex Embeddings, Vector Search (`findNeighbors`), Discovery Engine (`:search`), and BigQuery (`VECTOR_SEARCH` + hydration)."""
     hit_log: list[str] = []
-    q_vec = generate_deterministic_embedding("China export controls H20 Blackwell GPU")
+    q_vec = _mock_embedding_values("China export controls H20 Blackwell GPU")
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -868,7 +897,7 @@ def test_hybrid_rag_fuses_vertex_vector_search_vertex_ai_search_and_bigquery() -
     client = httpx.Client(transport=httpx.MockTransport(handler))
     configure_gcp_tool_adapters(
         GcpToolAdapters(
-            GcpToolConfig(data_backend="gcp"),
+            GcpToolConfig(),
             http_client=client,
             credentials=_FakeGcpCredentials(),
         )
@@ -1005,7 +1034,7 @@ def test_context_cache_miss_loads_from_bigquery_and_gcs_and_queries_cached_secti
         if ":predict" in url and "text-embedding-005" in url:
             hit_log.append("vertex_embeddings")
             preds = [
-                {"embeddings": {"values": generate_deterministic_embedding(inst["content"])}}
+                {"embeddings": {"values": _mock_embedding_values(inst["content"])}}
                 for inst in body["instances"]
             ]
             return httpx.Response(200, json={"predictions": preds})
@@ -1015,7 +1044,7 @@ def test_context_cache_miss_loads_from_bigquery_and_gcs_and_queries_cached_secti
     client = httpx.Client(transport=httpx.MockTransport(handler))
     configure_gcp_tool_adapters(
         GcpToolAdapters(
-            GcpToolConfig(data_backend="gcp"),
+            GcpToolConfig(),
             http_client=client,
             credentials=_FakeGcpCredentials(),
         )
@@ -1129,7 +1158,7 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
     _SESSION_10K_CONTEXT_CACHE.pop("NVDA_2026_item_1a", None)
 
     gcp_services_contacted: set[str] = set()
-    q_vec = generate_deterministic_embedding("Blackwell Data Center export control risks")
+    q_vec = _mock_embedding_values("Blackwell Data Center export control risks")
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
@@ -1284,7 +1313,6 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     cfg = GcpToolConfig(
-        data_backend="gcp",
         vvs_endpoint_id="987654321",
         vvs_public_domain="12345.us-central1-999.vdb.vertexai.goog",
         vvs_deployed_index_id="deployed_sec_10k_chunks_v1",
@@ -1328,8 +1356,8 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
     assert create_context_cache_agent().name == "ContextCacheAgent"
 
 
-def test_http_429_rate_limit_retries_and_strict_vs_auto_fallback() -> None:
-    """Verify HTTP 429 Retry-After backoff recovery and strict `gcp` error reporting vs `auto` fallback."""
+def test_http_429_rate_limit_retries_and_missing_credentials_error() -> None:
+    """Verify HTTP 429 Retry-After backoff recovery and that missing ADC is reported as an error."""
     attempts = 0
 
     def rate_limited_handler(request: httpx.Request) -> httpx.Response:
@@ -1361,7 +1389,7 @@ def test_http_429_rate_limit_retries_and_strict_vs_auto_fallback() -> None:
     client = httpx.Client(transport=httpx.MockTransport(rate_limited_handler))
     configure_gcp_tool_adapters(
         GcpToolAdapters(
-            GcpToolConfig(data_backend="gcp"),
+            GcpToolConfig(),
             http_client=client,
             credentials=_FakeGcpCredentials(),
         )
@@ -1379,33 +1407,21 @@ def test_http_429_rate_limit_retries_and_strict_vs_auto_fallback() -> None:
     assert attempts == 2
     assert ctx.state["tool_telemetry"][0]["attempts"] == 2
 
-    # Strict `gcp` mode with missing ADC credentials surfaces error instead of local fallback
+    # Missing ADC credentials surface as a tool error; there is no local data to fall back to
     configure_gcp_tool_adapters(
         GcpToolAdapters(
-            GcpToolConfig(data_backend="gcp"),
+            GcpToolConfig(),
             http_client=client,
             credentials=_FailingCredentials(),
         )
     )
+    attempts_before = attempts
     strict_err = fetch_financial_metrics(
         tickers="NVDA", start_year=2026, end_year=2026, gics_sector="ALL"
     )
     assert strict_err["status"] == "error"
     assert "DefaultCredentialsError" in strict_err["error_type"]
-
-    # `auto` mode with missing ADC credentials falls back cleanly to local curated dataset
-    configure_gcp_tool_adapters(
-        GcpToolAdapters(
-            GcpToolConfig(data_backend="auto", gcp_auto_triggered=True),
-            http_client=client,
-            credentials=_FailingCredentials(),
-        )
-    )
-    auto_res = fetch_financial_metrics(
-        tickers="NVDA", start_year=2026, end_year=2026, gics_sector="ALL"
-    )
-    assert auto_res["status"] == "success"
-    assert auto_res["record_count"] >= 1
+    assert attempts == attempts_before  # no request is sent without a bearer token
 
 
 def test_vector_search_adapter_queries_private_service_connect_over_grpc() -> None:
@@ -1432,7 +1448,6 @@ def test_vector_search_adapter_queries_private_service_connect_over_grpc() -> No
         return _FakePscEndpoint()
 
     cfg = GcpToolConfig(
-        data_backend="gcp",
         project_id="iron-radio-514217-q7",
         location="us-central1",
         vvs_endpoint_id="555",

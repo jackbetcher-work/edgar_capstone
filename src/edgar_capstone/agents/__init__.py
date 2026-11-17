@@ -31,6 +31,10 @@ from edgar_capstone.agents.context_memory import (
     resolve_model_for_task,
     resolve_task_and_model_for_agent,
 )
+from edgar_capstone.agents.disclosure_deltas import (
+    DisclosureDeltaTool,
+    compare_disclosures_across_years,
+)
 from edgar_capstone.agents.evaluation_and_coding import (
     CODING_ASSISTANT_INSTRUCTION,
     DEFAULT_FLASH_MODEL,
@@ -53,7 +57,6 @@ from edgar_capstone.agents.financial_analyst import (
 )
 from edgar_capstone.agents.live_runtime import (
     AdkStreamResult,
-    ExecutionMode,
     LiveBackendType,
     LiveRuntimeResolution,
     build_adk_llm_for_task,
@@ -69,6 +72,12 @@ from edgar_capstone.agents.live_runtime import (
     run_live_adk_narrative_evaluation_async,
     run_live_root_orchestrator_turn,
     run_live_root_orchestrator_turn_async,
+)
+from edgar_capstone.agents.material_variances import (
+    AnomalyFlagTool,
+    MaterialityThresholds,
+    compute_material_variance_flags,
+    flag_material_variances,
 )
 from edgar_capstone.agents.prompt_store import (
     DEFAULT_PROMPT_VERSION,
@@ -89,7 +98,6 @@ from edgar_capstone.agents.prompt_store import (
 from edgar_capstone.agents.react_loop import (
     StructuredReActExecutor,
     evaluate_calculated_variances,
-    format_react_grounded_output,
     query_cached_10k_for_explanations,
 )
 from edgar_capstone.agents.resilience import (
@@ -128,7 +136,6 @@ from edgar_capstone.agents.schemas import (
 from edgar_capstone.agents.tools import (
     BigQueryAdapter,
     ContextCacheTool,
-    DataBackendMode,
     GcpAdapterHttpError,
     GcpEndpointNotReadyError,
     GcpToolAdapters,
@@ -155,6 +162,12 @@ from edgar_capstone.agents.tools import (
 )
 
 __all__ = [
+    "AnomalyFlagTool",
+    "DisclosureDeltaTool",
+    "MaterialityThresholds",
+    "compare_disclosures_across_years",
+    "compute_material_variance_flags",
+    "flag_material_variances",
     "AdkStreamResult",
     "AnnualStepVariance",
     "BigQueryAdapter",
@@ -174,8 +187,6 @@ __all__ = [
     "DEFAULT_FLASH_MODEL",
     "DEFAULT_ORCHESTRATOR_MODEL",
     "DEFAULT_PROMPT_VERSION",
-    "DataBackendMode",
-    "ExecutionMode",
     "FINANCIAL_ANALYST_INSTRUCTION",
     "FINANCIAL_REASONING_MODEL",
     "FLASH_CODING_AND_EVAL_MODEL",
@@ -245,7 +256,6 @@ __all__ = [
     "extract_llm_request_context_breakdown",
     "fetch_financial_metrics",
     "financial_analyst_agent",
-    "format_react_grounded_output",
     "generate_financial_coding_assistance",
     "get_active_gcp_tool_adapters",
     "get_context_cache_runtime_stats",

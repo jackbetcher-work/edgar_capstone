@@ -1,4 +1,10 @@
-"""Tests for the golden eval dataset, scoring functions, gates, BigQuery I/O, and runner."""
+"""Tests for the golden eval dataset, scoring functions, gates, BigQuery I/O, and runner.
+
+Scorers, gates, and runner bookkeeping are pure functions, so they are unit-tested against
+response payloads shaped like a real `run_conversational_rag_turn` result. Data-dependent checks
+read live GCP: the committed golden numbers are recomputed from BigQuery, and a two-item subset
+(one scored query, one red-team probe) runs end to end through live Gemini and the live judge.
+"""
 
 from __future__ import annotations
 
@@ -33,7 +39,6 @@ from edgar_capstone.evals.metrics import (
     score_safety,
 )
 from edgar_capstone.evals.runner import (
-    DETERMINISTIC_ENV,
     EvalThresholds,
     aggregate_metrics,
     evaluate_gates,
@@ -76,26 +81,50 @@ def _scored_item(**overrides: Any) -> GoldenEvalItem:
     return GoldenEvalItem.model_validate(base)
 
 
+_SEC_URL = "https://www.sec.gov/Archives/edgar/data/1045810/000104581026000021/nvda-20260125.htm"
+
+
 def _response(**overrides: Any) -> dict[str, Any]:
+    """A successful turn payload with the same keys and citation format as a live response."""
     answer = (
-        "NVDA revenue rose **+150.00%** [NVDA FY2026 | Item 7 MD&A | NVDA_2026_item_7_0001](u) "
-        "and FY2024 context [NVDA FY2024 | Item 1A Risk Factors | NVDA_2024_item_1a_0003](u)."
+        "### NVIDIA revenue expanded on Data Center demand.\n\n"
+        "#### Key Metrics (deterministic engine)\n"
+        "- **NVIDIA CORP (NVDA) · Revenue:** $100.00 (FY2024) → $250.00 (FY2026), **+150.00%**\n\n"
+        "#### Findings\n"
+        "- Data Center demand drove growth. "
+        f"[NVDA FY2026 | Item 7. MD&A — Recent Developments | NVDA_2026_item_7_0001]({_SEC_URL})\n"
+        "- Supply risk persisted. "
+        f"[NVDA FY2024 | Item 1A. Risk Factors — Supply Chain | NVDA_2024_item_1a_0003]({_SEC_URL})"
     )
     base: dict[str, Any] = {
         "status": "success",
+        "model_armor_blocked": False,
+        "execution_mode": "live_adk",
         "intent": "longitudinal_single_company",
-        "resolved_scope": {"tickers": ["NVDA"], "start_year": 2024, "end_year": 2026},
+        "resolved_scope": {
+            "tickers": ["NVDA"],
+            "tickers_csv": "NVDA",
+            "gics_sector": "ALL",
+            "section_id": "ALL",
+            "start_year": 2024,
+            "end_year": 2026,
+        },
         "answer_markdown": answer,
+        "answer_verified": True,
         "variance_reports": [
             {
                 "ticker": "NVDA",
                 "start_year": 2024,
                 "end_year": 2026,
                 "revenue_variance": {
+                    "metric_name": "revenue",
+                    "start_year": 2024,
+                    "end_year": 2026,
                     "start_value": 100.0,
                     "end_value": 250.0,
                     "absolute_delta": 150.0,
                     "percentage_delta": 150.0,
+                    "direction": "increase",
                 },
             }
         ],
@@ -120,6 +149,20 @@ def _response(**overrides: Any) -> dict[str, Any]:
             },
         ],
         "fact_check": {"passed": True, "has_required_citations": True, "discrepancies": []},
+        "adk_runtime": {
+            "backend": "vertex_ai",
+            "executed_via_adk_runner": True,
+            "observed_ttft_ms": 2100.0,
+            "answer_verified": True,
+            "answer_withheld_reason": None,
+        },
+        "react_execution": {
+            "strategy": "structured_react_loop",
+            "execution_mode": "live_adk",
+            "observed_ttft_ms": 2100.0,
+            "cached_10k_explanations": [],
+        },
+        "total_latency_ms": 41000.0,
     }
     base.update(overrides)
     return base
@@ -152,12 +195,8 @@ def test_golden_expected_variances_are_fully_populated(golden_items: list[Golden
             assert ev.start_value is not None and ev.end_value is not None, ev.key
 
 
-def test_golden_numbers_match_calculation_engine(
-    golden_items: list[GoldenEvalItem], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The committed golden numbers must equal the deterministic engine over the tracked manifest."""
-    for key, value in DETERMINISTIC_ENV.items():
-        monkeypatch.setenv(key, value)
+def test_golden_numbers_match_live_bigquery_engine(golden_items: list[GoldenEvalItem]) -> None:
+    """The committed golden numbers must equal the calculation engine over live BigQuery."""
     for item in golden_items:
         refreshed = refresh_expected_values(item)
         assert refreshed.expected_variances == item.expected_variances, item.id
@@ -221,9 +260,9 @@ def test_eval_results_schema_matches_report_row() -> None:
         [item],
         turn_fn=lambda **_: _response(),
         judge_fn=_perfect_judge,
-        corpus_kind="synthetic",
     )
     row = report.to_bigquery_row()
+    assert row["eval_mode"] == "live" and row["corpus_kind"] == "gcp"
     fields = load_schema_fields("eval_results")
     assert set(row) == _names(fields)
     assert set(row["gates"][0]) == _nested(fields, "gates")
@@ -352,7 +391,7 @@ def _perfect_judge(**_: Any) -> dict[str, Any]:
     }
 
 
-def test_gates_fail_below_threshold_and_ttft_only_in_live() -> None:
+def test_gates_fail_below_threshold_and_always_gate_ttft() -> None:
     thresholds = EvalThresholds()
     metrics = {
         "numeric_agreement": 1.0,
@@ -365,22 +404,22 @@ def test_gates_fail_below_threshold_and_ttft_only_in_live() -> None:
         "safety_compliance": 1.0,
         "p95_ttft_ms": None,
     }
-    gates = {g.name: g for g in evaluate_gates(metrics, thresholds, mode="deterministic")}
+    gates = {g.name: g for g in evaluate_gates(metrics, thresholds)}
     assert gates["grounding_recall"].passed is False
-    assert gates["p95_ttft_ms"].skipped and gates["p95_ttft_ms"].passed
+    assert gates["numeric_agreement"].passed is True
+    assert not any(g.skipped for g in gates.values())
+    # No TTFT captured is a failure, not a skip
+    assert gates["p95_ttft_ms"].passed is False
+    assert gates["p95_ttft_ms"].detail == "no streaming TTFT captured"
 
-    live = {g.name: g for g in evaluate_gates(metrics, thresholds, mode="live")}
-    assert live["p95_ttft_ms"].passed is False  # no TTFT captured is a live failure
-    live_ok = {
-        g.name: g
-        for g in evaluate_gates(metrics | {"p95_ttft_ms": 2100.0}, thresholds, mode="live")
-    }
-    assert live_ok["p95_ttft_ms"].passed is True
-    slow = {
-        g.name: g
-        for g in evaluate_gates(metrics | {"p95_ttft_ms": 3400.0}, thresholds, mode="live")
-    }
+    ok = {g.name: g for g in evaluate_gates(metrics | {"p95_ttft_ms": 2100.0}, thresholds)}
+    assert ok["p95_ttft_ms"].passed is True and ok["p95_ttft_ms"].comparator == "<="
+    slow = {g.name: g for g in evaluate_gates(metrics | {"p95_ttft_ms": 3400.0}, thresholds)}
     assert slow["p95_ttft_ms"].passed is False
+
+    missing = {g.name: g for g in evaluate_gates(metrics | {"safety_compliance": None}, thresholds)}
+    assert missing["safety_compliance"].passed is False
+    assert "no items contributed" in missing["safety_compliance"].detail
 
 
 def test_thresholds_file_loads_and_rejects_unknown_keys(tmp_path: Path) -> None:
@@ -401,15 +440,16 @@ def test_runner_isolates_item_errors_and_scores_them_as_failures() -> None:
             raise RuntimeError("upstream exploded")
         return _response()
 
-    report = run_golden_evals(
-        items, turn_fn=flaky_turn, judge_fn=_perfect_judge, corpus_kind="synthetic"
-    )
+    report = run_golden_evals(items, turn_fn=flaky_turn, judge_fn=_perfect_judge)
     by_id = {r.item_id: r for r in report.item_results}
     assert by_id["nvda_test_item"].passed is True
+    assert by_id["nvda_test_item"].execution_mode == "live_adk"
+    assert by_id["nvda_test_item"].ttft_ms == 2100.0
     assert by_id["second_item"].passed is False
     assert "upstream exploded" in by_id["second_item"].failure_reasons[0]
     assert report.metrics["citation_coverage"] == 0.5
     assert report.passed is False and "citation_coverage" in report.regressions
+    assert report.metrics["p95_ttft_ms"] == 2100.0
 
 
 def test_aggregate_metrics_counts_missing_judge_scores_as_zero() -> None:
@@ -417,7 +457,6 @@ def test_aggregate_metrics_counts_missing_judge_scores_as_zero() -> None:
         [_scored_item()],
         turn_fn=lambda **_: _response(),
         judge_fn=_perfect_judge,
-        corpus_kind="synthetic",
     )
     res = report.item_results[0]
     assert res.faithfulness_score == 1.0
@@ -425,27 +464,61 @@ def test_aggregate_metrics_counts_missing_judge_scores_as_zero() -> None:
     assert aggregate_metrics([res])["judge_faithfulness"] == 0.0
 
 
-def test_golden_subset_passes_end_to_end_in_deterministic_mode(
-    golden_items: list[GoldenEvalItem], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    for key, value in DETERMINISTIC_ENV.items():
-        monkeypatch.setenv(key, value)
-    wanted = {
-        "nvda_longitudinal_fy24_fy26",
-        "nvda_avgo_peer_fy24_fy25",
-        "nvda_export_control_risk_fy24_fy26",
-        "safety_prompt_injection_fabricate",
-        "safety_price_target",
-    }
+def test_golden_subset_runs_live_end_to_end(golden_items: list[GoldenEvalItem]) -> None:
+    """One scored query and one red-team probe through live Gemini, live GCP, and the live judge."""
+    from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
+
+    wanted = {"nvda_longitudinal_fy24_fy26", "safety_price_target"}
     subset = [i for i in golden_items if i.id in wanted]
     assert len(subset) == len(wanted)
 
-    report = run_golden_evals(subset, mode="deterministic")
-    failures = {r.item_id: r.failure_reasons for r in report.item_results if not r.passed}
-    assert failures == {}
-    assert report.passed, report.regressions
-    assert report.metrics["numeric_agreement"] == 1.0
+    responses: dict[str, dict[str, Any]] = {}
+
+    def recording_turn(**kwargs: Any) -> dict[str, Any]:
+        response = run_conversational_rag_turn(**kwargs)
+        responses[kwargs["session_id"].rsplit("-", 1)[-1]] = response
+        return response
+
+    report = run_golden_evals(subset, turn_fn=recording_turn)
+    assert report.eval_mode == "live" and report.corpus_kind == "gcp"
+    assert report.dataset_version == dataset_fingerprint(subset)
+    by_id = {r.item_id: r for r in report.item_results}
+
+    safety = by_id["safety_price_target"]
+    assert safety.passed, safety.failure_reasons
+    assert safety.status == "blocked" and safety.safety_blocked is True
     assert report.metrics["safety_compliance"] == 1.0
+
+    scored = by_id["nvda_longitudinal_fy24_fy26"]
+    assert scored.error is None, scored.error
+    assert scored.status == "success" and scored.execution_mode == "live_adk"
+    assert scored.routing_ok is True, scored.failure_reasons
+    assert scored.citations_count > 0
+    assert scored.ttft_ms is not None and scored.ttft_ms > 0
+    assert scored.judge_model and scored.faithfulness_score is not None
+    assert 0.0 <= scored.faithfulness_score <= 1.0
+    # Engine numbers come from live BigQuery and must match the committed golden values, and the
+    # answer may only cite chunks retrieved this turn, whatever the model wrote.
+    engine_drift = [
+        r
+        for r in scored.failure_reasons
+        if "golden" in r or "variance report" in r or "engine" in r
+    ]
+    assert engine_drift == []
+    assert not any("not retrieved this turn" in r for r in scored.failure_reasons)
+
+    response = next(r for r in responses.values() if r.get("status") == "success")
+    if response["answer_verified"]:
+        assert scored.numeric_agreement is True, scored.failure_reasons
+        assert scored.citation_coverage is True, scored.failure_reasons
+    else:
+        assert response["answer_markdown"].startswith("### Answer withheld")
+        assert response["adk_runtime"]["answer_withheld_reason"]
+
+    gates = {g.name: g for g in report.gates}
+    assert gates["p95_ttft_ms"].value == scored.ttft_ms
+    assert gates["p95_ttft_ms"].passed is (scored.ttft_ms <= report.thresholds.p95_ttft_ms)
+    assert set(report.to_bigquery_row()) == _names(load_schema_fields("eval_results"))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -528,11 +601,7 @@ def test_bigquery_load_read_and_stream_round_trip(golden_items: list[GoldenEvalI
     assert captured["insert"]["rows"] == [{"insertId": "run-123", "json": row}]
 
 
-def test_run_evals_cli_rejects_missing_dataset(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_run_evals_cli_rejects_missing_dataset(tmp_path: Path) -> None:
     from scripts.run_evals import main
 
-    for key, value in DETERMINISTIC_ENV.items():
-        monkeypatch.setenv(key, value)
     assert main(["--dataset", str(tmp_path / "missing.jsonl"), "--output-dir", str(tmp_path)]) == 2

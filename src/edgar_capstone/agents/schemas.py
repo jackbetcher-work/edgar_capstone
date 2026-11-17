@@ -402,6 +402,132 @@ class Cached10KExplanation(BaseModel):
     sec_filing_url: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Deterministic anomaly flagging (`flag_material_variances`)
+# ---------------------------------------------------------------------------
+
+MaterialFlagRule = Literal[
+    "yoy_change", "sign_reversal", "margin_shift", "period_change", "sector_divergence"
+]
+MaterialFlagMetric = Literal[
+    "revenue",
+    "operating_income",
+    "net_income",
+    "research_and_development",
+    "operating_margin",
+    "net_margin",
+    "rd_intensity",
+]
+
+
+class MaterialFlagSource(BaseModel):
+    """Filing provenance for a flagged figure (current and comparison filings)."""
+
+    accession_number: str = ""
+    sec_filing_url: str = ""
+    period_of_report: str = ""
+    xbrl_concept: str | None = Field(
+        default=None, description="XBRL concept the current-year value was read from"
+    )
+    prior_accession_number: str | None = None
+    prior_sec_filing_url: str | None = None
+    prior_period_of_report: str | None = None
+
+
+class MaterialFlagExplanation(BaseModel):
+    """MD&A passage retrieved to explain a flagged variance."""
+
+    chunk_id: str
+    section_id: Literal["item_1a", "item_7"] = "item_7"
+    section_title: str = ""
+    excerpt: str
+    sec_filing_url: str = ""
+
+
+class MaterialVarianceFlag(BaseModel):
+    """A deterministically detected material variance (anomaly) that needs a 10-K explanation."""
+
+    flag_id: str
+    ticker: str
+    company_name: str
+    gics_sector: str = "Unknown"
+    fiscal_year: int = Field(..., description="Fiscal year in which the variance occurred")
+    prior_fiscal_year: int | None = Field(
+        default=None, description="Comparison fiscal year (YoY prior year or period start)"
+    )
+    metric: MaterialFlagMetric
+    rule: MaterialFlagRule
+    severity: Literal["high", "medium"] = "medium"
+    value: float = Field(..., description="Measured change: % (pct), bps, pp, or USD")
+    unit: Literal["pct", "bps", "pp", "usd"]
+    threshold: float = Field(..., description="Materiality threshold the value crossed")
+    prior_value: float | None = None
+    current_value: float | None = None
+    benchmark_value: float | None = Field(
+        default=None, description="Sector median for sector_divergence flags"
+    )
+    peer_count: int | None = None
+    description: str = Field(..., description="Deterministic one-sentence description")
+    explanation_query: str = Field(
+        default="", description="Suggested MD&A query for explaining the variance"
+    )
+    source: MaterialFlagSource = Field(default_factory=MaterialFlagSource)
+    explanation: MaterialFlagExplanation | None = None
+
+
+# ---------------------------------------------------------------------------
+# Disclosure Delta pipeline (`compare_disclosures_across_years`)
+# ---------------------------------------------------------------------------
+
+
+class DisclosureDelta(BaseModel):
+    """One theme-relevant passage compared across consecutive fiscal years."""
+
+    delta_id: str
+    ticker: str
+    company_name: str
+    section_id: Literal["item_1a", "item_7"]
+    section_title: str = ""
+    change_type: Literal["added", "removed", "modified", "unchanged"]
+    prior_fiscal_year: int
+    current_fiscal_year: int
+    prior_chunk_id: str | None = None
+    current_chunk_id: str | None = None
+    prior_excerpt: str | None = None
+    current_excerpt: str | None = None
+    similarity: float = Field(
+        default=0.0,
+        description="Share of the passage's word trigrams found in the other year's section",
+    )
+    added_phrases: list[str] = Field(default_factory=list)
+    removed_phrases: list[str] = Field(default_factory=list)
+    theme_relevance: float = 0.0
+
+
+class DisclosureYearPair(BaseModel):
+    """Deltas for one company between two consecutive available fiscal years."""
+
+    prior_fiscal_year: int
+    current_fiscal_year: int
+    counts: dict[str, int] = Field(default_factory=dict)
+    deltas: list[DisclosureDelta] = Field(default_factory=list)
+
+
+class CompanyDisclosureEvolution(BaseModel):
+    """Year-over-year evolution of one company's disclosures for a theme."""
+
+    ticker: str
+    company_name: str
+    gics_sector: str = "Unknown"
+    fiscal_years_available: list[int] = Field(default_factory=list)
+    missing_fiscal_years: list[int] = Field(default_factory=list)
+    theme_mentions: dict[str, int] = Field(
+        default_factory=dict,
+        description="Theme-term mentions per fiscal year across the compared section(s)",
+    )
+    year_pairs: list[DisclosureYearPair] = Field(default_factory=list)
+
+
 class ReActStep(BaseModel):
     """Single structured Thought -> Action -> Observation step in the ReAct execution loop."""
 

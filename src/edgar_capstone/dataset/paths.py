@@ -1,18 +1,13 @@
-"""Filesystem layout resolution for the curated SEC 10-K corpus.
+"""Filesystem layout of the local ingestion staging area (`data/`).
 
-The package can run from three layouts:
+The ingestion scripts (`build-sec-dataset`, `build-vector-db`, `backfill-rd-metric`) stage
+10-K profiles, Markdown, and manifests under `data/curated_dataset/` before publishing
+them to GCS, BigQuery, and Vertex AI Search. The serving runtime never reads this
+directory; it queries those GCP services directly.
 
-1. A source checkout / editable install (`<repo>/src/edgar_capstone/...`), where
-   `<repo>/data/` sits three directories above this module.
-2. A non-editable install inside the production container
-   (`/opt/venv/lib/python3.11/site-packages/edgar_capstone/...`), where walking up
-   from `__file__` lands inside the virtualenv instead of `/app/data/`.
-3. An arbitrary working directory containing a `data/` folder.
-
-Resolving the data root by probing these candidates (with explicit environment
-overrides taking precedence) keeps the baked container manifests and any
-GCS-hydrated fallback artifacts discoverable regardless of how the package was
-installed.
+The data root is resolved from (in order) the `EDGAR_DATA_ROOT` override, the source
+checkout (`<repo>/data`), `/app/data`, or `<cwd>/data`, so the scripts work from an
+editable install, a non-editable install, or an arbitrary working directory.
 """
 
 from __future__ import annotations

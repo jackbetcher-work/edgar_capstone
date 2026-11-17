@@ -252,11 +252,6 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
-        name  = "EDGAR_EXECUTION_MODE"
-        value = "auto"
-      }
-
-      env {
         name  = "RUNTIME_SERVICE_ACCOUNT_ID"
         value = var.analyst_service_account_id
       }

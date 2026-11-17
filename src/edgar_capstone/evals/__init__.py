@@ -1,7 +1,6 @@
 """Golden eval dataset + regression gate (`make eval-all`).
 
-Import-light on purpose: nothing here imports `edgar_capstone.agents` at module load, so
-`configure_eval_environment()` can pin the execution env before the agents read it.
+Import-light on purpose: nothing here imports `edgar_capstone.agents` at module load.
 """
 
 from edgar_capstone.evals.golden import (
@@ -18,7 +17,6 @@ from edgar_capstone.evals.golden import (
 from edgar_capstone.evals.runner import (
     EvalRunReport,
     EvalThresholds,
-    configure_eval_environment,
     format_report,
     run_golden_evals,
 )
@@ -32,7 +30,6 @@ __all__ = [
     "GoldenDatasetError",
     "GoldenEvalItem",
     "RequestFilters",
-    "configure_eval_environment",
     "dataset_fingerprint",
     "format_report",
     "load_golden_dataset",

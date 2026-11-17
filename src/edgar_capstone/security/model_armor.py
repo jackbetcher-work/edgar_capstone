@@ -989,8 +989,6 @@ class ModelArmorClient:
             return True
         if _truthy_env("GOOGLE_GENAI_USE_VERTEXAI", False):
             return True
-        if os.environ.get("EDGAR_DATA_BACKEND", "").strip().lower() == "gcp":
-            return True
         return False
 
     def _get_auth_token(self, *, target_service: str = "model-armor-service") -> str:
@@ -1033,6 +1031,9 @@ class ModelArmorClient:
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
+                # User ADC (developer shells, local CI runs) has no quota project, and the
+                # DLP API rejects such calls; bill them to the configured project explicitly.
+                "x-goog-user-project": self.config.project_id,
             }
             if self._http_client is not None:
                 resp = self._http_client.post(url, headers=headers, json=payload)
@@ -1175,13 +1176,37 @@ class ModelArmorClient:
             )
 
         url = f"https://dlp.googleapis.com/v2/{parent}/content:deidentify"
-        raw, _ = self._post_json(
-            url,
-            deid_payload,
-            service_label="Cloud SDP content:deidentify",
-            target_service="sdp-dlp-service",
-        )
+        try:
+            raw, _ = self._post_json(
+                url,
+                deid_payload,
+                service_label="Cloud SDP content:deidentify",
+                target_service="sdp-dlp-service",
+            )
+        except Exception:
+            if not local_spans:
+                raise
+            # Never pass detected PII through because the DLP call failed: redact the spans
+            # found locally (SSNs, phone numbers, emails, credentials) instead of letting the
+            # caller fail open with raw PII.
+            logger.warning(
+                "Cloud SDP deidentify failed; redacting %d locally detected span(s).",
+                len(local_spans),
+                exc_info=True,
+            )
+            return (
+                True,
+                tuple(sorted({it for _, _, it in local_spans})),
+                _redact_spans(text, local_spans),
+            )
         deid_text = str((raw.get("item") or {}).get("value") or text)
+        # DLP may skip values it treats as placeholders (e.g. 123-45-6789) at this likelihood.
+        # Anything detected locally must still be redacted, so the reported info types and the
+        # sanitized text always agree.
+        for start, end, info_type in local_spans:
+            original = text[start:end]
+            if original and original in deid_text:
+                deid_text = deid_text.replace(original, f"[{info_type}]")
         info_types: list[str] = [it for _, _, it in local_spans]
         summaries = (raw.get("overview") or {}).get("transformationSummaries") or []
         for s_item in summaries:
@@ -1380,7 +1405,10 @@ class ModelArmorGuardrailService:
         if ma_summary.sdp_deidentified_text is not None and ma_summary.sdp_matched:
             working_text = ma_summary.sdp_deidentified_text
 
-        if self.config.enable_cloud_dlp_api and not sdp_triggered:
+        # Always run Cloud DLP as well: Model Armor's basic SDP may match only some info types
+        # (e.g. an email) and leave others (SSNs, phone numbers) in the text. DLP skips the
+        # remote call itself when no candidate spans remain.
+        if self.config.enable_cloud_dlp_api:
             try:
                 dlp_matched, dlp_types, dlp_text = self.client.inspect_and_deidentify_sdp(
                     working_text
@@ -1578,7 +1606,10 @@ class ModelArmorGuardrailService:
         if ma_summary.sdp_deidentified_text is not None and ma_summary.sdp_matched:
             working_text = ma_summary.sdp_deidentified_text
 
-        if self.config.enable_cloud_dlp_api and not sdp_triggered:
+        # Always run Cloud DLP as well: Model Armor's basic SDP may match only some info types
+        # (e.g. an email) and leave others (SSNs, phone numbers) in the text. DLP skips the
+        # remote call itself when no candidate spans remain.
+        if self.config.enable_cloud_dlp_api:
             try:
                 dlp_matched, dlp_types, dlp_text = self.client.inspect_and_deidentify_sdp(
                     working_text

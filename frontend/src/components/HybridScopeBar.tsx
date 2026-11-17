@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, ChevronDown, Search, X } from 'lucide-react'
 import type {
+  CatalogLoadStatus,
   CompanySummary,
   SearchScopeFilters,
   SectionFilterId,
@@ -9,6 +10,8 @@ import { formatUsdCompact } from '../utils/formatters'
 
 interface HybridScopeBarProps {
   companies: CompanySummary[]
+  catalogStatus?: CatalogLoadStatus
+  catalogError?: string | null
   sectors: string[]
   minYear: number
   maxYear: number
@@ -24,6 +27,8 @@ const SECTION_OPTIONS: Array<{ id: SectionFilterId; label: string }> = [
 
 export function HybridScopeBar({
   companies,
+  catalogStatus = 'ready',
+  catalogError = null,
   sectors,
   minYear,
   maxYear,
@@ -180,9 +185,26 @@ export function HybridScopeBar({
                   </button>
                 )
               })}
-              {filteredCompanies.length === 0 && (
+              {catalogStatus === 'loading' && (
+                <p className="text-[11px] text-bb-amber py-3 text-center uppercase">
+                  LOADING COMPANIES FROM EDGAR API...
+                </p>
+              )}
+              {catalogStatus === 'error' && (
+                <p
+                  id="issuer-catalog-error"
+                  className="text-[11px] badge-negative p-2 my-1 text-left"
+                >
+                  COMPANY CATALOG UNAVAILABLE —{' '}
+                  {catalogError ??
+                    'Backend unreachable — could not reach the EDGAR API. No data was shown.'}
+                </p>
+              )}
+              {catalogStatus === 'ready' && filteredCompanies.length === 0 && (
                 <p className="text-[11px] text-ink-muted py-3 text-center">
-                  NO MATCHING EQUITIES
+                  {companies.length === 0
+                    ? 'NO COMPANIES RETURNED BY EDGAR API'
+                    : 'NO MATCHING EQUITIES'}
                 </p>
               )}
             </div>

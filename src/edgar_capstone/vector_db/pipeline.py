@@ -7,7 +7,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import google.auth
 import google.auth.exceptions
@@ -75,7 +75,6 @@ class VectorDBBuildConfig:
     end_year: int | None = None
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS
-    embedding_backend: Literal["vertex_ai", "deterministic", "auto"] = "auto"
     embedding_batch_size: int = 50
     embedding_max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS
     embedding_max_workers: int = 8
@@ -85,6 +84,8 @@ class VectorDBBuildConfig:
     min_chunk_chars: int = 150
     overlap_chunk_chars: int = 200
     skip_existing_embeddings: bool = True
+    # Stage manifests and the health report locally (still embedding with Vertex AI) without
+    # publishing to GCS, BigQuery, or Cloud Monitoring.
     local_only: bool = False
     load_bigquery: bool = True
     publish_monitoring_metrics: bool = True
@@ -347,19 +348,12 @@ def run_vector_db_pipeline(
     )
 
     checkpoint_path = output_dir / "vector_search" / ".embedding_checkpoint.jsonl"
-    requested_backend: Literal["vertex_ai", "deterministic", "auto"] = (
-        "deterministic"
-        if (config.local_only and config.embedding_backend == "auto")
-        else config.embedding_backend
-    )
-
-    all_chunks, resolved_backend = populate_chunk_embeddings(
+    all_chunks, embedding_source = populate_chunk_embeddings(
         all_chunks,
         project_id=config.project_id,
         location=config.location,
         model_name=config.embedding_model,
         dimensions=config.embedding_dimensions,
-        backend=requested_backend,
         batch_size=config.embedding_batch_size,
         existing_embeddings=cached_embeddings,
         vertex_embedder=vertex_embedder,
@@ -392,7 +386,7 @@ def run_vector_db_pipeline(
         table_id=config.table_id,
         location=config.location,
         embedding_model=config.embedding_model,
-        embedding_backend=resolved_backend,
+        embedding_backend=embedding_source,
         embedding_dimensions=config.embedding_dimensions,
         total_profiles_processed=len(profiles),
         total_chunks_generated=len(all_chunks),

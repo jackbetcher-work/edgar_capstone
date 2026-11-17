@@ -1,4 +1,10 @@
-"""Automated tests for Structured ReAct Reasoning, Dual-Model Routing, and Context/Memory Latency Tracking."""
+"""Structured ReAct reasoning, dual-model routing, and context/memory latency tracking.
+
+Tools read live GCP (BigQuery, GCS, Vertex AI embeddings) and chat turns call live Gemini. The
+only scripted ADK `BaseLlm` drives a fixed 3-step tool sequence over the live tools so the ReAct
+phase trace and the context-latency math (which depends on known token counts) can be asserted
+exactly; its final answer cites a chunk and quote returned by the live tool.
+"""
 
 from __future__ import annotations
 
@@ -37,7 +43,6 @@ from edgar_capstone.agents import (
     create_financial_analyst_agent,
     edgar_adk_app,
     evaluate_calculated_variances,
-    evaluate_variance_explanation,
     extract_llm_request_context_breakdown,
     generate_financial_coding_assistance,
     get_context_latency_tracker,
@@ -47,7 +52,6 @@ from edgar_capstone.agents import (
     reconcile_breakdown_with_usage_metadata,
     resolve_model_for_task,
 )
-from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.security import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
 from tests.structured_report_helpers import report_json, verbatim_quote
@@ -182,19 +186,15 @@ class _DeterministicReActProLlm(BaseLlm):
         cache_payload = next(
             resp for name, resp in fn_responses if name == "query_cached_10k_context"
         )
-        nvda_rep = var_payload["variance_reports"][0]
-        rev_pct = nvda_rep["revenue_variance"]["percentage_delta"]
-        op_pct = nvda_rep["operating_income_variance"]["percentage_delta"]
-        chunk_id = (cache_payload.get("matched_chunk_ids") or ["NVDA_2026_item_7_0001"])[0]
-        filing_url = cache_payload.get("sec_filing_url") or "https://www.sec.gov/nvda"
-        passage = (cache_payload.get("passages") or [{"text": "Data center compute growth."}])[0]
-        _ = (rev_pct, op_pct, filing_url)
+        assert var_payload["variance_reports"][0]["ticker"] == "NVDA"
+        passage = cache_payload["passages"][0]
+        chunk_id = passage["chunk_id"]
         final_md = report_json(
             headline="NVIDIA CORP (NVDA) Grounded Variance Report",
             key_metrics=[("NVDA", "revenue"), ("NVDA", "operating_income")],
             findings=[
                 {
-                    "statement": "Data center compute demand explains the revenue variance.",
+                    "statement": "The cached MD&A passage explains the revenue variance.",
                     "ticker": "NVDA",
                     "fiscal_year": 2026,
                     "chunk_ids": [chunk_id],
@@ -514,19 +514,27 @@ def test_context_induced_latency_attribution_and_cache_speedup_math() -> None:
     assert th_toks == 30
 
 
-def test_structured_react_executor_and_gemini_3_5_flash_tasks() -> None:
-    """Verify ReAct variance evaluation, cached 10-K querying, adaptive peer fill, and Flash coding/eval tasks."""
+def _is_model(name: str, family: str) -> bool:
+    """Live responses may report a versioned model name (e.g. `gemini-3.5-flash-001`)."""
+    return str(name).split("/")[-1].startswith(family)
+
+
+def test_structured_react_executor_live_peer_comparison() -> None:
+    """Variance pre-pass, cached 10-K querying with adaptive peer fill, live synthesis + judge."""
     var_res = calculate_period_variances(tickers="NVDA,AAPL", start_year=2024, end_year=2026)
     reports = var_res["variance_reports"]
+    assert {r["ticker"] for r in reports} == {"AAPL", "NVDA"}
 
     evals = evaluate_calculated_variances(reports, query="AI compute and Services margin")
     assert len(evals) == 2
-    nvda_eval = next(e for e in evals if e.ticker == "NVDA")
-    assert nvda_eval.revenue_pct_delta is not None and nvda_eval.revenue_pct_delta > 200.0
-    assert len(nvda_eval.divergences) >= 1
-    assert {q["section_id"] for q in nvda_eval.targeted_10k_queries} == {"item_7", "item_1a"}
+    for ev in evals:
+        rep = next(r for r in reports if r["ticker"] == ev.ticker)
+        # The pre-pass reads the deterministic engine's figures, never recomputes them
+        assert ev.revenue_pct_delta == rep["revenue_variance"]["percentage_delta"]
+        assert ev.targeted_10k_queries
+        assert {q["section_id"] for q in ev.targeted_10k_queries} <= {"item_7", "item_1a"}
+        assert all(q["ticker"] == ev.ticker for q in ev.targeted_10k_queries)
 
-    # Execute full StructuredReActExecutor post-retrieval reasoning
     executor = StructuredReActExecutor()
     out = executor.execute_post_retrieval_reasoning(
         query="Compare NVIDIA and Apple revenue and margin drivers from 2024 to 2026",
@@ -546,12 +554,19 @@ def test_structured_react_executor_and_gemini_3_5_flash_tasks() -> None:
         memory_tokens=48,
         memory_prep_latency_ms=0.8,
     )
+    assert out["execution_mode"] == "live_adk"
     assert out["reasoning_model"] == "gemini-3.8-flash"
-    assert out["evaluation_model"] == "gemini-3.5-flash"
-    assert len(out["cached_explanations"]) >= 2
+    assert _is_model(out["evaluation_model"], "gemini-3.5-flash")
+    assert out["adk_runtime"]["backend"] == "vertex_ai"
+    assert out["adk_runtime"]["executed_via_adk_runner"] is True
+
+    # Both peers got cached 10-K explanations, linked to live chunk citations
+    assert {e.ticker for e in out["cached_explanations"]} == {"AAPL", "NVDA"}
     assert len(out["citations"]) >= 2
-    assert out["evaluation_report"].evaluator_model == "gemini-3.5-flash"
-    assert out["evaluation_report"].grade == "pass"
+    assert {c["ticker"] for c in out["citations"]} >= {"AAPL", "NVDA"}
+    for exp in out["cached_explanations"]:
+        assert exp.extracted_explanations
+        assert all(cid.startswith(f"{exp.ticker}_") for cid in exp.matched_chunk_ids)
 
     step_phases = [s.phase for s in out["react_steps"]]
     assert step_phases[0] == "evaluate_variances"
@@ -559,8 +574,23 @@ def test_structured_react_executor_and_gemini_3_5_flash_tasks() -> None:
     assert "format_grounded_output" in step_phases
     assert step_phases[-1] == "fact_check_and_eval"
 
-    # Gemini 3.5 Flash Coding Assistance across SQL, Python, and LookML
-    for lang in ("sql", "python", "lookml"):
+    eval_report = out["evaluation_report"]
+    assert _is_model(eval_report.evaluator_model, "gemini-3.5-flash")
+    assert eval_report.grade in {"pass", "needs_revision", "fail"}
+    assert eval_report.context_tokens > 0
+
+    if out["answer_verified"]:
+        assert out["adk_runtime"]["answer_withheld_reason"] is None
+        retrieval = out["adk_runtime"]["agent_retrieval"]
+        assert retrieval["unresolved_cited_chunk_ids"] == []
+    else:
+        assert out["answer_markdown"].startswith("### Answer withheld")
+        assert out["adk_runtime"]["answer_withheld_reason"]
+
+
+def test_flash_coding_assistance_python_and_lookml() -> None:
+    """Live `gemini-3.5-flash` CodingAssistantAgent across non-SQL languages."""
+    for lang in ("python", "lookml"):
         code_rep = generate_financial_coding_assistance(
             prompt="Audit NVDA and MSFT YoY revenue and operating margin variances",
             language=lang,  # type: ignore[arg-type]
@@ -568,52 +598,15 @@ def test_structured_react_executor_and_gemini_3_5_flash_tasks() -> None:
             start_year=2024,
             end_year=2026,
         )
-        assert code_rep.assistant_model == "gemini-3.5-flash"
+        assert _is_model(code_rep.assistant_model, "gemini-3.5-flash")
         assert code_rep.task_category == "coding_assistance"
         assert code_rep.language == lang
-        assert "NVDA" in code_rep.code
+        assert code_rep.code.strip()
         assert code_rep.context_tokens > 0
 
-    # Direct Gemini 3.5 Flash evaluation check
-    eval_rep = evaluate_variance_explanation(
-        query="NVDA FY2024-2026 variance",
-        response_markdown=out["answer_markdown"],
-        variance_reports=reports,
-        citations=out["citations"],
-        cached_explanations_count=len(out["cached_explanations"]),
-    )
-    assert eval_rep.evaluator_model == "gemini-3.5-flash"
-    assert eval_rep.numeric_fidelity_score == 1.0
 
-
-def test_session_memory_multi_turn_recall_and_flash_compaction() -> None:
-    """Verify multi-turn entity/timeframe recall across follow-up turns and token-threshold compaction."""
-    mem_mgr = get_conversation_memory_manager()
-    mem_mgr.reset()
-
-    # Turn 1 explicitly names NVIDIA (2024-2026)
-    turn1 = run_conversational_rag_turn(
-        query="Analyze NVIDIA's revenue and operating margin from 2024 to 2026",
-        session_id="analyst-multi-turn-session",
-    )
-    assert turn1["status"] == "success"
-    assert turn1["resolved_scope"]["tickers"] == ["NVDA"]
-    assert turn1["resolved_scope"]["memory_inherited"] is False
-    assert turn1["context_and_memory"]["session_memory"]["persistence"]["persisted"] is True
-
-    # Turn 2 omits ticker name ("What Item 1A risk factors could impact those margins?")
-    turn2 = run_conversational_rag_turn(
-        query="What Item 1A risk factors could impact those margins?",
-        session_id="analyst-multi-turn-session",
-    )
-    assert turn2["status"] == "success"
-    assert turn2["resolved_scope"]["tickers"] == ["NVDA"]
-    assert turn2["resolved_scope"]["memory_inherited"] is True
-    assert turn2["resolved_scope"]["section_id"] == "item_1a"
-    assert turn2["context_and_memory"]["session_memory"]["has_prior_memory"] is True
-    assert turn2["context_and_memory"]["session_memory"]["turn_count"] == 1
-
-    # Verify token-threshold compaction using a tight threshold ConversationMemoryManager
+def test_conversation_memory_token_threshold_compaction() -> None:
+    """Older turns are compacted into a digest once session memory crosses the token threshold."""
     compact_mgr = ConversationMemoryManager(token_threshold=80, retention_turns=1)
     tracker = get_context_latency_tracker()
     before_flash_count = len(tracker.recent_records(limit=200, model_name="gemini-3.5-flash"))
@@ -626,7 +619,7 @@ def test_session_memory_multi_turn_recall_and_flash_compaction() -> None:
         gics_sector="Information Technology",
         start_year=2024,
         end_year=2026,
-        variance_highlights=["Revenue increased +254.45%"],
+        variance_highlights=["Revenue variance highlight"],
         answer_markdown="Detailed grounded synthesis paragraph " * 12,
     )
     res2 = compact_mgr.record_turn(
@@ -637,21 +630,23 @@ def test_session_memory_multi_turn_recall_and_flash_compaction() -> None:
         gics_sector="Information Technology",
         start_year=2024,
         end_year=2026,
-        variance_highlights=["AAPL Services margin expanded"],
+        variance_highlights=["AAPL Services margin highlight"],
         answer_markdown="Second detailed grounded synthesis paragraph " * 12,
     )
     assert res2["compaction_triggered"] is True
     assert res2["compaction_count"] == 1
     recalled = compact_mgr.recall_session_context("compact-sess")
     assert "[Compacted Prior Context]:" in recalled["memory_summary_text"]
+    assert "T1(NVDA FY2024-2026)" in recalled["memory_summary_text"]
 
     after_flash_records = tracker.recent_records(limit=200, model_name="gemini-3.5-flash")
     assert len(after_flash_records) > before_flash_count
     assert any(r.task_category == "context_compaction" for r in after_flash_records)
 
 
-def test_fastapi_react_telemetry_evaluation_and_coding_endpoints() -> None:
-    """Verify /health, /api/v1/chat, /api/v1/telemetry/context-latency, /api/v1/evaluate, and /api/v1/coding-assist."""
+def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
+    """Two live /api/v1/chat turns (follow-up inherits scope), then telemetry, evaluate, coding."""
+    get_conversation_memory_manager().reset()
     client = TestClient(app)
     headers = _bearer_headers()
 
@@ -664,25 +659,49 @@ def test_fastapi_react_telemetry_evaluation_and_coding_endpoints() -> None:
         "coding_and_evaluation": "gemini-3.5-flash",
     }
 
-    chat_resp = client.post(
+    # Turn 1 explicitly names NVIDIA (2024-2026)
+    resp1 = client.post(
         "/api/v1/chat",
         headers=headers,
         json={
-            "query": "Explain Microsoft's FY2024 to FY2026 revenue and cloud operating income variances",
-            "session_id": "http-sess-msft",
+            "query": "Analyze NVIDIA's revenue and operating margin from 2024 to 2026",
+            "session_id": "http-multi-turn-session",
         },
     )
-    assert chat_resp.status_code == 200
-    c_body = chat_resp.json()
-    assert c_body["status"] == "success"
-    assert c_body["react_execution"]["strategy"] == "structured_react_loop"
-    assert c_body["react_execution"]["iterations"] >= 4
-    assert len(c_body["react_execution"]["cached_10k_explanations"]) >= 1
-    assert c_body["evaluation"]["evaluator_model"] == "gemini-3.5-flash"
-    assert c_body["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
-    assert c_body["context_and_memory"]["turn_context_latency"]["total_calls"] >= 3
+    assert resp1.status_code == 200, resp1.text
+    turn1 = resp1.json()
+    assert turn1["status"] == "success"
+    assert turn1["execution_mode"] == "live_adk"
+    assert turn1["resolved_scope"]["tickers"] == ["NVDA"]
+    assert turn1["resolved_scope"]["memory_inherited"] is False
+    assert turn1["context_and_memory"]["session_memory"]["persistence"]["persisted"] is True
+    assert turn1["react_execution"]["strategy"] == "structured_react_loop"
+    assert turn1["react_execution"]["iterations"] >= 4
+    assert len(turn1["react_execution"]["cached_10k_explanations"]) >= 1
+    assert _is_model(turn1["evaluation"]["evaluator_model"], "gemini-3.5-flash")
+    assert turn1["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
+    assert turn1["context_and_memory"]["turn_context_latency"]["total_calls"] >= 2
+    assert isinstance(turn1["answer_verified"], bool)
 
-    # Context-induced latency telemetry endpoint
+    # Turn 2 omits the company ("those margins") and inherits NVDA from session memory
+    resp2 = client.post(
+        "/api/v1/chat",
+        headers=headers,
+        json={
+            "query": "What Item 1A risk factors could impact those margins?",
+            "session_id": "http-multi-turn-session",
+        },
+    )
+    assert resp2.status_code == 200, resp2.text
+    turn2 = resp2.json()
+    assert turn2["status"] == "success"
+    assert turn2["resolved_scope"]["tickers"] == ["NVDA"]
+    assert turn2["resolved_scope"]["memory_inherited"] is True
+    assert turn2["resolved_scope"]["section_id"] == "item_1a"
+    assert turn2["context_and_memory"]["session_memory"]["has_prior_memory"] is True
+    assert turn2["context_and_memory"]["session_memory"]["turn_count"] == 1
+
+    # Context-induced latency telemetry endpoint reflects the live model calls
     tel_resp = client.get(
         "/api/v1/telemetry/context-latency",
         headers=headers,
@@ -691,28 +710,30 @@ def test_fastapi_react_telemetry_evaluation_and_coding_endpoints() -> None:
     assert tel_resp.status_code == 200
     t_body = tel_resp.json()
     assert t_body["status"] == "ok"
-    assert t_body["summary"]["total_calls"] >= 3
+    assert t_body["summary"]["total_calls"] >= 4
     assert len(t_body["recent_records"]) >= 1
-    assert "gemini-2.5-pro" in t_body["summary"]["by_model"]
-    assert "gemini-3.5-flash" in t_body["summary"]["by_model"]
+    by_model = list(t_body["summary"]["by_model"])
+    assert any(_is_model(m, "gemini-3.8-flash") for m in by_model), by_model
+    assert any(_is_model(m, "gemini-3.5-flash") for m in by_model), by_model
 
-    # Gemini 3.5 Flash Evaluation endpoint
+    # Gemini 3.5 Flash Evaluation endpoint (live judge)
     eval_resp = client.post(
         "/api/v1/evaluate",
         headers=headers,
         json={
-            "query": "MSFT FY2024-2026 variance",
-            "response_markdown": c_body["answer_markdown"],
-            "variance_reports": c_body["variance_reports"],
-            "citations": c_body["citations"],
-            "cached_explanations_count": len(c_body["react_execution"]["cached_10k_explanations"]),
+            "query": "NVDA FY2024-2026 revenue and operating margin",
+            "response_markdown": turn1["answer_markdown"],
+            "variance_reports": turn1["variance_reports"],
+            "citations": turn1["citations"],
+            "cached_explanations_count": len(turn1["react_execution"]["cached_10k_explanations"]),
         },
     )
-    assert eval_resp.status_code == 200
-    assert eval_resp.json()["evaluation"]["evaluator_model"] == "gemini-3.5-flash"
-    assert eval_resp.json()["evaluation"]["grade"] == "pass"
+    assert eval_resp.status_code == 200, eval_resp.text
+    evaluation = eval_resp.json()["evaluation"]
+    assert _is_model(evaluation["evaluator_model"], "gemini-3.5-flash")
+    assert evaluation["grade"] in {"pass", "needs_revision", "fail"}
 
-    # Gemini 3.5 Flash Coding Assistance endpoint
+    # Gemini 3.5 Flash Coding Assistance endpoint (live)
     code_resp = client.post(
         "/api/v1/coding-assist",
         headers=headers,
@@ -724,10 +745,11 @@ def test_fastapi_react_telemetry_evaluation_and_coding_endpoints() -> None:
             "end_year": 2026,
         },
     )
-    assert code_resp.status_code == 200
+    assert code_resp.status_code == 200, code_resp.text
     code_body = code_resp.json()["coding_assistance"]
-    assert code_body["assistant_model"] == "gemini-3.5-flash"
-    assert "v_financial_variances_yoy" in code_body["code"]
+    assert _is_model(code_body["assistant_model"], "gemini-3.5-flash")
+    assert "SELECT" in code_body["code"].upper()
+    assert "sec_edgar." in code_body["code"]
 
 
 def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(

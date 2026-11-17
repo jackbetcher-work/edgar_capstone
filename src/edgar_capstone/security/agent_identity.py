@@ -117,7 +117,9 @@ TOOL_TARGET_SERVICE_MAP: dict[str, str] = {
     "fetch_financial_metrics": "bigquery-metrics-service",
     "query_looker_financial_explore": "looker-semantic-service",
     "calculate_period_variances": "variance-calculation-service",
+    "flag_material_variances": "variance-calculation-service",
     "search_10k_chunks_rag": "hybrid-rag-search-service",
+    "compare_disclosures_across_years": "hybrid-rag-search-service",
     "load_cached_10k_section": "context-cache-service",
     "query_cached_10k_context": "context-cache-service",
     "before_model_safety_and_latency_callback": "model-armor-service",
@@ -209,6 +211,8 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
                 "fetch_financial_metrics",
                 "query_looker_financial_explore",
                 "search_10k_chunks_rag",
+                "flag_material_variances",
+                "compare_disclosures_across_years",
                 "load_cached_10k_section",
                 "query_cached_10k_context",
             }

@@ -25,6 +25,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
+from edgar_capstone.agents.material_variances import material_flag_payload_figures
 from edgar_capstone.agents.schemas import AnalystFinding, AnalystMetricReference, AnalystReport
 from edgar_capstone.agents.tools import get_full_10k_section
 
@@ -103,9 +104,19 @@ def _figures_match(a: Figure, b: Figure) -> bool:
     return abs(abs(a.value) - abs(b.value)) <= 0.5
 
 
-def _payload_figures(variance_reports: list[dict[str, Any]]) -> list[Figure]:
-    """Every figure the deterministic engine produced, for tolerance matching."""
-    out: list[Figure] = []
+def _payload_figures(
+    variance_reports: list[dict[str, Any]],
+    material_flags: list[dict[str, Any]] | None = None,
+) -> list[Figure]:
+    """Every figure the deterministic engine produced, for tolerance matching.
+
+    Includes figures from deterministic material-variance flags (YoY margin bps shifts, sector
+    medians, sign-reversal amounts) so an analyst finding may quote them.
+    """
+    out: list[Figure] = [
+        Figure(kind, value, "material_flag")  # type: ignore[arg-type]
+        for kind, value in material_flag_payload_figures(material_flags)
+    ]
     for rep in variance_reports:
         for key in (
             "revenue_variance",
@@ -228,7 +239,7 @@ def _locate_quote(
     for cid in chunk_ids:
         m = _CHUNK_SECTION_RE.match(cid)
         entry = get_full_10k_section(m["key"]) if m else None
-        if entry and entry.get("content_source") != "synthesized_fallback":
+        if entry:
             if quote_norm in _normalize(str(entry.get("full_text") or "")):
                 return "section"
     return None
@@ -239,10 +250,11 @@ def verify_analyst_report(
     *,
     variance_reports: list[dict[str, Any]],
     citations: list[dict[str, Any]],
+    material_flags: list[dict[str, Any]] | None = None,
 ) -> VerifiedAnalystReport:
     """Check every claim in the report against retrieved passages and deterministic figures."""
     by_id = {str(c.get("chunk_id")): c for c in citations if c.get("chunk_id")}
-    payload = _payload_figures(variance_reports)
+    payload = _payload_figures(variance_reports, material_flags)
     payload_tickers = {str(r.get("ticker", "")).upper() for r in variance_reports}
 
     trimmed = AnalystReport(

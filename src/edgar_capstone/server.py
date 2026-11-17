@@ -34,20 +34,14 @@ from edgar_capstone.agents.root_orchestrator import (
     classify_query_intent,
 )
 from edgar_capstone.agents.tools import (
-    _SESSION_10K_CONTEXT_CACHE,
-    _get_dataset_dir,
-    _load_all_chunks_cached,
-    _load_all_profiles_cached,
     calculate_period_variances,
     fetch_financial_metrics,
+    get_active_gcp_tool_adapters,
     get_context_cache_runtime_stats,
+    get_gcp_adapters_status_metadata,
     load_cached_10k_section,
     query_looker_financial_explore,
     search_10k_chunks_rag,
-)
-from edgar_capstone.dataset.corpus_hydration import (
-    get_corpus_status_metadata,
-    run_startup_corpus_hydration,
 )
 from edgar_capstone.observability import (
     TRACE_ID_HEADER,
@@ -107,17 +101,7 @@ _FEEDBACK_AUDIT_LOG: list[dict[str, Any]] = []
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Optionally hydrate gitignored local corpus artifacts from GCS before serving traffic.
-
-    Controlled by `EDGAR_CORPUS_HYDRATION` (`off` by default). In `required` mode a
-    failed hydration raises and aborts startup so container smoke tests fail fast.
-    """
-    result = await asyncio.to_thread(run_startup_corpus_hydration)
-    if result.downloaded_objects:
-        # Newly materialized manifests / Markdown must replace any cached synthesized fallbacks.
-        _load_all_profiles_cached.cache_clear()
-        _load_all_chunks_cached.cache_clear()
-        _SESSION_10K_CONTEXT_CACHE.clear()
+    """Log startup metadata and flush batched spans on shutdown."""
     logger.info(
         "SEC EDGAR analyst API ready",
         extra={
@@ -251,7 +235,7 @@ def health() -> dict[str, Any]:
         },
         "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
         "iap_jwt_auth_enabled": True,
-        "corpus": get_corpus_status_metadata(),
+        "data_backend": get_gcp_adapters_status_metadata(),
         "observability": {
             "tracing": tracing_status_metadata(),
             "logging": logging_status_metadata(),
@@ -718,10 +702,6 @@ class ChatQueryRequest(BaseModel):
     end_year: int = Field(2026, ge=2015, le=2035)
     top_k: int = Field(8, ge=1, le=25)
     session_id: str | None = Field(default=None, max_length=128)
-    execution_mode: Literal["auto", "live", "deterministic"] | None = Field(
-        default=None,
-        description="Optional ADK execution mode override ('auto', 'live', or 'deterministic')",
-    )
 
 
 class EvaluationRequest(BaseModel):
@@ -730,10 +710,6 @@ class EvaluationRequest(BaseModel):
     variance_reports: list[dict[str, Any]] = Field(default_factory=list)
     citations: list[dict[str, Any]] = Field(default_factory=list)
     cached_explanations_count: int = Field(default=0, ge=0)
-    execution_mode: Literal["auto", "live", "deterministic"] | None = Field(
-        default=None,
-        description="Optional ADK execution mode override ('auto', 'live', or 'deterministic')",
-    )
 
 
 class CodingAssistRequest(BaseModel):
@@ -743,10 +719,6 @@ class CodingAssistRequest(BaseModel):
     start_year: int = Field(2024, ge=2015, le=2035)
     end_year: int = Field(2026, ge=2015, le=2035)
     dataset_id: str = Field("sec_edgar", min_length=1, max_length=128)
-    execution_mode: Literal["auto", "live", "deterministic"] | None = Field(
-        default=None,
-        description="Optional ADK execution mode override ('auto', 'live', or 'deterministic')",
-    )
 
 
 class SectionLoadRequest(BaseModel):
@@ -796,7 +768,6 @@ def conversational_rag_chat(
             top_k=req.top_k,
             session_id=req.session_id,
             user_id=user.email,
-            execution_mode=req.execution_mode,
         )
     except RuntimeError as exc:
         raise HTTPException(
@@ -814,7 +785,7 @@ def conversational_rag_chat(
         resource="/api/v1/chat",
         tickers=resolved_tickers,
         status_outcome=str(turn_result.get("status", "success")),
-        detail=f"intent={turn_result.get('intent', 'unknown')} mode={turn_result.get('execution_mode', 'auto')}",
+        detail=f"intent={turn_result.get('intent', 'unknown')} verified={turn_result.get('answer_verified')}",
     )
     turn_result["authenticated_principal"] = {
         "email": user.email,
@@ -905,7 +876,6 @@ def evaluate_grounded_narrative(
             variance_reports=req.variance_reports,
             citations=req.citations,
             cached_explanations_count=req.cached_explanations_count,
-            execution_mode=req.execution_mode,
         )
     except RuntimeError as exc:
         raise HTTPException(
@@ -942,7 +912,6 @@ def coding_assistance_endpoint(
             start_year=req.start_year,
             end_year=req.end_year,
             dataset_id=req.dataset_id,
-            execution_mode=req.execution_mode,
         )
     except RuntimeError as exc:
         raise HTTPException(
@@ -981,17 +950,11 @@ def _enrich_section_response(
     if res.get("status") == "error":
         raise HTTPException(status_code=404, detail=res.get("message", "Section not found"))
 
-    dataset_dir = _get_dataset_dir()
-    profiles = _load_all_profiles_cached(str(dataset_dir))
     norm_t = ticker.strip().upper().replace(".", "-")
-    matched_prof = next(
-        (
-            p
-            for p in profiles
-            if p.ticker.upper().replace(".", "-") == norm_t and p.fiscal_year == fiscal_year
-        ),
-        None,
+    profiles = get_active_gcp_tool_adapters().bigquery.fetch_profiles(
+        tickers={norm_t}, start_year=fiscal_year, end_year=fiscal_year
     )
+    matched_prof = profiles[0] if profiles else None
     if matched_prof is not None:
         res["cik"] = matched_prof.cik
         res["accession_number"] = matched_prof.accession_number

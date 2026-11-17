@@ -34,7 +34,7 @@ from edgar_capstone.agents import (
     search_10k_chunks_rag,
     with_tool_resilience,
 )
-from edgar_capstone.agents.tools import _get_dataset_dir, _load_all_profiles_cached
+from edgar_capstone.agents.tools import get_active_gcp_tool_adapters
 
 
 def _dummy_tool_context() -> SimpleNamespace:
@@ -143,13 +143,18 @@ def test_looker_query_tool_explores() -> None:
     assert bench["status"] == "success"
     assert bench["row_count"] == 1
     bench_row = bench["rows"][0]
-    # Don't hardcode corpus size: derive the expected sector membership from the active dataset.
+    # Don't hardcode corpus size: derive the expected sector membership from the live
+    # `sec_edgar.financial_metrics` rows (a different query than the aggregate benchmark).
     expected_it_tickers = {
         p.ticker
-        for p in _load_all_profiles_cached(str(_get_dataset_dir()))
-        if p.gics_sector == "Information Technology" and p.fiscal_year == 2025
+        for p in get_active_gcp_tool_adapters().bigquery.fetch_profiles(
+            tickers=set(),
+            start_year=2025,
+            end_year=2025,
+            gics_sector="Information Technology",
+        )
     }
-    assert expected_it_tickers, "active corpus has no Information Technology FY2025 filings"
+    assert expected_it_tickers, "BigQuery has no Information Technology FY2025 filings"
     assert set(bench_row["tickers"]) == expected_it_tickers
     assert bench_row["company_count"] == len(bench_row["tickers"]) == len(expected_it_tickers)
     assert {"AAPL", "MSFT", "NVDA"} <= expected_it_tickers

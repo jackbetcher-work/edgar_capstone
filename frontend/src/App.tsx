@@ -30,6 +30,7 @@ import type {
   AuthDiscoveryConfig,
   AuthenticatedUserProfile,
   CachedSectionResponse,
+  CatalogLoadStatus,
   CompanySummary,
   ConversationTurn,
   GroundedCitation,
@@ -47,8 +48,6 @@ const DEFAULT_FILTERS: SearchScopeFilters = {
 }
 
 export function App() {
-  const [isLiveBackend, setIsLiveBackend] = useState<boolean>(true)
-
   // IAP + Google Workspace Okta/SSO Authentication State
   const [authConfig, setAuthConfig] = useState<AuthDiscoveryConfig | null>(null)
   const [authRequired, setAuthRequired] = useState<boolean>(false)
@@ -60,7 +59,9 @@ export function App() {
 
   const [companies, setCompanies] = useState<CompanySummary[]>([])
   const [sectors, setSectors] = useState<string[]>([])
-  const [totalProfiles, setTotalProfiles] = useState<number>(114)
+  const [totalProfiles, setTotalProfiles] = useState<number | null>(null)
+  const [catalogStatus, setCatalogStatus] = useState<CatalogLoadStatus>('loading')
+  const [catalogError, setCatalogError] = useState<string | null>(null)
   const [yearBounds, setYearBounds] = useState<{ min: number; max: number }>({
     min: 2020,
     max: 2026,
@@ -80,6 +81,7 @@ export function App() {
   const [cachedSection, setCachedSection] =
     useState<CachedSectionResponse | null>(null)
   const [isLoadingSection, setIsLoadingSection] = useState<boolean>(false)
+  const [sectionError, setSectionError] = useState<string | null>(null)
   const [highlightedExcerpt, setHighlightedExcerpt] = useState<string | null>(
     null
   )
@@ -95,17 +97,30 @@ export function App() {
   }, [])
 
   const loadCompaniesCatalog = useCallback(async () => {
+    setCatalogStatus('loading')
+    setCatalogError(null)
     try {
-      const { catalog, live } = await fetchCompaniesCatalog()
-      setIsLiveBackend(live)
+      const catalog = await fetchCompaniesCatalog()
       setCompanies(catalog.companies)
       setSectors(catalog.gics_sectors)
       setTotalProfiles(catalog.total_profiles)
       setYearBounds({ min: catalog.min_year, max: catalog.max_year })
+      setCatalogStatus('ready')
     } catch (err) {
+      setCompanies([])
+      setSectors([])
+      setTotalProfiles(null)
+      setCatalogStatus('error')
       if (err instanceof ApiAuthError) {
+        setCatalogError(err.message)
         handleApiAuthFailure(err)
+        return
       }
+      setCatalogError(
+        err instanceof Error
+          ? err.message
+          : 'Backend unreachable — could not load the company catalog. No data was shown.'
+      )
     }
   }, [handleApiAuthFailure])
 
@@ -127,7 +142,6 @@ export function App() {
         return
       }
 
-      setIsLiveBackend(true)
       setAuthConfig(config)
       setAuthRequired(config.auth_required)
 
@@ -272,11 +286,12 @@ export function App() {
     setActiveCitations([])
     setActiveChunkId(null)
     setCachedSection(null)
+    setSectionError(null)
     setHighlightedExcerpt(null)
     setAuthErrorMessage(null)
   }
 
-  const isAuthLocked = isLiveBackend && authRequired && !authenticatedUser
+  const isAuthLocked = authRequired && !authenticatedUser
   const isAnyTurnLoading = turns.some((t) => t.isLoading)
 
   const scrollToLatestTurn = () => {
@@ -318,7 +333,6 @@ export function App() {
 
     try {
       const resp = await executeConversationalRagQuery(trimmed, snapshotFilters)
-      setIsLiveBackend(resp.connection_mode !== 'fallback')
 
       setTurns((prev) =>
         prev.map((t) =>
@@ -341,7 +355,7 @@ export function App() {
       const message =
         err instanceof Error
           ? err.message
-          : 'Failed to complete grounded hybrid RAG query.'
+          : 'Backend unreachable — could not reach the EDGAR API. No data was shown.'
       setTurns((prev) =>
         prev.map((t) =>
           t.id === turnId
@@ -397,6 +411,7 @@ export function App() {
     setSourceTab('document')
     setHighlightedExcerpt(excerptToHighlight ?? null)
     setIsLoadingSection(true)
+    setSectionError(null)
 
     try {
       const sectionResp = await fetchCached10kSection(
@@ -406,6 +421,12 @@ export function App() {
       )
       setCachedSection(sectionResp)
     } catch (err) {
+      setCachedSection(null)
+      setSectionError(
+        err instanceof Error
+          ? err.message
+          : 'Backend unreachable — could not load the 10-K section. No data was shown.'
+      )
       if (err instanceof ApiAuthError) {
         handleApiAuthFailure(err)
       }
@@ -450,8 +471,9 @@ export function App() {
   return (
     <div className="h-screen w-screen overflow-hidden flex flex-col surface-canvas">
       <HeaderBar
-        companyCount={companies.length || 18}
+        companyCount={catalogStatus === 'ready' ? companies.length : null}
         totalProfiles={totalProfiles}
+        isBackendUnavailable={catalogStatus === 'error' && !isAuthLocked}
         turnCount={turns.length}
         onResetConversation={handleResetConversation}
         isSourcePaneOpen={isSourcePaneOpen}
@@ -476,6 +498,8 @@ export function App() {
         <>
           <HybridScopeBar
             companies={companies}
+            catalogStatus={catalogStatus}
+            catalogError={catalogError}
             sectors={sectors}
             minYear={yearBounds.min}
             maxYear={yearBounds.max}
@@ -494,6 +518,8 @@ export function App() {
                 {turns.length === 0 ? (
                   <StarterPrompts
                     companies={companies}
+                    catalogStatus={catalogStatus}
+                    catalogError={catalogError}
                     onSelectPreset={handleSelectStarter}
                     onSelectIssuerFiling={(t, fy) => {
                       void handleLoadFilingSection(t, fy, 'item_7')
@@ -547,6 +573,7 @@ export function App() {
                   onChangeTab={setSourceTab}
                   cachedSection={cachedSection}
                   isLoadingSection={isLoadingSection}
+                  sectionError={sectionError}
                   onRequestFilingSection={(t, fy, sec, excerpt) => {
                     void handleLoadFilingSection(t, fy, sec, excerpt)
                   }}

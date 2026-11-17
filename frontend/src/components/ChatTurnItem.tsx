@@ -13,7 +13,9 @@ import {
   getIntentDisplayMeta,
   type ParsedInlineCitationToken,
 } from '../utils/formatters'
+import { DisclosureDeltaCard } from './DisclosureDeltaCard'
 import { GroundedMarkdown } from './GroundedMarkdown'
+import { MaterialFlagsCard } from './MaterialFlagsCard'
 import { VarianceTableCard } from './VarianceTableCard'
 
 interface ChatTurnItemProps {
@@ -124,7 +126,9 @@ export function ChatTurnItem({
 
       {/* Error State */}
       {turn.errorMessage && !turn.isLoading && (
-        <div className="m-3 p-2.5 badge-negative text-xs flex items-center gap-2 tabular-nums-mono">
+        <div
+          role="alert"
+          className="m-3 p-2.5 badge-negative text-xs flex items-center gap-2 tabular-nums-mono">
           <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
           <span>{turn.errorMessage}</span>
         </div>
@@ -151,6 +155,14 @@ export function ChatTurnItem({
                 <span className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-negative">
                   <AlertTriangle className="w-3 h-3" />
                   Guardrail Enforced
+                </span>
+              ) : resp.answer_verified === false ? (
+                <span
+                  className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-negative"
+                  title="The live answer failed verification, so its narrative was withheld"
+                >
+                  <AlertTriangle className="w-3 h-3" />
+                  Answer Withheld
                 </span>
               ) : resp.fact_check.passed ? (
                 <span
@@ -252,6 +264,27 @@ export function ChatTurnItem({
               turnId={turn.id}
               reports={resp.variance_reports}
               onInspectFilingSection={onInspectFilingSection}
+            />
+          )}
+
+          {/* Deterministic Anomaly Flags */}
+          {resp.material_variance_flags && resp.material_variance_flags.length > 0 && (
+            <MaterialFlagsCard
+              turnId={turn.id}
+              flags={resp.material_variance_flags}
+              totalFlags={resp.material_variance_summary?.total_flags}
+              citations={resp.citations}
+              onSelectCitation={(token) => onSelectInlineCitation(token, resp.citations)}
+            />
+          )}
+
+          {/* Year-over-Year Disclosure Deltas (thematic tracking) */}
+          {resp.disclosure_deltas && (
+            <DisclosureDeltaCard
+              turnId={turn.id}
+              result={resp.disclosure_deltas}
+              citations={resp.citations}
+              onSelectCitation={(token) => onSelectInlineCitation(token, resp.citations)}
             />
           )}
 

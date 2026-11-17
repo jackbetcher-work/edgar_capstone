@@ -42,7 +42,6 @@ dev = [
 build-sec-dataset = "scripts.build_sec_dataset:main"
 build-vector-db = "scripts.build_vector_db:main"
 verify-no-secrets = "scripts.verify_no_secrets:main"
-hydrate-sec-corpus = "scripts.hydrate_corpus:main"
 container-smoke-test = "scripts.container_smoke_test:main"
 publish-sec-corpus = "scripts.publish_corpus:main"
 backfill-rd-metric = "scripts.backfill_rd_metric:main"

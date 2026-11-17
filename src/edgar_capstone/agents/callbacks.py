@@ -90,7 +90,9 @@ def before_agent_telemetry_callback(
     return None
 
 
-RETRIEVAL_TOOL_NAMES = frozenset({"search_10k_chunks_rag", "query_cached_10k_context"})
+RETRIEVAL_TOOL_NAMES = frozenset(
+    {"search_10k_chunks_rag", "query_cached_10k_context", "compare_disclosures_across_years"}
+)
 DEFAULT_ANALYST_RETRIEVAL_BUDGET = 6
 _RETRIEVAL_CALLS_STATE_KEY = "temp:retrieval_calls_used"  # temp: = scoped to one invocation
 
@@ -391,12 +393,19 @@ def after_model_fact_check_callback(
                 "calculate_period_variances",
                 "fetch_financial_metrics",
                 "query_looker_financial_explore",
+                "flag_material_variances",
             )
             for t in called_tools
         ):
             react_phase = "evaluate_variances"
         elif any(
-            t in ("load_cached_10k_section", "query_cached_10k_context", "search_10k_chunks_rag")
+            t
+            in (
+                "load_cached_10k_section",
+                "query_cached_10k_context",
+                "search_10k_chunks_rag",
+                "compare_disclosures_across_years",
+            )
             for t in called_tools
         ):
             react_phase = "query_cached_10k_context"

@@ -7,9 +7,10 @@ Implements the structured ReAct loop (`Thought -> Action -> Observation -> ... -
 2. Query Cached 10-K Context for Explanation: Queries resident/warmed 10-K sections (`item_7` MD&A
    and `item_1a` Risk Factors) via `query_cached_10k_context` + metadata-filtered Hybrid RAG,
    adapting across iterations if peer or boundary-year coverage is incomplete.
-3. Format Grounded Output & Evaluate: Synthesizes the grounded report using the financial reasoning model (`EDGAR_ANALYST_MODEL`)
-   financial reasoning (with strict numeric & citation fact-checking) and scores output quality
-   using `gemini-3.5-flash`, tracking context-induced latency across every model call.
+3. Live Synthesis & Evaluate: the live `FinancialAnalystAgent` (`EDGAR_ANALYST_MODEL`) writes a
+   structured report that is verified claim by claim (numeric and citation fact-checks); answers
+   that fail verification are withheld, never replaced by template text. Output quality is scored
+   by the live `gemini-3.5-flash` judge, tracking context-induced latency across every model call.
 """
 
 from __future__ import annotations
@@ -18,11 +19,11 @@ import json
 import logging
 import re
 import time
-from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
+from pydantic import ValidationError
 
 from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
 from edgar_capstone.agents.context_memory import (
@@ -37,7 +38,6 @@ from edgar_capstone.agents.live_runtime import (
 )
 from edgar_capstone.agents.schemas import (
     Cached10KExplanation,
-    ContextBreakdown,
     ModelContextLatencyRecord,
     NarrativeEvaluationReport,
     ReActStep,
@@ -80,25 +80,6 @@ def _fmt_bps(value: float | None) -> str:
         return "N/A"
     sign = "+" if value > 0 else ""
     return f"{sign}{value:.1f} bps"
-
-
-def _clean_passage(text: str, max_len: int = 320) -> str:
-    cleaned = re.sub(r"\\([.\-(),&])", r"\1", text)
-    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if len(cleaned) <= max_len:
-        return cleaned
-    clipped = cleaned[:max_len].rsplit(" ", 1)[0]
-    return f"{clipped}..."
-
-
-def _inline_citation_tag(cit: dict[str, Any]) -> str:
-    ticker = cit["ticker"]
-    fy = cit["fiscal_year"]
-    sec_label = "Item 1A Risk Factors" if cit["section_id"] == "item_1a" else "Item 7 MD&A"
-    chunk_id = cit["chunk_id"]
-    url = cit.get("sec_filing_url") or "#source-viewer"
-    return f"[{ticker} FY{fy} | {sec_label} | {chunk_id}]({url})"
 
 
 @traced("react.evaluate_variances")
@@ -331,232 +312,36 @@ def query_cached_10k_for_explanations(
     return explanations, linked_citations
 
 
-@traced("react.format_grounded_output")
-def format_react_grounded_output(
-    *,
-    query: str,
-    intent: str,
-    scope: dict[str, Any],
-    variance_reports: list[dict[str, Any]],
-    variance_evaluations: list[VarianceEvaluationItem],
-    cached_explanations: list[Cached10KExplanation],
-    citations: list[dict[str, Any]],
-    sector_benchmarks: list[dict[str, Any]],
-    chunk_health: dict[str, Any] | None,
-) -> str:
-    """Step 3 of ReAct reasoning: format evaluated variances + cached 10-K explanations with citations."""
-    lines: list[str] = []
-
-    if intent == "chunk_health_monitoring" and chunk_health:
-        lines.append("### Vector Corpus & Hybrid Index Diagnostics")
-        lines.append(
-            f"- **Corpus Status:** `{chunk_health.get('health_status', 'HEALTHY')}` "
-            f"(Health Score: **{chunk_health.get('health_score', 1.0)}**)"
-        )
-        lines.append(
-            f"- **Indexed 10-K Chunks:** **{chunk_health.get('total_chunks', 0):,}** "
-            f"across 768-dimensional embeddings (`embedding_coverage_ratio`: "
-            f"**{float(chunk_health.get('embedding_coverage_ratio') or 1.0) * 100:.1f}%**)"
-        )
-        by_sec = chunk_health.get("by_section") or {}
-        if by_sec:
-            lines.append(
-                f"- **Section Distribution:** Item 1A Risk Factors (`{by_sec.get('item_1a', 0):,}` chunks) · "
-                f"Item 7 MD&A (`{by_sec.get('item_7', 0):,}` chunks)"
-            )
-        if citations:
-            lines.append("\n### Sample Retrieved Grounding Passages")
-            for cit in citations[:3]:
-                lines.append(
-                    f"- **{_clean_passage(cit['excerpt'], 240)}** {_inline_citation_tag(cit)}"
-                )
-        return "\n".join(lines)
-
-    # 1. Executive Synthesis Header
-    if intent == "multi_company_peer_comparison" and len(variance_reports) >= 2:
-        names = ", ".join(f"**{r['company_name']} ({r['ticker']})**" for r in variance_reports)
-        lines.append("### Multi-Company Variance & Filing Synthesis")
-        lines.append(
-            f"Structured ReAct multi-period analysis comparing {names} across "
-            f"**FY{scope['start_year']}–FY{scope['end_year']}**, grounded in cached SEC Form 10-K "
-            f"Item 7 (MD&A) and Item 1A (Risk Factors) disclosures."
-        )
-    elif variance_reports:
-        rep0 = variance_reports[0]
-        lines.append(
-            f"### {rep0['company_name']} ({rep0['ticker']}) — FY{rep0['start_year']}–FY{rep0['end_year']} Grounded Variance Synthesis"
-        )
-        lines.append(
-            f"Period-over-period financial performance and cached SEC Form 10-K narrative explanations for "
-            f"**{rep0['company_name']}** (`CIK {rep0['cik']}` · *{rep0['gics_sector']} — {rep0['gics_sub_industry']}*)."
-        )
-    else:
-        sector_desc = (
-            f"**{scope['gics_sector']}**"
-            if scope["gics_sector"] != "ALL"
-            else "**S&P 500 Curated Corpus**"
-        )
-        lines.append(
-            f"### Longitudinal 10-K Thematic Synthesis ({sector_desc}, FY{scope['start_year']}–FY{scope['end_year']})"
-        )
-        lines.append(
-            f"Cross-filing ReAct retrieval combining cached 10-K context and 768-d hybrid search "
-            f'for query: *"{query.strip()}"*.'
-        )
-
-    # 2. Deterministic Quantitative Findings + Evaluated Variance Insights
-    eval_by_ticker = {ev.ticker: ev for ev in variance_evaluations}
-    cit_by_id = {c["chunk_id"]: c for c in citations}
-
-    if variance_reports:
-        lines.append("\n### Deterministic Period-over-Period Metrics & Variance Evaluation")
-        for rep in variance_reports:
-            rev = rep["revenue_variance"]
-            op = rep["operating_income_variance"]
-            ni = rep["net_income_variance"]
-            fy_s, fy_e = rep["start_year"], rep["end_year"]
-
-            cits_for_ticker = [c for c in citations if c["ticker"] == rep["ticker"]]
-            primary_cit_tag = (
-                f" {_inline_citation_tag(cits_for_ticker[0])}" if cits_for_ticker else ""
-            )
-
-            cagr_clause = (
-                f" ({_fmt_pct(rev.get('cagr_pct'))} CAGR)"
-                if rev.get("cagr_pct") is not None and fy_e > fy_s
-                else ""
-            )
-            lines.append(
-                f"- **{rep['ticker']} (FY{fy_s} → FY{fy_e}):** "
-                f"Revenue moved from **{_fmt_usd(rev.get('start_value'))}** to "
-                f"**{_fmt_usd(rev.get('end_value'))}** "
-                f"(**{_fmt_pct(rev.get('percentage_delta'))}**, "
-                f"Δ **{_fmt_usd(rev.get('absolute_delta'))}**{cagr_clause}); "
-                f"Operating Income moved **{_fmt_pct(op.get('percentage_delta'))}** to "
-                f"**{_fmt_usd(op.get('end_value'))}** "
-                f"(Operating Margin **{_fmt_bps(rep.get('operating_margin_bps_delta'))}**); "
-                f"Net Income moved **{_fmt_pct(ni.get('percentage_delta'))}** to "
-                f"**{_fmt_usd(ni.get('end_value'))}** "
-                f"(Net Margin **{_fmt_bps(rep.get('net_margin_bps_delta'))}**).{primary_cit_tag}"
-            )
-            rd = rep.get("research_and_development_variance") or {}
-            if rd.get("start_value") is not None and rd.get("end_value") is not None:
-                lines.append(
-                    f"  - *R&D expense:* **{_fmt_usd(rd.get('start_value'))}** → "
-                    f"**{_fmt_usd(rd.get('end_value'))}** "
-                    f"(**{_fmt_pct(rd.get('percentage_delta'))}**, "
-                    f"Δ **{_fmt_usd(rd.get('absolute_delta'))}**; R&D intensity "
-                    f"**{_fmt_bps(rep.get('rd_intensity_bps_delta'))}**)."
-                )
-            ev = eval_by_ticker.get(rep["ticker"])
-            if ev and ev.divergences:
-                lines.append(
-                    f"  - *ReAct Variance Diagnostic ({rep['ticker']}):* {'; '.join(ev.divergences)}."
-                )
-
-    elif sector_benchmarks:
-        lines.append("\n### Sector Quantitative Benchmarks")
-        for bench in sector_benchmarks[-3:]:
-            lines.append(
-                f"- **{bench['gics_sector']} (FY{bench['fiscal_year']} · {bench['company_count']} issuers):** "
-                f"Aggregate Revenue **{_fmt_usd(bench.get('total_sector_revenue'))}**, "
-                f"Operating Income **{_fmt_usd(bench.get('total_sector_operating_income'))}**, "
-                f"Net Income **{_fmt_usd(bench.get('total_sector_net_income'))}**."
-            )
-
-    # 3. Cached 10-K Context Explanations & Hybrid RAG Narrative Drivers
-    if intent == "thematic_trend_tracking" and citations:
-        lines.append("\n### Longitudinal Disclosure Evolution Across Fiscal Periods")
-        by_year: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        for cit in citations:
-            by_year[int(cit["fiscal_year"])].append(cit)
-        for fy in sorted(by_year.keys()):
-            lines.append(f"#### Fiscal Year {fy} Filing Disclosures")
-            for cit in by_year[fy][:3]:
-                sec_title = cit.get("section_title") or cit["section_id"].upper()
-                lines.append(
-                    f"- **{cit['company_name']} ({cit['ticker']}) — {sec_title}:** "
-                    f'"{_clean_passage(cit["excerpt"], 290)}" {_inline_citation_tag(cit)}'
-                )
-    elif cached_explanations or citations:
-        mda_cached = [
-            e for e in cached_explanations if e.section_id == "item_7" and e.extracted_explanations
-        ]
-        risk_cached = [
-            e for e in cached_explanations if e.section_id == "item_1a" and e.extracted_explanations
-        ]
-        item7_cits = [c for c in citations if c["section_id"] == "item_7"]
-        item1a_cits = [c for c in citations if c["section_id"] == "item_1a"]
-
-        if mda_cached or item7_cits:
-            lines.append("\n### Item 7 (MD&A) Operational & Financial Variance Explanations")
-            rendered_mda = 0
-            for exp in mda_cached:
-                linked_cit = next(
-                    (cit_by_id[cid] for cid in exp.matched_chunk_ids if cid in cit_by_id),
-                    next(
-                        (
-                            c
-                            for c in item7_cits
-                            if c["ticker"] == exp.ticker
-                            and int(c["fiscal_year"]) == exp.fiscal_year
-                        ),
-                        item7_cits[0] if item7_cits else None,
-                    ),
-                )
-                cit_tag = f" {_inline_citation_tag(linked_cit)}" if linked_cit else ""
-                lines.append(
-                    f"- **{exp.ticker} FY{exp.fiscal_year} ({exp.variance_driver_focus}):** "
-                    f'"{_clean_passage(exp.extracted_explanations[0], 300)}"{cit_tag}'
-                )
-                rendered_mda += 1
-            for cit in item7_cits[: max(0, 4 - rendered_mda)]:
-                sec_title = cit.get("section_title") or "Item 7. MD&A"
-                lines.append(
-                    f"- **{cit['ticker']} FY{cit['fiscal_year']} ({sec_title}):** "
-                    f'"{_clean_passage(cit["excerpt"], 300)}" {_inline_citation_tag(cit)}'
-                )
-
-        if risk_cached or item1a_cits:
-            lines.append("\n### Item 1A Risk Factor Disclosures & Headwinds")
-            rendered_risk = 0
-            for exp in risk_cached:
-                linked_cit = next(
-                    (cit_by_id[cid] for cid in exp.matched_chunk_ids if cid in cit_by_id),
-                    next(
-                        (
-                            c
-                            for c in item1a_cits
-                            if c["ticker"] == exp.ticker
-                            and int(c["fiscal_year"]) == exp.fiscal_year
-                        ),
-                        item1a_cits[0] if item1a_cits else None,
-                    ),
-                )
-                cit_tag = f" {_inline_citation_tag(linked_cit)}" if linked_cit else ""
-                lines.append(
-                    f"- **{exp.ticker} FY{exp.fiscal_year} ({exp.variance_driver_focus}):** "
-                    f'"{_clean_passage(exp.extracted_explanations[0], 300)}"{cit_tag}'
-                )
-                rendered_risk += 1
-            for cit in item1a_cits[: max(0, 4 - rendered_risk)]:
-                sec_title = cit.get("section_title") or "Item 1A. Risk Factors"
-                lines.append(
-                    f"- **{cit['ticker']} FY{cit['fiscal_year']} ({sec_title}):** "
-                    f'"{_clean_passage(cit["excerpt"], 300)}" {_inline_citation_tag(cit)}'
-                )
-    else:
-        lines.append(
-            "\n### Grounding Status\n"
-            "No 10-K filing passages matched the current filter combination. "
-            "Widen the fiscal period range or reset the GICS sector / section filter to inspect broader disclosures."
-        )
-
-    return "\n".join(lines)
-
-
-_RETRIEVAL_TOOL_NAMES = frozenset({"search_10k_chunks_rag", "query_cached_10k_context"})
+_RETRIEVAL_TOOL_NAMES = frozenset(
+    {"search_10k_chunks_rag", "query_cached_10k_context", "compare_disclosures_across_years"}
+)
 _UNEXECUTED_ACTION_MARKERS = ("/*ACTION*/", "default_api.", "/*PLANNING*/")
+
+
+def _output_schema_error(exc: BaseException) -> str | None:
+    """Short message when `exc` (or its cause chain) is an output-schema validation failure."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ValidationError):
+            first = (current.errors() or [{}])[0]
+            return f"{first.get('type', 'validation_error')}: {first.get('msg', str(current))}"[
+                :200
+            ]
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _withheld_answer_markdown(reason: str) -> str:
+    """Narrative shown when the live answer fails verification (no template answer is substituted)."""
+    return (
+        "### Answer withheld: the live analyst response failed verification\n\n"
+        "The live FinancialAnalystAgent answer could not be verified against the retrieved 10-K "
+        f"passages and deterministic figures ({reason}). No narrative is shown. The variance "
+        "tables, material variance flags, disclosure deltas, and retrieved sources for this turn "
+        "are unaffected; rephrase or narrow the question and try again.\n"
+    )
 
 
 def _incomplete_agent_output(text: str) -> str | None:
@@ -621,22 +406,21 @@ def _summarize_agent_retrieval(
 
 
 class StructuredReActExecutor:
-    """Executes the structured ReAct loop (`evaluate_variances -> query_cached_10k_context -> format_grounded_output`)."""
+    """Executes the structured ReAct loop (`evaluate_variances -> query_cached_10k_context -> live synthesis`).
+
+    Every answer is written by the live `FinancialAnalystAgent`. When the live answer cannot be
+    verified against the retrieved passages and deterministic figures, the narrative is withheld
+    (`answer_verified=False`) instead of being replaced by template text.
+    """
 
     def __init__(
         self,
         *,
         max_iterations: int = 5,
-        llm_reasoning_fn: Callable[[str, dict[str, Any]], str] | None = None,
-        llm_judge_fn: Callable[[str, str], dict[str, Any]] | None = None,
-        execution_mode: str | None = None,
         reasoning_llm: BaseLlm | None = None,
         judge_llm: BaseLlm | None = None,
     ) -> None:
         self.max_iterations = max_iterations
-        self.llm_reasoning_fn = llm_reasoning_fn
-        self.llm_judge_fn = llm_judge_fn
-        self.execution_mode = execution_mode
         self.reasoning_llm = reasoning_llm
         self.judge_llm = judge_llm
 
@@ -657,25 +441,24 @@ class StructuredReActExecutor:
         session_id: str | None = None,
         user_id: str = "analyst",
         on_cache_s2s_call: Callable[[str, int, str], None] | None = None,
+        material_variance_flags: list[dict[str, Any]] | None = None,
+        disclosure_deltas: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run the structured ReAct reasoning, cached 10-K querying, formatting, and Flash evaluation."""
+        """Run the variance pre-pass, cached 10-K querying, live synthesis, and Flash evaluation."""
+        material_variance_flags = list(material_variance_flags or [])
         reasoning_model = (
             self.reasoning_llm.model
             if self.reasoning_llm is not None
             else resolve_model_for_task("financial_reasoning")
         )
         tracker = get_context_latency_tracker()
-        runtime_res = resolve_live_adk_runtime(
-            execution_mode=self.execution_mode,
-            custom_llm=self.reasoning_llm,
-        )
-        use_live_adk = runtime_res.live_adk_enabled and self.llm_reasoning_fn is None
+        runtime_res = resolve_live_adk_runtime(custom_llm=self.reasoning_llm)
 
         react_steps: list[ReActStep] = []
         turn_latency_records: list[ModelContextLatencyRecord] = []
 
         # ------------------------------------------------------------------
-        # ReAct Iteration 1: Evaluate Calculated Variances (financial reasoning model)
+        # ReAct Iteration 1: Evaluate Calculated Variances (deterministic pre-pass)
         # ------------------------------------------------------------------
         t_eval = time.perf_counter()
         variance_evaluations = evaluate_calculated_variances(
@@ -684,39 +467,7 @@ class StructuredReActExecutor:
             section_filter=scope.get("section_id", "ALL"),
         )
         eval_ms = (time.perf_counter() - t_eval) * 1000.0
-
         var_payload_tokens = estimate_token_count(json.dumps(variance_reports, default=str))
-        prompt_tokens = estimate_token_count(query)
-        sys_tokens = 220
-        step1_ctx_tokens = sys_tokens + memory_tokens + var_payload_tokens + prompt_tokens
-        step1_out_tokens = estimate_token_count(
-            json.dumps([v.model_dump(mode="json") for v in variance_evaluations], default=str)
-        )
-
-        step1_ctx_latency_ms = round(eval_ms + memory_prep_latency_ms, 3)
-        if not use_live_adk:
-            rec_step1 = tracker.record_call(
-                agent_name="FinancialAnalystAgent",
-                model_name=reasoning_model,
-                task_category="variance_explanation",
-                react_phase="evaluate_variances",
-                context_breakdown=ContextBreakdown(
-                    system_instruction_tokens=sys_tokens,
-                    memory_and_history_tokens=memory_tokens,
-                    variance_payload_tokens=var_payload_tokens,
-                    user_prompt_tokens=prompt_tokens,
-                    total_context_tokens=step1_ctx_tokens,
-                    uncached_context_tokens=step1_ctx_tokens,
-                ),
-                output_tokens=step1_out_tokens,
-                thoughts_tokens=max(16, step1_out_tokens // 3),
-                raw_inference_latency_ms=eval_ms,
-                context_prep_latency_ms=memory_prep_latency_ms,
-                session_id=session_id,
-                user_id=user_id,
-            )
-            turn_latency_records.append(rec_step1)
-            step1_ctx_latency_ms = rec_step1.context_latency_ms
 
         if variance_evaluations:
             thought_1 = (
@@ -752,10 +503,10 @@ class StructuredReActExecutor:
                 },
                 observation=obs_1,
                 agent="FinancialAnalystAgent",
-                model_used=reasoning_model,
-                context_tokens=step1_ctx_tokens,
+                model_used=None,
+                context_tokens=var_payload_tokens + memory_tokens,
                 cached_context_tokens=0,
-                context_latency_ms=step1_ctx_latency_ms,
+                context_latency_ms=round(eval_ms + memory_prep_latency_ms, 3),
                 duration_ms=round(eval_ms, 3),
             )
         )
@@ -778,7 +529,6 @@ class StructuredReActExecutor:
             )
         cache_query_ms = (time.perf_counter() - t_cache) * 1000.0
 
-        # Merge any newly linked chunk citations while preserving deterministic ordering
         merged_citations = list(citations)
         existing_cids = {c["chunk_id"] for c in merged_citations}
         for ec in extra_citations:
@@ -846,8 +596,6 @@ class StructuredReActExecutor:
                     merged_citations.append(mc)
                     existing_cids.add(mc["chunk_id"])
             add_cached_toks = sum(e.token_estimate for e in more_exps if e.cache_hit)
-            cached_toks_hit += add_cached_toks
-            uncached_toks_miss += sum(e.token_estimate for e in more_exps if not e.cache_hit)
             react_steps.append(
                 ReActStep(
                     iteration=len(react_steps) + 1,
@@ -869,285 +617,207 @@ class StructuredReActExecutor:
             )
 
         # ------------------------------------------------------------------
-        # ReAct Iteration 3: Format Grounded Output (financial reasoning model)
+        # ReAct Iteration 3: Live synthesis by FinancialAnalystAgent (ADK Runner, SSE)
         # ------------------------------------------------------------------
         t_synth = time.perf_counter()
-        deterministic_markdown = format_react_grounded_output(
-            query=query,
-            intent=intent,
-            scope=scope,
-            variance_reports=variance_reports,
-            variance_evaluations=variance_evaluations,
-            cached_explanations=cached_explanations,
-            citations=merged_citations,
-            sector_benchmarks=sector_benchmarks,
-            chunk_health=chunk_health,
+        calc_map = {f"{r['ticker']}_{r['start_year']}_{r['end_year']}": r for r in variance_reports}
+        schema_failure_reason: str | None = None
+        try:
+            live_stream_result = run_live_adk_financial_reasoning(
+                query=query,
+                intent=intent,
+                scope=scope,
+                variance_reports=variance_reports,
+                variance_evaluations=[v.model_dump(mode="json") for v in variance_evaluations],
+                cached_explanations=[c.model_dump(mode="json") for c in cached_explanations],
+                citations=merged_citations,
+                sector_benchmarks=sector_benchmarks,
+                chunk_health=chunk_health,
+                memory_context=memory_context,
+                session_id=session_id,
+                user_id=user_id,
+                resolution=runtime_res,
+                custom_llm=self.reasoning_llm,
+                summarizer_llm=self.judge_llm,
+                material_variance_flags=material_variance_flags,
+                disclosure_deltas=disclosure_deltas,
+            )
+        except Exception as exc:
+            schema_error = _output_schema_error(exc)
+            if schema_error is None:
+                raise
+            # The agent's final text wasn't a valid AnalystReport (e.g. a plan or tool call
+            # written as prose, or guardrail text replacing the JSON). Withhold the answer
+            # instead of failing the turn.
+            schema_failure_reason = (
+                f"Live agent output was not a valid AnalystReport ({schema_error})"
+            )
+            live_stream_result = AdkStreamResult(
+                agent_name="FinancialAnalystAgent",
+                app_name="edgar_chat_app",
+                session_id=session_id or "",
+                backend=runtime_res.backend,
+                final_text="",
+            )
+        candidate_md = live_stream_result.final_text
+        # Passages the agent retrieved itself with search_10k_chunks_rag /
+        # query_cached_10k_context become part of the turn's citation set (source
+        # viewer, fact-check, and evaluator).
+        agent_retrieved_citations = _merge_agent_retrieved_citations(
+            merged_citations,
+            live_stream_result.session_state.get("retrieved_citations"),
         )
 
-        calc_map = {f"{r['ticker']}_{r['start_year']}_{r['end_year']}": r for r in variance_reports}
-        answer_markdown = deterministic_markdown
-        live_stream_result: AdkStreamResult | None = None
-        live_adk_executed = False
-        grounding_fallback_applied = False
-        fallback_reason: str | None = None
+        answer_markdown = candidate_md
+        withheld_reason: str | None = None
         adk_response_blocked = False
-        agent_retrieved_citations: list[dict[str, Any]] = []
         structured_report_dict: dict[str, Any] | None = None
         raw_structured_report_text = ""
         report_verification: ReportVerification | None = None
         adk_response_decision: dict[str, Any] | None = None
         adk_response_block_message = ""
 
-        if use_live_adk:
-            try:
-                live_stream_result = run_live_adk_financial_reasoning(
-                    query=query,
-                    intent=intent,
-                    scope=scope,
-                    variance_reports=variance_reports,
-                    variance_evaluations=[v.model_dump(mode="json") for v in variance_evaluations],
-                    cached_explanations=[c.model_dump(mode="json") for c in cached_explanations],
-                    citations=merged_citations,
-                    sector_benchmarks=sector_benchmarks,
-                    chunk_health=chunk_health,
-                    memory_context=memory_context,
-                    session_id=session_id,
-                    user_id=user_id,
-                    resolution=runtime_res,
-                    custom_llm=self.reasoning_llm,
-                    summarizer_llm=self.judge_llm,
-                )
-                live_adk_executed = True
-                candidate_md = live_stream_result.final_text
-                # Passages the agent retrieved itself with search_10k_chunks_rag /
-                # query_cached_10k_context become part of the turn's citation set (source
-                # viewer, fact-check, and evaluator).
-                agent_retrieved_citations = _merge_agent_retrieved_citations(
-                    merged_citations,
-                    live_stream_result.session_state.get("retrieved_citations"),
-                )
-                if live_stream_result.session_state.get("model_armor_response_blocked") is True:
-                    adk_response_blocked = True
-                    raw_dec = live_stream_result.session_state.get(
-                        "model_armor_last_response_decision"
-                    )
-                    if isinstance(raw_dec, dict):
-                        adk_response_decision = raw_dec
-                    adk_response_block_message = str(
-                        live_stream_result.session_state.get("model_armor_response_block_message")
-                        or candidate_md
-                    )
-                    answer_markdown = candidate_md
-                elif (
-                    structured := parse_analyst_report(
-                        live_stream_result.session_state.get("financial_analyst_report")
-                    )
-                ) is not None:
-                    # Structured answer: verify each claim, then render compact Markdown.
-                    verified = verify_analyst_report(
-                        structured,
-                        variance_reports=variance_reports,
-                        citations=merged_citations,
-                    )
-                    report_verification = verified.verification
-                    structured_report_dict = verified.report.model_dump(mode="json")
-                    # Unverified original, kept so the response guardrail also sees claims
-                    # that verification removed (e.g. a price target in the notes).
-                    raw_structured_report_text = structured.model_dump_json()
-                    if not report_verification.usable:
-                        grounding_fallback_applied = True
-                        fallback_reason = report_verification.unusable_reason
-                    else:
-                        candidate_md = render_analyst_report_markdown(
-                            verified,
-                            variance_reports=variance_reports,
-                            citations=merged_citations,
-                            scope=scope,
-                        )
-                        check = verify_narrative_against_calculations(
-                            response_text=candidate_md,
-                            calculated_variances=calc_map,
-                            retrieved_citations=merged_citations,
-                        )
-                        if check.passed:
-                            answer_markdown = candidate_md
-                        else:
-                            grounding_fallback_applied = True
-                            fallback_reason = "; ".join(check.discrepancies)
-                elif (incomplete_reason := _incomplete_agent_output(candidate_md)) is not None:
-                    grounding_fallback_applied = True
-                    fallback_reason = incomplete_reason
-                else:
-                    check = verify_narrative_against_calculations(
-                        response_text=candidate_md,
-                        calculated_variances=calc_map,
-                        retrieved_citations=merged_citations,
-                    )
-                    if check.passed and candidate_md.strip():
-                        answer_markdown = candidate_md
-                    else:
-                        grounding_fallback_applied = True
-                        fallback_reason = (
-                            "; ".join(check.discrepancies)
-                            if check.discrepancies
-                            else "Empty or ungrounded live LLM output"
-                        )
-            except Exception as exc:
-                if runtime_res.requested_mode == "live":
-                    raise
-                fallback_reason = str(exc)
-                logger.warning(
-                    "Live ADK FinancialAnalystAgent execution failed in auto mode (%s); "
-                    "degrading gracefully to deterministic synthesis.",
-                    exc,
-                )
-        elif self.llm_reasoning_fn is not None:
-            candidate_md = self.llm_reasoning_fn(
-                reasoning_model,
-                {
-                    "query": query,
-                    "variance_reports": variance_reports,
-                    "variance_evaluations": [
-                        v.model_dump(mode="json") for v in variance_evaluations
-                    ],
-                    "cached_explanations": [c.model_dump(mode="json") for c in cached_explanations],
-                    "citations": merged_citations,
-                },
+        if schema_failure_reason is not None:
+            withheld_reason = schema_failure_reason
+        elif live_stream_result.session_state.get("model_armor_response_blocked") is True:
+            adk_response_blocked = True
+            raw_dec = live_stream_result.session_state.get("model_armor_last_response_decision")
+            if isinstance(raw_dec, dict):
+                adk_response_decision = raw_dec
+            adk_response_block_message = str(
+                live_stream_result.session_state.get("model_armor_response_block_message")
+                or candidate_md
             )
+        elif (
+            structured := parse_analyst_report(
+                live_stream_result.session_state.get("financial_analyst_report")
+            )
+        ) is not None:
+            # Structured answer: verify each claim, then render compact Markdown.
+            verified = verify_analyst_report(
+                structured,
+                variance_reports=variance_reports,
+                citations=merged_citations,
+                material_flags=material_variance_flags,
+            )
+            report_verification = verified.verification
+            structured_report_dict = verified.report.model_dump(mode="json")
+            # Unverified original, kept so the response guardrail also sees claims
+            # that verification removed (e.g. a price target in the notes).
+            raw_structured_report_text = structured.model_dump_json()
+            if not report_verification.usable:
+                withheld_reason = report_verification.unusable_reason
+            else:
+                answer_markdown = render_analyst_report_markdown(
+                    verified,
+                    variance_reports=variance_reports,
+                    citations=merged_citations,
+                    scope=scope,
+                )
+                check = verify_narrative_against_calculations(
+                    response_text=answer_markdown,
+                    calculated_variances=calc_map,
+                    retrieved_citations=merged_citations,
+                )
+                if not check.passed:
+                    withheld_reason = "; ".join(check.discrepancies)
+        elif (incomplete_reason := _incomplete_agent_output(candidate_md)) is not None:
+            withheld_reason = incomplete_reason
+        else:
             check = verify_narrative_against_calculations(
                 response_text=candidate_md,
                 calculated_variances=calc_map,
                 retrieved_citations=merged_citations,
             )
-            if check.passed and candidate_md.strip():
-                answer_markdown = candidate_md
-            else:
-                grounding_fallback_applied = True
+            if not check.passed:
+                withheld_reason = "; ".join(check.discrepancies) or "Ungrounded live LLM output"
+
+        answer_verified = withheld_reason is None and not adk_response_blocked
+        if withheld_reason is not None:
+            answer_markdown = _withheld_answer_markdown(withheld_reason)
 
         synth_ms = (time.perf_counter() - t_synth) * 1000.0
-        synth_out_tokens = estimate_token_count(answer_markdown)
-
-        if (
-            live_adk_executed
-            and live_stream_result is not None
-            and live_stream_result.latency_records
-        ):
-            turn_latency_records.extend(live_stream_result.latency_records)
-            rec_synth = live_stream_result.latency_records[-1]
-            synth_thought = (
-                live_stream_result.thoughts[-1]
-                if live_stream_result.thoughts
-                else (
-                    f"Executed live ADK Runner ({reasoning_model}, SSE streaming) combining deterministic "
-                    f"variances with {len(cached_explanations)} cached 10-K explanation(s) and "
-                    f"{len(merged_citations)} grounded citation(s)."
-                )
-            )
-            synth_action = "adk_runner.FinancialAnalystAgent(SSE)"
-            ttft_note = (
-                f", observed_ttft={live_stream_result.observed_ttft_ms:.2f}ms"
-                if live_stream_result.observed_ttft_ms is not None
-                else ""
-            )
-            synth_obs = (
-                f"Streamed grounded report via ADK Runner ({live_stream_result.partial_chunks_count} SSE chunk(s), "
-                f"{rec_synth.output_tokens} output tokens{ttft_note}; "
-                f"context_latency={rec_synth.context_latency_ms:.2f}ms, "
-                f"grounding_fallback={grounding_fallback_applied})."
-            )
-        else:
-            rag_chunk_tokens = estimate_token_count(
-                "\n".join(c.get("excerpt", "") for c in merged_citations)
-            )
-            total_synth_ctx = (
-                sys_tokens
-                + memory_tokens
-                + var_payload_tokens
-                + cached_toks_hit
-                + uncached_toks_miss
-                + rag_chunk_tokens
-                + prompt_tokens
-            )
-            rec_synth = tracker.record_call(
-                agent_name="FinancialAnalystAgent",
-                model_name=reasoning_model,
-                task_category="financial_reasoning",
-                react_phase="format_grounded_output",
-                context_breakdown=ContextBreakdown(
-                    system_instruction_tokens=sys_tokens,
-                    memory_and_history_tokens=memory_tokens,
-                    variance_payload_tokens=var_payload_tokens,
-                    cached_10k_tokens=cached_toks_hit,
-                    uncached_10k_and_tool_tokens=uncached_toks_miss + rag_chunk_tokens,
-                    user_prompt_tokens=prompt_tokens,
-                    total_context_tokens=total_synth_ctx,
-                    cached_context_tokens=cached_toks_hit,
-                    uncached_context_tokens=max(0, total_synth_ctx - cached_toks_hit),
-                    cache_hit=cached_toks_hit > 0,
-                ),
-                output_tokens=synth_out_tokens,
-                thoughts_tokens=max(24, synth_out_tokens // 4),
-                raw_inference_latency_ms=synth_ms,
-                context_prep_latency_ms=cache_query_ms,
-                session_id=session_id,
-                user_id=user_id,
-            )
-            turn_latency_records.append(rec_synth)
-            synth_thought = (
-                f"Combine deterministic variance figures with {len(cached_explanations)} cached 10-K explanation(s) "
-                f"and {len(merged_citations)} grounded chunk citation(s) using {reasoning_model}."
-            )
-            synth_action = "format_react_grounded_output"
-            synth_obs = (
-                f"Formatted grounded report ({synth_out_tokens} output tokens; "
-                f"context_latency={rec_synth.context_latency_ms:.2f}ms, "
-                f"cache_saved={rec_synth.estimated_cache_latency_saved_ms:.2f}ms)."
-            )
-
+        turn_latency_records.extend(live_stream_result.latency_records)
+        rec_synth = (
+            live_stream_result.latency_records[-1] if live_stream_result.latency_records else None
+        )
+        ttft_note = (
+            f", observed_ttft={live_stream_result.observed_ttft_ms:.2f}ms"
+            if live_stream_result.observed_ttft_ms is not None
+            else ""
+        )
         react_steps.append(
             ReActStep(
                 iteration=len(react_steps) + 1,
                 phase="format_grounded_output",
-                thought=synth_thought,
-                action=synth_action,
+                thought=(
+                    live_stream_result.thoughts[-1]
+                    if live_stream_result.thoughts
+                    else (
+                        f"Executed live ADK Runner ({reasoning_model}, SSE streaming) combining deterministic "
+                        f"variances with {len(cached_explanations)} cached 10-K explanation(s) and "
+                        f"{len(merged_citations)} grounded citation(s)."
+                    )
+                ),
+                action="adk_runner.FinancialAnalystAgent(SSE)",
                 action_input={
                     "model": reasoning_model,
-                    "execution_mode": "live_adk" if live_adk_executed else "deterministic_fallback",
                     "cached_explanations_count": len(cached_explanations),
                     "citation_count": len(merged_citations),
                 },
-                observation=synth_obs,
+                observation=(
+                    f"Streamed grounded report via ADK Runner ({live_stream_result.partial_chunks_count} SSE chunk(s)"
+                    f"{ttft_note}; answer_verified={answer_verified})."
+                ),
                 agent="FinancialAnalystAgent",
                 model_used=reasoning_model,
-                context_tokens=rec_synth.context_breakdown.total_context_tokens,
-                cached_context_tokens=rec_synth.context_breakdown.cached_context_tokens,
-                context_latency_ms=rec_synth.context_latency_ms,
+                context_tokens=rec_synth.context_breakdown.total_context_tokens if rec_synth else 0,
+                cached_context_tokens=(
+                    rec_synth.context_breakdown.cached_context_tokens if rec_synth else 0
+                ),
+                context_latency_ms=rec_synth.context_latency_ms if rec_synth else 0.0,
                 duration_ms=round(synth_ms, 3),
-                status="warning" if grounding_fallback_applied else "completed",
+                status="completed" if answer_verified else "warning",
             )
         )
 
         # ------------------------------------------------------------------
         # ReAct Verification & Gemini 3.5 Flash Evaluation Step
         # ------------------------------------------------------------------
-        eval_exec_mode = (
-            self.execution_mode
-            if (live_adk_executed or self.judge_llm is not None)
-            else "deterministic"
-        )
-        eval_report: NarrativeEvaluationReport = evaluate_variance_explanation(
-            query=query,
-            response_markdown=answer_markdown,
-            variance_reports=variance_reports,
-            citations=merged_citations,
-            cached_explanations_count=len(cached_explanations),
-            llm_judge_fn=self.llm_judge_fn,
-            execution_mode=eval_exec_mode,
-            llm=self.judge_llm,
-        )
-        latest_flash_recs = tracker.recent_records(limit=1, model_name=eval_report.evaluator_model)
-        if latest_flash_recs:
-            turn_latency_records.append(latest_flash_recs[-1])
+        if answer_verified:
+            eval_report: NarrativeEvaluationReport = evaluate_variance_explanation(
+                query=query,
+                response_markdown=answer_markdown,
+                variance_reports=variance_reports,
+                citations=merged_citations,
+                cached_explanations_count=len(cached_explanations),
+                llm=self.judge_llm,
+            )
+            latest_flash_recs = tracker.recent_records(
+                limit=1, model_name=eval_report.evaluator_model
+            )
+            if latest_flash_recs:
+                turn_latency_records.append(latest_flash_recs[-1])
+        else:
+            # Nothing to judge: the narrative was withheld (or blocked). Skip the Flash call and
+            # record a failing grade so telemetry and evals count the turn as unanswered.
+            eval_report = NarrativeEvaluationReport(
+                evaluator_model=resolve_model_for_task("evaluation"),
+                grade="fail",
+                overall_score=0.0,
+                numeric_fidelity_score=0.0,
+                citation_grounding_score=0.0,
+                explanation_quality_score=0.0,
+                thematic_consistency_score=0.0,
+                rationale=(
+                    "Not evaluated: the live answer was withheld"
+                    + (
+                        f" ({withheld_reason})."
+                        if withheld_reason
+                        else " by the response guardrail."
+                    )
+                ),
+            )
 
         react_steps.append(
             ReActStep(
@@ -1178,21 +848,13 @@ class StructuredReActExecutor:
 
         adk_runtime_meta: dict[str, Any] = {
             **runtime_res.to_public_dict(),
-            "executed_via_adk_runner": live_adk_executed,
-            "observed_ttft_ms": (
-                live_stream_result.observed_ttft_ms if live_stream_result is not None else None
-            ),
-            "streamed_chunks_count": (
-                live_stream_result.partial_chunks_count if live_stream_result is not None else 0
-            ),
-            "adk_events_count": (
-                live_stream_result.total_events_count if live_stream_result is not None else 0
-            ),
-            "adk_tool_calls": (
-                live_stream_result.function_calls if live_stream_result is not None else []
-            ),
-            "grounding_fallback_applied": grounding_fallback_applied,
-            "fallback_reason": fallback_reason,
+            "executed_via_adk_runner": True,
+            "observed_ttft_ms": live_stream_result.observed_ttft_ms,
+            "streamed_chunks_count": live_stream_result.partial_chunks_count,
+            "adk_events_count": live_stream_result.total_events_count,
+            "adk_tool_calls": live_stream_result.function_calls,
+            "answer_verified": answer_verified,
+            "answer_withheld_reason": withheld_reason,
             "structured_report": structured_report_dict,
             "report_verification": (
                 report_verification.model_dump(mode="json") if report_verification else None
@@ -1201,12 +863,13 @@ class StructuredReActExecutor:
                 live_stream_result,
                 agent_retrieved_citations,
                 merged_citations,
-                answer_markdown if live_adk_executed else "",
+                answer_markdown,
             ),
         }
 
         return {
             "answer_markdown": answer_markdown,
+            "answer_verified": answer_verified,
             "citations": merged_citations,
             "variance_evaluations": variance_evaluations,
             "cached_explanations": cached_explanations,
@@ -1216,7 +879,7 @@ class StructuredReActExecutor:
             "turn_latency_summary": turn_latency_summary,
             "reasoning_model": reasoning_model,
             "evaluation_model": eval_report.evaluator_model,
-            "execution_mode": "live_adk" if live_adk_executed else "deterministic_fallback",
+            "execution_mode": "live_adk",
             "adk_runtime": adk_runtime_meta,
             "raw_structured_report_text": raw_structured_report_text,
             "model_armor_response_blocked": adk_response_blocked,

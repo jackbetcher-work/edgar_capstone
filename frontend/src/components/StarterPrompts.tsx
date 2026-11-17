@@ -1,4 +1,9 @@
-import type { CompanySummary, SearchScopeFilters } from '../types/edgar'
+import { AlertTriangle, Loader2 } from 'lucide-react'
+import type {
+  CatalogLoadStatus,
+  CompanySummary,
+  SearchScopeFilters,
+} from '../types/edgar'
 import { formatUsdCompact } from '../utils/formatters'
 
 export interface StarterPromptPreset {
@@ -75,12 +80,16 @@ const STARTER_PRESETS: StarterPromptPreset[] = [
 
 interface StarterPromptsProps {
   companies: CompanySummary[]
+  catalogStatus?: CatalogLoadStatus
+  catalogError?: string | null
   onSelectPreset: (preset: StarterPromptPreset) => void
   onSelectIssuerFiling?: (ticker: string, fiscalYear: number) => void
 }
 
 export function StarterPrompts({
   companies,
+  catalogStatus = 'ready',
+  catalogError = null,
   onSelectPreset,
   onSelectIssuerFiling,
 }: StarterPromptsProps) {
@@ -158,8 +167,42 @@ export function StarterPrompts({
         </div>
       </div>
 
-      {/* Covered S&P 500 Financial Universe Table */}
-      {companies.length > 0 && (
+      {/* Covered S&P 500 Financial Universe Table (backend /api/v1/companies only) */}
+      {catalogStatus === 'loading' && (
+        <div
+          id="coverage-monitor-loading"
+          className="border border-hairline surface-panel px-3 py-2.5 flex items-center gap-2 text-[11px] text-bb-amber tabular-nums-mono uppercase"
+        >
+          <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+          <span>LOADING COVERAGE CATALOG FROM EDGAR API...</span>
+        </div>
+      )}
+
+      {catalogStatus === 'error' && (
+        <div
+          id="coverage-monitor-error"
+          role="alert"
+          className="p-2.5 badge-negative text-xs flex items-start gap-2 tabular-nums-mono"
+        >
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" aria-hidden="true" />
+          <span>
+            COVERAGE CATALOG UNAVAILABLE —{' '}
+            {catalogError ??
+              'Backend unreachable — could not reach the EDGAR API. No data was shown.'}
+          </span>
+        </div>
+      )}
+
+      {catalogStatus === 'ready' && companies.length === 0 && (
+        <div
+          id="coverage-monitor-empty"
+          className="border border-hairline surface-panel px-3 py-2.5 text-[11px] text-ink-muted tabular-nums-mono uppercase"
+        >
+          THE EDGAR API RETURNED NO COVERED COMPANIES.
+        </div>
+      )}
+
+      {catalogStatus === 'ready' && companies.length > 0 && (
         <div className="border border-hairline surface-panel overflow-hidden">
           <div className="px-3 py-1.5 surface-header border-b border-hairline flex items-center justify-between text-[11px] tabular-nums-mono uppercase">
             <span className="font-semibold text-ink-primary">

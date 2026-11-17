@@ -8,8 +8,10 @@ import {
 import type { AuthenticatedUserProfile } from '../types/edgar'
 
 interface HeaderBarProps {
-  companyCount: number
-  totalProfiles: number
+  /** Null until the backend catalog has loaded successfully. */
+  companyCount: number | null
+  totalProfiles: number | null
+  isBackendUnavailable?: boolean
   turnCount: number
   onResetConversation: () => void
   isSourcePaneOpen: boolean
@@ -28,6 +30,7 @@ export function HeaderBar({
   isSourcePaneOpen,
   onToggleSourcePane,
   citationCount,
+  isBackendUnavailable = false,
   authenticatedUser = null,
   isAuthLocked = false,
   onLogout,
@@ -50,7 +53,7 @@ export function HeaderBar({
         </span>
         <span className="hidden md:inline text-ink-muted">|</span>
         <span className="hidden md:inline text-[11px] text-ink-muted truncate">
-          {companyCount} ISSUERS · {totalProfiles} FILINGS
+          {companyCount ?? '—'} ISSUERS · {totalProfiles ?? '—'} FILINGS
         </span>
       </div>
 
@@ -64,10 +67,16 @@ export function HeaderBar({
             style={{
               backgroundColor: isAuthLocked
                 ? 'var(--bb-amber)'
-                : 'var(--positive-ink)',
+                : isBackendUnavailable
+                  ? 'var(--negative-ink)'
+                  : 'var(--positive-ink)',
             }}
           />
-          {isAuthLocked ? 'AUTH LOCKED' : 'READY'}
+          {isAuthLocked
+            ? 'AUTH LOCKED'
+            : isBackendUnavailable
+              ? 'BACKEND OFFLINE'
+              : 'READY'}
         </span>
 
         {authenticatedUser && (

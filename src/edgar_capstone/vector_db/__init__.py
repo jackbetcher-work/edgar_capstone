@@ -10,7 +10,6 @@ from edgar_capstone.vector_db.embedder import (
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
     VertexAIEmbedder,
-    generate_deterministic_embedding,
     populate_chunk_embeddings,
 )
 from edgar_capstone.vector_db.models import (
@@ -54,7 +53,6 @@ __all__ = [
     "evaluate_chunk_health",
     "extract_sections_from_combined_markdown",
     "format_structured_health_log",
-    "generate_deterministic_embedding",
     "populate_chunk_embeddings",
     "run_vector_db_pipeline",
     "split_section_into_passages",

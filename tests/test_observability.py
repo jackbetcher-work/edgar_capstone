@@ -266,7 +266,6 @@ def test_chat_request_continues_upstream_trace_end_to_end(
             "tickers": "NVDA,AAPL",
             "start_year": 2024,
             "end_year": 2026,
-            "execution_mode": "deterministic",
         },
     )
     assert resp.status_code == 200

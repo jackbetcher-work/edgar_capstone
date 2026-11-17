@@ -38,13 +38,9 @@ resource "google_bigquery_table" "eval_results" {
 
 # 3. CI runners stream eval_results rows and read the golden set. eval_results reuses the
 #    append-only custom role (tables.get + tables.updateData) defined in telemetry.tf.
+#    The CI principals are defined in ci_live_test_access.tf.
 locals {
-  eval_ci_principals = merge(
-    { github_actions = "serviceAccount:${google_service_account.cicd_runner.email}" },
-    local.cloudbuild_enabled ? {
-      cloud_build = "serviceAccount:${google_service_account.cloudbuild_runner[0].email}"
-    } : {}
-  )
+  eval_ci_principals = local.ci_live_test_principals
 }
 
 resource "google_bigquery_table_iam_member" "eval_results_ci_append" {

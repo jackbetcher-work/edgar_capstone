@@ -1,5 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ExternalLink, FileText, Loader2, Search, X } from 'lucide-react'
+import {
+  AlertTriangle,
+  ExternalLink,
+  FileText,
+  Loader2,
+  Search,
+  X,
+} from 'lucide-react'
 import type {
   CachedSectionResponse,
   CompanySummary,
@@ -16,6 +23,7 @@ interface SourceInspectorPaneProps {
   onChangeTab: (tab: 'citations' | 'document') => void
   cachedSection: CachedSectionResponse | null
   isLoadingSection: boolean
+  sectionError?: string | null
   onRequestFilingSection: (
     ticker: string,
     fiscalYear: number,
@@ -84,6 +92,7 @@ export function SourceInspectorPane({
   onChangeTab,
   cachedSection,
   isLoadingSection,
+  sectionError = null,
   onRequestFilingSection,
   highlightedExcerpt,
   onCloseMobilePane,
@@ -446,13 +455,11 @@ export function SourceInspectorPane({
                         type="button"
                         onClick={() => {
                           const targetTicker =
-                            cachedSection?.ticker ??
-                            filingTargets[0]?.ticker ??
-                            'NVDA'
+                            cachedSection?.ticker ?? filingTargets[0]?.ticker
                           const targetYear =
                             cachedSection?.fiscal_year ??
-                            filingTargets[0]?.fiscalYear ??
-                            2026
+                            filingTargets[0]?.fiscalYear
+                          if (!targetTicker || targetYear === undefined) return
                           onRequestFilingSection(targetTicker, targetYear, secId)
                         }}
                         className={`px-2 py-0.5 text-[10px] uppercase font-semibold cursor-pointer transition-colors ${
@@ -513,6 +520,15 @@ export function SourceInspectorPane({
               <div className="py-14 flex flex-col items-center justify-center gap-2 text-xs text-bb-amber tabular-nums-mono">
                 <Loader2 className="w-4 h-4 animate-spin" />
                 <span>LOADING SEC FORM 10-K SECTION...</span>
+              </div>
+            ) : sectionError ? (
+              <div
+                id="section-load-error"
+                role="alert"
+                className="p-2.5 badge-negative text-xs flex items-start gap-2 tabular-nums-mono"
+              >
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" aria-hidden="true" />
+                <span>{sectionError}</span>
               </div>
             ) : cachedSection ? (
               <div>

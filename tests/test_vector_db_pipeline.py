@@ -1,14 +1,21 @@
-"""Automated unit tests for the metadata-tagged RAG vector DB and chunk health monitoring."""
+"""Tests for the metadata-tagged RAG vector DB and chunk health monitoring.
+
+There is no synthetic embedding backend: tests that need vectors call live Vertex AI
+`text-embedding-005` with Application Default Credentials (inputs kept tiny). Mock HTTP
+transports are used only to simulate Vertex AI error responses (token limits, quota).
+"""
 
 from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import httpx
 import numpy as np
+import pytest
 
 from edgar_capstone.dataset.extractor import format_combined_10k_markdown
 from edgar_capstone.dataset.models import FinancialDataProfile
@@ -20,7 +27,6 @@ from edgar_capstone.vector_db.chunker import (
 from edgar_capstone.vector_db.embedder import (
     DEFAULT_EMBEDDING_DIMENSIONS,
     VertexAIEmbedder,
-    generate_deterministic_embedding,
     populate_chunk_embeddings,
 )
 from edgar_capstone.vector_db.monitoring import (
@@ -34,6 +40,15 @@ from edgar_capstone.vector_db.pipeline import (
     run_vector_db_pipeline,
 )
 from scripts.build_vector_db import parse_args
+
+LIVE_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "iron-radio-514217-q7")
+LIVE_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+
+@pytest.fixture(scope="module")
+def live_embedder() -> VertexAIEmbedder:
+    """Live Vertex AI `text-embedding-005` client authenticated with ADC."""
+    return VertexAIEmbedder(project_id=LIVE_PROJECT_ID, location=LIVE_LOCATION)
 
 
 def _sample_profile(
@@ -155,11 +170,11 @@ def test_missing_section_placeholder_is_skipped() -> None:
     assert "item_7" in sections
 
 
-def test_vertex_vector_search_record_format() -> None:
+def test_vertex_vector_search_record_format(live_embedder: VertexAIEmbedder) -> None:
     prof = _sample_profile()
     md = _sample_markdown(prof)
     chunks = chunk_filing_document(prof, md)
-    chunks[0].embedding = generate_deterministic_embedding(chunks[0].chunk_text)
+    chunks[0].embedding = live_embedder.embed_texts([chunks[0].chunk_text])[0]
 
     vx_rec = chunks[0].to_vertex_vector_search_record()
     assert vx_rec["id"] == chunks[0].chunk_id
@@ -176,55 +191,58 @@ def test_vertex_vector_search_record_format() -> None:
     assert num_restricts["fiscal_year"] == 2026
 
 
-def test_deterministic_and_vertex_ai_embeddings() -> None:
-    v1 = generate_deterministic_embedding(
-        "AI GPU export control restrictions in China impacted Data Center revenue."
-    )
-    v2 = generate_deterministic_embedding(
-        "US export control restrictions on China AI GPU chips reduced Data Center sales."
-    )
-    v3 = generate_deterministic_embedding(
-        "Retail store lease obligations and consumer packaged soap pricing."
+def test_live_vertex_ai_embeddings_capture_semantic_similarity(
+    live_embedder: VertexAIEmbedder,
+) -> None:
+    v1, v2, v3 = live_embedder.embed_texts(
+        [
+            "AI GPU export control restrictions in China impacted Data Center revenue.",
+            "US export control restrictions on China AI GPU chips reduced Data Center sales.",
+            "Retail store lease obligations and consumer packaged soap pricing.",
+        ]
     )
 
     assert len(v1) == DEFAULT_EMBEDDING_DIMENSIONS
     norm_v1 = math.sqrt(sum(x * x for x in v1))
-    assert math.isclose(norm_v1, 1.0, rel_tol=1e-3)
+    assert math.isclose(norm_v1, 1.0, rel_tol=1e-2)
 
     sim_related = float(np.dot(v1, v2))
     sim_unrelated = float(np.dot(v1, v3))
     assert sim_related > sim_unrelated
-    assert sim_related > 0.25
+    assert sim_related > 0.7
 
-    # Test VertexAIEmbedder with MockTransport
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        n = len(body["instances"])
-        preds = [{"embeddings": {"values": [0.1] * DEFAULT_EMBEDDING_DIMENSIONS}} for _ in range(n)]
-        return httpx.Response(200, json={"predictions": preds})
 
-    mock_creds = MagicMock()
-    mock_creds.valid = True
-    mock_creds.token = "fake-oauth-token"
-
-    embedder = VertexAIEmbedder(
-        project_id="iron-radio-514217-q7",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-        credentials=mock_creds,
+def test_populate_chunk_embeddings_uses_live_vertex_ai(live_embedder: VertexAIEmbedder) -> None:
+    prof = _sample_profile()
+    chunks = chunk_filing_document(prof, _sample_markdown(prof))[:2]
+    populated, source = populate_chunk_embeddings(
+        chunks,
+        project_id=LIVE_PROJECT_ID,
+        location=LIVE_LOCATION,
+        vertex_embedder=live_embedder,
     )
+    assert source == "vertex_ai"
+    assert all(len(c.embedding) == DEFAULT_EMBEDDING_DIMENSIONS for c in populated)
+    assert all(c.embedding_model == "text-embedding-005" for c in populated)
+    assert populated[0].embedding != populated[1].embedding
+
+
+def test_populate_chunk_embeddings_fails_loudly_without_vertex_ai() -> None:
+    """No synthetic fallback: a Vertex AI failure must abort ingestion."""
     prof = _sample_profile()
     chunks = chunk_filing_document(prof, _sample_markdown(prof))
-    populated, backend = populate_chunk_embeddings(
-        chunks,
-        project_id="iron-radio-514217-q7",
-        backend="vertex_ai",
-        vertex_embedder=embedder,
-    )
-    assert backend == "vertex_ai"
-    assert all(len(c.embedding) == DEFAULT_EMBEDDING_DIMENSIONS for c in populated)
+    with pytest.raises(RuntimeError, match="HTTP 403"):
+        populate_chunk_embeddings(
+            chunks,
+            project_id="p",
+            vertex_embedder=_mock_vertex_embedder([], fail_after=0),
+        )
+    assert all(not c.embedding for c in chunks)
 
 
-def test_chunk_health_evaluation_and_cloud_monitoring_export() -> None:
+def test_chunk_health_evaluation_and_cloud_monitoring_export(
+    live_embedder: VertexAIEmbedder,
+) -> None:
     prof_nvda = _sample_profile("NVDA", 2026)
     prof_aapl = _sample_profile("AAPL", 2026)
 
@@ -233,8 +251,9 @@ def test_chunk_health_evaluation_and_cloud_monitoring_export() -> None:
     all_chunks = chunks_nvda + chunks_aapl
     populate_chunk_embeddings(
         all_chunks,
-        project_id="iron-radio-514217-q7",
-        backend="deterministic",
+        project_id=LIVE_PROJECT_ID,
+        location=LIVE_LOCATION,
+        vertex_embedder=live_embedder,
     )
 
     healthy_report = evaluate_chunk_health(
@@ -303,7 +322,10 @@ def test_chunk_health_evaluation_and_cloud_monitoring_export() -> None:
     assert len(captured_requests) == 1
 
 
-def test_end_to_end_vector_db_pipeline_local(tmp_path: Path) -> None:
+def test_end_to_end_vector_db_pipeline_staged_with_live_embeddings(
+    tmp_path: Path, live_embedder: VertexAIEmbedder
+) -> None:
+    """Stage manifests locally (no GCS/BQ/Monitoring publish) with live Vertex AI vectors."""
     prof = _sample_profile("NVDA", 2026)
     md = _sample_markdown(prof)
 
@@ -315,14 +337,18 @@ def test_end_to_end_vector_db_pipeline_local(tmp_path: Path) -> None:
     json_path.write_text(json.dumps(prof.model_dump(mode="json")), encoding="utf-8")
 
     cfg = VectorDBBuildConfig(
+        project_id=LIVE_PROJECT_ID,
+        location=LIVE_LOCATION,
         output_dir=tmp_path,
         local_only=True,
         target_chunk_chars=400,
         max_chunk_chars=900,
         min_chunk_chars=80,
     )
-    summary, report = run_vector_db_pipeline(cfg)
+    summary, report = run_vector_db_pipeline(cfg, vertex_embedder=live_embedder)
 
+    assert summary.embedding_backend == "vertex_ai"
+    assert summary.uploaded_to_gcs is False
     assert summary.total_profiles_processed == 1
     assert summary.total_chunks_generated >= 2
     assert summary.health_status == "HEALTHY"
@@ -341,8 +367,13 @@ def test_end_to_end_vector_db_pipeline_local(tmp_path: Path) -> None:
     assert len(bq_lines) == summary.total_chunks_generated
     assert len(vx_lines) == summary.total_chunks_generated
 
-    # Second run should reuse cached embeddings
-    summary_cached, _ = run_vector_db_pipeline(cfg)
+    first_row = json.loads(bq_lines[0])
+    assert len(first_row["embedding"]) == DEFAULT_EMBEDDING_DIMENSIONS
+
+    # Second run reuses the cached Vertex AI vectors; a failing embedder proves no call is made.
+    summary_cached, _ = run_vector_db_pipeline(
+        cfg, vertex_embedder=_mock_vertex_embedder([], fail_after=0)
+    )
     assert summary_cached.embedding_backend == "cached"
 
 
@@ -351,6 +382,9 @@ def test_cli_parse_args_and_terraform_monitoring_definitions() -> None:
     assert args.tickers == ["NVDA", "AAPL"]
     assert args.local_only is True
     assert args.target_chars == 1800
+    assert not hasattr(args, "embedding_backend")
+    with pytest.raises(SystemExit):
+        parse_args(["--embedding-backend", "deterministic"])
     assert estimate_token_count("NVIDIA Blackwell data center revenue grew significantly.") > 5
 
     tf_dir = Path(__file__).resolve().parents[1] / "terraform"
@@ -440,7 +474,6 @@ def test_populate_chunk_embeddings_checkpoints_and_resumes(tmp_path: Path) -> No
         populate_chunk_embeddings(
             chunks,
             project_id="p",
-            backend="vertex_ai",
             vertex_embedder=failing,
             checkpoint_path=ckpt,
         )
@@ -455,7 +488,6 @@ def test_populate_chunk_embeddings_checkpoints_and_resumes(tmp_path: Path) -> No
     populated, backend = populate_chunk_embeddings(
         fresh,
         project_id="p",
-        backend="vertex_ai",
         vertex_embedder=ok,
         checkpoint_path=ckpt,
     )
@@ -466,7 +498,6 @@ def test_populate_chunk_embeddings_checkpoints_and_resumes(tmp_path: Path) -> No
     again, backend = populate_chunk_embeddings(
         chunk_filing_document(prof, _sample_markdown(prof)),
         project_id="p",
-        backend="vertex_ai",
         vertex_embedder=_mock_vertex_embedder([], fail_after=0),
         checkpoint_path=ckpt,
     )

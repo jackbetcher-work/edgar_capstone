@@ -1,15 +1,13 @@
 """ADK tools: MetricFetchTool, LookerQueryTool, VarianceCalculationTool, HybridSearchTool, and ContextCacheTool.
 
-Provides both live GCP client adapters (BigQuery, Vertex AI Search / Discovery Engine,
-Vertex AI Vector Search / Matching Engine, Vertex AI Embeddings, and Cloud Storage) and
-local curated-corpus execution so ADK agents hit live GCP backends in Cloud Run / Vertex AI
-environments while preserving zero-dependency deterministic execution in offline tests.
+Every tool reads live GCP data through the client adapters below: BigQuery (financial metrics,
+filing chunks, `VECTOR_SEARCH`), Vertex AI Search / Discovery Engine, Vertex AI Vector Search,
+Vertex AI `text-embedding-005` embeddings, and the Cloud Storage SEC corpus bucket. There is no
+local or synthesized data backend.
 """
 
 from __future__ import annotations
 
-import functools
-import json
 import logging
 import os
 import re
@@ -19,14 +17,13 @@ import urllib.parse
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterator, MutableMapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Literal
 
 import google.auth
 import httpx
 import numpy as np
 from google.adk.tools import FunctionTool, ToolContext
-from google.auth.exceptions import DefaultCredentialsError, RefreshError
+from google.auth.exceptions import DefaultCredentialsError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
 from edgar_capstone.agents.resilience import (
@@ -42,18 +39,14 @@ from edgar_capstone.agents.schemas import (
     MetricRecord,
     MetricVariance,
 )
-from edgar_capstone.dataset.extractor import format_combined_10k_markdown
 from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_BUCKET_NAME,
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
 )
 from edgar_capstone.dataset.models import FinancialDataProfile
-from edgar_capstone.dataset.paths import resolve_curated_dataset_dir
-from edgar_capstone.dataset.pipeline import DEFAULT_OUTPUT_DIR
 from edgar_capstone.telemetry import get_telemetry_sink
 from edgar_capstone.vector_db.chunker import (
-    chunk_filing_document,
     estimate_token_count,
     extract_sections_from_combined_markdown,
 )
@@ -61,7 +54,6 @@ from edgar_capstone.vector_db.embedder import (
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
     VertexAIEmbedder,
-    generate_deterministic_embedding,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,9 +61,7 @@ logger = logging.getLogger(__name__)
 _WORD_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _SAFE_BQ_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 
-DataBackendMode = Literal["auto", "gcp", "local"]
 
 # Canonical GICS sector names for exact-match token restricts in Vertex AI Search / Vector Search
 _CANONICAL_GICS_SECTORS: dict[str, str] = {
@@ -249,7 +239,6 @@ def _canonicalize_gics_sector(sector: str | None) -> str | None:
 class GcpToolConfig:
     """Runtime configuration for BigQuery, Vertex AI Search, Vector Search, and GCS adapters."""
 
-    data_backend: DataBackendMode = "auto"
     project_id: str = DEFAULT_PROJECT_ID
     location: str = DEFAULT_LOCATION
     bq_dataset_id: str = DEFAULT_BIGQUERY_DATASET_ID
@@ -271,36 +260,10 @@ class GcpToolConfig:
     vvs_deployed_index_id: str = ""
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
     embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS
-    gcp_auto_triggered: bool = False
 
     @classmethod
     def from_env(cls) -> GcpToolConfig:
         """Resolve live GCP tool adapter settings from environment variables."""
-        raw_backend = os.environ.get("EDGAR_DATA_BACKEND", "auto").strip().lower()
-        exec_mode = os.environ.get("EDGAR_EXECUTION_MODE", "auto").strip().lower()
-
-        if raw_backend in ("gcp", "live"):
-            data_backend: DataBackendMode = "gcp"
-        elif raw_backend in ("local", "deterministic"):
-            data_backend = "local"
-        elif exec_mode == "deterministic":
-            data_backend = "local"
-        else:
-            data_backend = "auto"
-
-        auto_signals = (
-            os.environ.get("EDGAR_USE_GCP_TOOLS", "").strip().lower() in _TRUTHY_ENV_VALUES
-            or bool(os.environ.get("K_SERVICE", "").strip())
-            or bool(os.environ.get("BIGQUERY_DATASET_ID", "").strip())
-            or bool(os.environ.get("VERTEX_AI_SEARCH_ENGINE_ID", "").strip())
-            or bool(os.environ.get("VERTEX_AI_SEARCH_DATASTORE_ID", "").strip())
-            or bool(os.environ.get("VERTEX_VECTOR_SEARCH_ENDPOINT_ID", "").strip())
-            or bool(os.environ.get("VERTEX_VECTOR_SEARCH_PUBLIC_DOMAIN", "").strip())
-            or bool(os.environ.get("VERTEX_VECTOR_SEARCH_PSC_ADDRESS", "").strip())
-            or exec_mode == "live"
-            or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in _TRUTHY_ENV_VALUES
-        )
-
         project_id = (
             os.environ.get("GCP_PROJECT_ID")
             or os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -316,7 +279,6 @@ class GcpToolConfig:
         dims = int(raw_dims) if raw_dims.isdigit() else DEFAULT_EMBEDDING_DIMENSIONS
 
         return cls(
-            data_backend=data_backend,
             project_id=project_id,
             location=location,
             bq_dataset_id=(
@@ -362,7 +324,6 @@ class GcpToolConfig:
                 os.environ.get("VERTEX_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
             ).strip(),
             embedding_dimensions=dims,
-            gcp_auto_triggered=auto_signals,
         )
 
 
@@ -1862,30 +1823,24 @@ def reset_gcp_tool_adapters() -> None:
     _ENV_GCP_ADAPTERS_CACHE = None
 
 
-def _resolve_gcp_dispatch() -> tuple[GcpToolAdapters | None, bool]:
-    """Return `(adapters, strict_gcp)` if live GCP execution should be attempted, else `(None, False)`."""
+def _gcp_adapters() -> GcpToolAdapters:
+    """Return the live GCP adapter bundle: an injected one, or one built from the environment.
+
+    There is no local data backend: every tool reads BigQuery, Vertex AI Search / Vector
+    Search, Vertex AI embeddings, and the GCS corpus bucket.
+    """
     global _ENV_GCP_ADAPTERS_CACHE
     if _CUSTOM_GCP_ADAPTERS is not None:
-        cfg = _CUSTOM_GCP_ADAPTERS.config
-        if cfg.data_backend == "local":
-            return None, False
-        return _CUSTOM_GCP_ADAPTERS, (cfg.data_backend == "gcp")
-
+        return _CUSTOM_GCP_ADAPTERS
     cfg = GcpToolConfig.from_env()
-    if cfg.data_backend == "local":
-        return None, False
-    if cfg.data_backend == "auto" and not cfg.gcp_auto_triggered:
-        return None, False
-
     if _ENV_GCP_ADAPTERS_CACHE is None or _ENV_GCP_ADAPTERS_CACHE[0] != cfg:
         _ENV_GCP_ADAPTERS_CACHE = (cfg, GcpToolAdapters(cfg))
-    return _ENV_GCP_ADAPTERS_CACHE[1], (cfg.data_backend == "gcp")
+    return _ENV_GCP_ADAPTERS_CACHE[1]
 
 
-def get_active_gcp_tool_adapters() -> GcpToolAdapters | None:
-    """Return the active `GcpToolAdapters` bundle when live GCP mode is enabled, else `None`."""
-    adapters, _ = _resolve_gcp_dispatch()
-    return adapters
+def get_active_gcp_tool_adapters() -> GcpToolAdapters:
+    """Return the active live `GcpToolAdapters` bundle."""
+    return _gcp_adapters()
 
 
 def get_gcp_adapters_status_metadata() -> dict[str, Any]:
@@ -1895,11 +1850,8 @@ def get_gcp_adapters_status_metadata() -> dict[str, Any]:
         if _CUSTOM_GCP_ADAPTERS is not None
         else GcpToolConfig.from_env()
     )
-    active_adapters, strict_gcp = _resolve_gcp_dispatch()
     return {
-        "data_backend_mode": cfg.data_backend,
-        "live_gcp_active": active_adapters is not None,
-        "strict_gcp": strict_gcp,
+        "data_backend": "gcp",
         "project_id": cfg.project_id,
         "location": cfg.location,
         "bigquery": {
@@ -1951,28 +1903,6 @@ def _is_transient_gcp_error(exc: BaseException) -> bool:
     return False
 
 
-def _should_fallback_in_auto_mode(exc: BaseException, *, strict_gcp: bool) -> bool:
-    """Determine whether an adapter failure in `auto` mode should gracefully fall back to local files."""
-    if strict_gcp:
-        return False
-    if _is_transient_gcp_error(exc):
-        return False
-    if isinstance(
-        exc,
-        (
-            DefaultCredentialsError,
-            RefreshError,
-            GcpAdapterHttpError,
-            GcpEndpointNotReadyError,
-            ToolExecutionError,
-            httpx.ConnectError,
-            OSError,
-        ),
-    ):
-        return True
-    return False
-
-
 def _record_gcp_backend_invocation(
     tool_context: ToolContext | None,
     *,
@@ -1998,7 +1928,7 @@ def _record_gcp_backend_invocation(
 
 
 # ---------------------------------------------------------------------------
-# Context Cache Telemetry & Local Curated Dataset Helpers
+# Context Cache Telemetry
 # ---------------------------------------------------------------------------
 
 
@@ -2026,144 +1956,6 @@ def get_context_cache_runtime_stats() -> dict[str, Any]:
         "mean_hit_lookup_latency_ms": round(hit_ms / hits, 3) if hits > 0 else 0.0,
         "mean_miss_load_latency_ms": round(miss_ms / misses, 3) if misses > 0 else 0.0,
     }
-
-
-def _get_dataset_dir() -> Path:
-    """Resolve the active curated dataset directory (`EDGAR_DATASET_DIR` / `EDGAR_DATA_ROOT` aware)."""
-    return resolve_curated_dataset_dir()
-
-
-def _synthesize_fallback_10k_markdown(profile: FinancialDataProfile) -> str:
-    """Generate grounded Item 1A and Item 7 Markdown for a profile when unstructured files are gitignored in CI."""
-    rev_str = f"${profile.revenue:,.0f}" if profile.revenue is not None else "N/A"
-    op_str = f"${profile.operating_income:,.0f}" if profile.operating_income is not None else "N/A"
-    ni_str = f"${profile.net_income:,.0f}" if profile.net_income is not None else "N/A"
-
-    item_1a = (
-        f"**Export Control Licensing & Geopolitical Trade Restrictions ({profile.ticker} FY{profile.fiscal_year})**\n\n"
-        f"{profile.company_name} ({profile.ticker}) faces regulatory and export control licensing risks, "
-        f"including U.S. government restrictions on advanced AI data center accelerators (such as H20, H100, H200, "
-        f"and Blackwell systems) shipped to China and D:5 countries during fiscal year {profile.fiscal_year}.\n\n"
-        f"**AI Infrastructure Demand, Customer Concentration & Cloud Capex Cycles**\n\n"
-        f"Rapid enterprise and hyperscale AI adoption in the {profile.gics_sector} ({profile.gics_sub_industry}) "
-        f"sector creates demand volatility, R&D investment intensity, and competitive pressure across "
-        f"next-generation compute and software platforms.\n\n"
-        f"**Supply Chain, Foundry & Advanced Packaging Constraints**\n\n"
-        f"Long manufacturing lead times for wafer fabrication, CoWoS advanced packaging, and high-bandwidth memory (HBM) "
-        f"could constrain shipment volumes or result in excess inventory reserves and purchase commitment charges.\n\n"
-        f"**Cybersecurity, Data Governance & AI Safety Compliance**\n\n"
-        f"Evolving global AI regulation, cybersecurity threats, and intellectual property litigation may increase "
-        f"compliance costs and affect international commercial operations."
-    )
-    item_7 = (
-        f"**Executive Overview & Fiscal Year {profile.fiscal_year} Financial Highlights**\n\n"
-        f"In fiscal year {profile.fiscal_year} (period ended {profile.period_of_report}), {profile.company_name} "
-        f"({profile.ticker}) recorded total revenue of {rev_str}, operating income of {op_str}, and net income of {ni_str}. "
-        f"Performance in {profile.gics_sector} was driven by enterprise cloud infrastructure, AI platform adoption, "
-        f"and R&D product execution.\n\n"
-        f"**Segment Results of Operations & Revenue Drivers**\n\n"
-        f"Data Center and accelerated computing demand expanded significantly as hyperscale cloud providers deployed "
-        f"Blackwell and Hopper architecture clusters for generative AI training and inference workloads.\n\n"
-        f"**Gross Margin, R&D Investment & Operating Expense Analysis**\n\n"
-        f"Operating leverage improved due to higher mix of data center systems and software, partially offset by "
-        f"increased research and development (R&D) engineering headcount and new product ramp costs.\n\n"
-        f"**Liquidity, Capital Resources & Cash Flows**\n\n"
-        f"{profile.company_name} maintained strong operating cash flows to fund capital expenditures, strategic "
-        f"supply capacity commitments, share repurchases, and quarterly dividends."
-    )
-    return format_combined_10k_markdown(
-        ticker=profile.ticker,
-        company_name=profile.company_name,
-        cik=profile.cik,
-        gics_sector=profile.gics_sector,
-        gics_sub_industry=profile.gics_sub_industry,
-        fiscal_year=profile.fiscal_year,
-        period_of_report=profile.period_of_report,
-        filing_date=profile.filing_date,
-        accession_number=profile.accession_number,
-        sec_filing_url=profile.sec_filing_url,
-        item_1a_markdown=item_1a,
-        item_7_markdown=item_7,
-    )
-
-
-@functools.lru_cache(maxsize=4)
-def _load_all_profiles_cached(dataset_dir_str: str) -> list[FinancialDataProfile]:
-    """Load and cache all structured `FinancialDataProfile` records from disk."""
-    dataset_dir = Path(dataset_dir_str)
-    manifest_path = dataset_dir / "manifests" / "bigquery_financials.jsonl"
-    if not manifest_path.exists():
-        default_manifest = DEFAULT_OUTPUT_DIR.resolve() / "manifests" / "bigquery_financials.jsonl"
-        if default_manifest.exists():
-            manifest_path = default_manifest
-
-    profiles: list[FinancialDataProfile] = []
-
-    if manifest_path.exists():
-        for line in manifest_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            profiles.append(FinancialDataProfile.model_validate_json(line))
-    else:
-        struct_root = dataset_dir / "structured"
-        if struct_root.exists():
-            for json_file in sorted(struct_root.rglob("*_financials.json")):
-                profiles.append(
-                    FinancialDataProfile.model_validate_json(json_file.read_text(encoding="utf-8"))
-                )
-
-    profiles.sort(key=lambda p: (p.ticker, p.fiscal_year))
-    return profiles
-
-
-@functools.lru_cache(maxsize=2)
-def _load_all_chunks_cached(dataset_dir_str: str) -> tuple[list[dict[str, Any]], np.ndarray]:
-    """Load metadata-tagged chunks and their 768-d embedding matrix for fast hybrid search."""
-    dataset_dir = Path(dataset_dir_str)
-    chunks_path = dataset_dir / "manifests" / "bigquery_filing_chunks.jsonl"
-    rows: list[dict[str, Any]] = []
-    embeddings: list[list[float]] = []
-
-    if chunks_path.exists():
-        for line in chunks_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
-            emb = row.get("embedding") or []
-            if len(emb) == 768:
-                rows.append(row)
-                embeddings.append(emb)
-    else:
-        # In CI/CD or container environments where the 92MB chunks JSONL is gitignored,
-        # synthesize deterministic chunks and 768-d embeddings on the fly from curated profiles.
-        profiles = _load_all_profiles_cached(dataset_dir_str)
-        for prof in profiles:
-            md_path = dataset_dir / prof.unstructured_blob_path
-            if md_path.exists():
-                md_text = md_path.read_text(encoding="utf-8")
-            else:
-                md_text = _synthesize_fallback_10k_markdown(prof)
-            filing_chunks = chunk_filing_document(
-                prof,
-                md_text,
-                target_chars=260,
-                max_chars=550,
-                min_chars=60,
-                overlap_chars=30,
-            )
-            for chunk in filing_chunks:
-                chunk.embedding = generate_deterministic_embedding(chunk.chunk_text)
-                row = chunk.to_bigquery_record()
-                rows.append(row)
-                embeddings.append(chunk.embedding)
-
-    if not embeddings:
-        return [], np.zeros((0, 768), dtype=np.float32)
-
-    matrix = np.asarray(embeddings, dtype=np.float32)
-    return rows, matrix
 
 
 def _parse_ticker_list(tickers_csv: str) -> set[str]:
@@ -2415,7 +2207,6 @@ def _execute_live_gcp_hybrid_rag(
     start_year: int,
     end_year: int,
     effective_top_k: int,
-    strict_gcp: bool,
 ) -> tuple[list[dict[str, Any]], int, list[str]]:
     """Run hybrid retrieval across Vertex AI Vector Search, Vertex AI Search, and BigQuery."""
     candidate_k = min(25, max(effective_top_k * 2, 10))
@@ -2518,9 +2309,11 @@ def _execute_live_gcp_hybrid_rag(
             if "bigquery_chunk_hydration" not in services_hit:
                 services_hit.append("bigquery_chunk_hydration")
         except Exception as exc:
-            if _is_transient_gcp_error(exc) or strict_gcp:
+            if _is_transient_gcp_error(exc):
                 raise
-            logger.warning("BigQuery chunk hydration failed for Vector Search IDs: %s", exc)
+            raise ToolExecutionError(
+                f"BigQuery chunk hydration failed for Vector Search IDs: {exc}"
+            ) from exc
 
     # Reciprocal Rank Fusion (RRF) + semantic similarity + lexical keyword scoring
     fused: dict[str, dict[str, Any]] = {}
@@ -2688,43 +2481,20 @@ def fetch_financial_metrics(
         else None
     )
 
-    records: list[dict[str, Any]] | None = None
-    adapters, strict_gcp = _resolve_gcp_dispatch()
-    if adapters is not None:
-        try:
-            bq_profiles = adapters.bigquery.fetch_profiles(
-                tickers=ticker_filter,
-                start_year=start_year,
-                end_year=end_year,
-                gics_sector=sector_norm,
-            )
-            records = [_profile_to_metric_record(p).model_dump(mode="json") for p in bq_profiles]
-            _record_gcp_backend_invocation(
-                tool_context,
-                tool_name="fetch_financial_metrics",
-                data_source="gcp",
-                services_hit=["bigquery"],
-            )
-        except Exception as exc:
-            if not _should_fallback_in_auto_mode(exc, strict_gcp=strict_gcp):
-                raise
-            logger.warning(
-                "BigQuery fetch_financial_metrics unavailable in auto mode (%s); falling back to local corpus.",
-                exc,
-            )
-
-    if records is None:
-        dataset_dir = _get_dataset_dir()
-        profiles = _load_all_profiles_cached(str(dataset_dir))
-        records = []
-        for p in profiles:
-            if ticker_filter and p.ticker.upper().replace(".", "-") not in ticker_filter:
-                continue
-            if sector_norm and p.gics_sector.lower() != sector_norm:
-                continue
-            if p.fiscal_year < start_year or p.fiscal_year > end_year:
-                continue
-            records.append(_profile_to_metric_record(p).model_dump(mode="json"))
+    adapters = _gcp_adapters()
+    bq_profiles = adapters.bigquery.fetch_profiles(
+        tickers=ticker_filter,
+        start_year=start_year,
+        end_year=end_year,
+        gics_sector=sector_norm,
+    )
+    records = [_profile_to_metric_record(p).model_dump(mode="json") for p in bq_profiles]
+    _record_gcp_backend_invocation(
+        tool_context,
+        tool_name="fetch_financial_metrics",
+        data_source="gcp",
+        services_hit=["bigquery"],
+    )
 
     if tool_context is not None and hasattr(tool_context, "state"):
         existing = list(tool_context.state.get("fetched_metrics", []))
@@ -2848,199 +2618,48 @@ def query_looker_financial_explore(
             tool_context.state["looker_query_results"] = history
         return tel_result
 
-    adapters, strict_gcp = _resolve_gcp_dispatch()
-    if adapters is not None:
-        try:
-            if explore_key == "chunk_health":
-                health_res = adapters.bigquery.query_chunk_health()
-                _record_gcp_backend_invocation(
-                    tool_context,
-                    tool_name="query_looker_financial_explore",
-                    data_source="gcp",
-                    services_hit=["bigquery"],
-                )
-                return health_res
-
-            if explore_key in ("yoy_variances", "peer_comparison"):
-                bq_rows = adapters.bigquery.query_yoy_variances(
-                    tickers=ticker_filter,
-                    gics_sector=sector_norm,
-                    start_year=start_year,
-                    end_year=end_year,
-                )
-            else:
-                bq_rows = adapters.bigquery.query_sector_benchmarks(
-                    tickers=ticker_filter,
-                    gics_sector=sector_norm,
-                    start_year=start_year,
-                    end_year=end_year,
-                )
-
-            gcp_result = {
-                "status": "success",
-                "explore_name": explore_key,
-                "row_count": len(bq_rows),
-                "rows": bq_rows,
-            }
-            if tool_context is not None and hasattr(tool_context, "state"):
-                history = list(tool_context.state.get("looker_query_results", []))
-                history.append(gcp_result)
-                tool_context.state["looker_query_results"] = history
-            _record_gcp_backend_invocation(
-                tool_context,
-                tool_name="query_looker_financial_explore",
-                data_source="gcp",
-                services_hit=["bigquery"],
-            )
-            return gcp_result
-        except Exception as exc:
-            if not _should_fallback_in_auto_mode(exc, strict_gcp=strict_gcp):
-                raise
-            logger.warning(
-                "BigQuery query_looker_financial_explore('%s') unavailable in auto mode (%s); falling back to local corpus.",
-                explore_key,
-                exc,
-            )
-
-    dataset_dir = _get_dataset_dir()
+    adapters = _gcp_adapters()
     if explore_key == "chunk_health":
-        health_path = dataset_dir / "manifests" / "chunk_health_report.json"
-        if not health_path.exists():
-            default_health = DEFAULT_OUTPUT_DIR.resolve() / "manifests" / "chunk_health_report.json"
-            if default_health.exists():
-                health_path = default_health
-        if not health_path.exists():
-            return {
-                "status": "error",
-                "explore_name": explore_key,
-                "message": f"Chunk health report not found at {health_path}",
-            }
-        health_data = json.loads(health_path.read_text(encoding="utf-8"))
-        return {
-            "status": "success",
-            "explore_name": "chunk_health",
-            "health_status": health_data.get("health_status"),
-            "health_score": health_data.get("health_score"),
-            "total_chunks": health_data.get("total_chunks"),
-            "embedding_coverage_ratio": health_data.get("embedding_coverage_ratio"),
-            "full_section_coverage_ratio": health_data.get("full_section_coverage_ratio"),
-            "by_section": health_data.get("by_section", {}),
-            "by_sector": health_data.get("by_sector", {}),
-        }
-
-    profiles = _load_all_profiles_cached(str(dataset_dir))
-    by_ticker: dict[str, list[FinancialDataProfile]] = defaultdict(list)
-    for p in profiles:
-        if ticker_filter and p.ticker.upper().replace(".", "-") not in ticker_filter:
-            continue
-        if sector_norm and p.gics_sector.lower() != sector_norm:
-            continue
-        by_ticker[p.ticker].append(p)
-
-    rows: list[dict[str, Any]] = []
+        health_res = adapters.bigquery.query_chunk_health()
+        _record_gcp_backend_invocation(
+            tool_context,
+            tool_name="query_looker_financial_explore",
+            data_source="gcp",
+            services_hit=["bigquery"],
+        )
+        return health_res
 
     if explore_key in ("yoy_variances", "peer_comparison"):
-        for _ticker, t_profiles in sorted(by_ticker.items()):
-            t_profiles.sort(key=lambda x: x.fiscal_year)
-            prev_prof: FinancialDataProfile | None = None
-            for prof in t_profiles:
-                if prof.fiscal_year >= start_year and prof.fiscal_year <= end_year:
-                    rev_delta = rev_pct = op_delta = op_pct = ni_delta = ni_pct = None
-                    rd_delta = rd_pct = None
-                    if prev_prof and prev_prof.fiscal_year == prof.fiscal_year - 1:
-                        if prof.revenue is not None and prev_prof.revenue is not None:
-                            rev_delta = round(prof.revenue - prev_prof.revenue, 2)
-                            if prev_prof.revenue != 0:
-                                rev_pct = round((rev_delta / abs(prev_prof.revenue)) * 100.0, 2)
-                        if (
-                            prof.operating_income is not None
-                            and prev_prof.operating_income is not None
-                        ):
-                            op_delta = round(prof.operating_income - prev_prof.operating_income, 2)
-                            if prev_prof.operating_income != 0:
-                                op_pct = round(
-                                    (op_delta / abs(prev_prof.operating_income)) * 100.0,
-                                    2,
-                                )
-                        if prof.net_income is not None and prev_prof.net_income is not None:
-                            ni_delta = round(prof.net_income - prev_prof.net_income, 2)
-                            if prev_prof.net_income != 0:
-                                ni_pct = round((ni_delta / abs(prev_prof.net_income)) * 100.0, 2)
-                        prof_rd = prof.research_and_development
-                        prev_rd = prev_prof.research_and_development
-                        if prof_rd is not None and prev_rd is not None:
-                            rd_delta = round(prof_rd - prev_rd, 2)
-                            if prev_rd != 0:
-                                rd_pct = round((rd_delta / abs(prev_rd)) * 100.0, 2)
-
-                    rec = _profile_to_metric_record(prof)
-                    rows.append(
-                        {
-                            "profile_id": prof.profile_id,
-                            "ticker": prof.ticker,
-                            "company_name": prof.company_name,
-                            "gics_sector": prof.gics_sector,
-                            "fiscal_year": prof.fiscal_year,
-                            "prev_fiscal_year": prev_prof.fiscal_year if prev_prof else None,
-                            "revenue": prof.revenue,
-                            "revenue_yoy_delta": rev_delta,
-                            "revenue_yoy_pct": rev_pct,
-                            "operating_income": prof.operating_income,
-                            "operating_income_yoy_delta": op_delta,
-                            "operating_income_yoy_pct": op_pct,
-                            "net_income": prof.net_income,
-                            "net_income_yoy_delta": ni_delta,
-                            "net_income_yoy_pct": ni_pct,
-                            "research_and_development": prof.research_and_development,
-                            "research_and_development_yoy_delta": rd_delta,
-                            "research_and_development_yoy_pct": rd_pct,
-                            "operating_margin_pct": rec.operating_margin_pct,
-                            "net_margin_pct": rec.net_margin_pct,
-                            "rd_intensity_pct": rec.rd_intensity_pct,
-                            "sec_filing_url": prof.sec_filing_url,
-                        }
-                    )
-                prev_prof = prof
-
-    elif explore_key == "sector_benchmarks":
-        sector_year_groups: dict[tuple[str, int], list[FinancialDataProfile]] = defaultdict(list)
-        for t_profiles in by_ticker.values():
-            for prof in t_profiles:
-                if start_year <= prof.fiscal_year <= end_year:
-                    sector_year_groups[(prof.gics_sector, prof.fiscal_year)].append(prof)
-
-        for (sector_name, fy), group in sorted(sector_year_groups.items()):
-            revs = [p.revenue for p in group if p.revenue is not None]
-            ops = [p.operating_income for p in group if p.operating_income is not None]
-            nis = [p.net_income for p in group if p.net_income is not None]
-            rds = [
-                p.research_and_development for p in group if p.research_and_development is not None
-            ]
-            rows.append(
-                {
-                    "gics_sector": sector_name,
-                    "fiscal_year": fy,
-                    "company_count": len(group),
-                    "tickers": sorted(p.ticker for p in group),
-                    "total_sector_revenue": round(sum(revs), 2) if revs else None,
-                    "avg_company_revenue": round(sum(revs) / len(revs), 2) if revs else None,
-                    "total_sector_operating_income": round(sum(ops), 2) if ops else None,
-                    "total_sector_net_income": round(sum(nis), 2) if nis else None,
-                    "total_sector_research_and_development": (round(sum(rds), 2) if rds else None),
-                }
-            )
+        bq_rows = adapters.bigquery.query_yoy_variances(
+            tickers=ticker_filter,
+            gics_sector=sector_norm,
+            start_year=start_year,
+            end_year=end_year,
+        )
+    else:
+        bq_rows = adapters.bigquery.query_sector_benchmarks(
+            tickers=ticker_filter,
+            gics_sector=sector_norm,
+            start_year=start_year,
+            end_year=end_year,
+        )
 
     result = {
         "status": "success",
         "explore_name": explore_key,
-        "row_count": len(rows),
-        "rows": rows,
+        "row_count": len(bq_rows),
+        "rows": bq_rows,
     }
     if tool_context is not None and hasattr(tool_context, "state"):
         history = list(tool_context.state.get("looker_query_results", []))
         history.append(result)
         tool_context.state["looker_query_results"] = history
-
+    _record_gcp_backend_invocation(
+        tool_context,
+        tool_name="query_looker_financial_explore",
+        data_source="gcp",
+        services_hit=["bigquery"],
+    )
     return result
 
 
@@ -3071,33 +2690,18 @@ def calculate_period_variances(
             "message": "Please specify at least one ticker symbol (e.g., 'NVDA' or 'NVDA,AAPL').",
         }
 
-    profiles: list[FinancialDataProfile] | None = None
-    adapters, strict_gcp = _resolve_gcp_dispatch()
-    if adapters is not None:
-        try:
-            # Fetch start_year - 1 so the initial year's YoY step delta is populated
-            profiles = adapters.bigquery.fetch_profiles(
-                tickers=ticker_filter,
-                start_year=start_year - 1,
-                end_year=end_year,
-            )
-            _record_gcp_backend_invocation(
-                tool_context,
-                tool_name="calculate_period_variances",
-                data_source="gcp",
-                services_hit=["bigquery"],
-            )
-        except Exception as exc:
-            if not _should_fallback_in_auto_mode(exc, strict_gcp=strict_gcp):
-                raise
-            logger.warning(
-                "BigQuery calculate_period_variances unavailable in auto mode (%s); falling back to local corpus.",
-                exc,
-            )
-
-    if profiles is None:
-        dataset_dir = _get_dataset_dir()
-        profiles = _load_all_profiles_cached(str(dataset_dir))
+    # Fetch start_year - 1 so the initial year's YoY step delta is populated
+    profiles = _gcp_adapters().bigquery.fetch_profiles(
+        tickers=ticker_filter,
+        start_year=start_year - 1,
+        end_year=end_year,
+    )
+    _record_gcp_backend_invocation(
+        tool_context,
+        tool_name="calculate_period_variances",
+        data_source="gcp",
+        services_hit=["bigquery"],
+    )
 
     reports, missing_tickers = _build_variance_reports_from_profiles(
         profiles,
@@ -3161,131 +2765,38 @@ def search_10k_chunks_rag(
     )
     effective_top_k = max(1, min(int(top_k), 25))
 
-    adapters, strict_gcp = _resolve_gcp_dispatch()
-    if adapters is not None:
-        try:
-            gcp_citations, cand_count, services_hit = _execute_live_gcp_hybrid_rag(
-                adapters,
-                query=query,
-                ticker_filter=ticker_filter,
-                sector_norm=sector_norm,
-                sec_norm=sec_norm,
-                start_year=start_year,
-                end_year=end_year,
-                effective_top_k=effective_top_k,
-                strict_gcp=strict_gcp,
-            )
-            if tool_context is not None and hasattr(tool_context, "state"):
-                existing_cits = list(tool_context.state.get("retrieved_citations", []))
-                existing_cits.extend(gcp_citations)
-                tool_context.state["retrieved_citations"] = existing_cits
-            _record_gcp_backend_invocation(
-                tool_context,
-                tool_name="search_10k_chunks_rag",
-                data_source="gcp",
-                services_hit=services_hit,
-            )
-            if not gcp_citations:
-                return {
-                    "status": "success",
-                    "citation_count": 0,
-                    "citations": [],
-                    "message": "No 10-K chunks matched the requested metadata filters.",
-                }
-            return {
-                "status": "success",
-                "citation_count": len(gcp_citations),
-                "candidates_searched": cand_count,
-                "citations": gcp_citations,
-            }
-        except Exception as exc:
-            if not _should_fallback_in_auto_mode(exc, strict_gcp=strict_gcp):
-                raise
-            logger.warning(
-                "Live GCP Hybrid RAG search unavailable in auto mode (%s); falling back to local corpus.",
-                exc,
-            )
-
-    dataset_dir = _get_dataset_dir()
-    rows, matrix = _load_all_chunks_cached(str(dataset_dir))
-    if not rows:
-        return {
-            "status": "error",
-            "message": "Vector database chunk manifest is empty or not yet generated.",
-        }
-
-    candidate_indices: list[int] = []
-    for idx, row in enumerate(rows):
-        if (
-            ticker_filter
-            and str(row.get("ticker", "")).upper().replace(".", "-") not in ticker_filter
-        ):
-            continue
-        if sector_norm and str(row.get("gics_sector", "")).lower() != sector_norm:
-            continue
-        if sec_norm and str(row.get("section_id", "")).lower() != sec_norm:
-            continue
-        fy = int(row.get("fiscal_year", 0))
-        if fy < start_year or fy > end_year:
-            continue
-        candidate_indices.append(idx)
-
-    if not candidate_indices:
+    gcp_citations, cand_count, services_hit = _execute_live_gcp_hybrid_rag(
+        _gcp_adapters(),
+        query=query,
+        ticker_filter=ticker_filter,
+        sector_norm=sector_norm,
+        sec_norm=sec_norm,
+        start_year=start_year,
+        end_year=end_year,
+        effective_top_k=effective_top_k,
+    )
+    if tool_context is not None and hasattr(tool_context, "state"):
+        existing_cits = list(tool_context.state.get("retrieved_citations", []))
+        existing_cits.extend(gcp_citations)
+        tool_context.state["retrieved_citations"] = existing_cits
+    _record_gcp_backend_invocation(
+        tool_context,
+        tool_name="search_10k_chunks_rag",
+        data_source="gcp",
+        services_hit=services_hit,
+    )
+    if not gcp_citations:
         return {
             "status": "success",
             "citation_count": 0,
             "citations": [],
             "message": "No 10-K chunks matched the requested metadata filters.",
         }
-
-    q_vec = np.asarray(generate_deterministic_embedding(query), dtype=np.float32)
-    cand_matrix = matrix[candidate_indices]
-    dense_scores = cand_matrix @ q_vec
-
-    query_terms = set(_WORD_TOKEN_RE.findall(query.lower()))
-    scored: list[tuple[float, int]] = []
-    for pos, row_idx in enumerate(candidate_indices):
-        row = rows[row_idx]
-        text_lower = str(row.get("chunk_text", "")).lower()
-        lexical_boost = 0.0
-        if query_terms:
-            matched_terms = sum(1 for term in query_terms if term in text_lower)
-            lexical_boost = 0.35 * (matched_terms / len(query_terms))
-        hybrid_score = float(dense_scores[pos]) + lexical_boost
-        scored.append((hybrid_score, row_idx))
-
-    scored.sort(key=lambda item: item[0], reverse=True)
-    top_hits = scored[:effective_top_k]
-
-    citations: list[dict[str, Any]] = []
-    for score, row_idx in top_hits:
-        row = rows[row_idx]
-        cit = GroundedCitation(
-            chunk_id=str(row["chunk_id"]),
-            profile_id=str(row["profile_id"]),
-            ticker=str(row["ticker"]),
-            company_name=str(row["company_name"]),
-            gics_sector=str(row.get("gics_sector") or "Unknown"),
-            fiscal_year=int(row["fiscal_year"]),
-            section_id=row["section_id"],
-            section_title=str(row.get("section_title") or row["section_id"]),
-            excerpt=str(row["chunk_text"]),
-            sec_filing_url=str(row.get("sec_filing_url") or ""),
-            unstructured_gcs_uri=str(row.get("unstructured_gcs_uri") or ""),
-            score=round(score, 4),
-        )
-        citations.append(cit.model_dump(mode="json"))
-
-    if tool_context is not None and hasattr(tool_context, "state"):
-        existing_cits = list(tool_context.state.get("retrieved_citations", []))
-        existing_cits.extend(citations)
-        tool_context.state["retrieved_citations"] = existing_cits
-
     return {
         "status": "success",
-        "citation_count": len(citations),
-        "candidates_searched": len(candidate_indices),
-        "citations": citations,
+        "citation_count": len(gcp_citations),
+        "candidates_searched": cand_count,
+        "citations": gcp_citations,
     }
 
 
@@ -3311,7 +2822,6 @@ def load_cached_10k_section(
         Dictionary with 'status', 'cache_hit', 'token_estimate', 'lookup_latency_ms', 'sec_filing_url', and grounded Markdown 'content'.
     """
     t0 = time.perf_counter()
-    dataset_dir = _get_dataset_dir()
     norm_ticker = ticker.strip().upper().replace(".", "-")
     sec_key = section_id.strip().lower()
     if sec_key not in ("item_1a", "item_7"):
@@ -3325,68 +2835,27 @@ def load_cached_10k_section(
     cache_hit = entry is not None
 
     if entry is None:
-        matched_prof: FinancialDataProfile | None = None
-        md_content: str | None = None
+        adapters = _gcp_adapters()
+        bq_profiles = adapters.bigquery.fetch_profiles(
+            tickers={norm_ticker},
+            start_year=fiscal_year,
+            end_year=fiscal_year,
+        )
+        matched_prof = bq_profiles[0] if bq_profiles else None
+        if matched_prof is None:
+            return {
+                "status": "error",
+                "message": f"No curated 10-K filing found in BigQuery for {norm_ticker} FY{fiscal_year}.",
+            }
+        gcs_target = matched_prof.unstructured_gcs_uri or matched_prof.unstructured_blob_path
+        md_content = adapters.gcs_corpus.fetch_markdown(gcs_target)
         content_source = "gcs"
-        adapters, strict_gcp = _resolve_gcp_dispatch()
-
-        if adapters is not None:
-            try:
-                bq_profiles = adapters.bigquery.fetch_profiles(
-                    tickers={norm_ticker},
-                    start_year=fiscal_year,
-                    end_year=fiscal_year,
-                )
-                matched_prof = bq_profiles[0] if bq_profiles else None
-                if matched_prof is None and strict_gcp:
-                    return {
-                        "status": "error",
-                        "message": f"No curated 10-K filing found in BigQuery for {norm_ticker} FY{fiscal_year}.",
-                    }
-                if matched_prof is not None:
-                    gcs_target = (
-                        matched_prof.unstructured_gcs_uri or matched_prof.unstructured_blob_path
-                    )
-                    md_content = adapters.gcs_corpus.fetch_markdown(gcs_target)
-                    _record_gcp_backend_invocation(
-                        tool_context,
-                        tool_name="load_cached_10k_section",
-                        data_source="gcp",
-                        services_hit=["bigquery", "gcs"],
-                    )
-            except Exception as exc:
-                if not _should_fallback_in_auto_mode(exc, strict_gcp=strict_gcp):
-                    raise
-                logger.warning(
-                    "GCP load_cached_10k_section unavailable in auto mode (%s); falling back to local corpus.",
-                    exc,
-                )
-                matched_prof = None
-                md_content = None
-
-        if matched_prof is None or md_content is None:
-            profiles = _load_all_profiles_cached(str(dataset_dir))
-            matched_prof = next(
-                (
-                    p
-                    for p in profiles
-                    if p.ticker.upper().replace(".", "-") == norm_ticker
-                    and p.fiscal_year == fiscal_year
-                ),
-                None,
-            )
-            if matched_prof is None:
-                return {
-                    "status": "error",
-                    "message": f"No curated 10-K filing found for {norm_ticker} FY{fiscal_year}.",
-                }
-            md_path = dataset_dir / matched_prof.unstructured_blob_path
-            if md_path.exists():
-                md_content = md_path.read_text(encoding="utf-8")
-                content_source = "local_markdown"
-            else:
-                md_content = _synthesize_fallback_10k_markdown(matched_prof)
-                content_source = "synthesized_fallback"
+        _record_gcp_backend_invocation(
+            tool_context,
+            tool_name="load_cached_10k_section",
+            data_source="gcp",
+            services_hit=["bigquery", "gcs"],
+        )
 
         sections = extract_sections_from_combined_markdown(md_content)
         sec_text = sections.get(sec_key, "")
@@ -3401,7 +2870,6 @@ def load_cached_10k_section(
             "unstructured_gcs_uri": matched_prof.unstructured_gcs_uri,
             "token_estimate": token_est,
             "full_text": sec_text,
-            # gcs | local_markdown | synthesized_fallback (placeholder text, not a filing)
             "content_source": content_source,
         }
         _SESSION_10K_CONTEXT_CACHE[cache_id] = entry
@@ -3525,9 +2993,8 @@ def query_cached_10k_context(
 
     Returns:
         Dictionary with 'status', 'passages' (each with 'text', 'chunk_id', 'chunk_match'),
-        'section_title', 'sec_filing_url', 'content_source' (gcs | local_markdown |
-        synthesized_fallback; never cite synthesized_fallback text as filing evidence), and
-        'matched_citations'.
+        'section_title', 'sec_filing_url', 'content_source' (always 'gcs': the filing
+        Markdown in the SEC corpus bucket), and 'matched_citations'.
     """
     t0 = time.perf_counter()
     cached_res = load_cached_10k_section(
@@ -3556,60 +3023,43 @@ def query_cached_10k_context(
     sec_key = str(cached_res["section_id"])
     q_terms = set(_WORD_TOKEN_RE.findall(variance_query.lower()))
 
-    adapters, strict_gcp = _resolve_gcp_dispatch()
-    dense_sims: list[float] | None = None
-    section_chunks: list[dict[str, Any]] | None = None
+    adapters = _gcp_adapters()
+    dense_sims: list[float] = []
     services_hit: list[str] = []
-
-    if adapters is not None and raw_blocks:
-        try:
-            q_emb = np.asarray(adapters.embed_query(variance_query), dtype=np.float32)
+    if raw_blocks:
+        q_emb = np.asarray(adapters.embed_query(variance_query), dtype=np.float32)
+        # Paragraph embeddings depend only on the section text, so they are computed once per
+        # cached section and reused by every later query against it (flag explanations, the
+        # ReAct pre-pass, and agent tool calls often hit the same company-year section).
+        cache_key = str(cached_res["cache_key"])
+        section_entry = _SESSION_10K_CONTEXT_CACHE.get(cache_key)
+        cached_blocks = (section_entry or {}).get("block_embeddings")
+        if cached_blocks is not None and len(cached_blocks) == len(raw_blocks):
+            blk_embs = np.asarray(cached_blocks, dtype=np.float32)
+        else:
             blk_embs = np.asarray(
                 adapters.embed_texts(
                     [blk[:600] for blk in raw_blocks], task_type="RETRIEVAL_DOCUMENT"
                 ),
                 dtype=np.float32,
             )
-            dense_sims = [float(x) for x in (blk_embs @ q_emb)]
-            services_hit.append("vertex_ai_embeddings")
-        except Exception as exc:
-            if not _should_fallback_in_auto_mode(exc, strict_gcp=strict_gcp):
-                raise
-            logger.warning(
-                "Vertex AI embeddings unavailable in query_cached_10k_context (%s); using deterministic scoring.",
-                exc,
-            )
+            if section_entry is not None:
+                section_entry["block_embeddings"] = blk_embs.tolist()
+        dense_sims = [float(x) for x in (blk_embs @ q_emb)]
+        services_hit.append("vertex_ai_embeddings")
 
-        try:
-            section_chunks = adapters.bigquery.fetch_section_chunks(
-                ticker=norm_ticker,
-                fiscal_year=int(fiscal_year),
-                section_id=sec_key,
-            )
-            services_hit.append("bigquery")
-        except Exception as exc:
-            if not _should_fallback_in_auto_mode(exc, strict_gcp=strict_gcp):
-                raise
-            logger.warning(
-                "BigQuery fetch_section_chunks unavailable in auto mode (%s); falling back to local chunk manifest.",
-                exc,
-            )
-            section_chunks = None
-
-    if services_hit:
-        _record_gcp_backend_invocation(
-            tool_context,
-            tool_name="query_cached_10k_context",
-            data_source="gcp",
-            services_hit=services_hit,
-        )
-
-    if dense_sims is None:
-        q_vec = np.asarray(generate_deterministic_embedding(variance_query), dtype=np.float32)
-        dense_sims = [
-            float(np.asarray(generate_deterministic_embedding(blk[:600]), dtype=np.float32) @ q_vec)
-            for blk in raw_blocks
-        ]
+    section_chunks = adapters.bigquery.fetch_section_chunks(
+        ticker=norm_ticker,
+        fiscal_year=int(fiscal_year),
+        section_id=sec_key,
+    )
+    services_hit.append("bigquery")
+    _record_gcp_backend_invocation(
+        tool_context,
+        tool_name="query_cached_10k_context",
+        data_source="gcp",
+        services_hit=services_hit,
+    )
 
     scored_blocks: list[tuple[float, str]] = []
     for idx, blk in enumerate(raw_blocks):
@@ -3626,17 +3076,6 @@ def query_cached_10k_context(
     top_passages = [text for _, text in scored_blocks[:eff_limit]]
 
     # Link cached section explanations to canonical chunk IDs for split-pane traceability
-    if section_chunks is None:
-        dataset_dir = _get_dataset_dir()
-        rows, _ = _load_all_chunks_cached(str(dataset_dir))
-        section_chunks = [
-            r
-            for r in rows
-            if str(r.get("ticker", "")).upper() == norm_ticker.upper()
-            and int(r.get("fiscal_year", 0)) == int(fiscal_year)
-            and str(r.get("section_id", "")).lower() == sec_key
-        ]
-
     matched_chunk_ids: list[str] = []
     matched_citations: list[dict[str, Any]] = []
     passages: list[dict[str, Any]] = []
@@ -3713,14 +3152,6 @@ def query_cached_10k_context(
         "lookup_latency_ms": total_lookup_ms,
         "sec_filing_url": cached_res["sec_filing_url"],
         "content_source": content_source,
-        **(
-            {
-                "warning": "Section text is a synthesized placeholder (filing Markdown unavailable); "
-                "do not cite it as 10-K evidence."
-            }
-            if content_source == "synthesized_fallback"
-            else {}
-        ),
         "passages": passages,
         "explanations": top_passages,
         "matched_chunk_ids": matched_chunk_ids,

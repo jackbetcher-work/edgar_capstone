@@ -27,8 +27,13 @@ def evidence_leads(llm_request: LlmRequest) -> list[dict[str, Any]]:
     return [lead for lead in json.loads(m.group(1)) if lead.get("chunk_id")]
 
 
+_CHUNK_HEADER_RE = re.compile(r"^\s*\[[^\]\n]*\]\s*")
+
+
 def verbatim_quote(text: str, words: int = 14) -> str:
-    return " ".join(str(text or "").split()[:words])
+    """First `words` words of a live chunk's body (skipping its `[TICKER | FY | Section]` header)."""
+    body = _CHUNK_HEADER_RE.sub("", str(text or ""), count=1)
+    return " ".join(body.split()[:words])
 
 
 def finding_from_citation(

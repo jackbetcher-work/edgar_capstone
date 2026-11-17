@@ -5,14 +5,10 @@ Bridges the ADK multi-agent hierarchy (`edgar_adk_app`, `RootOrchestrator`, `Fin
 execution via `google.adk.runners.Runner` with Server-Sent Events (`StreamingMode.SSE`) to capture real
 wall-clock Time-to-First-Thought / Time-to-First-Token (`observed_ttft_ms`).
 
-Execution Modes (`EDGAR_EXECUTION_MODE`):
-- `"auto"` (default): Automatically activates live ADK `Runner` execution when Vertex AI
-  (`GOOGLE_GENAI_USE_VERTEXAI=true` + project/location), Gemini API (`GEMINI_API_KEY` / `GOOGLE_API_KEY`),
-  or an explicit `BaseLlm` instance is configured, and gracefully falls back to deterministic offline
-  synthesis in local/CI environments when no live credentials are present.
-- `"live"`: Strictly requires live ADK `Runner` execution and raises immediately if credentials are missing
-  or if an upstream Gemini call fails after retry backoff.
-- `"deterministic"`: Forces offline deterministic Python orchestration and template synthesis.
+Every answer comes from live Gemini. The backend is Vertex AI (Application Default Credentials;
+the default), the Gemini API when `GEMINI_API_KEY` / `GOOGLE_API_KEY` is set and
+`GOOGLE_GENAI_USE_VERTEXAI` is not, or an explicitly injected ADK `BaseLlm`. There is no offline or
+template-synthesis mode: upstream failures surface as errors after retry backoff.
 """
 
 from __future__ import annotations
@@ -56,13 +52,7 @@ from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID
 
 logger = logging.getLogger(__name__)
 
-ExecutionMode = Literal["auto", "live", "deterministic"]
-LiveBackendType = Literal[
-    "vertex_ai",
-    "gemini_api",
-    "custom_llm",
-    "deterministic_fallback",
-]
+LiveBackendType = Literal["vertex_ai", "gemini_api", "custom_llm"]
 
 _TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
 _PLACEHOLDER_SECRET_VALUES = frozenset({"", "unset", "none", "null", "placeholder", "changeme"})
@@ -82,8 +72,6 @@ _T = TypeVar("_T")
 class LiveRuntimeResolution:
     """Resolved live ADK / Gemini execution configuration (with secrets redacted from repr)."""
 
-    requested_mode: ExecutionMode
-    live_adk_enabled: bool
     backend: LiveBackendType
     project_id: str
     location: str
@@ -93,8 +81,6 @@ class LiveRuntimeResolution:
     def to_public_dict(self) -> dict[str, Any]:
         """Return safe, secret-free runtime status metadata for `/health` and telemetry responses."""
         return {
-            "requested_mode": self.requested_mode,
-            "live_adk_enabled": self.live_adk_enabled,
             "backend": self.backend,
             "vertex_project_id": self.project_id,
             "vertex_location": self.location,
@@ -133,37 +119,16 @@ def _clean_api_key(raw: str | None) -> str | None:
     return cleaned
 
 
-def resolve_live_adk_runtime(
-    *,
-    execution_mode: str | None = None,
-    custom_llm: BaseLlm | None = None,
-) -> LiveRuntimeResolution:
-    """Resolve whether live ADK `Runner` execution is active and which Gemini backend to target."""
-    raw_mode = (
-        execution_mode
-        if execution_mode is not None
-        else os.environ.get("EDGAR_EXECUTION_MODE", "auto")
-    )
-    norm_mode = raw_mode.strip().lower() or "auto"
-    if norm_mode not in ("auto", "live", "deterministic"):
-        raise ValueError(
-            f"Unsupported EDGAR_EXECUTION_MODE={raw_mode!r}; expected 'auto', 'live', or 'deterministic'."
-        )
-    mode: ExecutionMode = norm_mode  # type: ignore[assignment]
-
+def resolve_live_adk_runtime(*, custom_llm: BaseLlm | None = None) -> LiveRuntimeResolution:
+    """Resolve which live Gemini backend to target (Vertex AI unless an API key is configured)."""
     project_id = (
         os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
         or os.environ.get("GCP_PROJECT_ID", "").strip()
         or DEFAULT_PROJECT_ID
     )
-    # Gemini models may only be served from the `global` endpoint while BigQuery, GCS,
+    # Gemini models are served from the `global` endpoint in this project while BigQuery, GCS,
     # Model Armor, and embeddings stay regional, so the Gemini location is set separately.
-    location = (
-        os.environ.get("EDGAR_GEMINI_LOCATION", "").strip()
-        or os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
-        or os.environ.get("GCP_REGION", "").strip()
-        or "us-central1"
-    )
+    location = os.environ.get("EDGAR_GEMINI_LOCATION", "").strip() or "global"
     api_key = _clean_api_key(os.environ.get("GOOGLE_API_KEY")) or _clean_api_key(
         os.environ.get("GEMINI_API_KEY")
     )
@@ -172,64 +137,17 @@ def resolve_live_adk_runtime(
     )
 
     if custom_llm is not None:
-        return LiveRuntimeResolution(
-            requested_mode=mode,
-            live_adk_enabled=True,
-            backend="custom_llm",
-            project_id=project_id,
-            location=location,
-            api_key_configured=api_key is not None,
-            _api_key=api_key,
-        )
-
-    if mode == "deterministic":
-        return LiveRuntimeResolution(
-            requested_mode="deterministic",
-            live_adk_enabled=False,
-            backend="deterministic_fallback",
-            project_id=project_id,
-            location=location,
-            api_key_configured=api_key is not None,
-            _api_key=None,
-        )
-
-    if use_vertexai:
-        return LiveRuntimeResolution(
-            requested_mode=mode,
-            live_adk_enabled=True,
-            backend="vertex_ai",
-            project_id=project_id,
-            location=location,
-            api_key_configured=api_key is not None,
-            _api_key=None,
-        )
-
-    if api_key is not None:
-        return LiveRuntimeResolution(
-            requested_mode=mode,
-            live_adk_enabled=True,
-            backend="gemini_api",
-            project_id=project_id,
-            location=location,
-            api_key_configured=True,
-            _api_key=api_key,
-        )
-
-    if mode == "live":
-        raise RuntimeError(
-            "EDGAR_EXECUTION_MODE='live' requires live Gemini credentials: set "
-            "GOOGLE_GENAI_USE_VERTEXAI=true (with GOOGLE_CLOUD_PROJECT / GCP_PROJECT_ID) "
-            "or provide GEMINI_API_KEY / GOOGLE_API_KEY."
-        )
-
+        backend: LiveBackendType = "custom_llm"
+    elif api_key is not None and not use_vertexai:
+        backend = "gemini_api"
+    else:
+        backend = "vertex_ai"
     return LiveRuntimeResolution(
-        requested_mode="auto",
-        live_adk_enabled=False,
-        backend="deterministic_fallback",
+        backend=backend,
         project_id=project_id,
         location=location,
-        api_key_configured=False,
-        _api_key=None,
+        api_key_configured=api_key is not None,
+        _api_key=api_key if backend == "gemini_api" else None,
     )
 
 
@@ -506,6 +424,8 @@ def run_adk_agent_stream(**kwargs: Any) -> AdkStreamResult:
 # Retrieval budget hints for the agent; FinancialAnalystAgent runs with max_llm_calls=8.
 _EVIDENCE_LEAD_EXCERPT_CHARS = 240
 _MAX_EVIDENCE_LEADS = 8
+_MAX_PROMPT_FLAGS = 8
+_MAX_PROMPT_DELTAS_PER_PAIR = 4
 
 
 def _compact_evidence_leads(
@@ -572,6 +492,12 @@ def _retrieval_instructions(
         "- `search_10k_chunks_rag(query, tickers, gics_sector, section_id, start_year, end_year, "
         "top_k)`: hybrid search across filings, for peer comparisons, thematic questions, and "
         "changes across fiscal years (query each relevant year and compare).",
+        "- `compare_disclosures_across_years(theme, tickers, gics_sector, section_id, start_year, "
+        "end_year)`: deterministic year-over-year wording comparison (added / removed / modified "
+        "passages with both-year chunk_ids). Use it for wording-change questions not already "
+        "covered by the disclosure deltas above.",
+        "- `flag_material_variances(tickers, start_year, end_year)`: deterministic anomaly flags "
+        "for companies or years the payload does not cover.",
         f"- Scope: tickers `{scope.get('tickers_csv', 'ALL')}`, sector "
         f"`{scope.get('gics_sector', 'ALL')}`, sections `{scope.get('section_id', 'ALL')}`, "
         f"fiscal years `FY{scope.get('start_year')}`–`FY{scope.get('end_year')}`.",
@@ -588,6 +514,89 @@ def _retrieval_instructions(
     return "\n".join(lines)
 
 
+def _material_flags_prompt_section(flags: list[dict[str, Any]] | None) -> str:
+    """Compact, authoritative anomaly flags for the analyst (explain these first)."""
+    if not flags:
+        return ""
+    compact = [
+        {
+            "flag_id": f.get("flag_id"),
+            "ticker": f.get("ticker"),
+            "fiscal_year": f.get("fiscal_year"),
+            "prior_fiscal_year": f.get("prior_fiscal_year"),
+            "metric": f.get("metric"),
+            "rule": f.get("rule"),
+            "severity": f.get("severity"),
+            "value": f.get("value"),
+            "unit": f.get("unit"),
+            "description": f.get("description"),
+            "explanation_query": f.get("explanation_query"),
+            "explanation_chunk_id": (f.get("explanation") or {}).get("chunk_id"),
+        }
+        for f in flags[:_MAX_PROMPT_FLAGS]
+    ]
+    return (
+        "## Authoritative Material Variance Flags (deterministic anomaly detection)\n"
+        "(These anomalies were detected by fixed rules; never recompute or re-threshold them. "
+        "Explain the high-severity flags first with MD&A evidence: use `explanation_chunk_id` when "
+        "present, otherwise call `query_cached_10k_context` with the flag's `explanation_query`.)\n"
+        f"```json\n{json.dumps(compact, indent=2, default=str)}\n```"
+    )
+
+
+def _disclosure_deltas_prompt_section(result: dict[str, Any] | None) -> str:
+    """Compact year-over-year disclosure deltas (theme wording changes) for the analyst."""
+    if not result or result.get("status") != "success" or not result.get("companies"):
+        return ""
+    compact_companies: list[dict[str, Any]] = []
+    for comp in result["companies"]:
+        pairs = []
+        for pair in comp.get("year_pairs") or []:
+            pairs.append(
+                {
+                    "years": f"FY{pair['prior_fiscal_year']}->FY{pair['current_fiscal_year']}",
+                    "counts": pair.get("counts"),
+                    "deltas": [
+                        {
+                            "change_type": d["change_type"],
+                            "prior_chunk_id": d.get("prior_chunk_id"),
+                            "current_chunk_id": d.get("current_chunk_id"),
+                            "added_phrases": d.get("added_phrases") or [],
+                            "removed_phrases": d.get("removed_phrases") or [],
+                            "excerpt": " ".join(
+                                str(
+                                    d.get("current_excerpt") or d.get("prior_excerpt") or ""
+                                ).split()
+                            )[:_EVIDENCE_LEAD_EXCERPT_CHARS],
+                        }
+                        for d in pair.get("deltas") or []
+                        if d["change_type"] != "unchanged"
+                    ][:_MAX_PROMPT_DELTAS_PER_PAIR],
+                }
+            )
+        compact_companies.append(
+            {
+                "ticker": comp["ticker"],
+                "theme_mentions": comp.get("theme_mentions") or {},
+                "missing_fiscal_years": comp.get("missing_fiscal_years") or [],
+                "year_pairs": pairs,
+            }
+        )
+    payload = {
+        "theme": result.get("theme"),
+        "summary": result.get("summary"),
+        "companies": compact_companies,
+    }
+    return (
+        "## Authoritative Year-over-Year Disclosure Deltas (deterministic wording comparison)\n"
+        "(Each delta compares a theme passage with the adjacent year's filing. Summarize the trend "
+        "from these; for a `modified` delta cite BOTH `prior_chunk_id` and `current_chunk_id` in the "
+        "finding's chunk_ids and quote the current-year chunk; for `removed` quote the prior-year "
+        "chunk. Report missing fiscal years as data gaps.)\n"
+        f"```json\n{json.dumps(payload, indent=2, default=str)}\n```"
+    )
+
+
 def _build_financial_reasoning_prompt(
     *,
     query: str,
@@ -600,6 +609,8 @@ def _build_financial_reasoning_prompt(
     sector_benchmarks: list[dict[str, Any]],
     chunk_health: dict[str, Any] | None,
     memory_summary_text: str = "",
+    material_variance_flags: list[dict[str, Any]] | None = None,
+    disclosure_deltas: dict[str, Any] | None = None,
 ) -> str:
     """Assemble the deterministic facts and retrieval brief for `FinancialAnalystAgent`.
 
@@ -645,6 +656,12 @@ def _build_financial_reasoning_prompt(
             "## Vector Corpus & Chunk Health Diagnostics\n"
             f"```json\n{json.dumps(chunk_health, indent=2, default=str)}\n```"
         )
+    flags_section = _material_flags_prompt_section(material_variance_flags)
+    if flags_section:
+        sections.append(flags_section)
+    deltas_section = _disclosure_deltas_prompt_section(disclosure_deltas)
+    if deltas_section:
+        sections.append(deltas_section)
     leads = _compact_evidence_leads(cached_explanations, citations)
     if leads:
         sections.append(
@@ -680,6 +697,8 @@ async def run_live_adk_financial_reasoning_async(
     resolution: LiveRuntimeResolution | None = None,
     custom_llm: BaseLlm | None = None,
     summarizer_llm: BaseLlm | None = None,
+    material_variance_flags: list[dict[str, Any]] | None = None,
+    disclosure_deltas: dict[str, Any] | None = None,
 ) -> AdkStreamResult:
     """Execute `FinancialAnalystAgent` (`EDGAR_ANALYST_MODEL`) via ADK `Runner` with SSE streaming TTFT."""
     from edgar_capstone.agents.financial_analyst import create_financial_analyst_agent
@@ -713,6 +732,7 @@ async def run_live_adk_financial_reasoning_async(
         "calculated_variances": calc_map,
         "retrieved_citations": list(citations),
         "memory_context": dict(memory_context or {}),
+        "material_variance_flags": list(material_variance_flags or []),
         "context_cache_stats": {
             "hits": cache_hits,
             "misses": cache_misses,
@@ -731,6 +751,8 @@ async def run_live_adk_financial_reasoning_async(
         sector_benchmarks=sector_benchmarks,
         chunk_health=chunk_health,
         memory_summary_text=str((memory_context or {}).get("memory_summary_text") or ""),
+        material_variance_flags=material_variance_flags,
+        disclosure_deltas=disclosure_deltas,
     )
 
     return await run_adk_agent_stream_async(
@@ -951,21 +973,13 @@ async def run_live_root_orchestrator_turn_async(
     query: str,
     user_id: str = "analyst",
     session_id: str | None = None,
-    execution_mode: str | None = None,
     orchestrator_llm: BaseLlm | None = None,
     flash_llm: BaseLlm | None = None,
 ) -> AdkStreamResult:
     """Execute the full multi-agent `RootOrchestrator` ADK `App` via `Runner.run_async` (SSE)."""
     from edgar_capstone.agents.root_orchestrator import create_root_orchestrator
 
-    resolved = resolve_live_adk_runtime(
-        execution_mode=execution_mode,
-        custom_llm=orchestrator_llm,
-    )
-    if not resolved.live_adk_enabled:
-        raise RuntimeError(
-            "Live ADK RootOrchestrator execution is disabled in deterministic mode or without credentials."
-        )
+    resolved = resolve_live_adk_runtime(custom_llm=orchestrator_llm)
 
     pro_model = build_adk_llm_for_task(
         "orchestration",

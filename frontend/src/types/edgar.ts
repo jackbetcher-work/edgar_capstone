@@ -24,6 +24,9 @@ export interface CompanySummary {
   sec_filing_url: string
 }
 
+/** Load state of the backend `/api/v1/companies` catalog. */
+export type CatalogLoadStatus = 'loading' | 'ready' | 'error'
+
 export interface CompaniesCatalogResponse {
   status: string
   company_count: number
@@ -205,6 +208,122 @@ export interface TurnContextLatencySummary {
   total_estimated_cache_latency_saved_ms: number
 }
 
+export interface MaterialVarianceFlag {
+  flag_id: string
+  ticker: string
+  company_name: string
+  gics_sector: string
+  fiscal_year: number
+  prior_fiscal_year: number | null
+  metric:
+    | 'revenue'
+    | 'operating_income'
+    | 'net_income'
+    | 'research_and_development'
+    | 'operating_margin'
+    | 'net_margin'
+    | 'rd_intensity'
+  rule:
+    | 'yoy_change'
+    | 'sign_reversal'
+    | 'margin_shift'
+    | 'period_change'
+    | 'sector_divergence'
+  severity: 'high' | 'medium'
+  value: number
+  unit: 'pct' | 'bps' | 'pp' | 'usd'
+  threshold: number
+  prior_value: number | null
+  current_value: number | null
+  benchmark_value: number | null
+  peer_count: number | null
+  description: string
+  explanation_query: string
+  source: {
+    accession_number: string
+    sec_filing_url: string
+    period_of_report: string
+    xbrl_concept: string | null
+    prior_accession_number: string | null
+    prior_sec_filing_url: string | null
+    prior_period_of_report: string | null
+  }
+  explanation: {
+    chunk_id: string
+    section_id: 'item_1a' | 'item_7'
+    section_title: string
+    excerpt: string
+    sec_filing_url: string
+  } | null
+}
+
+export interface MaterialVarianceSummary {
+  total_flags: number
+  returned_flags: number
+  high_severity_count: number
+  explained_flags: number
+  thresholds: Record<string, number>
+}
+
+export type DisclosureChangeType = 'added' | 'removed' | 'modified' | 'unchanged'
+
+export interface DisclosureDelta {
+  delta_id: string
+  ticker: string
+  company_name: string
+  section_id: 'item_1a' | 'item_7'
+  section_title: string
+  change_type: DisclosureChangeType
+  prior_fiscal_year: number
+  current_fiscal_year: number
+  prior_chunk_id: string | null
+  current_chunk_id: string | null
+  prior_excerpt: string | null
+  current_excerpt: string | null
+  similarity: number
+  added_phrases: string[]
+  removed_phrases: string[]
+  theme_relevance: number
+}
+
+export interface DisclosureYearPair {
+  prior_fiscal_year: number
+  current_fiscal_year: number
+  counts: Partial<Record<DisclosureChangeType, number>>
+  deltas: DisclosureDelta[]
+}
+
+export interface CompanyDisclosureEvolution {
+  ticker: string
+  company_name: string
+  gics_sector: string
+  fiscal_years_available: number[]
+  missing_fiscal_years: number[]
+  theme_mentions: Record<string, number>
+  year_pairs: DisclosureYearPair[]
+}
+
+export interface DisclosureDeltaResult {
+  status: 'success' | 'error'
+  message?: string
+  theme?: string
+  theme_terms?: string[]
+  section_id?: SectionFilterId
+  start_year?: number
+  end_year?: number
+  companies_selected_by?: 'explicit' | 'theme_relevance'
+  summary?: {
+    added: number
+    removed: number
+    modified: number
+    unchanged: number
+    year_pairs: number
+    companies_analyzed: number
+  }
+  companies?: CompanyDisclosureEvolution[]
+  citations?: GroundedCitation[]
+}
+
 export interface ChatTurnResponse {
   status: 'success' | 'blocked' | 'error'
   model_armor_blocked: boolean
@@ -212,8 +331,13 @@ export interface ChatTurnResponse {
   orchestrator: string
   resolved_scope: ResolvedQueryScope
   answer_markdown: string
+  /** False when the live answer failed verification and its narrative was withheld. */
+  answer_verified?: boolean
   variance_reports: CompanyVarianceReport[]
   sector_benchmarks?: SectorBenchmarkRow[]
+  material_variance_flags?: MaterialVarianceFlag[]
+  material_variance_summary?: MaterialVarianceSummary | null
+  disclosure_deltas?: DisclosureDeltaResult | null
   citations: GroundedCitation[]
   candidates_searched?: number
   context_cache: ContextCacheInfo | null
@@ -234,7 +358,6 @@ export interface ChatTurnResponse {
   agent_trace: AgentTraceStep[]
   agent_identities_used?: AgentIdentitySummary[]
   total_latency_ms: number
-  connection_mode?: 'live' | 'fallback'
 }
 
 export interface CachedSectionResponse {

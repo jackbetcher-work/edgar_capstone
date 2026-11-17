@@ -1,11 +1,9 @@
 """Golden eval runner: executes every golden item through the RAG pipeline, scores it, and
 applies the regression gates from `evals/thresholds.yaml`.
 
-Modes:
-- `deterministic` (default, CI): deterministic synthesis + rubric judge, local corpus, offline
-  Model Armor emulator. Needs no credentials and is fully reproducible.
-- `live`: Gemini reasoning + Gemini 3.5 Flash reference-guided judge on Vertex AI; adds the
-  p95 TTFT gate.
+Every run is live: answers come from the Gemini `FinancialAnalystAgent`, retrieval reads
+BigQuery / Vertex AI Search / Vertex AI embeddings / GCS, and the Gemini 3.5 Flash judge scores
+each answer against its reference explanation. The p95 TTFT gate always applies.
 """
 
 from __future__ import annotations
@@ -39,35 +37,7 @@ from edgar_capstone.evals.metrics import (
     score_safety,
 )
 
-EvalMode = Literal["deterministic", "live"]
 DEFAULT_THRESHOLDS_PATH = REPO_ROOT / "evals" / "thresholds.yaml"
-
-# Environment pinned for deterministic runs so a developer shell (e.g. EDGAR_DATA_BACKEND=gcp)
-# cannot make the CI gate depend on cloud state. The Model Armor emulator stays ON so the
-# red-team items are actually exercised.
-DETERMINISTIC_ENV: dict[str, str] = {
-    "EDGAR_EXECUTION_MODE": "deterministic",
-    "EDGAR_DATA_BACKEND": "local",
-    "EDGAR_TELEMETRY_BACKEND": "local",
-    "EDGAR_FEEDBACK_BACKEND": "local",
-    "EDGAR_PROMPT_STORE_BACKEND": "local",
-    "EDGAR_MODEL_ARMOR_MODE": "emulator",
-}
-LIVE_ENV_DEFAULTS: dict[str, str] = {
-    "EDGAR_EXECUTION_MODE": "live",
-}
-
-
-def configure_eval_environment(mode: EvalMode) -> dict[str, str]:
-    """Apply the env for `mode`. Must run before `edgar_capstone.agents` is imported."""
-    if mode == "deterministic":
-        os.environ.update(DETERMINISTIC_ENV)
-        return dict(DETERMINISTIC_ENV)
-    applied: dict[str, str] = {}
-    for key, value in LIVE_ENV_DEFAULTS.items():
-        os.environ[key] = value
-        applied[key] = value
-    return applied
 
 
 @dataclass(frozen=True)
@@ -262,16 +232,6 @@ def detect_commit_sha() -> str:
         return "unknown"
 
 
-def detect_corpus_kind(mode: EvalMode) -> str:
-    """`gcp` (live BigQuery/Vertex), `hydrated` (real chunk manifest), or `synthetic` (CI)."""
-    from edgar_capstone.agents.tools import _get_dataset_dir, get_active_gcp_tool_adapters
-
-    if mode == "live" and get_active_gcp_tool_adapters() is not None:
-        return "gcp"
-    chunks = _get_dataset_dir() / "manifests" / "bigquery_filing_chunks.jsonl"
-    return "hydrated" if chunks.exists() else "synthetic"
-
-
 def _default_turn_fn() -> TurnFn:
     from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 
@@ -287,7 +247,6 @@ def _default_judge_fn() -> JudgeFn:
 def evaluate_item(
     item: GoldenEvalItem,
     *,
-    mode: EvalMode,
     run_id: str,
     thresholds: EvalThresholds,
     score_chunk_ids: bool,
@@ -307,7 +266,6 @@ def evaluate_item(
             top_k=f.top_k,
             session_id=f"golden-eval-{run_id}-{item.id}",
             user_id="golden-eval-runner",
-            execution_mode=mode,
         )
     except Exception as exc:  # noqa: BLE001 - one broken item must not abort the run
         res.error = f"{type(exc).__name__}: {exc}"
@@ -367,7 +325,6 @@ def evaluate_item(
             variance_reports=response.get("variance_reports") or [],
             citations=response.get("citations") or [],
             cached_explanations_count=cached_count,
-            execution_mode=mode,
             reference_explanation=item.reference_explanation,
         )
         judged = report.model_dump(mode="json") if hasattr(report, "model_dump") else dict(report)
@@ -434,7 +391,7 @@ def aggregate_metrics(results: list[ItemResult]) -> dict[str, float | None]:
 
 
 def evaluate_gates(
-    metrics: dict[str, float | None], thresholds: EvalThresholds, *, mode: EvalMode
+    metrics: dict[str, float | None], thresholds: EvalThresholds
 ) -> list[GateResult]:
     gates: list[GateResult] = []
     for name in (
@@ -461,48 +418,33 @@ def evaluate_gates(
         )
 
     ttft = metrics.get("p95_ttft_ms")
-    if mode == "live":
-        gates.append(
-            GateResult(
-                name="p95_ttft_ms",
-                value=ttft,
-                threshold=thresholds.p95_ttft_ms,
-                comparator="<=",
-                passed=ttft is not None and ttft <= thresholds.p95_ttft_ms,
-                detail="" if ttft is not None else "no streaming TTFT captured in live mode",
-            )
+    gates.append(
+        GateResult(
+            name="p95_ttft_ms",
+            value=ttft,
+            threshold=thresholds.p95_ttft_ms,
+            comparator="<=",
+            passed=ttft is not None and ttft <= thresholds.p95_ttft_ms,
+            detail="" if ttft is not None else "no streaming TTFT captured",
         )
-    else:
-        gates.append(
-            GateResult(
-                name="p95_ttft_ms",
-                value=None,
-                threshold=thresholds.p95_ttft_ms,
-                comparator="<=",
-                passed=True,
-                skipped=True,
-                detail="TTFT is only gated in EVAL_MODE=live (deterministic mode streams no tokens)",
-            )
-        )
+    )
     return gates
 
 
 def run_golden_evals(
     items: list[GoldenEvalItem],
     *,
-    mode: EvalMode = "deterministic",
     thresholds: EvalThresholds | None = None,
     dataset_source: str = "evals/golden_dataset.jsonl",
     turn_fn: TurnFn | None = None,
     judge_fn: JudgeFn | None = None,
-    corpus_kind: str | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> EvalRunReport:
     thresholds = thresholds or EvalThresholds()
     turn_fn = turn_fn or _default_turn_fn()
     judge_fn = judge_fn or _default_judge_fn()
-    corpus = corpus_kind or detect_corpus_kind(mode)
-    score_chunk_ids = corpus in ("hydrated", "gcp")
+    corpus = "gcp"
+    score_chunk_ids = True
     run_id = f"{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
     started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     t0 = time.perf_counter()
@@ -512,7 +454,6 @@ def run_golden_evals(
         item_t0 = time.perf_counter()
         res = evaluate_item(
             item,
-            mode=mode,
             run_id=run_id,
             thresholds=thresholds,
             score_chunk_ids=score_chunk_ids,
@@ -529,7 +470,7 @@ def run_golden_evals(
             )
 
     metrics = aggregate_metrics(results)
-    gates = evaluate_gates(metrics, thresholds, mode=mode)
+    gates = evaluate_gates(metrics, thresholds)
     judge_models = sorted({r.judge_model for r in results if r.judge_model})
     try:
         from edgar_capstone.agents.context_memory import resolve_model_for_task
@@ -542,7 +483,7 @@ def run_golden_evals(
         run_id=run_id,
         started_at=started_at,
         finished_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-        eval_mode=mode,
+        eval_mode="live",
         dataset_source=dataset_source,
         dataset_version=dataset_fingerprint(items),
         corpus_kind=corpus,
