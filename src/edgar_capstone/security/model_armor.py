@@ -1155,7 +1155,9 @@ class ModelArmorClient:
             },
             "deidentifyConfig": {
                 "infoTypeTransformations": {
-                    "transformations": [{"primitiveTransformation": {"replaceWithInfoTypeConfig": {}}}]
+                    "transformations": [
+                        {"primitiveTransformation": {"replaceWithInfoTypeConfig": {}}}
+                    ]
                 }
             },
         }

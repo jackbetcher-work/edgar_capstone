@@ -772,7 +772,9 @@ def test_dlp_deidentify_payload_uses_primitive_transformation_and_allows_10k_pro
     )
     assert decision.blocked is False
     assert len(captured_dlp_payloads) == 1
-    tx = captured_dlp_payloads[0]["deidentifyConfig"]["infoTypeTransformations"]["transformations"][0]
+    tx = captured_dlp_payloads[0]["deidentifyConfig"]["infoTypeTransformations"]["transformations"][
+        0
+    ]
     assert "primitiveTransformation" in tx
     assert "replaceWithInfoTypeConfig" in tx["primitiveTransformation"]
     assert "replaceWithInfoTypeConfig" not in tx
