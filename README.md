@@ -326,7 +326,7 @@ The app is never anonymous. IAP sits on the Cloud Run service, so anyone who ope
 4. **Revoke** by removing the principal and applying again. Users can sign out from the header; that clears their IAP session cookie.
 
 > [!NOTE]
-> As of 2026-11-16, Cloud Run serves revision `sec-edgar-analyst-00011-kct`, built from commit `3d743f9`. None of the later work is deployed yet: the IAP-session sign-in, observability, `gemini-3.8-flash` on `global`, agent-driven retrieval, structured output, and the R&D metric. (The BigQuery and Vertex AI Search data behind them is already live.) Until a new image is built and deployed, people who pass IAP still see the Okta/Bearer sign-in panel.
+> As of 2026-11-16, Cloud Run serves revision `sec-edgar-analyst-00014-62n`, built from commit `c0db656`, in `iap_direct` mode (ingress `all`, IAP on the service, `domain:jackbetcher.altostrat.com` holds `roles/iap.httpsResourceAccessor`). Every deploy gates on a `GET /health` startup probe. The Vector Search index is not deployed to its endpoint yet (`deploy_vertex_vector_index` was held at `false` for that apply), so vector retrieval falls back to BigQuery / Vertex AI Search until the next full `terraform apply`.
 
 ---
 

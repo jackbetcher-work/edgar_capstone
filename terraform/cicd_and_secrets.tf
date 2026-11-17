@@ -453,6 +453,9 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
   lifecycle {
     ignore_changes = [
       template[0].containers[0].image,
+      # CI/CD deploys set a GET /health startup probe; the bootstrap placeholder
+      # image doesn't serve /health, so Terraform leaves the probe to the pipelines.
+      template[0].containers[0].startup_probe,
       client,
       client_version,
     ]

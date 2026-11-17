@@ -238,9 +238,56 @@ jobs:
             --min-instances=1
             --max-instances=10
             --timeout=300
+            --startup-probe=httpGet.path=/health,initialDelaySeconds=0,periodSeconds=10,timeoutSeconds=5,failureThreshold=24
+
+      # The service is not reachable from GitHub's runners: in load_balancer mode its
+      # ingress is internal-and-cloud-load-balancing (run.app answers 404), and in
+      # iap_direct mode IAP gates every request. Health is therefore verified inside
+      # Cloud Run: the startup probe above sends GET /health to the new revision, and
+      # Cloud Run only marks the revision Ready (and the deploy step only succeeds)
+      # once /health returns 200. This step confirms that revision is the one serving.
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Verify the new revision passed its /health probe and serves all traffic
+        id: verify_revision
+        env:
+          EXPECTED_IMAGE: ${{ env.IMAGE_URI }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          svc="$(gcloud run services describe "${SERVICE_NAME}" \
+            --project "${GCP_PROJECT_ID}" --region "${GCP_REGION}" --format=json)"
+
+          created="$(jq -r '.status.latestCreatedRevisionName' <<<"${svc}")"
+          ready="$(jq -r '.status.latestReadyRevisionName' <<<"${svc}")"
+          image="$(jq -r '.spec.template.spec.containers[0].image' <<<"${svc}")"
+          probe_path="$(jq -r '.spec.template.spec.containers[0].startupProbe.httpGet.path // ""' <<<"${svc}")"
+          traffic="$(jq -r --arg rev "${ready}" \
+            '[.status.traffic[] | select(.revisionName == $rev) | .percent] | add // 0' <<<"${svc}")"
+          # Ingress and IAP settings come from the v2 API (iapEnabled is v2-only).
+          svc_v2="$(curl --fail --silent --show-error \
+            --header "Authorization: Bearer $(gcloud auth print-access-token)" \
+            "https://run.googleapis.com/v2/projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/services/${SERVICE_NAME}")"
+          ingress="$(jq -r '.ingress // "INGRESS_TRAFFIC_ALL"' <<<"${svc_v2}")"
+          iap="$(jq -r '.iapEnabled // false' <<<"${svc_v2}")"
+
+          echo "revision=${ready} image=${image} probe=${probe_path} traffic=${traffic}% ingress=${ingress} iap=${iap}"
+          fail=0
+          [[ "${created}" == "${ready}" ]] || { echo "::error::Latest revision ${created} is not Ready (serving ${ready})."; fail=1; }
+          [[ "${image}" == "${EXPECTED_IMAGE}" ]] || { echo "::error::Service image is ${image}, expected ${EXPECTED_IMAGE}."; fail=1; }
+          [[ "${probe_path}" == "/health" ]] || { echo "::error::Startup probe is not GET /health (got '${probe_path}')."; fail=1; }
+          [[ "${traffic}" == "100" ]] || { echo "::error::Revision ${ready} serves ${traffic}% of traffic, expected 100%."; fail=1; }
+          if (( fail )); then exit 1; fi
+
+          if [[ "${ingress}" == "INGRESS_TRAFFIC_ALL" && "${iap}" != "true" ]]; then
+            echo "public_http=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "public_http=false" >> "${GITHUB_OUTPUT}"
+          fi
 
       - name: Mint OIDC ID token for Cloud Run health check
         id: id_token_auth
+        if: steps.verify_revision.outputs.public_http == 'true'
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
@@ -249,7 +296,9 @@ jobs:
           id_token_audience: ${{ steps.deploy_cloud_run.outputs.url }}
           id_token_include_email: true
 
-      - name: Verify deployed Cloud Run service health and frontend UI
+      # Only runs when the service accepts direct internet traffic without IAP.
+      - name: Verify deployed Cloud Run service health and frontend UI over HTTPS
+        if: steps.verify_revision.outputs.public_http == 'true'
         run: |
           SERVICE_URL="${{ steps.deploy_cloud_run.outputs.url }}"
           curl --fail --silent --show-error \

@@ -100,6 +100,16 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert "${SERVICE_URL}/health" in deploy_steps_str
     assert "${SERVICE_URL}/healthz" not in deploy_steps_str
 
+    # Cloud Run's ingress / IAP make run.app unreachable from GitHub runners, so health
+    # is gated in-platform: a GET /health startup probe plus a revision/traffic check.
+    assert "--startup-probe=httpGet.path=/health," in deploy_cloudrun_step["with"]["flags"]
+    verify_step = next(s for s in deploy_job["steps"] if s.get("id") == "verify_revision")
+    assert "latestReadyRevisionName" in verify_step["run"]
+    assert "iapEnabled" in verify_step["run"]
+    for step in deploy_job["steps"]:
+        if "curl" in step.get("run", "") and step.get("id") != "verify_revision":
+            assert step.get("if") == "steps.verify_revision.outputs.public_http == 'true'"
+
 
 def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     cb_path = REPO_ROOT / "cloudbuild.yaml"
