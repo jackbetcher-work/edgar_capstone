@@ -8,29 +8,23 @@ audit logging.
 
 from __future__ import annotations
 
-import base64
-import hashlib
-import json
 import logging
 import os
 import threading
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import TracebackType
 from typing import Any
 
 import httpx
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
-from cryptography.hazmat.primitives.asymmetric.utils import (
-    decode_dss_signature,
-    encode_dss_signature,
-)
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import Depends, HTTPException, Request, status
 
+from edgar_capstone.common.domain import sha256_text
+from edgar_capstone.common.env import env_bool, split_csv_env
+from edgar_capstone.gcp.defaults import DEFAULT_PROJECT_ID, DEFAULT_PROJECT_NAME
 from edgar_capstone.observability.tracing import traced
 from edgar_capstone.security.agent_identity import (
     S2S_AGENT_ASSERTION_HEADER,
@@ -39,18 +33,28 @@ from edgar_capstone.security.agent_identity import (
     resolve_agent_by_service_account_id,
     resolve_agent_identity,
 )
+from edgar_capstone.security.jwt_codec import (
+    PublicKey,
+    b64url_decode,
+    b64url_encode,
+    ec_public_key_to_jwk,
+    jwk_to_public_key,
+    parse_jwt_header_and_claims,
+    rsa_public_key_to_jwk,
+    sign_jwt_es256,
+    sign_jwt_rs256,
+    verify_jws_signature,
+)
 from edgar_capstone.security.rbac import (
     ANALYST_PERMISSIONS,
     CUSTOM_RUNTIME_SA_ACCOUNT_ID,
     DEFAULT_CLOUD_IDENTITY_DOMAIN,
-    DEFAULT_PROJECT_NAME,
     CloudIdentityRBACPolicy,
     Permission,
     RuntimeServiceAccountConfig,
     is_default_gcp_service_account,
     validate_custom_service_account_email,
 )
-from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID, SecretManagerClient
 from edgar_capstone.telemetry import get_telemetry_sink
 
 logger = logging.getLogger(__name__)
@@ -80,6 +84,38 @@ IAP_ASSERTION_HEADER = "X-Goog-IAP-JWT-Assertion"
 # Cloud Identity group claims. Admin is deliberately excluded: it must come from a group.
 IAP_DEFAULT_ROLE_CHOICES: frozenset[str] = frozenset({"analyst", "viewer"})
 
+_AUTH_ENV_KEYS: tuple[str, ...] = (
+    "K_SERVICE",
+    "IAP_STRICT_MODE",
+    "EDGAR_ENABLE_LOCAL_SSO_DEV_BROKER",
+    "INTERNAL_IAP_AUDIENCE",
+    "ADDITIONAL_IAP_AUDIENCES",
+    "OKTA_CLIENT_ID",
+    "GOOGLE_OAUTH_CLIENT_ID",
+    "OKTA_ISSUER_URI",
+    "OKTA_JWKS_URI",
+    "ALLOWED_WORKSPACE_DOMAINS",
+    "REQUIRED_ANALYST_GROUPS",
+    "ADMIN_CLOUD_IDENTITY_GROUPS",
+    "ADMIN_WORKSPACE_GROUPS",
+    "ANALYST_CLOUD_IDENTITY_GROUPS",
+    "ANALYST_WORKSPACE_GROUPS",
+    "VIEWER_CLOUD_IDENTITY_GROUPS",
+    "VIEWER_WORKSPACE_GROUPS",
+    "CLOUD_IDENTITY_DOMAIN",
+    "ALLOWED_CUSTOM_SERVICE_ACCOUNTS",
+    "ALLOW_GCP_SERVICE_ACCOUNTS",
+    "IAP_ASSERTION_DEFAULT_ROLE",
+    "GCP_PROJECT_ID",
+    "GOOGLE_CLOUD_PROJECT",
+    "GCLOUD_PROJECT",
+    "EDGAR_GCP_PROJECT_ID",
+    "GCP_PROJECT_NAME",
+    "RUNTIME_SERVICE_ACCOUNT_ID",
+    "RUNTIME_SERVICE_ACCOUNT",
+    "ALLOWED_SERVICE_ACCOUNT_PROJECTS",
+)
+
 
 class AuthenticationError(Exception):
     """Raised when a request lacks a valid JWT bearer credential (HTTP 401)."""
@@ -98,159 +134,11 @@ class AuthorizationError(Exception):
         self.message = message
 
 
-def _b64url_encode(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
-
-
-def _b64url_decode(segment: str) -> bytes:
-    padded = segment + "=" * ((4 - len(segment) % 4) % 4)
-    try:
-        return base64.urlsafe_b64decode(padded.encode("ascii"))
-    except Exception as exc:
-        raise AuthenticationError("Malformed base64url segment in JWT.") from exc
-
-
-def _int_to_b64url(value: int, byte_length: int | None = None) -> str:
-    if byte_length is None:
-        byte_length = max(1, (value.bit_length() + 7) // 8)
-    return _b64url_encode(value.to_bytes(byte_length, "big"))
-
-
-def _b64url_to_int(segment: str) -> int:
-    raw = _b64url_decode(segment)
-    if not raw:
-        raise AuthenticationError("Empty numeric parameter in JWK.")
-    return int.from_bytes(raw, "big")
-
-
-def jwk_to_public_key(jwk: dict[str, Any]) -> ec.EllipticCurvePublicKey | rsa.RSAPublicKey:
-    """Construct a cryptographic public key from an EC (P-256) or RSA JWK dictionary."""
-    kty = jwk.get("kty")
-    if kty == "EC":
-        crv = jwk.get("crv")
-        if crv != "P-256":
-            raise AuthenticationError(f"Unsupported EC curve in JWK: {crv!r}")
-        x = _b64url_to_int(str(jwk["x"]))
-        y = _b64url_to_int(str(jwk["y"]))
-        return ec.EllipticCurvePublicNumbers(x, y, ec.SECP256R1()).public_key()
-    if kty == "RSA":
-        n = _b64url_to_int(str(jwk["n"]))
-        e = _b64url_to_int(str(jwk["e"]))
-        return rsa.RSAPublicNumbers(e, n).public_key()
-    raise AuthenticationError(f"Unsupported JWK key type: {kty!r}")
-
-
-def ec_public_key_to_jwk(
-    public_key: ec.EllipticCurvePublicKey,
-    *,
-    kid: str,
-) -> dict[str, Any]:
-    """Serialize a P-256 public key into standard RFC 7517 JWK representation."""
-    numbers = public_key.public_numbers()
-    return {
-        "kty": "EC",
-        "crv": "P-256",
-        "alg": "ES256",
-        "use": "sig",
-        "kid": kid,
-        "x": _int_to_b64url(numbers.x, 32),
-        "y": _int_to_b64url(numbers.y, 32),
-    }
-
-
-def rsa_public_key_to_jwk(
-    public_key: rsa.RSAPublicKey,
-    *,
-    kid: str,
-) -> dict[str, Any]:
-    """Serialize an RSA public key into standard RFC 7517 JWK representation."""
-    numbers = public_key.public_numbers()
-    return {
-        "kty": "RSA",
-        "alg": "RS256",
-        "use": "sig",
-        "kid": kid,
-        "n": _int_to_b64url(numbers.n),
-        "e": _int_to_b64url(numbers.e),
-    }
-
-
-def sign_jwt_es256(
-    claims: dict[str, Any],
-    private_key: ec.EllipticCurvePrivateKey,
-    *,
-    kid: str,
-) -> str:
-    """Create a compact JWS signed with ECDSA P-256 + SHA-256 (ES256)."""
-    header = {"alg": "ES256", "typ": "JWT", "kid": kid}
-    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
-    payload_b64 = _b64url_encode(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    der_sig = private_key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
-    r, s = decode_dss_signature(der_sig)
-    raw_sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
-    return f"{header_b64}.{payload_b64}.{_b64url_encode(raw_sig)}"
-
-
-def sign_jwt_rs256(
-    claims: dict[str, Any],
-    private_key: rsa.RSAPrivateKey,
-    *,
-    kid: str,
-) -> str:
-    """Create a compact JWS signed with RSA PKCS#1 v1.5 + SHA-256 (RS256)."""
-    header = {"alg": "RS256", "typ": "JWT", "kid": kid}
-    header_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
-    payload_b64 = _b64url_encode(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
-    signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-    sig = private_key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
-    return f"{header_b64}.{payload_b64}.{_b64url_encode(sig)}"
-
-
-def _verify_jws_signature(
-    *,
-    alg: str,
-    signing_input: bytes,
-    signature_bytes: bytes,
-    public_key: ec.EllipticCurvePublicKey | rsa.RSAPublicKey,
-) -> None:
-    if alg == "ES256":
-        if not isinstance(public_key, ec.EllipticCurvePublicKey):
-            raise AuthenticationError("JWK key type does not match ES256 header.")
-        if len(signature_bytes) != 64:
-            raise AuthenticationError("Invalid ES256 signature length.")
-        r = int.from_bytes(signature_bytes[:32], "big")
-        s = int.from_bytes(signature_bytes[32:], "big")
-        if r <= 0 or s <= 0:
-            raise AuthenticationError("Invalid ES256 signature scalar.")
-        der_sig = encode_dss_signature(r, s)
-        try:
-            public_key.verify(der_sig, signing_input, ec.ECDSA(hashes.SHA256()))
-        except InvalidSignature as exc:
-            raise AuthenticationError("ES256 JWT signature verification failed.") from exc
-        return
-
-    if alg == "RS256":
-        if not isinstance(public_key, rsa.RSAPublicKey):
-            raise AuthenticationError("JWK key type does not match RS256 header.")
-        try:
-            public_key.verify(
-                signature_bytes,
-                signing_input,
-                padding.PKCS1v15(),
-                hashes.SHA256(),
-            )
-        except InvalidSignature as exc:
-            raise AuthenticationError("RS256 JWT signature verification failed.") from exc
-        return
-
-    raise AuthenticationError(f"Unsupported JWT signing algorithm: {alg!r}")
-
-
-def _split_csv_env(raw: str | None) -> tuple[str, ...]:
-    if not raw:
-        return ()
-    return tuple(part.strip() for part in raw.split(",") if part.strip())
+def _sanitize_www_auth_value(raw: str, *, max_len: int = 200) -> str:
+    """Sanitize a string for safe embedding inside an RFC 9110 quoted-string header value."""
+    printable = "".join(ch if 0x20 <= ord(ch) <= 0x7E else " " for ch in str(raw))
+    collapsed = " ".join(printable.split())[:max_len]
+    return collapsed.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _derive_okta_endpoints(okta_issuer_uri: str) -> tuple[str, str]:
@@ -265,20 +153,20 @@ def is_production_iap_mode() -> bool:
     """Return True when running in Cloud Run or when strict IAP mode is enabled."""
     if os.environ.get("K_SERVICE"):
         return True
-    if os.environ.get("IAP_STRICT_MODE", "").strip().lower() in {"1", "true", "yes"}:
+    if env_bool("IAP_STRICT_MODE", False):
         return True
-    if os.environ.get("EDGAR_ENABLE_LOCAL_SSO_DEV_BROKER", "true").strip().lower() in {
-        "0",
-        "false",
-        "no",
-    }:
+    if not env_bool("EDGAR_ENABLE_LOCAL_SSO_DEV_BROKER", True):
         return True
     return False
 
 
+def _auth_env_snapshot() -> tuple[str | None, ...]:
+    return tuple(os.environ.get(key) for key in _AUTH_ENV_KEYS)
+
+
 @dataclass(frozen=True)
 class AuthSettings:
-    """Runtime authentication and authorization settings loaded from environment / Secret Manager."""
+    """Runtime authentication and authorization settings loaded from environment variables."""
 
     audiences: tuple[str, ...]
     okta_issuer_uri: str | None
@@ -312,35 +200,15 @@ class AuthSettings:
     iap_default_role: str | None = None
 
     @classmethod
-    def from_env(
-        cls,
-        *,
-        secret_client: SecretManagerClient | None = None,
-    ) -> AuthSettings:
+    def from_env(cls) -> AuthSettings:
         strict_mode = is_production_iap_mode()
         raw_iap_aud = os.environ.get("INTERNAL_IAP_AUDIENCE", "").strip()
-
-        if not raw_iap_aud and os.environ.get(
-            "IAP_RESOLVE_AUDIENCE_FROM_SECRET_MANAGER", ""
-        ).lower() in {"1", "true", "yes"}:
-            try:
-                client = secret_client or SecretManagerClient()
-                secret = client.get_secret(
-                    "sec-edgar-iap-audience",
-                    env_fallback="INTERNAL_IAP_AUDIENCE",
-                )
-                raw_iap_aud = secret.get_secret_value().strip()
-            except Exception as exc:
-                logger.warning(
-                    "Unable to resolve IAP audience from Secret Manager: %s", type(exc).__name__
-                )
-
         okta_client_id = os.environ.get("OKTA_CLIENT_ID", "").strip() or None
         google_client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip() or None
-        extra_audiences = _split_csv_env(os.environ.get("ADDITIONAL_IAP_AUDIENCES"))
+        extra_audiences = split_csv_env(os.environ.get("ADDITIONAL_IAP_AUDIENCES"))
 
         aud_list: list[str] = []
-        for candidate in (*_split_csv_env(raw_iap_aud), *extra_audiences):
+        for candidate in (*split_csv_env(raw_iap_aud), *extra_audiences):
             if candidate and candidate not in aud_list:
                 aud_list.append(candidate)
         for cid in (okta_client_id, google_client_id):
@@ -359,32 +227,32 @@ class AuthSettings:
             okta_jwks, _ = _derive_okta_endpoints(okta_issuer)
 
         allowed_domains = tuple(
-            d.lower() for d in _split_csv_env(os.environ.get("ALLOWED_WORKSPACE_DOMAINS"))
+            d.lower() for d in split_csv_env(os.environ.get("ALLOWED_WORKSPACE_DOMAINS"))
         )
         required_groups = tuple(
-            g.lower() for g in _split_csv_env(os.environ.get("REQUIRED_ANALYST_GROUPS"))
+            g.lower() for g in split_csv_env(os.environ.get("REQUIRED_ANALYST_GROUPS"))
         )
         admin_groups = tuple(
             g.lower()
             for g in (
-                _split_csv_env(os.environ.get("ADMIN_CLOUD_IDENTITY_GROUPS"))
-                or _split_csv_env(os.environ.get("ADMIN_WORKSPACE_GROUPS"))
+                split_csv_env(os.environ.get("ADMIN_CLOUD_IDENTITY_GROUPS"))
+                or split_csv_env(os.environ.get("ADMIN_WORKSPACE_GROUPS"))
                 or ("sec-edgar-admins", "gcp-security-admins", "okta-sec-admins")
             )
         )
         analyst_groups = tuple(
             g.lower()
             for g in (
-                _split_csv_env(os.environ.get("ANALYST_CLOUD_IDENTITY_GROUPS"))
-                or _split_csv_env(os.environ.get("ANALYST_WORKSPACE_GROUPS"))
+                split_csv_env(os.environ.get("ANALYST_CLOUD_IDENTITY_GROUPS"))
+                or split_csv_env(os.environ.get("ANALYST_WORKSPACE_GROUPS"))
                 or ("sec-edgar-analysts", "financial-analysts")
             )
         )
         viewer_groups = tuple(
             g.lower()
             for g in (
-                _split_csv_env(os.environ.get("VIEWER_CLOUD_IDENTITY_GROUPS"))
-                or _split_csv_env(os.environ.get("VIEWER_WORKSPACE_GROUPS"))
+                split_csv_env(os.environ.get("VIEWER_CLOUD_IDENTITY_GROUPS"))
+                or split_csv_env(os.environ.get("VIEWER_WORKSPACE_GROUPS"))
                 or ("sec-edgar-viewers", "sec-edgar-auditors", "compliance-auditors")
             )
         )
@@ -393,13 +261,9 @@ class AuthSettings:
         )
         runtime_sa_cfg = RuntimeServiceAccountConfig.from_env()
         allowed_custom_sas = tuple(
-            sa.lower() for sa in _split_csv_env(os.environ.get("ALLOWED_CUSTOM_SERVICE_ACCOUNTS"))
+            sa.lower() for sa in split_csv_env(os.environ.get("ALLOWED_CUSTOM_SERVICE_ACCOUNTS"))
         )
-        allow_sa = os.environ.get("ALLOW_GCP_SERVICE_ACCOUNTS", "true").strip().lower() not in {
-            "0",
-            "false",
-            "no",
-        }
+        allow_sa = env_bool("ALLOW_GCP_SERVICE_ACCOUNTS", True)
         raw_iap_default_role = os.environ.get("IAP_ASSERTION_DEFAULT_ROLE", "").strip().lower()
         if raw_iap_default_role and raw_iap_default_role not in IAP_DEFAULT_ROLE_CHOICES:
             raise ValueError(
@@ -493,7 +357,7 @@ class AuthenticatedUser:
 
 
 # ---------------------------------------------------------------------------
-# Ephemeral Local Development SSO Broker Keypair (In-Memory Only, Zero Secrets)
+# Ephemeral Local Development SSO Broker Keypair (Lazily Initialized, Zero Secrets)
 # ---------------------------------------------------------------------------
 
 
@@ -535,23 +399,32 @@ class _EphemeralDevSsoSigner:
         return sign_jwt_es256(claims, self._private_key, kid=self.kid), exp
 
 
-_LOCAL_DEV_SIGNER = _EphemeralDevSsoSigner()
+_LOCAL_SIGNER_LOCK = threading.Lock()
+_LOCAL_SIGNER_HOLDER: dict[str, _EphemeralDevSsoSigner | None] = {"instance": None}
+
+
+def _get_local_dev_signer() -> _EphemeralDevSsoSigner:
+    signer = _LOCAL_SIGNER_HOLDER["instance"]
+    if signer is None:
+        with _LOCAL_SIGNER_LOCK:
+            signer = _LOCAL_SIGNER_HOLDER["instance"]
+            if signer is None:
+                signer = _EphemeralDevSsoSigner()
+                _LOCAL_SIGNER_HOLDER["instance"] = signer
+    return signer
 
 
 # ---------------------------------------------------------------------------
-# Token Revocation & Security Audit Trail Registries
+# Token Revocation & Security Audit Trail (Single Source of Truth in telemetry.py)
 # ---------------------------------------------------------------------------
 
 _REVOKED_TOKENS_LOCK = threading.Lock()
 _REVOKED_TOKEN_FINGERPRINTS: dict[str, int] = {}
 
-_AUDIT_LOG_LOCK = threading.Lock()
-_SECURITY_AUDIT_LOG: deque[dict[str, Any]] = deque(maxlen=500)
-
 
 def compute_token_fingerprint(raw_jwt: str) -> str:
     """Compute a non-reversible SHA-256 digest of a JWT for revocation and audit tracking."""
-    return hashlib.sha256(raw_jwt.encode("utf-8")).hexdigest()
+    return sha256_text(raw_jwt)
 
 
 def revoke_bearer_token(raw_jwt: str, *, expires_at: int) -> None:
@@ -598,7 +471,7 @@ def record_security_audit_event(
 
     now_epoch = round(time.time(), 3)
     now_iso = datetime.fromtimestamp(now_epoch, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    entry = {
+    entry: dict[str, Any] = {
         "event_id": f"aud-{uuid.uuid4().hex[:12]}",
         "recorded_at": now_iso,
         "recorded_at_epoch": now_epoch,
@@ -617,40 +490,26 @@ def record_security_audit_event(
         "iap_assertion_verified": user.iap_assertion_verified if user else False,
         "detail": detail,
     }
-    with _AUDIT_LOG_LOCK:
-        _SECURITY_AUDIT_LOG.appendleft(entry)
-
-    get_telemetry_sink().record_security_audit_log(entry)
-
-    logger.info(
-        "security_audit event_type=%s status=%s user=%s idp=%s resource=%s tickers=%s",
-        event_type,
-        status_outcome,
-        entry["user_email"],
-        entry["identity_provider"],
-        resource,
-        ",".join(ticker_list) or "-",
-    )
-    return entry
+    # BigQueryTelemetrySink is the single source of truth: it buffers locally, emits the
+    # structured Cloud Logging sink record, and streams to BigQuery when enabled.
+    result = get_telemetry_sink().record_security_audit_log(entry)
+    row = result.get("row") if isinstance(result, dict) else None
+    return row if isinstance(row, dict) else entry
 
 
 def get_security_audit_events(limit: int = 50) -> list[dict[str, Any]]:
     """Return the most recent structured security and 10-K access audit events."""
     bounded = max(1, min(limit, 500))
     sink = get_telemetry_sink()
-    attempt_gcp, _ = sink._should_attempt_gcp()
-    if attempt_gcp:
-        bq_events = sink.query_security_audit_logs(limit=bounded)
-        if bq_events:
-            return bq_events
-    with _AUDIT_LOG_LOCK:
-        return list(_SECURITY_AUDIT_LOG)[:bounded]
+    events = sink.query_security_audit_logs(limit=bounded)
+    if events or not sink.is_gcp_enabled():
+        return events
+    return []
 
 
 def clear_security_audit_events() -> None:
     """Clear in-memory security audit events (intended for isolated test suites)."""
-    with _AUDIT_LOG_LOCK:
-        _SECURITY_AUDIT_LOG.clear()
+    get_telemetry_sink().clear_local_audit_events()
 
 
 # ---------------------------------------------------------------------------
@@ -658,8 +517,16 @@ def clear_security_audit_events() -> None:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class _ParsedJwksCacheEntry:
+    fetched_at: float
+    raw_by_kid: dict[str, dict[str, Any]]
+    parsed_keys: dict[str, PublicKey]
+    parse_errors: dict[str, str]
+
+
 class JwksKeyStore:
-    """Fetches and caches JWKS public keys for Google IAP, Google Workspace, and Okta OIDC."""
+    """Fetches and caches parsed JWKS public keys for Google IAP, Google Workspace, and Okta."""
 
     def __init__(
         self,
@@ -672,25 +539,99 @@ class JwksKeyStore:
         self.cache_ttl_seconds = cache_ttl_seconds
         self.min_refresh_interval_seconds = min_refresh_interval_seconds
         self._http_client = http_client
+        self._pooled_http_client: httpx.Client | None = None
         self._static_jwks: dict[str, dict[str, Any]] = dict(static_jwks_by_uri or {})
-        self._cache: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
+        self._cache: dict[str, dict[str, dict[str, Any]]] = {}
+        self._parsed_keys: dict[str, _ParsedJwksCacheEntry] = {}
+        self._uri_locks: dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
+
+    def _get_http_client(self) -> httpx.Client:
+        if self._http_client is not None:
+            return self._http_client
+        with self._lock:
+            if self._pooled_http_client is None or self._pooled_http_client.is_closed:
+                self._pooled_http_client = httpx.Client(
+                    timeout=5.0,
+                    limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+                )
+            return self._pooled_http_client
+
+    def close(self) -> None:
+        """Close the internally managed pooled ``httpx.Client`` (leaves injected clients open)."""
+        with self._lock:
+            if self._pooled_http_client is not None and not self._pooled_http_client.is_closed:
+                self._pooled_http_client.close()
+            self._pooled_http_client = None
+
+    def __enter__(self) -> JwksKeyStore:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def _get_uri_lock(self, jwks_uri: str) -> threading.Lock:
+        with self._lock:
+            uri_lock = self._uri_locks.get(jwks_uri)
+            if uri_lock is None:
+                uri_lock = threading.Lock()
+                self._uri_locks[jwks_uri] = uri_lock
+            return uri_lock
 
     def register_static_jwks(self, jwks_uri: str, jwks_payload: dict[str, Any]) -> None:
         with self._lock:
+            if self._static_jwks.get(jwks_uri) == jwks_payload:
+                return
             self._static_jwks[jwks_uri] = jwks_payload
             self._cache.pop(jwks_uri, None)
+            self._parsed_keys.pop(jwks_uri, None)
 
-    def _fetch_jwks(self, jwks_uri: str) -> dict[str, dict[str, Any]]:
-        if jwks_uri in self._static_jwks:
-            payload = self._static_jwks[jwks_uri]
+    @staticmethod
+    def _parse_jwks_payload(payload: Any) -> _ParsedJwksCacheEntry:
+        if not isinstance(payload, dict):
+            raise AuthenticationError("Identity provider returned an empty or invalid JWKS keyset.")
+        keys_list = payload.get("keys")
+        if not isinstance(keys_list, list) or not keys_list:
+            raise AuthenticationError("Identity provider returned an empty or invalid JWKS keyset.")
+
+        raw_by_kid: dict[str, dict[str, Any]] = {}
+        parsed_keys: dict[str, PublicKey] = {}
+        parse_errors: dict[str, str] = {}
+
+        for item in keys_list:
+            if not isinstance(item, dict):
+                continue
+            raw_kid = item.get("kid")
+            if not raw_kid:
+                continue
+            kid_str = str(raw_kid)
+            raw_by_kid[kid_str] = item
+            try:
+                parsed_keys[kid_str] = jwk_to_public_key(item)
+            except (ValueError, KeyError, TypeError) as exc:
+                parse_errors[kid_str] = str(exc)
+
+        return _ParsedJwksCacheEntry(
+            fetched_at=time.monotonic(),
+            raw_by_kid=raw_by_kid,
+            parsed_keys=parsed_keys,
+            parse_errors=parse_errors,
+        )
+
+    def _fetch_jwks_entry(self, jwks_uri: str) -> _ParsedJwksCacheEntry:
+        with self._lock:
+            static_payload = self._static_jwks.get(jwks_uri)
+
+        if static_payload is not None:
+            payload: Any = static_payload
         else:
             try:
-                if self._http_client is not None:
-                    resp = self._http_client.get(jwks_uri)
-                else:
-                    with httpx.Client(timeout=5.0) as client:
-                        resp = client.get(jwks_uri)
+                resp = self._get_http_client().get(jwks_uri)
                 resp.raise_for_status()
                 payload = resp.json()
             except Exception as exc:
@@ -698,46 +639,61 @@ class JwksKeyStore:
                     f"Unable to retrieve JWKS signing keys from identity provider ({type(exc).__name__})."
                 ) from exc
 
-        keys_list = payload.get("keys")
-        if not isinstance(keys_list, list) or not keys_list:
-            raise AuthenticationError("Identity provider returned an empty or invalid JWKS keyset.")
+        return self._parse_jwks_payload(payload)
 
-        by_kid: dict[str, dict[str, Any]] = {}
-        for item in keys_list:
-            if isinstance(item, dict) and item.get("kid"):
-                by_kid[str(item["kid"])] = item
-        return by_kid
+    @staticmethod
+    def _resolve_from_entry(entry: _ParsedJwksCacheEntry, kid: str) -> PublicKey | None:
+        if kid in entry.parsed_keys:
+            return entry.parsed_keys[kid]
+        if kid in entry.parse_errors:
+            raise AuthenticationError(
+                f"Invalid JWK signing key for kid={kid!r}: {entry.parse_errors[kid]}"
+            )
+        return None
 
     def get_public_key(
         self,
         *,
         jwks_uri: str,
         kid: str,
-    ) -> ec.EllipticCurvePublicKey | rsa.RSAPublicKey:
+    ) -> PublicKey:
         now = time.monotonic()
         with self._lock:
-            cached = self._cache.get(jwks_uri)
+            cached = self._parsed_keys.get(jwks_uri)
+            is_static = jwks_uri in self._static_jwks
 
-        if cached is not None and (now - cached[0]) < self.cache_ttl_seconds:
-            jwk = cached[1].get(kid)
-            if jwk is not None:
-                return jwk_to_public_key(jwk)
-            # Unknown kid: refresh if minimum interval elapsed (key rotation handling)
-            if (
-                now - cached[0]
-            ) < self.min_refresh_interval_seconds and jwks_uri not in self._static_jwks:
+        if cached is not None and (now - cached.fetched_at) < self.cache_ttl_seconds:
+            resolved = self._resolve_from_entry(cached, kid)
+            if resolved is not None:
+                return resolved
+            if (now - cached.fetched_at) < self.min_refresh_interval_seconds and not is_static:
                 raise AuthenticationError(f"Signing key kid={kid!r} not found in cached JWKS.")
 
-        fresh_map = self._fetch_jwks(jwks_uri)
-        with self._lock:
-            self._cache[jwks_uri] = (now, fresh_map)
+        # Deduplicate concurrent refreshes for the same JWKS URI across threads.
+        uri_lock = self._get_uri_lock(jwks_uri)
+        with uri_lock:
+            now = time.monotonic()
+            with self._lock:
+                cached = self._parsed_keys.get(jwks_uri)
+                is_static = jwks_uri in self._static_jwks
+            if cached is not None and (now - cached.fetched_at) < self.cache_ttl_seconds:
+                resolved = self._resolve_from_entry(cached, kid)
+                if resolved is not None:
+                    return resolved
+                if (now - cached.fetched_at) < self.min_refresh_interval_seconds and not is_static:
+                    raise AuthenticationError(f"Signing key kid={kid!r} not found in cached JWKS.")
 
-        jwk = fresh_map.get(kid)
-        if jwk is None:
+            fresh_entry = self._fetch_jwks_entry(jwks_uri)
+            with self._lock:
+                self._parsed_keys[jwks_uri] = fresh_entry
+                self._cache[jwks_uri] = fresh_entry.raw_by_kid
+
+        resolved = self._resolve_from_entry(fresh_entry, kid)
+        if resolved is None:
             raise AuthenticationError(
                 f"Signing key kid={kid!r} not found in identity provider JWKS."
             )
-        return jwk_to_public_key(jwk)
+        return resolved
 
 
 class IAPJwtVerifier:
@@ -752,9 +708,10 @@ class IAPJwtVerifier:
         self.settings = settings or AuthSettings.from_env()
         self.jwks_store = jwks_store or JwksKeyStore()
         if not self.settings.strict_production_mode:
+            signer = _get_local_dev_signer()
             self.jwks_store.register_static_jwks(
                 f"{LOCAL_DEV_SSO_ISSUER}/.well-known/jwks.json",
-                {"keys": [_LOCAL_DEV_SIGNER.public_jwk]},
+                {"keys": [signer.public_jwk]},
             )
 
     def _resolve_issuer_target(self, issuer: str) -> tuple[str, str]:
@@ -766,7 +723,8 @@ class IAPJwtVerifier:
             return GOOGLE_WORKSPACE_JWKS_URI, "google_workspace_oidc"
 
         if self.settings.okta_issuer_uri and issuer.rstrip("/") == self.settings.okta_issuer_uri:
-            assert self.settings.okta_jwks_uri is not None
+            if not self.settings.okta_jwks_uri:
+                raise AuthenticationError("Okta JWKS URI is not configured on the server.")
             return self.settings.okta_jwks_uri, "okta_sso"
 
         if not self.settings.strict_production_mode and issuer == LOCAL_DEV_SSO_ISSUER:
@@ -1020,15 +978,9 @@ class IAPJwtVerifier:
 
         header_b64, payload_b64, sig_b64 = parts
         try:
-            header = json.loads(_b64url_decode(header_b64).decode("utf-8"))
-            claims = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
-        except AuthenticationError:
-            raise
-        except Exception as exc:
-            raise AuthenticationError("JWT header or payload is not valid UTF-8 JSON.") from exc
-
-        if not isinstance(header, dict) or not isinstance(claims, dict):
-            raise AuthenticationError("JWT header and payload must be JSON objects.")
+            header, claims = parse_jwt_header_and_claims(header_b64, payload_b64)
+        except ValueError as exc:
+            raise AuthenticationError(str(exc)) from exc
 
         alg = header.get("alg")
         if not isinstance(alg, str) or alg not in ALLOWED_JWS_ALGORITHMS:
@@ -1052,13 +1004,16 @@ class IAPJwtVerifier:
 
         public_key = self.jwks_store.get_public_key(jwks_uri=jwks_uri, kid=kid.strip())
         signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
-        signature_bytes = _b64url_decode(sig_b64)
-        _verify_jws_signature(
-            alg=alg,
-            signing_input=signing_input,
-            signature_bytes=signature_bytes,
-            public_key=public_key,
-        )
+        try:
+            signature_bytes = b64url_decode(sig_b64)
+            verify_jws_signature(
+                alg=alg,
+                signing_input=signing_input,
+                signature_bytes=signature_bytes,
+                public_key=public_key,
+            )
+        except ValueError as exc:
+            raise AuthenticationError(str(exc)) from exc
 
         sub = claims.get("sub")
         if not isinstance(sub, str) or not sub.strip():
@@ -1122,14 +1077,23 @@ class IAPJwtVerifier:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_JWKS_STORE = JwksKeyStore()
+_VERIFIER_CACHE_LOCK = threading.Lock()
+_VERIFIER_CACHE: dict[str, tuple[tuple[str | None, ...], IAPJwtVerifier] | None] = {"entry": None}
 
 
 def get_auth_verifier() -> IAPJwtVerifier:
-    """Build an `IAPJwtVerifier` reflecting current environment settings and shared JWKS cache."""
-    return IAPJwtVerifier(
-        settings=AuthSettings.from_env(),
-        jwks_store=_DEFAULT_JWKS_STORE,
-    )
+    """Return a cached `IAPJwtVerifier` keyed by the active auth environment snapshot."""
+    snapshot = _auth_env_snapshot()
+    with _VERIFIER_CACHE_LOCK:
+        cached = _VERIFIER_CACHE["entry"]
+        if cached is not None and cached[0] == snapshot:
+            return cached[1]
+        verifier = IAPJwtVerifier(
+            settings=AuthSettings.from_env(),
+            jwks_store=_DEFAULT_JWKS_STORE,
+        )
+        _VERIFIER_CACHE["entry"] = (snapshot, verifier)
+        return verifier
 
 
 def extract_bearer_token_from_request(request: Request) -> str:
@@ -1173,9 +1137,13 @@ def require_authenticated_user(
 
         # Defense-in-depth: if routed through Google Cloud IAP proxy with X-Goog-IAP-JWT-Assertion,
         # cryptographically validate the proxy assertion as well and ensure identity consistency.
+        # SECURITY: Keep Bearer JWT's roles, permissions, groups, and cloud_identity_groups
+        # strictly authoritative. Never union iap_user's roles/permissions (which may come from
+        # `iap_default_role` fallback or a different principal when calling with a service account).
         if iap_assertion and not iap_session_only:
             iap_user = verifier.verify_jwt(iap_assertion, require_iap_issuer=True)
-            if iap_user.email != user.email and not user.email.endswith(".gserviceaccount.com"):
+            is_sa_principal = user.email.endswith(".gserviceaccount.com")
+            if not is_sa_principal and iap_user.email != user.email:
                 raise AuthenticationError(
                     "Principal mismatch between Bearer JWT and X-Goog-IAP-JWT-Assertion header."
                 )
@@ -1183,21 +1151,21 @@ def require_authenticated_user(
                 sub=user.sub,
                 email=user.email,
                 name=user.name,
-                hosted_domain=user.hosted_domain or iap_user.hosted_domain,
+                hosted_domain=(
+                    user.hosted_domain or (None if is_sa_principal else iap_user.hosted_domain)
+                ),
                 identity_provider=user.identity_provider,
                 sso_federation=user.sso_federation,
                 issuer=user.issuer,
                 audience=user.audience,
-                groups=tuple(dict.fromkeys((*user.groups, *iap_user.groups))),
-                roles=tuple(dict.fromkeys((*user.roles, *iap_user.roles))),
+                groups=user.groups,
+                roles=user.roles,
                 issued_at=user.issued_at,
-                expires_at=user.expires_at,
+                expires_at=min(user.expires_at, iap_user.expires_at),
                 token_fingerprint=user.token_fingerprint,
                 iap_assertion_verified=True,
-                permissions=tuple(dict.fromkeys((*user.permissions, *iap_user.permissions))),
-                cloud_identity_groups=tuple(
-                    dict.fromkeys((*user.cloud_identity_groups, *iap_user.cloud_identity_groups))
-                ),
+                permissions=user.permissions,
+                cloud_identity_groups=user.cloud_identity_groups,
                 agent_identity=user.agent_identity,
                 spiffe_id=user.spiffe_id,
             )
@@ -1216,8 +1184,10 @@ def require_authenticated_user(
                 s2s_claims = get_agent_s2s_broker().verify_s2s_assertion(s2s_assertion)
             except AgentAuthorizationError as exc:
                 raise AuthorizationError(exc.message) from exc
-            except ValueError as exc:
-                raise AuthenticationError(str(exc)) from exc
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                raise AuthorizationError(
+                    f"Invalid {S2S_AGENT_ASSERTION_HEADER} assertion: {exc}"
+                ) from exc
 
             # If Bearer token is itself a per-agent SA, ensure it matches the S2S assertion agent
             if user.agent_identity and user.agent_identity != s2s_claims.agent_name:
@@ -1272,6 +1242,8 @@ def require_authenticated_user(
             status_outcome="denied_401",
             detail=exc.message,
         )
+        safe_code = _sanitize_www_auth_value(exc.error_code, max_len=64)
+        safe_desc = _sanitize_www_auth_value(exc.message, max_len=200)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={
@@ -1283,8 +1255,8 @@ def require_authenticated_user(
             },
             headers={
                 "WWW-Authenticate": (
-                    f'Bearer realm="sec-edgar-iap", error="{exc.error_code}", '
-                    f'error_description="{exc.message}"'
+                    f'Bearer realm="sec-edgar-iap", error="{safe_code}", '
+                    f'error_description="{safe_desc}"'
                 )
             },
         ) from exc
@@ -1305,34 +1277,6 @@ def require_authenticated_user(
                 "message": exc.message,
             },
         ) from exc
-
-
-def require_roles(*required_roles: str):
-    """Build a FastAPI dependency requiring the authenticated user to hold at least one role."""
-
-    def _dependency(
-        request: Request,
-        user: AuthenticatedUser = Depends(require_authenticated_user),
-    ) -> AuthenticatedUser:
-        if not any(r in user.roles for r in required_roles):
-            record_security_audit_event(
-                event_type="api_authorization_denied",
-                user=user,
-                resource=request.url.path,
-                status_outcome="denied_403",
-                detail=f"Required one of roles {list(required_roles)}, got {list(user.roles)}.",
-            )
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail={
-                    "status": "forbidden",
-                    "error": "insufficient_role",
-                    "message": f"Required one of roles {list(required_roles)}, got {list(user.roles)}.",
-                },
-            )
-        return user
-
-    return _dependency
 
 
 def require_permissions(
@@ -1438,7 +1382,7 @@ def issue_local_dev_workspace_sso_token(
         else ["sec-edgar-analysts"]
     )
 
-    raw_jwt, _ = _LOCAL_DEV_SIGNER.mint_token(
+    raw_jwt, _ = _get_local_dev_signer().mint_token(
         email=cleaned_email,
         name=name.strip() or "SEC Analyst",
         hosted_domain=hosted_domain,
@@ -1447,3 +1391,42 @@ def issue_local_dev_workspace_sso_token(
     )
     verified_user = active_verifier.verify_jwt(raw_jwt)
     return raw_jwt, verified_user
+
+
+__all__ = [
+    "ALLOWED_JWS_ALGORITHMS",
+    "DEFAULT_LOCAL_IAP_AUDIENCE",
+    "GOOGLE_IAP_ISSUER",
+    "GOOGLE_IAP_JWKS_URI",
+    "GOOGLE_WORKSPACE_ISSUERS",
+    "GOOGLE_WORKSPACE_JWKS_URI",
+    "IAP_ASSERTION_HEADER",
+    "IAP_DEFAULT_ROLE_CHOICES",
+    "LOCAL_DEV_SSO_ISSUER",
+    "MAX_JWT_LENGTH_BYTES",
+    "AuthSettings",
+    "AuthenticatedUser",
+    "AuthenticationError",
+    "AuthorizationError",
+    "IAPJwtVerifier",
+    "JwksKeyStore",
+    "b64url_decode",
+    "b64url_encode",
+    "clear_security_audit_events",
+    "compute_token_fingerprint",
+    "ec_public_key_to_jwk",
+    "extract_bearer_token_from_request",
+    "get_auth_verifier",
+    "get_security_audit_events",
+    "is_bearer_token_revoked",
+    "is_production_iap_mode",
+    "issue_local_dev_workspace_sso_token",
+    "jwk_to_public_key",
+    "record_security_audit_event",
+    "require_authenticated_user",
+    "require_permissions",
+    "revoke_bearer_token",
+    "rsa_public_key_to_jwk",
+    "sign_jwt_es256",
+    "sign_jwt_rs256",
+]

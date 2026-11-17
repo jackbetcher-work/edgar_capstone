@@ -11,13 +11,12 @@ Two publishing steps, both driven by manifests already staged in the GCS corpus 
    data store, followed by long-running-operation polling. ``search_vertex_ai_datastore``
    runs a post-import smoke query against the ``default_search`` serving config.
 
-All calls are plain REST over ``httpx`` with Application Default Credentials bearer tokens,
-mirroring the rest of the code base (no extra client libraries required).
+All calls are plain REST over ``httpx`` via `GcpRestClient` with Application Default
+Credentials bearer tokens refreshed on every poll (no extra client libraries required).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 import uuid
@@ -26,27 +25,41 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-import google.auth
 import httpx
-from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.auth.exceptions import DefaultCredentialsError
 
-from edgar_capstone.dataset.gcs_storage import (
+from edgar_capstone.dataset.gcs_storage import normalize_bucket_name
+from edgar_capstone.gcp.bigquery import (
+    BIGQUERY_API_ROOT,
+)
+from edgar_capstone.gcp.bigquery import (
+    load_bigquery_schema_fields as _gcp_load_bigquery_schema_fields,
+)
+from edgar_capstone.gcp.defaults import (
+    DEFAULT_BIGQUERY_DATASET_ID,
     DEFAULT_BUCKET_NAME,
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
-    normalize_bucket_name,
 )
+from edgar_capstone.gcp.discovery_engine import (
+    DEFAULT_VERTEX_AI_SEARCH_COLLECTION,
+    DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID,
+    DEFAULT_VERTEX_AI_SEARCH_LOCATION,
+    discovery_engine_root,
+)
+from edgar_capstone.gcp.discovery_engine import (
+    vertex_search_datastore_path as _gcp_vertex_search_datastore_path,
+)
+from edgar_capstone.gcp.lro import OperationError, OperationTimeoutError, poll_operation
+from edgar_capstone.gcp.paths import resolve_repo_root
+from edgar_capstone.gcp.rest_client import GcpRestClient
 
 logger = logging.getLogger(__name__)
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-
-_CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
-BIGQUERY_API_ROOT = "https://bigquery.googleapis.com/bigquery/v2"
-DISCOVERY_ENGINE_API_ROOT = "https://discoveryengine.googleapis.com/v1"
+REPO_ROOT = resolve_repo_root()
+DISCOVERY_ENGINE_API_ROOT = discovery_engine_root(DEFAULT_VERTEX_AI_SEARCH_LOCATION)
 
 # --- BigQuery financial_metrics defaults -------------------------------------------------
-DEFAULT_BIGQUERY_DATASET_ID = "sec_edgar"
 DEFAULT_FINANCIAL_METRICS_TABLE_ID = "financial_metrics"
 DEFAULT_BIGQUERY_LOCATION = DEFAULT_LOCATION
 FINANCIALS_MANIFEST_BLOB = "manifests/bigquery_financials.jsonl"
@@ -62,9 +75,9 @@ FINANCIAL_METRICS_RANGE_PARTITIONING: dict[str, Any] = {
 FINANCIAL_METRICS_CLUSTERING_FIELDS: tuple[str, ...] = ("gics_sector", "ticker")
 
 # --- Vertex AI Search (Discovery Engine) defaults ----------------------------------------
-DEFAULT_VERTEX_SEARCH_DATASTORE_ID = "sec-edgar-10k-corpus-ds"
-DEFAULT_VERTEX_SEARCH_LOCATION = "global"
-DEFAULT_VERTEX_SEARCH_COLLECTION = "default_collection"
+DEFAULT_VERTEX_SEARCH_DATASTORE_ID = DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID
+DEFAULT_VERTEX_SEARCH_LOCATION = DEFAULT_VERTEX_AI_SEARCH_LOCATION
+DEFAULT_VERTEX_SEARCH_COLLECTION = DEFAULT_VERTEX_AI_SEARCH_COLLECTION
 DEFAULT_VERTEX_SEARCH_BRANCH = "default_branch"
 DEFAULT_VERTEX_SEARCH_SERVING_CONFIG = "default_search"
 VERTEX_SEARCH_MANIFEST_BLOB = "manifests/vertex_ai_search_metadata.jsonl"
@@ -88,27 +101,6 @@ class CloudPublishTimeoutError(CloudPublishError):
 # ------------------------------------------------------------------------------------------
 
 
-def _bearer_token(credentials: Any | None) -> str:
-    """Return a valid OAuth2 bearer token from `credentials` (or ADC when omitted)."""
-    if credentials is None:
-        credentials, _ = google.auth.default(scopes=[_CLOUD_PLATFORM_SCOPE])
-    if not getattr(credentials, "valid", False) or not getattr(credentials, "token", None):
-        credentials.refresh(GoogleAuthRequest())
-    token = getattr(credentials, "token", None)
-    if not token:
-        raise CloudPublishError("Application Default Credentials did not return a bearer token.")
-    return str(token)
-
-
-def _auth_headers(token: str, *, quota_project_id: str | None, json_body: bool) -> dict[str, str]:
-    headers = {"Authorization": f"Bearer {token}"}
-    if json_body:
-        headers["Content-Type"] = "application/json"
-    if quota_project_id:
-        headers["x-goog-user-project"] = quota_project_id
-    return headers
-
-
 def _raise_for_http(resp: httpx.Response, action: str) -> None:
     if resp.status_code not in (200, 201):
         raise CloudPublishError(f"{action} failed (HTTP {resp.status_code}): {resp.text[:400]}")
@@ -127,6 +119,20 @@ def _to_int(value: Any) -> int | None:
 def gcs_uri(bucket_name: str, blob_path: str) -> str:
     """Build a `gs://` URI from a (possibly `gs://`-prefixed) bucket name and blob path."""
     return f"gs://{normalize_bucket_name(bucket_name)}/{blob_path.lstrip('/')}"
+
+
+def _make_rest_client(
+    *,
+    http_client: httpx.Client | None,
+    credentials: Any | None,
+    quota_project_id: str | None = None,
+) -> GcpRestClient:
+    return GcpRestClient(
+        http_client=http_client,
+        credentials=credentials,
+        default_timeout=60.0,
+        quota_project_id=quota_project_id,
+    )
 
 
 # ------------------------------------------------------------------------------------------
@@ -163,13 +169,10 @@ class BigQueryLoadJobResult:
 
 def load_bigquery_schema_fields(path: Path | str) -> list[dict[str, Any]]:
     """Load a BigQuery `TableFieldSchema` list (the terraform `schemas/*.json` format)."""
-    schema_path = Path(path)
-    data = json.loads(schema_path.read_text(encoding="utf-8"))
-    if isinstance(data, dict) and isinstance(data.get("fields"), list):
-        data = data["fields"]
-    if not isinstance(data, list) or not all(isinstance(f, dict) and "name" in f for f in data):
-        raise ValueError(f"{schema_path} is not a BigQuery schema field list")
-    return data
+    fields = _gcp_load_bigquery_schema_fields(path)
+    if not all("name" in f for f in fields):
+        raise ValueError(f"{path} is not a BigQuery schema field list")
+    return fields
 
 
 def resolve_schema_path(schema_path: Path | str | None) -> Path | None:
@@ -214,9 +217,13 @@ def run_bigquery_load_job(
 ) -> BigQueryLoadJobResult:
     """Submit a BigQuery load job via `jobs.insert` and (optionally) poll it until `DONE`.
 
-    Raises `CloudPublishError` on submission failure or a terminal `errorResult`, and
-    `CloudPublishTimeoutError` if the job is still running at the deadline (unless
-    `raise_on_timeout=False`, in which case a warning is logged and the pending result returned).
+    Acquires a fresh OAuth2 bearer token on every poll via `GcpRestClient` + `poll_operation`,
+    retries only transient 429/5xx/timeout responses, and fails fast on fatal HTTP 4xx errors.
+
+    Raises `CloudPublishError` on submission failure, fatal poll HTTP 4xx, or a terminal
+    `errorResult`, and `CloudPublishTimeoutError` if the job is still running at the deadline
+    (unless `raise_on_timeout=False`, in which case a warning is logged and the pending result
+    is returned).
 
     BigQuery rejects `schemaUpdateOptions` combined with `WRITE_TRUNCATE` unless the destination
     is a single partition (`table$partition`); a plain `WRITE_TRUNCATE` with an explicit schema
@@ -229,7 +236,6 @@ def run_bigquery_load_job(
             "WRITE_TRUNCATE with an explicit schema already replaces the table schema."
         )
 
-    token = _bearer_token(credentials)
     job_id = f"{job_id_prefix}_{uuid.uuid4().hex[:12]}"
     load_config: dict[str, Any] = {
         "sourceUris": list(source_uris),
@@ -269,14 +275,20 @@ def run_bigquery_load_job(
         schema_update_options=update_options,
     )
 
-    client = http_client or httpx.Client(timeout=60.0)
-    close_client = http_client is None
-    try:
-        resp = client.post(
-            f"{BIGQUERY_API_ROOT}/projects/{project_id}/jobs",
-            json=payload,
-            headers=_auth_headers(token, quota_project_id=quota_project_id, json_body=True),
-        )
+    with _make_rest_client(
+        http_client=http_client,
+        credentials=credentials,
+        quota_project_id=quota_project_id,
+    ) as rest:
+        try:
+            resp = rest._raw_request(
+                "POST",
+                f"{BIGQUERY_API_ROOT}/projects/{project_id}/jobs",
+                json_body=payload,
+            )
+        except DefaultCredentialsError as exc:
+            raise CloudPublishError(str(exc)) from exc
+
         _raise_for_http(resp, f"BigQuery load job submission ({job_id})")
         logger.info("Submitted BigQuery load job %s -> %s", job_id, result.destination_table)
         if not wait:
@@ -284,51 +296,57 @@ def run_bigquery_load_job(
             return result
 
         status_url = f"{BIGQUERY_API_ROOT}/projects/{project_id}/jobs/{job_id}"
-        interval = poll_interval_seconds
-        if interval is None:
-            interval = 1.5 if poll_timeout_seconds <= 120 else 5.0
-        deadline = time.monotonic() + poll_timeout_seconds
-        while time.monotonic() < deadline:
-            poll_resp = client.get(
-                status_url,
-                params={"location": location},
-                headers=_auth_headers(token, quota_project_id=quota_project_id, json_body=False),
-            )
-            if poll_resp.status_code == 200:
-                job_data = poll_resp.json()
-                status = job_data.get("status", {})
-                result.state = str(status.get("state") or result.state)
-                if result.done:
-                    err = status.get("errorResult")
-                    if err:
-                        details = status.get("errors") or []
-                        raise CloudPublishError(
-                            f"BigQuery load job {job_id} failed: {err}"
-                            + (f" (first errors: {details[:3]})" if details else "")
-                        )
-                    load_stats = job_data.get("statistics", {}).get("load", {})
-                    result.output_rows = _to_int(load_stats.get("outputRows"))
-                    result.input_files = _to_int(load_stats.get("inputFiles"))
-                    result.input_file_bytes = _to_int(load_stats.get("inputFileBytes"))
-                    result.bad_records = _to_int(load_stats.get("badRecords"))
-                    return result
-            else:
-                logger.debug(
-                    "BigQuery job poll for %s returned HTTP %s", job_id, poll_resp.status_code
-                )
-            time.sleep(interval)
-
-        message = (
-            f"BigQuery load job {job_id} still running after {poll_timeout_seconds:.0f}s; "
-            f"check `bq show -j --location={location} {job_id}`."
+        interval = (
+            poll_interval_seconds
+            if poll_interval_seconds is not None
+            else (1.5 if poll_timeout_seconds <= 120 else 5.0)
         )
-        if raise_on_timeout:
-            raise CloudPublishTimeoutError(message)
-        logger.warning(message)
+
+        def _poll_job() -> httpx.Response:
+            return rest._raw_request("GET", status_url, params={"location": location})
+
+        def _is_done(job_data: dict[str, Any]) -> bool:
+            status = job_data.get("status") or {}
+            result.state = str(status.get("state") or result.state)
+            return result.done
+
+        try:
+            job_data = poll_operation(
+                _poll_job,
+                _is_done,
+                label=f"BigQuery load job {job_id}",
+                timeout_seconds=poll_timeout_seconds,
+                initial_interval_seconds=interval,
+                max_interval_seconds=interval,
+                backoff_multiplier=1.0,
+                sleep_fn=time.sleep,
+            )
+        except OperationTimeoutError as exc:
+            message = (
+                f"BigQuery load job {job_id} still running after {poll_timeout_seconds:.0f}s; "
+                f"check `bq show -j --location={location} {job_id}`."
+            )
+            if raise_on_timeout:
+                raise CloudPublishTimeoutError(message) from exc
+            logger.warning(message)
+            return result
+        except (OperationError, DefaultCredentialsError) as exc:
+            raise CloudPublishError(str(exc)) from exc
+
+        status = job_data.get("status") or {}
+        err = status.get("errorResult")
+        if err:
+            details = status.get("errors") or []
+            raise CloudPublishError(
+                f"BigQuery load job {job_id} failed: {err}"
+                + (f" (first errors: {details[:3]})" if details else "")
+            )
+        load_stats = (job_data.get("statistics") or {}).get("load") or {}
+        result.output_rows = _to_int(load_stats.get("outputRows"))
+        result.input_files = _to_int(load_stats.get("inputFiles"))
+        result.input_file_bytes = _to_int(load_stats.get("inputFileBytes"))
+        result.bad_records = _to_int(load_stats.get("badRecords"))
         return result
-    finally:
-        if close_client:
-            client.close()
 
 
 def reload_financial_metrics_table(
@@ -368,9 +386,12 @@ def reload_financial_metrics_table(
         logger.warning("No financial_metrics schema file found; relying on the table schema.")
 
     update_options: list[str] = []
-    if allow_field_addition and schema_fields is not None:
-        if write_disposition == "WRITE_APPEND" or "$" in table_id:
-            update_options.append("ALLOW_FIELD_ADDITION")
+    if (
+        allow_field_addition
+        and schema_fields is not None
+        and (write_disposition == "WRITE_APPEND" or "$" in table_id)
+    ):
+        update_options.append("ALLOW_FIELD_ADDITION")
 
     return run_bigquery_load_job(
         project_id=project_id,
@@ -407,16 +428,12 @@ def vertex_search_datastore_path(
     location: str = DEFAULT_VERTEX_SEARCH_LOCATION,
     collection: str = DEFAULT_VERTEX_SEARCH_COLLECTION,
 ) -> str:
-    return (
-        f"projects/{project_id}/locations/{location}/collections/{collection}"
-        f"/dataStores/{data_store_id}"
+    return _gcp_vertex_search_datastore_path(
+        project_id,
+        data_store_id=data_store_id,
+        location=location,
+        collection=collection,
     )
-
-
-def _discovery_engine_root(location: str) -> str:
-    if location == "global":
-        return DISCOVERY_ENGINE_API_ROOT
-    return f"https://{location}-discoveryengine.googleapis.com/v1"
 
 
 @dataclass(slots=True)
@@ -474,45 +491,42 @@ def poll_discovery_engine_operation(
     Returns the final operation JSON. Raises `CloudPublishError` if the operation finished
     with an `error`, and `CloudPublishTimeoutError` if it is still running at the deadline.
     """
-    url = f"{_discovery_engine_root(location)}/{operation_name}"
-    client = http_client or httpx.Client(timeout=60.0)
-    close_client = http_client is None
-    interval = initial_interval_seconds
-    deadline = time.monotonic() + timeout_seconds
-    try:
-        while True:
-            token = _bearer_token(credentials)
-            resp = client.get(
-                url,
-                headers=_auth_headers(token, quota_project_id=quota_project_id, json_body=False),
-            )
-            if resp.status_code == 200:
-                operation = resp.json()
-                if on_progress is not None:
-                    on_progress(operation)
-                if operation.get("done"):
-                    if operation.get("error"):
-                        raise CloudPublishError(
-                            f"Discovery Engine operation {operation_name} failed: "
-                            f"{operation['error']}"
-                        )
-                    return operation
-            elif resp.status_code in (429,) or resp.status_code >= 500:
-                logger.warning("Operation poll HTTP %s; retrying", resp.status_code)
-            else:
-                _raise_for_http(resp, f"Polling Discovery Engine operation {operation_name}")
+    url = f"{discovery_engine_root(location)}/{operation_name}"
+    with _make_rest_client(
+        http_client=http_client,
+        credentials=credentials,
+        quota_project_id=quota_project_id,
+    ) as rest:
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise CloudPublishTimeoutError(
-                    f"Discovery Engine operation {operation_name} not done after "
-                    f"{timeout_seconds:.0f}s; re-poll with GET {url}"
-                )
-            time.sleep(min(interval, remaining))
-            interval = min(interval * backoff_multiplier, max_interval_seconds)
-    finally:
-        if close_client:
-            client.close()
+        def _is_done(operation: dict[str, Any]) -> bool:
+            if on_progress is not None:
+                on_progress(operation)
+            return bool(operation.get("done"))
+
+        try:
+            operation = poll_operation(
+                lambda: rest._raw_request("GET", url),
+                _is_done,
+                label=f"Discovery Engine operation {operation_name}",
+                timeout_seconds=timeout_seconds,
+                initial_interval_seconds=initial_interval_seconds,
+                max_interval_seconds=max_interval_seconds,
+                backoff_multiplier=backoff_multiplier,
+                sleep_fn=time.sleep,
+            )
+        except OperationTimeoutError as exc:
+            raise CloudPublishTimeoutError(
+                f"Discovery Engine operation {operation_name} not done after "
+                f"{timeout_seconds:.0f}s; re-poll with GET {url}"
+            ) from exc
+        except (OperationError, DefaultCredentialsError) as exc:
+            raise CloudPublishError(str(exc)) from exc
+
+        if operation.get("error"):
+            raise CloudPublishError(
+                f"Discovery Engine operation {operation_name} failed: {operation['error']}"
+            )
+        return operation
 
 
 def import_vertex_ai_search_documents(
@@ -547,22 +561,22 @@ def import_vertex_ai_search_documents(
     data_store = vertex_search_datastore_path(
         project_id=project_id, data_store_id=data_store_id, location=location, collection=collection
     )
-    url = f"{_discovery_engine_root(location)}/{data_store}/branches/{branch}/documents:import"
+    url = f"{discovery_engine_root(location)}/{data_store}/branches/{branch}/documents:import"
     payload = {
         "gcsSource": {"inputUris": uris, "dataSchema": "document"},
         "reconciliationMode": mode,
         "errorConfig": {"gcsPrefix": errors_prefix},
     }
 
-    client = http_client or httpx.Client(timeout=60.0)
-    close_client = http_client is None
-    try:
-        token = _bearer_token(credentials)
-        resp = client.post(
-            url,
-            json=payload,
-            headers=_auth_headers(token, quota_project_id=project_id, json_body=True),
-        )
+    with _make_rest_client(
+        http_client=http_client,
+        credentials=credentials,
+        quota_project_id=project_id,
+    ) as rest:
+        try:
+            resp = rest._raw_request("POST", url, json_body=payload)
+        except DefaultCredentialsError as exc:
+            raise CloudPublishError(str(exc)) from exc
         _raise_for_http(resp, f"Vertex AI Search documents:import into {data_store_id}")
         operation = resp.json()
         operation_name = str(operation.get("name") or "")
@@ -599,15 +613,12 @@ def import_vertex_ai_search_documents(
                 timeout_seconds=timeout_seconds,
                 initial_interval_seconds=initial_poll_interval_seconds,
                 max_interval_seconds=max_poll_interval_seconds,
-                http_client=client,
+                http_client=rest._get_http_client(),
                 credentials=credentials,
                 on_progress=_log_progress,
             )
         _apply_operation(result, operation)
         return result
-    finally:
-        if close_client:
-            client.close()
 
 
 def search_vertex_ai_datastore(
@@ -626,16 +637,20 @@ def search_vertex_ai_datastore(
     data_store = vertex_search_datastore_path(
         project_id=project_id, data_store_id=data_store_id, location=location, collection=collection
     )
-    url = f"{_discovery_engine_root(location)}/{data_store}/servingConfigs/{serving_config}:search"
-    client = http_client or httpx.Client(timeout=60.0)
-    close_client = http_client is None
-    try:
-        token = _bearer_token(credentials)
-        resp = client.post(
-            url,
-            json={"query": query, "pageSize": page_size},
-            headers=_auth_headers(token, quota_project_id=project_id, json_body=True),
-        )
+    url = f"{discovery_engine_root(location)}/{data_store}/servingConfigs/{serving_config}:search"
+    with _make_rest_client(
+        http_client=http_client,
+        credentials=credentials,
+        quota_project_id=project_id,
+    ) as rest:
+        try:
+            resp = rest._raw_request(
+                "POST",
+                url,
+                json_body={"query": query, "pageSize": page_size},
+            )
+        except DefaultCredentialsError as exc:
+            raise CloudPublishError(str(exc)) from exc
         _raise_for_http(resp, f"Vertex AI Search query against {data_store_id}")
         hits: list[str] = []
         for item in resp.json().get("results") or []:
@@ -643,15 +658,9 @@ def search_vertex_ai_datastore(
             if doc_id:
                 hits.append(str(doc_id))
         return hits
-    finally:
-        if close_client:
-            client.close()
 
 
 __all__ = [
-    "BigQueryLoadJobResult",
-    "CloudPublishError",
-    "CloudPublishTimeoutError",
     "DEFAULT_BIGQUERY_DATASET_ID",
     "DEFAULT_BIGQUERY_LOCATION",
     "DEFAULT_FINANCIAL_METRICS_SCHEMA_PATH",
@@ -661,6 +670,9 @@ __all__ = [
     "FINANCIALS_MANIFEST_BLOB",
     "RECONCILIATION_MODES",
     "VERTEX_SEARCH_MANIFEST_BLOB",
+    "BigQueryLoadJobResult",
+    "CloudPublishError",
+    "CloudPublishTimeoutError",
     "VertexSearchImportResult",
     "gcs_uri",
     "import_vertex_ai_search_documents",

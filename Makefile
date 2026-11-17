@@ -134,5 +134,5 @@ docker-smoke: docker-build ## Run the image and smoke-test /health + UI over HTT
 	$(DOCKER) rm -f $(SMOKE_CONTAINER) >/dev/null; exit $$status
 
 clean: ## Remove build artifacts and caches
-	rm -rf frontend/dist .pytest_cache .ruff_cache
+	rm -rf frontend/dist .pytest_cache .ruff_cache .coverage build/lib build/bdist.* *.egg-info
 	find src tests scripts -type d -name "__pycache__" -exec rm -rf {} +

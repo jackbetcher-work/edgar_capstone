@@ -28,19 +28,20 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import os
 import sys
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+try:
+    from scripts._cli import add_gcp_args, configure_script_logging
+except ImportError:  # pragma: no cover - direct script execution without editable install
+    from _cli import (  # type: ignore[import-not-found,no-redef]
+        add_gcp_args,
+        configure_script_logging,
+    )
 
-from edgar_capstone.dataset.cloud_publish import (  # noqa: E402
-    DEFAULT_BIGQUERY_DATASET_ID,
+from edgar_capstone.dataset.cloud_publish import (
     DEFAULT_BIGQUERY_LOCATION,
     DEFAULT_FINANCIAL_METRICS_TABLE_ID,
     DEFAULT_SMOKE_QUERY,
@@ -51,25 +52,25 @@ from edgar_capstone.dataset.cloud_publish import (  # noqa: E402
     reload_financial_metrics_table,
     search_vertex_ai_datastore,
 )
-from edgar_capstone.dataset.gcs_storage import (  # noqa: E402
-    DEFAULT_BUCKET_NAME,
+from edgar_capstone.gcp.defaults import (
     DEFAULT_PROJECT_ID,
+    resolve_bq_dataset_id,
+    resolve_corpus_bucket,
 )
 
 SUBCOMMANDS = ("financial-metrics", "vertex-search", "all")
 
 
 def _add_common_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--project-id",
+    add_gcp_args(
+        parser,
+        include_project=True,
+        include_bucket=True,
         # Deliberately not $GCP_PROJECT_ID: shells often carry a different sandbox project there.
-        default=os.environ.get("GOOGLE_CLOUD_PROJECT") or DEFAULT_PROJECT_ID,
-        help="GCP project (default: $GOOGLE_CLOUD_PROJECT or %(default)s).",
-    )
-    parser.add_argument(
-        "--bucket",
-        default=os.environ.get("SEC_CORPUS_BUCKET") or DEFAULT_BUCKET_NAME,
-        help="GCS corpus bucket holding manifests/ (default: $SEC_CORPUS_BUCKET or %(default)s).",
+        project_default=os.environ.get("GOOGLE_CLOUD_PROJECT") or DEFAULT_PROJECT_ID,
+        bucket_default=resolve_corpus_bucket(),
+        project_help="GCP project (default: $GOOGLE_CLOUD_PROJECT or %(default)s).",
+        bucket_help="GCS corpus bucket holding manifests/ (default: $SEC_CORPUS_BUCKET or %(default)s).",
     )
     parser.add_argument(
         "--timeout-seconds",
@@ -87,7 +88,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_financial_metrics_args(parser: argparse.ArgumentParser) -> None:
     group = parser.add_argument_group("BigQuery financial_metrics")
-    group.add_argument("--dataset-id", default=DEFAULT_BIGQUERY_DATASET_ID)
+    group.add_argument("--dataset-id", default=resolve_bq_dataset_id())
     group.add_argument("--table-id", default=DEFAULT_FINANCIAL_METRICS_TABLE_ID)
     group.add_argument(
         "--bq-location",
@@ -180,6 +181,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def run_financial_metrics(args: argparse.Namespace) -> dict[str, Any]:
+    timeout_seconds = args.timeout_seconds if args.timeout_seconds is not None else 600.0
     result = reload_financial_metrics_table(
         project_id=args.project_id,
         bucket_name=args.bucket,
@@ -192,19 +194,20 @@ def run_financial_metrics(args: argparse.Namespace) -> dict[str, Any]:
         write_disposition=args.write_disposition,
         ignore_unknown_values=args.ignore_unknown_values,
         wait=not args.no_wait,
-        timeout_seconds=args.timeout_seconds or 600.0,
+        timeout_seconds=timeout_seconds,
     )
     return result.to_dict()
 
 
 def run_vertex_search(args: argparse.Namespace) -> dict[str, Any]:
+    timeout_seconds = args.timeout_seconds if args.timeout_seconds is not None else 3600.0
     result = import_vertex_ai_search_documents(
         project_id=args.project_id,
         bucket_name=args.bucket,
         data_store_id=args.data_store_id,
         reconciliation_mode=args.reconciliation_mode,
         wait=not args.no_wait,
-        timeout_seconds=args.timeout_seconds or 3600.0,
+        timeout_seconds=timeout_seconds,
     )
     summary = result.to_dict()
     summary.pop("metadata", None)
@@ -224,13 +227,16 @@ def _print_summary(title: str, summary: dict[str, Any]) -> None:
     print(title)
     print("=" * 72)
     for key, value in summary.items():
-        if isinstance(value, list):
-            value = ", ".join(str(v) for v in value) if value else "-"
-        print(f"{key:<22}: {value}")
+        rendered = (
+            (", ".join(str(v) for v in value) if value else "-")
+            if isinstance(value, list)
+            else value
+        )
+        print(f"{key:<22}: {rendered}")
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    configure_script_logging(fmt="%(levelname)s %(name)s: %(message)s", datefmt=None)
     args = parse_args(argv)
     results: dict[str, dict[str, Any]] = {}
     exit_code = 0

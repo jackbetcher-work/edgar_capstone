@@ -13,31 +13,29 @@ boundary, and short-lived audience-bound S2S token attestation.
 
 from __future__ import annotations
 
-import base64
-import json
-import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
-import google.auth
 import httpx
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.hazmat.primitives.asymmetric.utils import (
-    decode_dss_signature,
-    encode_dss_signature,
-)
-from google.auth.transport.requests import Request as GoogleAuthRequest
 
+from edgar_capstone.gcp.defaults import resolve_gcp_project_id
+from edgar_capstone.gcp.rest_client import GcpRestClient
+from edgar_capstone.security.jwt_codec import (
+    b64url_decode,
+    parse_jwt_header_and_claims,
+    sign_jwt_es256,
+    verify_es256_signature,
+)
 from edgar_capstone.security.rbac import (
     CUSTOM_RUNTIME_SA_ACCOUNT_ID,
     Permission,
     RuntimeServiceAccountConfig,
 )
-from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID, RedactedSecret
+from edgar_capstone.security.secrets import RedactedSecret
 
 S2S_AGENT_ASSERTION_HEADER = "X-Agent-Identity-Assertion"
 AGENT_IDENTITY_ISSUER = "https://agent-identity.sec-edgar.internal"
@@ -74,22 +72,16 @@ class AgentIdentitySpec:
     gcp_iam_roles: tuple[str, ...]
     oauth_scopes: tuple[str, ...]
 
+    @staticmethod
+    def _resolve_project(project_name: str | None = None) -> str:
+        return resolve_gcp_project_id(project_name).lower()
+
     def service_account_email(self, project_name: str | None = None) -> str:
-        resolved_project = (
-            (project_name or "").strip().lower()
-            or os.environ.get("GCP_PROJECT_ID", "").strip().lower()
-            or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip().lower()
-            or DEFAULT_PROJECT_ID
-        )
+        resolved_project = self._resolve_project(project_name)
         return f"{self.service_account_id}@{resolved_project}.iam.gserviceaccount.com"
 
     def spiffe_id(self, project_name: str | None = None) -> str:
-        resolved_project = (
-            (project_name or "").strip().lower()
-            or os.environ.get("GCP_PROJECT_ID", "").strip().lower()
-            or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip().lower()
-            or DEFAULT_PROJECT_ID
-        )
+        resolved_project = self._resolve_project(project_name)
         return (
             f"spiffe://{resolved_project}.svc.id.goog"
             f"/ns/sec-edgar/sa/{self.service_account_id}/agent/{self.agent_name}"
@@ -122,8 +114,6 @@ TOOL_TARGET_SERVICE_MAP: dict[str, str] = {
     "compare_disclosures_across_years": "hybrid-rag-search-service",
     "load_cached_10k_section": "context-cache-service",
     "query_cached_10k_context": "context-cache-service",
-    "before_model_safety_and_latency_callback": "model-armor-service",
-    "after_model_fact_check_callback": "fact-check-verification-service",
 }
 
 AGENT_TARGET_SERVICE_IDS: dict[str, str] = {
@@ -302,6 +292,7 @@ TARGET_SERVICE_TO_AGENT_NAME: dict[str, str] = {
     "financial-analyst-agent": "FinancialAnalystAgent",
     "context-cache-agent": "ContextCacheManager",
     "model-armor-guardrail": "ModelArmorGuardrail",
+    "fact-check-verification-service": "ModelArmorGuardrail",
 }
 
 
@@ -323,13 +314,27 @@ def resolve_agent_by_service_account_id(account_id: str) -> AgentIdentitySpec | 
     return SERVICE_ACCOUNT_ID_TO_AGENT.get(account_id.strip().lower())
 
 
-def _b64url_encode(raw: bytes) -> str:
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+def _require_str_claim(claims: dict[str, Any], field: str) -> str:
+    raw = claims.get(field)
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"S2S agent assertion is missing required {field!r} claim.")
+    return raw.strip()
 
 
-def _b64url_decode(segment: str) -> bytes:
-    padded = segment + "=" * ((4 - len(segment) % 4) % 4)
-    return base64.urlsafe_b64decode(padded.encode("ascii"))
+def _require_str_list_claim(claims: dict[str, Any], field: str) -> tuple[str, ...]:
+    raw = claims.get(field)
+    if raw is None:
+        return ()
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ValueError(f"S2S agent assertion claim {field!r} must be a list of strings.")
+    return tuple(raw)
+
+
+def _require_epoch_claim(claims: dict[str, Any], field: str) -> int:
+    raw = claims.get(field)
+    if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+        raise ValueError(f"S2S agent assertion is missing numeric {field!r} claim.")
+    return int(raw)
 
 
 @dataclass(frozen=True)
@@ -410,7 +415,6 @@ class AgentS2STokenBroker:
             if target_service.startswith(("https://", "http://", "service://", "/projects/"))
             else f"service://{target_service}"
         )
-        header = {"alg": "ES256", "typ": "at+jwt", "kid": self.kid}
         claims: dict[str, Any] = {
             "iss": AGENT_IDENTITY_ISSUER,
             "sub": spec.spiffe_id(project_name),
@@ -425,13 +429,7 @@ class AgentS2STokenBroker:
             "exp": exp,
             "jti": uuid.uuid4().hex,
         }
-        h_b64 = _b64url_encode(json.dumps(header, separators=(",", ":")).encode("utf-8"))
-        p_b64 = _b64url_encode(json.dumps(claims, separators=(",", ":")).encode("utf-8"))
-        signing_input = f"{h_b64}.{p_b64}".encode("ascii")
-        der_sig = self._ephemeral_ec_key.sign(signing_input, ec.ECDSA(hashes.SHA256()))
-        r, s = decode_dss_signature(der_sig)
-        sig_b64 = _b64url_encode(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
-        return f"{h_b64}.{p_b64}.{sig_b64}"
+        return sign_jwt_es256(claims, self._ephemeral_ec_key, kid=self.kid, typ="at+jwt")
 
     def verify_s2s_assertion(
         self,
@@ -443,46 +441,49 @@ class AgentS2STokenBroker:
         clock_skew_seconds: int = 15,
     ) -> VerifiedAgentS2SClaims:
         """Cryptographically verify a per-agent S2S assertion and enforce audience/tool/permission bounds."""
+        if not isinstance(raw_assertion, str):
+            raise ValueError("Malformed S2S agent assertion JWT.")
         parts = raw_assertion.strip().split(".")
         if len(parts) != 3 or not all(parts):
             raise ValueError("Malformed S2S agent assertion JWT.")
 
         h_b64, p_b64, sig_b64 = parts
-        header = json.loads(_b64url_decode(h_b64).decode("utf-8"))
-        claims = json.loads(_b64url_decode(p_b64).decode("utf-8"))
+        header, claims = parse_jwt_header_and_claims(h_b64, p_b64)
 
         if header.get("alg") != "ES256" or header.get("kid") != self.kid:
             raise ValueError("Untrusted S2S agent assertion key or algorithm.")
 
-        sig_bytes = _b64url_decode(sig_b64)
-        if len(sig_bytes) != 64:
-            raise ValueError("Invalid ES256 signature length in S2S agent assertion.")
-        r = int.from_bytes(sig_bytes[:32], "big")
-        s = int.from_bytes(sig_bytes[32:], "big")
+        sig_bytes = b64url_decode(sig_b64)
         try:
-            self._public_ec_key.verify(
-                encode_dss_signature(r, s),
+            verify_es256_signature(
                 f"{h_b64}.{p_b64}".encode("ascii"),
-                ec.ECDSA(hashes.SHA256()),
+                sig_bytes,
+                self._public_ec_key,
             )
-        except InvalidSignature as exc:
-            raise ValueError("S2S agent assertion signature verification failed.") from exc
+        except ValueError as exc:
+            raise ValueError(f"S2S agent assertion signature verification failed: {exc}") from exc
 
         if claims.get("iss") != AGENT_IDENTITY_ISSUER:
             raise ValueError(f"Unexpected S2S assertion issuer: {claims.get('iss')!r}")
 
         now = int(time.time())
-        iat = int(claims["iat"])
-        exp = int(claims["exp"])
+        iat = _require_epoch_claim(claims, "iat")
+        exp = _require_epoch_claim(claims, "exp")
         if now - clock_skew_seconds >= exp:
             raise ValueError("S2S agent assertion has expired.")
         if iat > now + clock_skew_seconds:
             raise ValueError("S2S agent assertion 'iat' is in the future.")
 
-        agent_name = str(claims["agent_name"])
+        agent_name = _require_str_claim(claims, "agent_name")
         spec = resolve_agent_identity(agent_name)
-        target_service = str(claims["target_service"])
-        aud = str(claims["aud"])
+        target_service = _require_str_claim(claims, "target_service")
+        aud = _require_str_claim(claims, "aud")
+        email = _require_str_claim(claims, "email")
+        spiffe_id = _require_str_claim(claims, "sub")
+        caller = _require_str_claim(claims, "caller")
+        jti = _require_str_claim(claims, "jti")
+        allowed_tools = _require_str_list_claim(claims, "allowed_tools")
+        permissions = _require_str_list_claim(claims, "permissions")
 
         if expected_target_service is not None:
             expected_aud = (
@@ -516,25 +517,33 @@ class AgentS2STokenBroker:
 
         return VerifiedAgentS2SClaims(
             agent_name=spec.agent_name,
-            service_account_email=str(claims["email"]),
-            spiffe_id=str(claims["sub"]),
-            caller=str(claims["caller"]),
+            service_account_email=email,
+            spiffe_id=spiffe_id,
+            caller=caller,
             target_service=target_service,
             audience=aud,
-            allowed_tools=tuple(claims.get("allowed_tools") or ()),
-            permissions=tuple(claims.get("permissions") or ()),
+            allowed_tools=allowed_tools,
+            permissions=permissions,
             issued_at=iat,
             expires_at=exp,
-            jti=str(claims["jti"]),
+            jti=jti,
         )
 
 
-_DEFAULT_S2S_BROKER = AgentS2STokenBroker()
+_BROKER_LOCK = threading.Lock()
+_BROKER_HOLDER: dict[str, AgentS2STokenBroker | None] = {"instance": None}
 
 
 def get_agent_s2s_broker() -> AgentS2STokenBroker:
-    """Return the process-wide per-agent S2S cryptographic assertion broker."""
-    return _DEFAULT_S2S_BROKER
+    """Return the lazily initialized process-wide per-agent S2S cryptographic assertion broker."""
+    broker = _BROKER_HOLDER["instance"]
+    if broker is None:
+        with _BROKER_LOCK:
+            broker = _BROKER_HOLDER["instance"]
+            if broker is None:
+                broker = AgentS2STokenBroker()
+                _BROKER_HOLDER["instance"] = broker
+    return broker
 
 
 def authorize_agent_tool_invocation(
@@ -556,7 +565,7 @@ def authorize_agent_tool_invocation(
         )
 
     target_service = TOOL_TARGET_SERVICE_MAP.get(tool_name, f"tool:{tool_name}")
-    active_broker = broker or _DEFAULT_S2S_BROKER
+    active_broker = broker or get_agent_s2s_broker()
     raw_assertion = active_broker.mint_s2s_assertion(
         agent_name=spec.agent_name,
         target_service=target_service,
@@ -586,7 +595,7 @@ def authorize_agent_s2s_hop(
             target=callee_agent,
         )
 
-    active_broker = broker or _DEFAULT_S2S_BROKER
+    active_broker = broker or get_agent_s2s_broker()
     if caller_agent == CUSTOM_RUNTIME_SA_ACCOUNT_ID:
         # Host runtime SA (`sec-analyst-sa`) initiating entry into a registered agent
         callee_spec = resolve_agent_identity(callee_agent)
@@ -620,7 +629,7 @@ def authorize_agent_s2s_hop(
     )
 
 
-class GcpAgentIamCredentialsClient:
+class GcpAgentIamCredentialsClient(GcpRestClient):
     """Impersonates granular per-agent GCP service accounts via IAM Credentials API.
 
     Allows the Cloud Run host identity (`sec-analyst-sa@<project>.iam.gserviceaccount.com`)
@@ -635,20 +644,57 @@ class GcpAgentIamCredentialsClient:
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
     ) -> None:
+        super().__init__(
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=10.0,
+        )
         runtime_cfg = RuntimeServiceAccountConfig.from_env()
         self.project_id = (project_id or runtime_cfg.project_id).strip().lower()
         self.host_service_account = runtime_cfg.email
-        self._http_client = http_client
-        self._credentials = credentials
 
     def _get_host_bearer_token(self) -> str:
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+        return self._get_bearer_token()
+
+    def _authorize_target_spec(
+        self,
+        *,
+        agent_name: str,
+        target_service: str,
+        action_label: str,
+    ) -> tuple[AgentIdentitySpec, str]:
+        spec = resolve_agent_identity(agent_name)
+        if target_service not in spec.allowed_target_services:
+            raise AgentAuthorizationError(
+                f"Agent {spec.agent_name!r} is forbidden from requesting {action_label} for {target_service!r}.",
+                agent_name=spec.agent_name,
+                target=target_service,
             )
-        if not self._credentials.valid or not getattr(self._credentials, "token", None):
-            self._credentials.refresh(GoogleAuthRequest())
-        return str(self._credentials.token)
+        return spec, spec.service_account_email(self.project_id)
+
+    def _request_downscoped_access_token(
+        self,
+        *,
+        agent_name: str,
+        target_service: str,
+        lifetime_seconds: int = 300,
+    ) -> tuple[AgentIdentitySpec, str, dict[str, Any]]:
+        spec, agent_sa = self._authorize_target_spec(
+            agent_name=agent_name,
+            target_service=target_service,
+            action_label="credentials",
+        )
+        bounded_lifetime = max(60, min(lifetime_seconds, MAX_AGENT_S2S_TTL_SECONDS))
+        url = (
+            f"https://iamcredentials.googleapis.com/v1/projects/-"
+            f"/serviceAccounts/{agent_sa}:generateAccessToken"
+        )
+        payload = {
+            "scope": list(spec.oauth_scopes),
+            "lifetime": f"{bounded_lifetime}s",
+        }
+        data = self._request_json("POST", url, json_body=payload)
+        return spec, agent_sa, data if isinstance(data, dict) else {}
 
     def generate_agent_id_token(
         self,
@@ -658,34 +704,21 @@ class GcpAgentIamCredentialsClient:
         audience: str,
     ) -> str:
         """Mint a Google-signed OIDC ID token for `agent_name`'s dedicated service account."""
-        spec = resolve_agent_identity(agent_name)
-        if target_service not in spec.allowed_target_services:
-            raise AgentAuthorizationError(
-                f"Agent {spec.agent_name!r} is forbidden from requesting OIDC token for {target_service!r}.",
-                agent_name=spec.agent_name,
-                target=target_service,
-            )
-
-        agent_sa = spec.service_account_email(self.project_id)
+        _spec, agent_sa = self._authorize_target_spec(
+            agent_name=agent_name,
+            target_service=target_service,
+            action_label="OIDC token",
+        )
         url = (
             f"https://iamcredentials.googleapis.com/v1/projects/-"
             f"/serviceAccounts/{agent_sa}:generateIdToken"
         )
-        headers = {
-            "Authorization": f"Bearer {self._get_host_bearer_token()}",
-            "Content-Type": "application/json",
-        }
         payload = {
             "audience": audience,
             "includeEmail": True,
         }
-        if self._http_client is not None:
-            resp = self._http_client.post(url, headers=headers, json=payload)
-        else:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        signed_id_jwt = str(resp.json().get("token") or "").strip()
+        data = self._request_json("POST", url, json_body=payload)
+        signed_id_jwt = str((data.get("token") if isinstance(data, dict) else "") or "").strip()
         if not signed_id_jwt:
             raise RuntimeError(f"IAM Credentials API returned empty ID token for {agent_sa}.")
         return signed_id_jwt
@@ -698,34 +731,11 @@ class GcpAgentIamCredentialsClient:
         lifetime_seconds: int = 300,
     ) -> dict[str, Any]:
         """Mint a short-lived downscoped GCP OAuth2 token scoped strictly to `spec.oauth_scopes`."""
-        spec = resolve_agent_identity(agent_name)
-        if target_service not in spec.allowed_target_services:
-            raise AgentAuthorizationError(
-                f"Agent {spec.agent_name!r} is forbidden from requesting credentials for {target_service!r}.",
-                agent_name=spec.agent_name,
-                target=target_service,
-            )
-        bounded_lifetime = max(60, min(lifetime_seconds, MAX_AGENT_S2S_TTL_SECONDS))
-        agent_sa = spec.service_account_email(self.project_id)
-        url = (
-            f"https://iamcredentials.googleapis.com/v1/projects/-"
-            f"/serviceAccounts/{agent_sa}:generateAccessToken"
+        spec, agent_sa, data = self._request_downscoped_access_token(
+            agent_name=agent_name,
+            target_service=target_service,
+            lifetime_seconds=lifetime_seconds,
         )
-        headers = {
-            "Authorization": f"Bearer {self._get_host_bearer_token()}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "scope": list(spec.oauth_scopes),
-            "lifetime": f"{bounded_lifetime}s",
-        }
-        if self._http_client is not None:
-            resp = self._http_client.post(url, headers=headers, json=payload)
-        else:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
         return {
             "agent_name": spec.agent_name,
             "service_account_email": agent_sa,
@@ -742,34 +752,12 @@ class GcpAgentIamCredentialsClient:
         lifetime_seconds: int = 300,
     ) -> RedactedSecret:
         """Mint and return a `RedactedSecret` downscoped OAuth2 access token for GCP S2S calls."""
-        spec = resolve_agent_identity(agent_name)
-        if target_service not in spec.allowed_target_services:
-            raise AgentAuthorizationError(
-                f"Agent {spec.agent_name!r} is forbidden from requesting credentials for {target_service!r}.",
-                agent_name=spec.agent_name,
-                target=target_service,
-            )
-        bounded_lifetime = max(60, min(lifetime_seconds, MAX_AGENT_S2S_TTL_SECONDS))
-        agent_sa = spec.service_account_email(self.project_id)
-        url = (
-            f"https://iamcredentials.googleapis.com/v1/projects/-"
-            f"/serviceAccounts/{agent_sa}:generateAccessToken"
+        _spec, agent_sa, data = self._request_downscoped_access_token(
+            agent_name=agent_name,
+            target_service=target_service,
+            lifetime_seconds=lifetime_seconds,
         )
-        headers = {
-            "Authorization": f"Bearer {self._get_host_bearer_token()}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "scope": list(spec.oauth_scopes),
-            "lifetime": f"{bounded_lifetime}s",
-        }
-        if self._http_client is not None:
-            resp = self._http_client.post(url, headers=headers, json=payload)
-        else:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        raw_token = str(resp.json().get("accessToken") or "").strip()
+        raw_token = str(data.get("accessToken") or "").strip()
         if not raw_token:
             raise RuntimeError(f"IAM Credentials API returned empty access token for {agent_sa}.")
         return RedactedSecret(raw_token, name=f"{agent_sa}:{target_service}")

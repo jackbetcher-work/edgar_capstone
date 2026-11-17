@@ -12,23 +12,34 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import time
 
-import google.auth
 import httpx
-from google.auth.transport.requests import Request
 from google.cloud import storage
 
-DEFAULT_PROJECT_ID = "iron-radio-514217-q7"
-DEFAULT_TFSTATE_BUCKET = "iron-radio-514217-q7-tfstate"
-DEFAULT_LOCATION = "us-central1"
+try:
+    from scripts._cli import add_gcp_args, configure_script_logging
+except ImportError:  # pragma: no cover - direct script execution without editable install
+    from _cli import (  # type: ignore[import-not-found,no-redef]
+        add_gcp_args,
+        configure_script_logging,
+    )
+
+from edgar_capstone.gcp.defaults import (
+    DEFAULT_LOCATION,
+    DEFAULT_PROJECT_ID,
+)
+from edgar_capstone.gcp.lro import OperationError, poll_operation
+from edgar_capstone.gcp.rest_client import GcpRestClient, GcpRestError
+
+DEFAULT_TFSTATE_BUCKET = f"{DEFAULT_PROJECT_ID}-tfstate"
 
 
-def ensure_bootstrap_apis(project_id: str = DEFAULT_PROJECT_ID) -> None:
+def ensure_bootstrap_apis(
+    project_id: str = DEFAULT_PROJECT_ID,
+    *,
+    timeout_seconds: float = 120.0,
+) -> None:
     """Enable Cloud Resource Manager & Service Usage APIs required by Terraform."""
-    creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    creds.refresh(Request())
-    headers = {"Authorization": f"Bearer {creds.token}"}
     url = f"https://serviceusage.googleapis.com/v1/projects/{project_id}/services:batchEnable"
     services = [
         "serviceusage.googleapis.com",
@@ -40,17 +51,30 @@ def ensure_bootstrap_apis(project_id: str = DEFAULT_PROJECT_ID) -> None:
         ", ".join(services),
         project_id,
     )
-    resp = httpx.post(url, headers=headers, json={"serviceIds": services}, timeout=60)
-    resp.raise_for_status()
-    op_name = resp.json().get("name", "")
-    if op_name and not resp.json().get("done", False):
-        op_url = f"https://serviceusage.googleapis.com/v1/{op_name}"
-        for _ in range(30):
-            time.sleep(2)
-            poll = httpx.get(op_url, headers=headers, timeout=30)
-            poll.raise_for_status()
-            if poll.json().get("done"):
-                break
+    with GcpRestClient(default_timeout=60.0) as rest:
+        payload = rest._request_json("POST", url, json_body={"serviceIds": services})
+        if not isinstance(payload, dict):
+            payload = {}
+        if payload.get("error"):
+            raise OperationError(
+                f"Service Usage batchEnable failed on '{project_id}': {payload['error']}"
+            )
+        op_name = str(payload.get("name") or "")
+        if op_name and not payload.get("done", False):
+            op_url = f"https://serviceusage.googleapis.com/v1/{op_name}"
+            final = poll_operation(
+                lambda: rest._raw_request("GET", op_url, timeout=30.0),
+                lambda data: bool(data.get("done")),
+                label=f"serviceusage batchEnable ({project_id})",
+                timeout_seconds=timeout_seconds,
+                initial_interval_seconds=2.0,
+                max_interval_seconds=10.0,
+            )
+            if final.get("error"):
+                raise OperationError(
+                    f"Service Usage batchEnable operation {op_name} failed on '{project_id}': "
+                    f"{final['error']}"
+                )
     logging.info("Prerequisite Terraform APIs enabled on '%s'.", project_id)
 
 
@@ -115,37 +139,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="Bootstrap the GCS bucket for Terraform remote state.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--project-id",
-        default=os.environ.get("EDGAR_GCP_PROJECT_ID", DEFAULT_PROJECT_ID),
-        help="Google Cloud project ID.",
-    )
-    parser.add_argument(
-        "--bucket",
-        default=os.environ.get("EDGAR_TFSTATE_BUCKET", DEFAULT_TFSTATE_BUCKET),
-        help="GCS bucket name for Terraform state.",
-    )
-    parser.add_argument(
-        "--location",
-        default=os.environ.get("EDGAR_GCP_REGION", DEFAULT_LOCATION),
-        help="GCS region for the state bucket.",
+    add_gcp_args(
+        parser,
+        include_project=True,
+        include_bucket=True,
+        include_location=True,
+        project_default=os.environ.get("EDGAR_GCP_PROJECT_ID") or DEFAULT_PROJECT_ID,
+        bucket_default=os.environ.get("EDGAR_TFSTATE_BUCKET") or DEFAULT_TFSTATE_BUCKET,
+        location_default=os.environ.get("EDGAR_GCP_REGION") or DEFAULT_LOCATION,
+        project_help="Google Cloud project ID.",
+        bucket_help="GCS bucket name for Terraform state.",
+        location_help="GCS region for the state bucket.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)-7s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    configure_script_logging(fmt="%(asctime)s | %(levelname)-7s | %(message)s")
     args = parse_args(argv)
-    ensure_bootstrap_apis(project_id=args.project_id)
-    ensure_tfstate_bucket(
-        project_id=args.project_id,
-        bucket_name=args.bucket,
-        location=args.location,
-    )
+    try:
+        ensure_bootstrap_apis(project_id=args.project_id)
+        ensure_tfstate_bucket(
+            project_id=args.project_id,
+            bucket_name=args.bucket,
+            location=args.location,
+        )
+    except (OperationError, GcpRestError, httpx.HTTPError, RuntimeError):
+        logging.exception("Failed to bootstrap Terraform state bucket.")
+        return 1
     return 0
 
 

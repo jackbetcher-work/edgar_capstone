@@ -29,27 +29,37 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+try:
+    from scripts._cli import (
+        add_gcp_args,
+        add_logging_args,
+        configure_script_logging,
+        parse_ticker_args,
+    )
+except ImportError:  # pragma: no cover - direct script execution without editable install
+    from _cli import (  # type: ignore[import-not-found,no-redef]
+        add_gcp_args,
+        add_logging_args,
+        configure_script_logging,
+        parse_ticker_args,
+    )
 
-from edgar_capstone.dataset.gcs_storage import (  # noqa: E402
-    DEFAULT_BUCKET_NAME,
+from edgar_capstone.dataset.gcs_storage import GCSAccessError
+from edgar_capstone.dataset.paths import resolve_curated_dataset_dir
+from edgar_capstone.gcp.defaults import (
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
-    GCSAccessError,
+    resolve_bq_dataset_id,
+    resolve_corpus_bucket,
 )
-from edgar_capstone.dataset.pipeline import DEFAULT_OUTPUT_DIR  # noqa: E402
-from edgar_capstone.vector_db.embedder import (  # noqa: E402
+from edgar_capstone.vector_db.embedder import (
     DEFAULT_EMBEDDING_DIMENSIONS,
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_MAX_BATCH_CHARS,
 )
-from edgar_capstone.vector_db.pipeline import (  # noqa: E402
+from edgar_capstone.vector_db.pipeline import (
     VectorDBBuildConfig,
     run_vector_db_pipeline,
     upload_vector_db_artifacts_to_gcs,
@@ -93,23 +103,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # Google Cloud & BigQuery settings
-    parser.add_argument(
-        "--project-id",
-        type=str,
-        default=os.environ.get("EDGAR_GCP_PROJECT_ID", DEFAULT_PROJECT_ID),
-        help="Google Cloud project ID.",
-    )
-    parser.add_argument(
-        "--bucket",
-        type=str,
-        default=os.environ.get("EDGAR_GCS_BUCKET", DEFAULT_BUCKET_NAME),
-        help="Target GCS corpus bucket name.",
-    )
-    parser.add_argument(
-        "--dataset-id",
-        type=str,
-        default=os.environ.get("EDGAR_BQ_DATASET", "sec_edgar"),
-        help="Target BigQuery dataset ID.",
+    add_gcp_args(
+        parser,
+        include_project=True,
+        include_bucket=True,
+        include_dataset=True,
+        include_location=True,
+        project_default=os.environ.get("EDGAR_GCP_PROJECT_ID") or DEFAULT_PROJECT_ID,
+        bucket_default=resolve_corpus_bucket(),
+        dataset_default=resolve_bq_dataset_id(),
+        location_default=os.environ.get("EDGAR_GCP_REGION") or DEFAULT_LOCATION,
+        project_help="Google Cloud project ID.",
+        bucket_help="Target GCS corpus bucket name.",
+        dataset_help="Target BigQuery dataset ID.",
+        location_help="Google Cloud region for Vertex AI and BigQuery.",
     )
     parser.add_argument(
         "--table-id",
@@ -118,15 +125,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Target BigQuery chunks table ID.",
     )
     parser.add_argument(
-        "--location",
-        type=str,
-        default=os.environ.get("EDGAR_GCP_REGION", DEFAULT_LOCATION),
-        help="Google Cloud region for Vertex AI and BigQuery.",
-    )
-    parser.add_argument(
         "--output-dir",
         type=Path,
-        default=DEFAULT_OUTPUT_DIR,
+        default=resolve_curated_dataset_dir(),
         help="Local staging directory containing curated 10-K profiles and Markdown.",
     )
 
@@ -192,7 +193,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # Execution & Cloud sync flags
-    parser.add_argument(
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
         "--local-only",
         action="store_true",
         help=(
@@ -200,7 +202,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "GCS/BigQuery/Cloud Monitoring. Embeddings still come from Vertex AI."
         ),
     )
-    parser.add_argument(
+    mode_group.add_argument(
         "--upload-only",
         action="store_true",
         help=(
@@ -219,11 +221,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip publishing custom chunk health time series to Google Cloud Monitoring.",
     )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable debug logging.",
-    )
+    add_logging_args(parser, use_verbose=True)
 
     return parser.parse_args(argv)
 
@@ -231,9 +229,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint."""
     args = parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s | %(levelname)-7s | %(message)s",
+    configure_script_logging(
+        verbose=args.verbose,
+        fmt="%(asctime)s | %(levelname)-7s | %(message)s",
         datefmt="%H:%M:%S",
     )
 
@@ -248,8 +246,8 @@ def main(argv: list[str] | None = None) -> int:
         except GCSAccessError as exc:
             logging.error("GCS access or authentication error:\n%s", exc)
             return 2
-        except Exception as exc:
-            logging.error("Vector DB artifact upload failed: %s", exc)
+        except Exception:
+            logging.exception("Vector DB artifact upload failed.")
             return 1
         if uploaded == 0:
             logging.error(
@@ -267,7 +265,7 @@ def main(argv: list[str] | None = None) -> int:
         table_id=args.table_id,
         location=args.location,
         output_dir=args.output_dir,
-        tickers=args.tickers,
+        tickers=parse_ticker_args(args.tickers),
         sector_filter=args.sector,
         start_year=args.start_year,
         end_year=args.end_year,
@@ -291,8 +289,8 @@ def main(argv: list[str] | None = None) -> int:
     except GCSAccessError as exc:
         logging.error("GCS access or authentication error:\n%s", exc)
         return 2
-    except Exception as exc:
-        logging.error("Vector database pipeline failed: %s", exc)
+    except Exception:
+        logging.exception("Vector database pipeline failed.")
         return 1
 
     print("\n" + "=" * 78)

@@ -2,21 +2,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from edgar_capstone.common.domain import SECTION_TITLES, MetricName, SectionId
+from edgar_capstone.common.models import FilingMetadataBase
 
-class MetricRecord(BaseModel):
+
+class AgentReportTelemetryMixin(BaseModel):
+    """Shared context/latency telemetry fields attached to agent evaluation & report outputs."""
+
+    context_tokens: int = 0
+    context_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
+
+
+class MetricRecord(FilingMetadataBase):
     """Structured financial metric record for a single company and fiscal year."""
 
-    profile_id: str = Field(..., description="Unique profile ID ({TICKER}_{FY})")
-    ticker: str = Field(..., description="Canonical company ticker symbol")
     cik: str = Field(..., description="10-digit zero-padded SEC CIK")
-    company_name: str = Field(..., description="Official SEC registrant name")
-    gics_sector: str = Field(..., description="GICS Sector classification")
     gics_sub_industry: str = Field(..., description="GICS Sub-Industry classification")
-    fiscal_year: int = Field(..., description="Reporting fiscal year")
     period_of_report: str = Field(..., description="Fiscal period end date (YYYY-MM-DD)")
     filing_date: str = Field(..., description="SEC 10-K filing date (YYYY-MM-DD)")
     accession_number: str = Field(..., description="SEC accession number")
@@ -37,8 +44,6 @@ class MetricRecord(BaseModel):
     rd_intensity_pct: float | None = Field(
         default=None, description="R&D intensity percentage (R&D expense / Revenue * 100)"
     )
-    sec_filing_url: str = Field(..., description="Public SEC EDGAR URL for the 10-K filing")
-    unstructured_gcs_uri: str = Field(..., description="GCS URI for unstructured 10-K Markdown")
     structured_gcs_uri: str = Field(..., description="GCS URI for structured financials JSON")
     provenance: dict[str, Any] = Field(
         default_factory=dict, description="XBRL concept provenance metadata"
@@ -76,7 +81,6 @@ class CoverageNotice(BaseModel):
         "out_of_range_year",
         "non_sp500_issuer",
         "sector_coverage_summary",
-        "partial_coverage",
     ]
     severity: Literal["info", "warning"] = "info"
     message: str
@@ -88,7 +92,7 @@ class CoverageNotice(BaseModel):
 class MetricVariance(BaseModel):
     """Deterministic period-over-period variance for a single financial metric."""
 
-    metric_name: Literal["revenue", "operating_income", "net_income", "research_and_development"]
+    metric_name: MetricName
     start_year: int
     end_year: int
     start_value: float | None = None
@@ -224,8 +228,9 @@ class CompanyVarianceReport(BaseModel):
     )
 
 
+# TODO(Wave 3b): Delete dead `LookerExploreQuery` atomically with `agents/__init__.py` lines 131 & 214.
 class LookerExploreQuery(BaseModel):
-    """Input parameters for querying the Looker BI semantic layer explore."""
+    """DEPRECATED: Retained temporarily until `agents/__init__.py` removes its re-export in Wave 3b."""
 
     explore_name: Literal[
         "yoy_variances",
@@ -235,10 +240,7 @@ class LookerExploreQuery(BaseModel):
         "llm_telemetry",
         "session_analytics",
         "audit_trail",
-    ] = Field(
-        ...,
-        description="Target Looker semantic explore view to query",
-    )
+    ] = Field(..., description="Target Looker semantic explore view to query")
     tickers: list[str] = Field(default_factory=list, description="Optional ticker symbols filter")
     gics_sector: str | None = Field(default=None, description="Optional GICS Sector filter")
     start_year: int = Field(default=2020, description="Start fiscal year (inclusive)")
@@ -246,30 +248,75 @@ class LookerExploreQuery(BaseModel):
     limit: int = Field(default=25, ge=1, le=200, description="Max rows to return")
 
 
-class GroundedCitation(BaseModel):
+class GroundedCitation(FilingMetadataBase):
     """Grounded citation linking a narrative claim to an exact 10-K section chunk."""
 
     chunk_id: str = Field(..., description="Unique chunk ID (e.g., NVDA_2026_item_7_0001)")
-    profile_id: str = Field(..., description="Company-year profile ID (e.g., NVDA_2026)")
-    ticker: str = Field(..., description="Company ticker symbol")
-    company_name: str = Field(..., description="Official company name")
-    gics_sector: str = Field(..., description="GICS Sector")
-    fiscal_year: int = Field(..., description="Reporting fiscal year")
     period_of_report: str | None = Field(
         default=None, description="Fiscal period end date (YYYY-MM-DD)"
     )
     filing_date: str | None = Field(default=None, description="SEC 10-K filing date (YYYY-MM-DD)")
     accession_number: str | None = Field(default=None, description="SEC EDGAR accession number")
-    section_id: Literal["item_1a", "item_7"] = Field(..., description="10-K section identifier")
+    section_id: SectionId = Field(..., description="10-K section identifier")
     section_title: str = Field(..., description="Human-readable section & subsection breadcrumb")
     excerpt: str = Field(..., description="Grounded 10-K Markdown passage text")
-    sec_filing_url: str = Field(
-        ..., description="Direct SEC EDGAR archive URL for split-pane source viewing"
-    )
-    unstructured_gcs_uri: str = Field(
-        ..., description="GCS URI of the unstructured 10-K Markdown document"
-    )
     score: float = Field(default=0.0, description="Hybrid retrieval relevance score")
+
+    @classmethod
+    def from_row(
+        cls,
+        row: Mapping[str, Any],
+        *,
+        score: float | None = None,
+        excerpt: str | None = None,
+        fallback_ticker: str | None = None,
+        fallback_fiscal_year: int | None = None,
+        fallback_section_id: SectionId = "item_1a",
+        clamp_score: bool = False,
+    ) -> GroundedCitation:
+        """Build a `GroundedCitation` from a BigQuery, Discovery Engine, or fused chunk row."""
+        ticker = str(row.get("ticker") or fallback_ticker or "")
+        fy_raw = row.get("fiscal_year")
+        if fy_raw is None:
+            fy_raw = fallback_fiscal_year if fallback_fiscal_year is not None else 0
+        fy = int(fy_raw)
+        raw_sec = str(row.get("section_id") or fallback_section_id).strip().lower()
+        sec_id: SectionId = (
+            "item_7"
+            if raw_sec == "item_7"
+            else ("item_1a" if raw_sec == "item_1a" else fallback_section_id)
+        )
+        text = (
+            excerpt
+            if excerpt is not None
+            else str(row.get("chunk_text") or row.get("excerpt") or "")
+        )
+        raw_score = (
+            float(score)
+            if score is not None
+            else float(
+                row.get("score") if row.get("score") is not None else (row.get("similarity") or 0.0)
+            )
+        )
+        if clamp_score:
+            raw_score = max(0.0, min(1.0, raw_score))
+        return cls(
+            chunk_id=str(row["chunk_id"]),
+            profile_id=str(row.get("profile_id") or f"{ticker}_{fy}"),
+            ticker=ticker,
+            company_name=str(row.get("company_name") or ticker),
+            gics_sector=str(row.get("gics_sector") or "Unknown"),
+            fiscal_year=fy,
+            period_of_report=str(row.get("period_of_report") or "") or None,
+            filing_date=str(row.get("filing_date") or "") or None,
+            accession_number=str(row.get("accession_number") or "") or None,
+            section_id=sec_id,
+            section_title=str(row.get("section_title") or SECTION_TITLES[sec_id]),
+            excerpt=text,
+            sec_filing_url=str(row.get("sec_filing_url") or ""),
+            unstructured_gcs_uri=str(row.get("unstructured_gcs_uri") or ""),
+            score=round(raw_score, 4),
+        )
 
 
 class FactCheckVerification(BaseModel):
@@ -476,7 +523,7 @@ class VarianceEvaluationItem(BaseModel):
     company_name: str
     start_year: int
     end_year: int
-    primary_metric_mover: Literal["revenue", "operating_income", "net_income"] = "revenue"
+    primary_metric_mover: MetricName = "revenue"
     revenue_pct_delta: float | None = None
     operating_income_pct_delta: float | None = None
     net_income_pct_delta: float | None = None
@@ -496,7 +543,7 @@ class Cached10KExplanation(BaseModel):
     ticker: str
     company_name: str
     fiscal_year: int
-    section_id: Literal["item_1a", "item_7"]
+    section_id: SectionId
     section_title: str
     variance_driver_focus: str
     extracted_explanations: list[str] = Field(default_factory=list)
@@ -552,7 +599,7 @@ class MaterialFlagExplanation(BaseModel):
     """MD&A passage retrieved to explain a flagged variance."""
 
     chunk_id: str
-    section_id: Literal["item_1a", "item_7"] = "item_7"
+    section_id: SectionId = "item_7"
     section_title: str = ""
     excerpt: str
     sec_filing_url: str = ""
@@ -600,7 +647,7 @@ class DisclosureDelta(BaseModel):
     delta_id: str
     ticker: str
     company_name: str
-    section_id: Literal["item_1a", "item_7"]
+    section_id: SectionId
     section_title: str = ""
     change_type: Literal["added", "removed", "modified", "unchanged"]
     prior_fiscal_year: int
@@ -660,26 +707,24 @@ class ReActStep(BaseModel):
     status: Literal["completed", "warning", "blocked"] = "completed"
 
 
-class NarrativeEvaluationReport(BaseModel):
+class NarrativeEvaluationReport(AgentReportTelemetryMixin):
     """LLM-as-a-Judge / rubric evaluation output powered by Gemini 3.5 Flash."""
 
     evaluator_model: str = "gemini-3.5-flash"
     task_category: Literal["evaluation", "llm_as_judge"] = "evaluation"
-    grade: Literal["pass", "needs_revision", "fail"] = "pass"
-    overall_score: float = Field(default=1.0, ge=0.0, le=1.0)
-    numeric_fidelity_score: float = Field(default=1.0, ge=0.0, le=1.0)
-    citation_grounding_score: float = Field(default=1.0, ge=0.0, le=1.0)
+    grade: Literal["pass", "needs_revision", "fail", "pending"] = "pass"
+    overall_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    numeric_fidelity_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    citation_grounding_score: float | None = Field(default=None, ge=0.0, le=1.0)
     citation_precision_score: float | None = Field(default=None, ge=0.0, le=1.0)
-    explanation_quality_score: float = Field(default=1.0, ge=0.0, le=1.0)
-    thematic_consistency_score: float = Field(default=1.0, ge=0.0, le=1.0)
+    explanation_quality_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    thematic_consistency_score: float | None = Field(default=None, ge=0.0, le=1.0)
     unsupported_claims_count: int = Field(default=0, ge=0)
     rationale: str = ""
-    context_tokens: int = 0
-    context_latency_ms: float = 0.0
-    total_latency_ms: float = 0.0
 
 
-class CodingAssistanceReport(BaseModel):
+# TODO(Wave 3b): Delete `CodingAssistanceReport` atomically with `evaluation_and_coding.py` & `agents/__init__.py`.
+class CodingAssistanceReport(AgentReportTelemetryMixin):
     """Analytical code / query generation output powered by Gemini 3.5 Flash."""
 
     assistant_model: str = "gemini-3.5-flash"
@@ -689,9 +734,6 @@ class CodingAssistanceReport(BaseModel):
     code: str
     explanation: str
     tickers_referenced: list[str] = Field(default_factory=list)
-    context_tokens: int = 0
-    context_latency_ms: float = 0.0
-    total_latency_ms: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -708,14 +750,12 @@ class AnalystMetricReference(BaseModel):
     ticker: str = Field(
         ..., description="Ticker of a company in the variance payload, e.g. 'NVDA'."
     )
-    metric: Literal["revenue", "operating_income", "net_income", "research_and_development"] = (
-        Field(
-            ...,
-            description=(
-                "Metric to show; its figures and XBRL citations come from the deterministic engine. "
-                "Use 'research_and_development' for R&D spend questions."
-            ),
-        )
+    metric: MetricName = Field(
+        ...,
+        description=(
+            "Metric to show; its figures and XBRL citations come from the deterministic engine. "
+            "Use 'research_and_development' for R&D spend questions."
+        ),
     )
 
 

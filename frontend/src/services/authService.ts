@@ -3,20 +3,13 @@ import type {
   AuthenticatedUserProfile,
   SsoSessionResponse,
 } from '../types/edgar'
+import { ApiAuthError, buildAuthError, requestJson } from './httpClient'
+
+export { ApiAuthError }
 
 const SESSION_STORAGE_JWT_KEY = 'edgar_iap_bearer_jwt'
 
 let inMemoryBearerJwt: string | null = null
-
-export class ApiAuthError extends Error {
-  readonly status: 401 | 403
-
-  constructor(status: 401 | 403, message: string) {
-    super(message)
-    this.name = 'ApiAuthError'
-    this.status = status
-  }
-}
 
 export function getStoredBearerToken(): string | null {
   if (inMemoryBearerJwt) {
@@ -66,36 +59,7 @@ export function buildAuthorizedHeaders(
 export async function parseAuthErrorResponse(
   res: Response
 ): Promise<ApiAuthError> {
-  const statusCode: 401 | 403 = res.status === 403 ? 403 : 401
-  let detailMessage =
-    statusCode === 403
-      ? 'Access denied by Google Workspace / Cloud Identity RBAC policy.'
-      : 'Authentication required. Sign in with Google Workspace (Okta SSO) or provide a valid IAP Bearer JWT.'
-
-  try {
-    const payload = (await res.json()) as {
-      detail?: string | { message?: string }
-      message?: string
-    }
-    if (typeof payload.detail === 'string' && payload.detail.trim()) {
-      detailMessage = payload.detail
-    } else if (
-      payload.detail &&
-      typeof payload.detail === 'object' &&
-      typeof payload.detail.message === 'string'
-    ) {
-      detailMessage = payload.detail.message
-    } else if (typeof payload.message === 'string' && payload.message.trim()) {
-      detailMessage = payload.message
-    }
-  } catch {
-    // Keep fallback message when body is non-JSON
-  }
-
-  if (statusCode === 401) {
-    clearStoredBearerToken()
-  }
-  return new ApiAuthError(statusCode, detailMessage)
+  return buildAuthError(res, clearStoredBearerToken)
 }
 
 export async function fetchAuthDiscoveryConfig(): Promise<{
@@ -176,18 +140,20 @@ export async function exchangeBearerTokenSession(
   rawJwt: string
 ): Promise<AuthenticatedUserProfile> {
   const cleaned = rawJwt.trim().replace(/^Bearer\s+/i, '').trim()
-  const res = await fetch('/api/v1/auth/sso/exchange', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ id_token: cleaned }),
-  })
-  if (res.status === 401 || res.status === 403) {
-    throw await parseAuthErrorResponse(res)
-  }
-  if (!res.ok) {
-    throw new Error(`SSO token verification failed (HTTP ${res.status}).`)
-  }
-  const body = (await res.json()) as SsoSessionResponse
+  const body = await requestJson<SsoSessionResponse>(
+    '/api/v1/auth/sso/exchange',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id_token: cleaned }),
+    },
+    {
+      onUnauthorized: clearStoredBearerToken,
+      wrapNetworkError: false,
+      formatHttpError: (status) =>
+        new Error(`SSO token verification failed (HTTP ${status}).`),
+    }
+  )
   setStoredBearerToken(body.access_token)
   return body.user
 }
@@ -197,37 +163,41 @@ export async function loginWithWorkspaceOktaDevBroker(params: {
   name?: string
   groups?: string[]
 }): Promise<AuthenticatedUserProfile> {
-  const res = await fetch('/api/v1/auth/sso/dev-token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      email: params.email ?? 'analyst@fde-workspace.corp',
-      name: params.name ?? 'Senior Financial Analyst',
-      groups: params.groups ?? ['sec-edgar-analysts'],
-    }),
-  })
-  if (res.status === 401 || res.status === 403) {
-    throw await parseAuthErrorResponse(res)
-  }
-  if (!res.ok) {
-    throw new Error(`Workspace Okta SSO handshake failed (HTTP ${res.status}).`)
-  }
-  const body = (await res.json()) as SsoSessionResponse
+  const body = await requestJson<SsoSessionResponse>(
+    '/api/v1/auth/sso/dev-token',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: params.email ?? 'analyst@fde-workspace.corp',
+        name: params.name ?? 'Senior Financial Analyst',
+        groups: params.groups ?? ['sec-edgar-analysts'],
+      }),
+    },
+    {
+      onUnauthorized: clearStoredBearerToken,
+      wrapNetworkError: false,
+      formatHttpError: (status) =>
+        new Error(`Workspace Okta SSO handshake failed (HTTP ${status}).`),
+    }
+  )
   setStoredBearerToken(body.access_token)
   return body.user
 }
 
 export async function fetchAuthenticatedUser(): Promise<AuthenticatedUserProfile> {
-  const res = await fetch('/api/v1/auth/me', {
-    headers: buildAuthorizedHeaders(),
-  })
-  if (res.status === 401 || res.status === 403) {
-    throw await parseAuthErrorResponse(res)
-  }
-  if (!res.ok) {
-    throw new Error(`Unable to verify current session (HTTP ${res.status}).`)
-  }
-  const body = (await res.json()) as { user: AuthenticatedUserProfile }
+  const body = await requestJson<{ user: AuthenticatedUserProfile }>(
+    '/api/v1/auth/me',
+    {
+      headers: buildAuthorizedHeaders(),
+    },
+    {
+      onUnauthorized: clearStoredBearerToken,
+      wrapNetworkError: false,
+      formatHttpError: (status) =>
+        new Error(`Unable to verify current session (HTTP ${status}).`),
+    }
+  )
   return body.user
 }
 

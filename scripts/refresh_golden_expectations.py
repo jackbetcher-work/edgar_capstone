@@ -14,13 +14,24 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+
+try:
+    from scripts._cli import ensure_src_on_path
+except ImportError:  # pragma: no cover - direct script execution without editable install
+    from _cli import ensure_src_on_path  # type: ignore[import-not-found,no-redef]
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
+    p.add_argument("--dataset", type=Path, default=None)
+    p.add_argument("--check", action="store_true", help="Report drift without rewriting.")
+    return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("--dataset", default=None)
-    p.add_argument("--check", action="store_true", help="Report drift without rewriting.")
-    args = p.parse_args(argv)
+    ensure_src_on_path()
+    args = parse_args(argv)
 
     from edgar_capstone.evals.golden import (
         DEFAULT_GOLDEN_DATASET_PATH,

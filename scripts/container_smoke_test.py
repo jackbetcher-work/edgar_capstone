@@ -31,21 +31,15 @@ import argparse
 import json
 import sys
 import time
-from contextlib import AbstractContextManager, nullcontext
-from pathlib import Path
+from contextlib import AbstractContextManager
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-try:
-    # Prefer the installed package (the container's /opt/venv site-packages, exactly what
-    # uvicorn imports) so in-process checks exercise the same code as production.
-    import edgar_capstone  # noqa: F401
-except ImportError:
-    if SRC_DIR.is_dir() and str(SRC_DIR) not in sys.path:
-        sys.path.insert(0, str(SRC_DIR))
+import httpx
 
-import httpx  # noqa: E402
+try:
+    from scripts._cli import ensure_src_on_path
+except ImportError:  # pragma: no cover - direct script execution without editable install
+    from _cli import ensure_src_on_path  # type: ignore[import-not-found,no-redef]
 
 REQUIRED_DATA_BACKEND_KEYS = ("project_id", "bigquery", "vertex_ai_search", "gcs_corpus_bucket")
 
@@ -161,13 +155,14 @@ def run_smoke_checks(
 
 def _build_client(args: argparse.Namespace) -> AbstractContextManager[Any]:
     if args.in_process:
+        ensure_src_on_path()
         from fastapi.testclient import TestClient
 
         from edgar_capstone.server import app
 
         # Entering the TestClient context runs the FastAPI lifespan.
         return TestClient(app)
-    return nullcontext(httpx.Client(base_url=args.base_url.rstrip("/"), timeout=args.timeout))
+    return httpx.Client(base_url=args.base_url.rstrip("/"), timeout=args.timeout)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -210,8 +205,6 @@ def main(argv: list[str] | None = None) -> int:
                 check_frontend=not args.skip_ui,
                 live_data=args.live_data,
             )
-            if not args.in_process:
-                client.close()
     except SmokeTestFailure as exc:
         print(f"SMOKE TEST FAILED: {exc}", file=sys.stderr)
         return 1

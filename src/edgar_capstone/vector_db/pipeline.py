@@ -2,29 +2,34 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import google.auth
 import google.auth.exceptions
 import httpx
-from google.cloud import storage
 
+from edgar_capstone.common.domain import normalize_edgar_ticker, sha256_text
+from edgar_capstone.common.jsonl import iter_jsonl, write_json
 from edgar_capstone.dataset.cloud_publish import run_bigquery_load_job
 from edgar_capstone.dataset.gcs_storage import (
+    DEFAULT_RETRY,
+    GCSAccessError,
+    content_type_for_path,
+    ensure_gcs_bucket,
+    normalize_bucket_name,
+    upload_files_to_bucket,
+)
+from edgar_capstone.dataset.models import FinancialDataProfile
+from edgar_capstone.dataset.paths import resolve_curated_dataset_dir
+from edgar_capstone.gcp.defaults import (
+    DEFAULT_BIGQUERY_DATASET_ID,
     DEFAULT_BUCKET_NAME,
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
-    GCSAccessError,
-    ensure_gcs_bucket,
-    normalize_bucket_name,
 )
-from edgar_capstone.dataset.models import FinancialDataProfile
-from edgar_capstone.dataset.pipeline import DEFAULT_OUTPUT_DIR
 from edgar_capstone.vector_db.chunker import chunk_filing_document
 from edgar_capstone.vector_db.embedder import (
     DEFAULT_EMBEDDING_DIMENSIONS,
@@ -42,6 +47,11 @@ from edgar_capstone.vector_db.monitoring import (
     CloudMonitoringHealthPublisher,
     evaluate_chunk_health,
 )
+
+try:
+    from google.cloud import storage
+except ImportError:  # pragma: no cover - optional `[ingest]` extra
+    storage = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +75,10 @@ class VectorDBBuildConfig:
 
     project_id: str = DEFAULT_PROJECT_ID
     bucket_name: str = DEFAULT_BUCKET_NAME
-    dataset_id: str = "sec_edgar"
+    dataset_id: str = DEFAULT_BIGQUERY_DATASET_ID
     table_id: str = "filing_chunks"
     location: str = DEFAULT_LOCATION
-    output_dir: Path = DEFAULT_OUTPUT_DIR
+    output_dir: Path = field(default_factory=resolve_curated_dataset_dir)
     tickers: list[str] | None = None
     sector_filter: str | None = None
     start_year: int | None = None
@@ -107,7 +117,7 @@ def _load_filtered_profiles(
         return []
 
     ticker_set = (
-        {t.strip().upper() for raw in tickers for t in raw.split(",") if t.strip()}
+        {norm for raw in tickers for t in raw.split(",") if (norm := normalize_edgar_ticker(t))}
         if tickers
         else None
     )
@@ -119,7 +129,7 @@ def _load_filtered_profiles(
         profile.unstructured_gcs_uri = f"gs://{bucket_name}/{profile.unstructured_blob_path}"
         profile.structured_gcs_uri = f"gs://{bucket_name}/{profile.structured_blob_path}"
 
-        if ticker_set and profile.ticker.upper() not in ticker_set:
+        if ticker_set and normalize_edgar_ticker(profile.ticker) not in ticker_set:
             continue
         if sector_norm and profile.gics_sector.lower() != sector_norm:
             continue
@@ -136,29 +146,45 @@ def _load_filtered_profiles(
 def _load_cached_embeddings(
     bq_chunks_jsonl_path: Path,
 ) -> dict[str, tuple[str, list[float]]]:
-    """Load previously generated `chunk_id -> (sha256(chunk_text), embedding)` mappings."""
+    """Stream previously generated `chunk_id -> (sha256(chunk_text), embedding)` mappings.
+
+    Uses line-by-line streaming (`iter_jsonl(..., skip_corrupt=True)`) to avoid loading
+    multi-GB manifests into RAM at once and to isolate any single corrupt trailing line.
+    """
     if not bq_chunks_jsonl_path.exists():
         return {}
 
     cached: dict[str, tuple[str, list[float]]] = {}
     try:
-        for line in bq_chunks_jsonl_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            row = json.loads(line)
+        for row in iter_jsonl(bq_chunks_jsonl_path, skip_corrupt=True):
             cid = row.get("chunk_id")
             text = row.get("chunk_text", "")
             emb = row.get("embedding", [])
             if cid and text and isinstance(emb, list) and emb:
-                text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
-                cached[str(cid)] = (text_hash, [float(v) for v in emb])
-    except Exception as exc:
+                try:
+                    cached[str(cid)] = (sha256_text(str(text)), [float(v) for v in emb])
+                except (TypeError, ValueError) as exc:
+                    logger.warning("Skipping invalid embedding row %r: %s", cid, exc)
+    except OSError as exc:
         logger.warning(
             "Ignoring unreadable cached chunk manifest %s: %s", bq_chunks_jsonl_path, exc
         )
 
     return cached
+
+
+def _write_status_artifacts(
+    output_dir: Path,
+    health_report: ChunkHealthReport,
+    summary: VectorDBBuildSummary,
+) -> tuple[Path, Path]:
+    """Write only the small status files (`chunk_health_report.json` and `vector_db_catalog.json`)."""
+    manifests_dir = output_dir / "manifests"
+    health_path = manifests_dir / "chunk_health_report.json"
+    catalog_path = manifests_dir / "vector_db_catalog.json"
+    write_json(health_path, health_report.model_dump(mode="json"), indent=2)
+    write_json(catalog_path, summary.model_dump(mode="json"), indent=2)
+    return health_path, catalog_path
 
 
 def _write_vector_db_artifacts(
@@ -175,8 +201,6 @@ def _write_vector_db_artifacts(
 
     bq_chunks_path = manifests_dir / "bigquery_filing_chunks.jsonl"
     vertex_chunks_path = vector_dir / "chunks_embeddings.json"
-    health_path = manifests_dir / "chunk_health_report.json"
-    catalog_path = manifests_dir / "vector_db_catalog.json"
 
     with (
         bq_chunks_path.open("w", encoding="utf-8") as bq_f,
@@ -186,16 +210,15 @@ def _write_vector_db_artifacts(
             bq_f.write(json.dumps(chunk.to_bigquery_record()) + "\n")
             vx_f.write(json.dumps(chunk.to_vertex_vector_search_record()) + "\n")
 
-    health_path.write_text(
-        json.dumps(health_report.model_dump(mode="json"), indent=2) + "\n",
-        encoding="utf-8",
-    )
-    catalog_path.write_text(
-        json.dumps(summary.model_dump(mode="json"), indent=2) + "\n",
-        encoding="utf-8",
-    )
-
+    health_path, catalog_path = _write_status_artifacts(output_dir, health_report, summary)
     return bq_chunks_path, vertex_chunks_path, health_path, catalog_path
+
+
+def _vector_artifact_content_type(local_path: Path, blob_path: str) -> str:
+    """Resolve HTTP Content-Type for vector DB artifacts (Vertex batch JSON is NDJSON)."""
+    if blob_path.endswith("chunks_embeddings.json"):
+        return "application/x-ndjson; charset=utf-8"
+    return content_type_for_path(local_path)
 
 
 def upload_vector_db_artifacts_to_gcs(
@@ -205,20 +228,31 @@ def upload_vector_db_artifacts_to_gcs(
     bucket_name: str,
     location: str = DEFAULT_LOCATION,
     create_bucket_if_missing: bool = True,
-    storage_client: storage.Client | None = None,
+    storage_client: Any | None = None,
     rel_paths: list[str] | None = None,
 ) -> int:
     """Upload the vector database manifests and Vertex AI Vector Search files to GCS.
 
     `rel_paths` limits the upload to a subset of `VECTOR_DB_ARTIFACT_PATHS`.
     """
-    try:
-        client = storage_client or storage.Client(project=project_id)
-    except google.auth.exceptions.DefaultCredentialsError as exc:
-        raise GCSAccessError(
-            f"Google Cloud Application Default Credentials not found for project '{project_id}': {exc}\n"
-            "Run `gcloud auth application-default login`, then re-run `build-vector-db --upload-only`."
-        ) from exc
+    if storage_client is not None:
+        client = storage_client
+    else:
+        if storage is None:
+            raise GCSAccessError(
+                "google-cloud-storage is not installed. Install the optional ingestion "
+                "dependencies with: pip install -e '.[ingest]'"
+            )
+        try:
+            client = storage.Client(project=project_id)
+        except google.auth.exceptions.DefaultCredentialsError as exc:
+            raise GCSAccessError(
+                f"Google Cloud Application Default Credentials not found for project "
+                f"'{project_id}': {exc}\n"
+                "Run `gcloud auth application-default login`, then re-run "
+                "`build-vector-db --upload-only`."
+            ) from exc
+
     bucket = ensure_gcs_bucket(
         client,
         project_id=project_id,
@@ -228,19 +262,16 @@ def upload_vector_db_artifacts_to_gcs(
     )
     if rel_paths is None:
         rel_paths = list(VECTOR_DB_ARTIFACT_PATHS)
-    uploaded = 0
-    for rel in rel_paths:
-        local_file = output_dir / rel
-        if not local_file.exists():
-            continue
-        blob = bucket.blob(rel)
-        content_type = (
-            "application/x-ndjson"
-            if rel.endswith(".jsonl") or rel.endswith("chunks_embeddings.json")
-            else "application/json; charset=utf-8"
-        )
-        blob.upload_from_filename(str(local_file), content_type=content_type)
-        uploaded += 1
+
+    items = [(local_file, rel) for rel in rel_paths if (local_file := output_dir / rel).exists()]
+    uploaded = upload_files_to_bucket(
+        bucket,
+        items,
+        max_workers=1,
+        timeout=300.0,
+        retry=DEFAULT_RETRY,
+        content_type_fn=_vector_artifact_content_type,
+    )
 
     logger.info(
         "Uploaded %d vector DB artifacts to gs://%s/",
@@ -257,6 +288,7 @@ def trigger_bigquery_chunks_load_job(
     table_id: str,
     source_gcs_uri: str,
     location: str = DEFAULT_LOCATION,
+    quota_project_id: str | None = None,
     http_client: httpx.Client | None = None,
     credentials: Any | None = None,
     poll_timeout_seconds: float = 120.0,
@@ -276,6 +308,7 @@ def trigger_bigquery_chunks_load_job(
         job_id_prefix="load_filing_chunks",
         poll_timeout_seconds=poll_timeout_seconds,
         raise_on_timeout=False,
+        quota_project_id=quota_project_id,
         http_client=http_client,
         credentials=credentials,
     )
@@ -285,7 +318,7 @@ def trigger_bigquery_chunks_load_job(
 def run_vector_db_pipeline(
     config: VectorDBBuildConfig,
     *,
-    storage_client: storage.Client | None = None,
+    storage_client: Any | None = None,
     vertex_embedder: VertexAIEmbedder | None = None,
     monitoring_publisher: CloudMonitoringHealthPublisher | None = None,
     http_client: httpx.Client | None = None,
@@ -423,21 +456,28 @@ def run_vector_db_pipeline(
                 table_id=config.table_id,
                 source_gcs_uri=source_uri,
                 location=config.location,
+                quota_project_id=config.project_id,
                 http_client=http_client,
                 poll_timeout_seconds=config.bigquery_load_timeout_seconds,
             )
             summary.loaded_to_bigquery = True
 
         if config.publish_monitoring_metrics:
+            owns_publisher = monitoring_publisher is None
             publisher = monitoring_publisher or CloudMonitoringHealthPublisher(
                 project_id=config.project_id,
                 http_client=http_client,
             )
-            publisher.publish_report(health_report)
+            try:
+                publisher.publish_report(health_report)
+            finally:
+                if owns_publisher:
+                    publisher.close()
             summary.published_monitoring_metrics = True
 
-        # Re-write local & GCS catalog/health files so published flags are persisted
-        _write_vector_db_artifacts(output_dir, all_chunks, health_report, summary)
+        # Write ONLY the tiny catalog & health report files so published flags are persisted
+        # without rewriting multi-GB `bigquery_filing_chunks.jsonl` and `chunks_embeddings.json`.
+        _write_status_artifacts(output_dir, health_report, summary)
         upload_vector_db_artifacts_to_gcs(
             output_dir=output_dir,
             project_id=config.project_id,

@@ -33,9 +33,9 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, Literal
 
+from edgar_capstone.gcp.defaults import resolve_gcp_project_id
 from edgar_capstone.observability.tracing import (
     current_trace_correlation,
-    resolve_gcp_project_id,
     running_on_cloud_run,
 )
 
@@ -50,7 +50,21 @@ _SAMPLED_KEY = "logging.googleapis.com/trace_sampled"
 _SOURCE_KEY = "logging.googleapis.com/sourceLocation"
 
 _RESERVED_PAYLOAD_KEYS = frozenset(
-    {"severity", "message", "time", _TRACE_KEY, _SPAN_KEY, _SAMPLED_KEY, _SOURCE_KEY}
+    {
+        "severity",
+        "message",
+        "time",
+        "logger",
+        "trace_id",
+        "span_id",
+        "request",
+        "@type",
+        "serviceContext",
+        _TRACE_KEY,
+        _SPAN_KEY,
+        _SAMPLED_KEY,
+        _SOURCE_KEY,
+    }
 )
 _STANDARD_RECORD_ATTRS = frozenset(
     set(vars(logging.LogRecord("x", logging.INFO, "x", 0, "x", None, None)).keys())
@@ -135,11 +149,11 @@ class CloudLoggingJsonFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         message = record.getMessage()
-        if record.exc_info:
-            if not record.exc_text:
-                record.exc_text = self.formatException(record.exc_info)
-        if record.exc_text:
-            message = f"{message}\n{record.exc_text}"
+        exc_text = record.exc_text
+        if record.exc_info and not exc_text:
+            exc_text = self.formatException(record.exc_info)
+        if exc_text:
+            message = f"{message}\n{exc_text}"
         if record.stack_info:
             message = f"{message}\n{self.formatStack(record.stack_info)}"
 
@@ -186,19 +200,26 @@ class TraceAwareTextFormatter(logging.Formatter):
     """Human-readable local format that still carries trace/span IDs and structured fields."""
 
     def __init__(self) -> None:
-        super().__init__(
-            fmt="%(asctime)s %(levelname)-8s %(name)s [trace=%(trace_id)s span=%(span_id)s] %(message)s"
-        )
+        super().__init__()
 
     def format(self, record: logging.LogRecord) -> str:
         corr = current_trace_correlation()
-        record.trace_id = corr.trace_id if corr else "-"
-        record.span_id = corr.span_id if corr else "-"
-        try:
-            rendered = super().format(record)
-        finally:
-            del record.trace_id
-            del record.span_id
+        trace_id = corr.trace_id if corr else "-"
+        span_id = corr.span_id if corr else "-"
+        asctime = self.formatTime(record, self.datefmt)
+        message = record.getMessage()
+        # Format without mutating the shared LogRecord (safe with multi-handler setups).
+        rendered = (
+            f"{asctime} {record.levelname:<8s} {record.name} "
+            f"[trace={trace_id} span={span_id}] {message}"
+        )
+        exc_text = record.exc_text
+        if record.exc_info and not exc_text:
+            exc_text = self.formatException(record.exc_info)
+        if exc_text:
+            rendered = f"{rendered}\n{exc_text}"
+        if record.stack_info:
+            rendered = f"{rendered}\n{self.formatStack(record.stack_info)}"
         extras = _record_extras(record)
         if extras:
             rendered = f"{rendered} | {json.dumps(extras, default=str, separators=(',', ':'))}"
@@ -232,14 +253,27 @@ def resolve_log_format(log_format: str | None = None) -> LogFormat:
 
 
 def resolve_log_level(level: str | int | None = None) -> int:
-    if isinstance(level, int):
+    if isinstance(level, int) and not isinstance(level, bool):
         return level
     raw = level or os.environ.get("EDGAR_LOG_LEVEL") or os.environ.get("LOG_LEVEL") or "INFO"
-    resolved = logging.getLevelName(str(raw).strip().upper())
-    return resolved if isinstance(resolved, int) else logging.INFO
+    normalized = str(raw).strip().upper()
+    if normalized.isdigit():
+        return int(normalized)
+    return logging.getLevelNamesMapping().get(normalized, logging.INFO)
 
 
-_CONFIGURED_FORMAT: LogFormat | None = None
+def _level_name_for(levelno: int) -> str:
+    if levelno == logging.NOTSET:
+        return "NOTSET"
+    if levelno in _SEVERITY_BY_LEVEL:
+        return _SEVERITY_BY_LEVEL[levelno]
+    for name, value in logging.getLevelNamesMapping().items():
+        if value == levelno:
+            return name
+    return f"LEVEL_{levelno}"
+
+
+_LOGGING_STATE: dict[str, LogFormat | None] = {"format": None}
 
 
 def configure_logging(
@@ -255,8 +289,6 @@ def configure_logging(
     handlers (e.g. pytest's `caplog`) untouched. Uvicorn's own access log is silenced
     because `RequestTelemetryMiddleware` emits a richer, trace-correlated access log.
     """
-    global _CONFIGURED_FORMAT
-
     fmt = resolve_log_format(log_format)
     lvl = resolve_log_level(level)
 
@@ -286,14 +318,14 @@ def configure_logging(
     for name in _NOISY_LOGGERS:
         logging.getLogger(name).setLevel(max(lvl, logging.WARNING))
 
-    _CONFIGURED_FORMAT = fmt
+    _LOGGING_STATE["format"] = fmt
     return fmt
 
 
 def logging_status_metadata() -> dict[str, Any]:
     return {
-        "format": _CONFIGURED_FORMAT or resolve_log_format(),
-        "level": logging.getLevelName(logging.getLogger().level),
+        "format": _LOGGING_STATE["format"] or resolve_log_format(),
+        "level": _level_name_for(logging.getLogger().level),
         "trace_correlation": True,
         "destination": "stdout -> Cloud Logging" if running_on_cloud_run() else "stdout",
     }

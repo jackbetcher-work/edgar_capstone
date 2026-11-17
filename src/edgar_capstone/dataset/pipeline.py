@@ -5,16 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
+from typing import Any
 
-from google.cloud import storage
-
-from edgar_capstone.dataset.constituents import (
-    DEFAULT_SP500_CSV_PATH,
-    load_constituents,
-)
+from edgar_capstone.common.jsonl import write_json, write_jsonl
+from edgar_capstone.dataset.constituents import load_constituents
 from edgar_capstone.dataset.extractor import (
     DEFAULT_SEC_USER_AGENT,
     MIN_SUBSTANTIVE_SECTION_CHARS,
@@ -26,10 +23,10 @@ from edgar_capstone.dataset.extractor import (
     truncate_at_section_boundary,
 )
 from edgar_capstone.dataset.gcs_storage import (
-    DEFAULT_BUCKET_NAME,
-    DEFAULT_LOCATION,
-    DEFAULT_PROJECT_ID,
+    DEFAULT_RETRY,
+    create_storage_client,
     normalize_bucket_name,
+    upload_files_to_bucket,
     upload_staged_dataset,
 )
 from edgar_capstone.dataset.models import (
@@ -38,15 +35,30 @@ from edgar_capstone.dataset.models import (
     FinancialDataProfile,
     VertexAISearchManifestRecord,
 )
+from edgar_capstone.dataset.paths import (
+    resolve_curated_dataset_dir,
+    resolve_sp500_constituents_csv,
+)
+from edgar_capstone.gcp.defaults import (
+    DEFAULT_BUCKET_NAME,
+    DEFAULT_LOCATION,
+    DEFAULT_PROJECT_ID,
+)
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parents[3] / "data" / "curated_dataset"
+# Retained for backward compatibility; DatasetBuildConfig resolves dynamically at instantiation.
+DEFAULT_OUTPUT_DIR = resolve_curated_dataset_dir()
 
 _CACHED_MD_SPLIT_RE = re.compile(
     r"^## Item 1A\. Risk Factors\n(.*?)\n---\n\n"
     r"## Item 7\. Management's Discussion and Analysis of Financial Condition and Results of Operations\n(.*)$",
     re.MULTILINE | re.DOTALL,
+)
+
+_STALE_FILE_SPECS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
+    ("structured", "*_financials.json", re.compile(r"^(\d{4})_financials\.json$")),
+    ("unstructured", "*_10k.md", re.compile(r"^(\d{4})_10k\.md$")),
 )
 
 
@@ -57,13 +69,13 @@ class DatasetBuildConfig:
     project_id: str = DEFAULT_PROJECT_ID
     bucket_name: str = DEFAULT_BUCKET_NAME
     location: str = DEFAULT_LOCATION
-    output_dir: Path = DEFAULT_OUTPUT_DIR
+    output_dir: Path = field(default_factory=resolve_curated_dataset_dir)
     start_year: int = 2020
-    end_year: int = date.today().year
+    end_year: int = field(default_factory=lambda: date.today().year)
     full_sp500: bool = False
     tickers: list[str] | None = None
     sector_filter: str | None = None
-    sp500_csv_path: Path = DEFAULT_SP500_CSV_PATH
+    sp500_csv_path: Path = field(default_factory=resolve_sp500_constituents_csv)
     refresh_sp500: bool = False
     sec_user_agent: str = DEFAULT_SEC_USER_AGENT
     skip_existing: bool = True
@@ -122,10 +134,7 @@ def _is_cached_bundle_healthy(bundle: ExtractedFilingBundle) -> bool:
         return False
     if prof.operating_income > 0 and prof.operating_income > 1.5 * prof.revenue:
         return False
-    if prof.net_income > 0 and prof.net_income > 1.5 * prof.revenue:
-        return False
-
-    return True
+    return not (prof.net_income > 0 and prof.net_income > 1.5 * prof.revenue)
 
 
 def _load_existing_company_bundles(
@@ -211,35 +220,32 @@ def _prune_stale_company_files(
     valid_fiscal_years: set[int],
 ) -> None:
     """Remove any orphaned per-year files in `[start_year, end_year]` after fiscal-year repairs."""
-    struct_dir = output_dir / "structured" / ticker
-    unstruct_dir = output_dir / "unstructured" / ticker
-
-    if struct_dir.exists():
-        for json_file in struct_dir.glob("*_financials.json"):
-            m = re.match(r"^(\d{4})_financials\.json$", json_file.name)
-            if not m:
+    for subdir, pattern, filename_re in _STALE_FILE_SPECS:
+        target_dir = output_dir / subdir / ticker
+        if not target_dir.exists():
+            continue
+        for file_path in target_dir.glob(pattern):
+            match = filename_re.match(file_path.name)
+            if not match:
                 continue
-            fy = int(m.group(1))
+            fy = int(match.group(1))
             if start_year <= fy <= end_year and fy not in valid_fiscal_years:
-                logger.info("[%s] Removing stale cached file %s", ticker, json_file)
-                json_file.unlink(missing_ok=True)
-
-    if unstruct_dir.exists():
-        for md_file in unstruct_dir.glob("*_10k.md"):
-            m = re.match(r"^(\d{4})_10k\.md$", md_file.name)
-            if not m:
-                continue
-            fy = int(m.group(1))
-            if start_year <= fy <= end_year and fy not in valid_fiscal_years:
-                logger.info("[%s] Removing stale cached file %s", ticker, md_file)
-                md_file.unlink(missing_ok=True)
+                logger.info("[%s] Removing stale cached file %s", ticker, file_path)
+                file_path.unlink(missing_ok=True)
 
 
-def _collect_all_staged_profiles(
+def collect_staged_profiles(
     output_dir: Path,
+    *,
     bucket_name: str,
+    update_uris_on_disk: bool = False,
 ) -> list[FinancialDataProfile]:
-    """Read all staged structured JSON profiles under `output_dir/structured`."""
+    """Read all staged structured JSON profiles under `output_dir/structured`.
+
+    By default this read is non-mutating on disk (`update_uris_on_disk=False`). In-memory
+    GCS URIs are normalized against `bucket_name`; pass `update_uris_on_disk=True` to rewrite
+    any JSON files whose stored URIs pointed at a different bucket.
+    """
     struct_root = output_dir / "structured"
     if not struct_root.exists():
         return []
@@ -255,17 +261,33 @@ def _collect_all_staged_profiles(
         ):
             profile.unstructured_gcs_uri = expected_unstructured_uri
             profile.structured_gcs_uri = expected_structured_uri
-            json_path.write_text(
-                json.dumps(profile.model_dump(mode="json"), indent=2) + "\n",
-                encoding="utf-8",
-            )
+            if update_uris_on_disk:
+                json_path.write_text(
+                    json.dumps(profile.model_dump(mode="json"), indent=2) + "\n",
+                    encoding="utf-8",
+                )
         profiles.append(profile)
 
     profiles.sort(key=lambda p: (p.ticker, p.fiscal_year))
     return profiles
 
 
-def _write_manifests(
+def _collect_all_staged_profiles(
+    output_dir: Path,
+    bucket_name: str,
+) -> list[FinancialDataProfile]:
+    """Backward-compatible alias for `collect_staged_profiles(..., update_uris_on_disk=True)`."""
+    return collect_staged_profiles(output_dir, bucket_name=bucket_name, update_uris_on_disk=True)
+
+
+def write_dataset_catalog_only(output_dir: Path, summary: DatasetBuildSummary) -> Path:
+    """Write only `manifests/dataset_catalog.json` (used after upload status flips)."""
+    catalog_path = output_dir / "manifests" / "dataset_catalog.json"
+    write_json(catalog_path, summary.model_dump(mode="json"), indent=2)
+    return catalog_path
+
+
+def write_manifests(
     output_dir: Path,
     profiles: list[FinancialDataProfile],
     summary: DatasetBuildSummary,
@@ -276,33 +298,28 @@ def _write_manifests(
 
     vais_path = manifests_dir / "vertex_ai_search_metadata.jsonl"
     bq_path = manifests_dir / "bigquery_financials.jsonl"
-    catalog_path = manifests_dir / "dataset_catalog.json"
 
-    vais_lines: list[str] = []
-    bq_lines: list[str] = []
-    for prof in profiles:
-        vais_rec = VertexAISearchManifestRecord.from_profile(prof)
-        vais_lines.append(json.dumps(vais_rec.model_dump(mode="json")))
-        bq_lines.append(json.dumps(prof.model_dump(mode="json")))
+    write_jsonl(
+        vais_path,
+        (
+            VertexAISearchManifestRecord.from_profile(prof).model_dump(mode="json")
+            for prof in profiles
+        ),
+    )
+    write_jsonl(
+        bq_path,
+        (prof.model_dump(mode="json") for prof in profiles),
+    )
+    write_dataset_catalog_only(output_dir, summary)
 
-    vais_path.write_text(
-        ("\n".join(vais_lines) + "\n") if vais_lines else "",
-        encoding="utf-8",
-    )
-    bq_path.write_text(
-        ("\n".join(bq_lines) + "\n") if bq_lines else "",
-        encoding="utf-8",
-    )
-    catalog_path.write_text(
-        json.dumps(summary.model_dump(mode="json"), indent=2) + "\n",
-        encoding="utf-8",
-    )
+
+_write_manifests = write_manifests
 
 
 def run_dataset_pipeline(
     config: DatasetBuildConfig,
     *,
-    storage_client: storage.Client | None = None,
+    storage_client: Any | None = None,
 ) -> DatasetBuildSummary:
     """Execute extraction, manifest generation, and optional GCS upload."""
     bucket_name = normalize_bucket_name(config.bucket_name)
@@ -383,7 +400,9 @@ def run_dataset_pipeline(
                 )
                 failed_tickers[constituent.ticker] = err_msg
 
-    staged_profiles = _collect_all_staged_profiles(output_dir, bucket_name)
+    staged_profiles = collect_staged_profiles(
+        output_dir, bucket_name=bucket_name, update_uris_on_disk=True
+    )
     if config.upload_only:
         processed_tickers = sorted({p.ticker for p in staged_profiles})
         requested_tickers = list(processed_tickers)
@@ -402,7 +421,7 @@ def run_dataset_pipeline(
         uploaded_blob_count=0,
         warnings=all_warnings,
     )
-    _write_manifests(output_dir, staged_profiles, summary)
+    write_manifests(output_dir, staged_profiles, summary)
 
     if not config.local_only:
         profiles_by_blob: dict[str, FinancialDataProfile] = {}
@@ -422,14 +441,17 @@ def run_dataset_pipeline(
         )
         summary.uploaded_to_gcs = True
         summary.uploaded_blob_count = uploaded_count
-        # Update catalog locally & re-upload catalog so GCS catalog reflects uploaded_to_gcs=True
-        _write_manifests(output_dir, staged_profiles, summary)
-        catalog_only_client = storage_client or storage.Client(project=config.project_id)
-        catalog_bucket = catalog_only_client.bucket(bucket_name)
-        catalog_blob = catalog_bucket.blob("manifests/dataset_catalog.json")
-        catalog_blob.upload_from_filename(
-            str(output_dir / "manifests" / "dataset_catalog.json"),
-            content_type="application/json; charset=utf-8",
+        # Update ONLY dataset_catalog.json locally & re-upload so GCS reflects uploaded_to_gcs=True
+        # without rewriting the full Vertex AI Search and BigQuery JSONL manifests.
+        catalog_path = write_dataset_catalog_only(output_dir, summary)
+        catalog_client = storage_client or create_storage_client(project_id=config.project_id)
+        catalog_bucket = catalog_client.bucket(bucket_name)
+        upload_files_to_bucket(
+            catalog_bucket,
+            [(catalog_path, "manifests/dataset_catalog.json")],
+            max_workers=1,
+            timeout=120.0,
+            retry=DEFAULT_RETRY,
         )
 
     return summary

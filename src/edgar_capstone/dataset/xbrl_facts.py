@@ -24,11 +24,15 @@ from typing import Any
 
 import httpx
 
-from edgar_capstone.dataset.extractor import (
-    DEFAULT_SEC_USER_AGENT,
-    RESEARCH_AND_DEVELOPMENT_CONCEPTS,
+from edgar_capstone.common.domain import (
+    canonical_xbrl_tag,
+    format_cik,
+    normalize_edgar_ticker,
+    parse_iso_date,
 )
+from edgar_capstone.dataset.financial_extractor import RESEARCH_AND_DEVELOPMENT_CONCEPTS
 from edgar_capstone.dataset.models import FinancialDataProfile
+from edgar_capstone.gcp.defaults import DEFAULT_SEC_USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +42,7 @@ SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json
 DEFAULT_REQUESTS_PER_SECOND = 8.0
 _ANNUAL_DURATION_DAYS = (300, 400)
 _PERIOD_END_TOLERANCE_DAYS = 10
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+_RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
 
 RD_PROVENANCE_PREFIX = "sec-companyfacts:"
 
@@ -69,7 +73,9 @@ def fetch_company_facts(
     max_attempts: int = 4,
 ) -> dict[str, Any] | None:
     """Fetch SEC `companyfacts` JSON for a CIK. Returns None when SEC has no XBRL facts (404)."""
-    cik_10 = str(int(str(cik).strip())).zfill(10)
+    cik_10 = format_cik(cik)
+    if not cik_10:
+        raise ValueError(f"Invalid CIK for SEC companyfacts lookup: {cik!r}")
     url = SEC_COMPANYFACTS_URL.format(cik=cik_10)
     headers = {"User-Agent": user_agent, "Accept": "application/json"}
     last_error: Exception | None = None
@@ -97,13 +103,6 @@ def fetch_company_facts(
     raise last_error
 
 
-def _parse_date(raw: Any) -> date | None:
-    try:
-        return date.fromisoformat(str(raw)[:10])
-    except (TypeError, ValueError):
-        return None
-
-
 def _annual_facts_for_period(
     facts: Iterable[dict[str, Any]],
     period_end: date,
@@ -115,7 +114,7 @@ def _annual_facts_for_period(
         form = str(fact.get("form") or "").upper()
         if not form.startswith("10-K"):
             continue
-        start, end = _parse_date(fact.get("start")), _parse_date(fact.get("end"))
+        start, end = parse_iso_date(fact.get("start")), parse_iso_date(fact.get("end"))
         if start is None or end is None:
             continue
         if not (low <= (end - start).days <= high):
@@ -143,7 +142,7 @@ def select_annual_usd_fact(
 
     Returns `(value, provenance, note)`; `(None, None, None)` when no concept matches.
     """
-    period_end = _parse_date(period_of_report)
+    period_end = parse_iso_date(period_of_report)
     if not company_facts or period_end is None:
         return None, None, None
 
@@ -162,13 +161,13 @@ def select_annual_usd_fact(
     for concept, annual in candidates_by_concept:
         same_filing = [f for f in annual if str(f.get("accn") or "").strip() == target_accn]
         if same_filing:
-            tag = concept.replace("_", ":", 1)
+            tag = canonical_xbrl_tag(concept)
             return float(same_filing[0]["val"]), f"{RD_PROVENANCE_PREFIX}{tag}", None
 
     for concept, annual in candidates_by_concept:
         later = sorted(annual, key=lambda f: str(f.get("filed") or ""))
         fact = later[0]
-        tag = concept.replace("_", ":", 1)
+        tag = canonical_xbrl_tag(concept)
         note = (
             f"{tag} for period ending {period_of_report} was not tagged in 10-K "
             f"{target_accn}; value taken from 10-K {fact.get('accn')} (filed {fact.get('filed')})."
@@ -178,7 +177,7 @@ def select_annual_usd_fact(
     return None, None, None
 
 
-@dataclass
+@dataclass(slots=True)
 class MetricBackfillSummary:
     """Outcome of `backfill_research_and_development`."""
 
@@ -191,6 +190,9 @@ class MetricBackfillSummary:
     companies_failed: dict[str, str] = field(default_factory=dict)
     updated_paths: list[str] = field(default_factory=list)
     scanned_paths: list[str] = field(default_factory=list)
+    # Full sorted list of validated staged profiles loaded during the scan so callers
+    # (e.g. `scripts/backfill_rd_metric.py`) can rebuild manifests without re-parsing disk.
+    all_profiles: list[FinancialDataProfile] = field(default_factory=list, repr=False)
 
 
 def _apply_rd_value(
@@ -215,6 +217,17 @@ def _apply_rd_value(
     return changed
 
 
+def _parse_ticker_filter(tickers: Iterable[str] | None) -> set[str]:
+    """Normalize optional space- or comma-separated ticker filters (e.g., BRK.B -> BRK-B)."""
+    wanted: set[str] = set()
+    for raw in tickers or ():
+        for part in str(raw).split(","):
+            norm = normalize_edgar_ticker(part)
+            if norm:
+                wanted.add(norm)
+    return wanted
+
+
 def backfill_research_and_development(
     output_dir: Path,
     *,
@@ -230,17 +243,22 @@ def backfill_research_and_development(
     `sec-companyfacts:`) are left alone unless `overwrite_extracted` is set.
     """
     struct_root = output_dir / "structured"
-    wanted = {t.strip().upper() for t in tickers or [] if t.strip()}
+    wanted = _parse_ticker_filter(tickers)
     summary = MetricBackfillSummary()
 
+    all_profiles: list[FinancialDataProfile] = []
     by_cik: dict[str, list[tuple[Path, FinancialDataProfile]]] = defaultdict(list)
-    for json_path in sorted(struct_root.rglob("*_financials.json")):
-        profile = FinancialDataProfile.model_validate_json(json_path.read_text(encoding="utf-8"))
-        if wanted and profile.ticker.upper() not in wanted:
-            continue
-        summary.profiles_scanned += 1
-        summary.scanned_paths.append(json_path.relative_to(output_dir).as_posix())
-        by_cik[profile.cik].append((json_path, profile))
+    if struct_root.exists():
+        for json_path in sorted(struct_root.rglob("*_financials.json")):
+            profile = FinancialDataProfile.model_validate_json(
+                json_path.read_text(encoding="utf-8")
+            )
+            all_profiles.append(profile)
+            if wanted and normalize_edgar_ticker(profile.ticker) not in wanted:
+                continue
+            summary.profiles_scanned += 1
+            summary.scanned_paths.append(json_path.relative_to(output_dir).as_posix())
+            by_cik[profile.cik].append((json_path, profile))
 
     limiter = _RateLimiter(requests_per_second)
     owns_client = client is None
@@ -291,6 +309,9 @@ def backfill_research_and_development(
     finally:
         if owns_client:
             http.close()
+
+    all_profiles.sort(key=lambda p: (p.ticker, p.fiscal_year))
+    summary.all_profiles = all_profiles
 
     logger.info(
         "R&D backfill: %d profiles scanned, %d with R&D, %d without, %d updated, %d companies failed.",

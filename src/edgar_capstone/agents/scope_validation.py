@@ -1,7 +1,7 @@
-"""Dynamic S&P 500 entity resolution, scope validation, clarification, and coverage notices (Gap 4 & 5).
+"""Dynamic S&P 500 entity resolution, scope validation, clarification, and coverage notices.
 
-Replaces the old 18-company hardcoded alias list and silent fallback guessing with:
-1. Full dynamic entity resolution against the 501-company BigQuery S&P 500 catalog (tickers +
+Replaces hardcoded alias lists and silent fallback guessing with:
+1. Full dynamic entity resolution against the ~501-company BigQuery S&P 500 catalog (tickers +
    normalized official names + common brand aliases) and all 11 GICS sectors.
 2. Additive / subtractive multi-turn follow-up refinement ("now add Microsoft", "drop Apple").
 3. Explicit out-of-corpus detection for non-S&P 500 issuers, unsupported filing types
@@ -19,6 +19,7 @@ import re
 from typing import Any
 
 from edgar_capstone.agents.schemas import CoverageNotice
+from edgar_capstone.common.domain import lookup_year_key, normalize_edgar_ticker
 
 MIN_CORPUS_YEAR = 2020
 MAX_CORPUS_YEAR = 2026
@@ -95,7 +96,7 @@ _COMMON_BRAND_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\blinde\b|\blin\b", re.IGNORECASE), "LIN"),
 )
 
-# All 11 GICS sectors (fixes missing Utilities, Real Estate, Materials!)
+# All 11 GICS sectors
 SECTOR_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
@@ -156,7 +157,8 @@ SECTOR_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 # Common English / financial acronyms that are ALSO S&P 500 ticker symbols —
-# only match these as tickers when explicitly written as `$TICKER` or via full company name.
+# only match these as tickers when explicitly written as `$TICKER`, via full company name,
+# or (for `V`/Visa) in explicit financial/peer comparison context.
 _AMBIGUOUS_TICKER_WORDS = frozenset(
     {
         "A",
@@ -381,7 +383,6 @@ _SUPPORTED_TOPIC_RE = re.compile(
 )
 
 _ANY_4DIGIT_YEAR_RE = re.compile(r"\b(?:FY\s*)?((?:19|20)\d{2})\b", re.IGNORECASE)
-_CORPUS_YEAR_RE = re.compile(r"\b(?:FY\s*)?(202[0-6])\b", re.IGNORECASE)
 _ADDITIVE_FOLLOWUP_RE = re.compile(
     r"\b(?:now\s+add|also\s+(?:add|include|show|compare)|add\s+(?:in\s+)?|and\s+add|"
     r"include\s+[A-Z]|compare\s+(?:that|it|them)?\s*(?:with|to|against))\b",
@@ -400,6 +401,31 @@ _LEGAL_SUFFIX_RE = re.compile(
     r"limited|group|class\s+[a-z]|the|nv|n\.v\.|s\.a\.|ag|se|lp|llc)\b",
     re.IGNORECASE,
 )
+_COMPANY_NAME_PUNCT_RE = re.compile(r"[/,.\-()]+")
+
+# Precompiled detection regexes
+_UPPERCASE_TICKER_RE = re.compile(r"(?<![A-Za-z0-9\-])([A-Z]{2,5}(?:[.-][A-Z])?)(?![A-Za-z0-9\-])")
+_STANDALONE_V_RE = re.compile(r"(?<![A-Za-z0-9\-])V(?![A-Za-z0-9\-])")
+_ROMAN_NUMERAL_PREFIX_RE = re.compile(
+    r"\b(?:part|section|item|title|article|series|schedule|chapter|table|note|"
+    r"class|version|phase|stage|tier|gen|level|model|plan|option|type|grade|"
+    r"exhibit|appendix)\s+$",
+    re.IGNORECASE,
+)
+_VISA_PRE_CONTEXT_RE = re.compile(
+    r"(?:,\s*|\b(?:compare|between|vs\.?|versus|and)\s+)$", re.IGNORECASE
+)
+_VISA_POST_CONTEXT_RE = re.compile(
+    r"^\s+(?:vs\.?|versus|and\s+[A-Z]{2,5}\b|revenue|sales|margin|operating|"
+    r"net|income|r&d|10-?k|filings?|risks?|FY\d{4})\b",
+    re.IGNORECASE,
+)
+_CHUNK_HEALTH_RE = re.compile(
+    r"\b(?:chunk\s+health|embedding\s+coverage|vector\s+(?:db|database)\s+health)\b",
+    re.IGNORECASE,
+)
+_MENTIONS_10K_RE = re.compile(r"\b10-?k\b|\bannual\s+report\b", re.IGNORECASE)
+_ASKED_RD_RE = re.compile(r"\b(?:r&d|research\s+and\s+development)\b", re.IGNORECASE)
 
 # Phrases indicating broad/corpus-wide intent rather than an ambiguous missing-ticker query
 _BROAD_CORPUS_PHRASE_RE = re.compile(
@@ -410,9 +436,27 @@ _BROAD_CORPUS_PHRASE_RE = re.compile(
 
 
 def _normalize_company_name(name: str) -> str:
-    cleaned = re.sub(r"[/,.\-()]+", " ", (name or "").lower())
+    cleaned = _COMPANY_NAME_PUNCT_RE.sub(" ", (name or "").lower())
     cleaned = _LEGAL_SUFFIX_RE.sub(" ", cleaned)
     return " ".join(cleaned.split())
+
+
+def _has_visa_ticker_mention(query: str, *, has_peer_context: bool) -> bool:
+    """Detect uppercase standalone `'V'` (Visa) only in explicit financial/peer context.
+
+    Avoids false positives on Roman numerals (`Part V`, `Section V`, `Title V`, `Series V`).
+    """
+    has_topic = has_peer_context or bool(_SUPPORTED_TOPIC_RE.search(query))
+    for match in _STANDALONE_V_RE.finditer(query):
+        before = query[: match.start()]
+        after = query[match.end() :]
+        if _ROMAN_NUMERAL_PREFIX_RE.search(before):
+            continue
+        if _VISA_POST_CONTEXT_RE.search(after):
+            return True
+        if has_topic and _VISA_PRE_CONTEXT_RE.search(before):
+            return True
+    return False
 
 
 _CANONICAL_DUAL_CLASS_PREFERENCE: dict[str, str] = {
@@ -435,7 +479,7 @@ class EntityCatalog:
 
         seen_norm_names: dict[str, str] = {}
         for p in profiles:
-            tk = str(getattr(p, "ticker", "") or "").strip().upper().replace(".", "-")
+            tk = normalize_edgar_ticker(str(getattr(p, "ticker", "") or ""))
             if not tk:
                 continue
             self.tickers.add(tk)
@@ -452,9 +496,7 @@ class EntityCatalog:
             norm_name = _normalize_company_name(cname)
             if len(norm_name) >= 4:
                 existing = seen_norm_names.get(norm_name)
-                if existing is None:
-                    seen_norm_names[norm_name] = tk
-                elif _CANONICAL_DUAL_CLASS_PREFERENCE.get(existing) == tk:
+                if existing is None or _CANONICAL_DUAL_CLASS_PREFERENCE.get(existing) == tk:
                     seen_norm_names[norm_name] = tk
 
         # Longest company names first so e.g. "bank of america" matches before "america"
@@ -468,7 +510,7 @@ class EntityCatalog:
             self._name_patterns.append((re.compile(rf"\b{escaped}\b", re.IGNORECASE), tk))
 
     def contains_ticker(self, ticker: str) -> bool:
-        return ticker.strip().upper().replace(".", "-") in self.tickers
+        return normalize_edgar_ticker(ticker) in self.tickers
 
     def detect_tickers_in_query(self, query: str) -> tuple[list[str], list[str]]:
         """Return `(detected_known_tickers, unknown_ticker_mentions)` from natural language."""
@@ -476,20 +518,20 @@ class EntityCatalog:
         unknown: list[str] = []
 
         def _add_known(sym: str) -> None:
-            norm = sym.upper().replace(".", "-")
+            norm = normalize_edgar_ticker(sym)
             if norm not in found and (not self.tickers or norm in self.tickers):
                 found.append(norm)
 
         # 1. Explicit `$TICKER` or `ticker XYZ`
         for m in _DOLLAR_TICKER_RE.finditer(query):
-            sym = m.group(1).upper().replace(".", "-")
+            sym = normalize_edgar_ticker(m.group(1))
             if not self.tickers or sym in self.tickers:
                 _add_known(sym)
             elif sym not in unknown:
                 unknown.append(sym)
         for m in _EXPLICIT_TICKER_RE.finditer(query):
             raw = m.group(1)
-            sym = raw.upper().replace(".", "-")
+            sym = normalize_edgar_ticker(raw)
             if not raw.isalpha() or len(sym) > 5:
                 continue
             if sym in _AMBIGUOUS_TICKER_WORDS and not raw.isupper():
@@ -499,27 +541,25 @@ class EntityCatalog:
             elif sym not in unknown:
                 unknown.append(sym)
 
-        # 2. High-precision curated brand aliases
+        # 2. High-precision curated brand aliases (includes "Visa" -> "V")
         for pattern, sym in _COMMON_BRAND_ALIASES:
             if pattern.search(query):
                 _add_known(sym)
 
-        # Exact uppercase standalone 'V' check (Visa)
-        if re.search(r"(?<![A-Za-z0-9\-])V(?![A-Za-z0-9\-])", query):
-            _add_known("V")
-
-        # 3. Full dynamic S&P 500 ticker symbol matching (uppercase 2-5 char tokens, excluding common words)
+        # 3. Dynamic S&P 500 uppercase 2-5 char ticker matching (excluding ambiguous words)
         if self.tickers:
-            for m in re.finditer(
-                r"(?<![A-Za-z0-9\-])([A-Z]{2,5}(?:[.-][A-Z])?)(?![A-Za-z0-9\-])", query
-            ):
-                tok = m.group(1).upper().replace(".", "-")
+            for m in _UPPERCASE_TICKER_RE.finditer(query):
+                tok = normalize_edgar_ticker(m.group(1))
                 if tok in _AMBIGUOUS_TICKER_WORDS:
                     continue
                 if tok in self.tickers:
                     _add_known(tok)
 
-        # 4. Full dynamic S&P 500 company name matching (case-insensitive).
+        # 4. Context-guarded standalone uppercase 'V' (Visa) — requires financial/peer context
+        if "V" not in found and _has_visa_ticker_mention(query, has_peer_context=bool(found)):
+            _add_known("V")
+
+        # 5. Full dynamic S&P 500 company name matching (case-insensitive).
         # Deduplicate dual-class shares by CIK so "Alphabet" resolves to GOOGL, not [GOOG, GOOGL].
         found_ciks = {self.ticker_to_cik[t] for t in found if t in self.ticker_to_cik}
         for pattern, tk in self._name_patterns:
@@ -533,12 +573,226 @@ class EntityCatalog:
                 if tk_cik:
                     found_ciks.add(tk_cik)
 
-        # 5. Detect well-known private / foreign / non-S&P 500 entities
+        # 6. Detect well-known private / foreign / non-S&P 500 entities
         for pattern, label in _KNOWN_NON_SP500_ENTITIES:
             if pattern.search(query) and label not in unknown:
                 unknown.append(label)
 
         return found, unknown
+
+
+# ---------------------------------------------------------------------------
+# Scope Validation Rule Helpers
+# ---------------------------------------------------------------------------
+
+
+def _validation_result(
+    *,
+    action: str,
+    reason: str | None = None,
+    message: str = "",
+    suggested_followups: list[str] | None = None,
+    pre_notices: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    return {
+        "action": action,
+        "reason": reason,
+        "message": message,
+        "suggested_followups": list(suggested_followups or []),
+        "pre_notices": list(pre_notices or []),
+    }
+
+
+def _check_unsupported_filings(
+    query: str, known_tickers: list[str]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    unsupported = [label for pat, label in _UNSUPPORTED_FILING_PATTERNS if pat.search(query)]
+    if not unsupported:
+        return None, None
+    filing_str = ", ".join(unsupported)
+    if not _MENTIONS_10K_RE.search(query):
+        sample_tk = known_tickers[0] if known_tickers else "NVDA"
+        notice = CoverageNotice(
+            code="unsupported_filing_type",
+            severity="warning",
+            message=(
+                f"Unsupported filing type requested: {filing_str}. "
+                "Only Form 10-K (Item 1A & Item 7) is indexed."
+            ),
+            details={"requested_filing_types": unsupported},
+        ).model_dump(mode="json")
+        return (
+            _validation_result(
+                action="out_of_corpus",
+                reason="unsupported_filing_type",
+                message=(
+                    f"This workspace only indexes annual **SEC Form 10-K filings** (Item 1A Risk Factors "
+                    f"and Item 7 MD&A) for S&P 500 companies from **FY{MIN_CORPUS_YEAR}–FY{MAX_CORPUS_YEAR}**. "
+                    f"It does not include **{filing_str}**."
+                ),
+                suggested_followups=[
+                    f"Analyze {sample_tk}'s annual 10-K revenue and operating income from FY2024 to FY2026",
+                    f"What risk factors changed in {sample_tk}'s Item 1A 10-K filings since FY2024?",
+                    "Compare NVIDIA and Apple's R&D spend from 2024 to 2026",
+                ],
+                pre_notices=[notice],
+            ),
+            None,
+        )
+    notice = CoverageNotice(
+        code="unsupported_filing_type",
+        severity="warning",
+        message=(
+            f"Only annual Form 10-K filings are indexed; {filing_str} "
+            "are excluded from this analysis."
+        ),
+        details={"requested_filing_types": unsupported},
+    ).model_dump(mode="json")
+    return None, notice
+
+
+def _check_unknown_issuers(
+    all_unknown: list[str],
+    known_tickers: list[str],
+    scope: dict[str, Any],
+    catalog: EntityCatalog,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    if not all_unknown:
+        return None, None
+    unknown_str = ", ".join(all_unknown)
+    if not known_tickers and scope.get("gics_sector") == "ALL":
+        notice = CoverageNotice(
+            code="non_sp500_issuer",
+            severity="warning",
+            message=f"Issuer(s) outside the S&P 500 corpus: {unknown_str}.",
+            tickers=all_unknown,
+        ).model_dump(mode="json")
+        return (
+            _validation_result(
+                action="out_of_corpus",
+                reason="non_sp500_issuer",
+                message=(
+                    f"I could not find **{unknown_str}** in the curated **S&P 500** 10-K corpus. "
+                    f"This tool covers the {len(catalog.tickers) or 500} S&P 500 constituents "
+                    f"(FY{MIN_CORPUS_YEAR}–FY{MAX_CORPUS_YEAR} Form 10-K filings) and does not include "
+                    "private companies, non-U.S. primary filers outside the S&P 500, or unindexed tickers."
+                ),
+                suggested_followups=[
+                    "Compare NVIDIA and Apple's R&D spend from 2024 to 2026",
+                    "Analyze Tesla's revenue and operating margin trends from FY2024 to FY2026",
+                    "How has AI risk wording changed across all tech companies in the S&P 500 since 2024?",
+                ],
+                pre_notices=[notice],
+            ),
+            None,
+        )
+    notice = CoverageNotice(
+        code="non_sp500_issuer",
+        severity="warning",
+        message=(
+            f"Excluded out-of-corpus issuer(s) not in the S&P 500 snapshot: {unknown_str}. "
+            f"Proceeding with in-corpus ticker(s): {', '.join(known_tickers) or scope.get('gics_sector')}."
+        ),
+        tickers=all_unknown,
+    ).model_dump(mode="json")
+    return None, notice
+
+
+def _check_unsupported_metrics(
+    query: str, known_tickers: list[str]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    unsupported = [label for pat, label in _UNSUPPORTED_METRIC_PATTERNS if pat.search(query)]
+    if not unsupported:
+        return None, None
+    metric_str = ", ".join(unsupported)
+    if not _SUPPORTED_TOPIC_RE.search(query):
+        tk_label = ", ".join(known_tickers) if known_tickers else "NVDA"
+        notice = CoverageNotice(
+            code="unsupported_metric",
+            severity="warning",
+            message=(
+                f"Unsupported metric(s) requested: {metric_str}. "
+                f"Supported deterministic metrics: {SUPPORTED_METRICS_DISPLAY}."
+            ),
+            details={"unsupported_metrics": unsupported},
+        ).model_dump(mode="json")
+        return (
+            _validation_result(
+                action="out_of_corpus",
+                reason="unsupported_metric",
+                message=(
+                    f"**{metric_str}** is not in the deterministic financial metrics table. "
+                    "To guarantee 100% mathematical accuracy without LLM estimation, this tool calculates "
+                    f"deterministic figures only for **{SUPPORTED_METRICS_DISPLAY}** from XBRL 10-K filings."
+                ),
+                suggested_followups=[
+                    f"Analyze {tk_label}'s revenue, operating income, and net income from FY2024 to FY2026",
+                    f"Compare {tk_label} and MSFT R&D spend and operating margin from FY2024 to FY2026",
+                    f"Summarize MD&A key performance drivers for {tk_label} in FY2025",
+                ],
+                pre_notices=[notice],
+            ),
+            None,
+        )
+    notice = CoverageNotice(
+        code="unsupported_metric",
+        severity="warning",
+        message=(
+            f"Deterministic data is unavailable for {metric_str}. "
+            f"Reporting covers supported XBRL metrics ({SUPPORTED_METRICS_DISPLAY}) and 10-K narrative text."
+        ),
+        details={"unsupported_metrics": unsupported},
+    ).model_dump(mode="json")
+    return None, notice
+
+
+def _check_out_of_range_years(
+    query: str, known_tickers: list[str]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    all_years = sorted({int(y) for y in _ANY_4DIGIT_YEAR_RE.findall(query)})
+    out_of_range = [y for y in all_years if y < MIN_CORPUS_YEAR or y > MAX_CORPUS_YEAR]
+    if not out_of_range:
+        return None, None
+    in_range = [y for y in all_years if MIN_CORPUS_YEAR <= y <= MAX_CORPUS_YEAR]
+    yrs_str = ", ".join(f"FY{y}" for y in out_of_range)
+    if not in_range:
+        tk_label = ", ".join(known_tickers) if known_tickers else "Apple"
+        notice = CoverageNotice(
+            code="out_of_range_year",
+            severity="warning",
+            message=(
+                f"Requested year(s) {yrs_str} fall outside corpus coverage "
+                f"(FY{MIN_CORPUS_YEAR}–FY{MAX_CORPUS_YEAR})."
+            ),
+            missing_years=out_of_range,
+        ).model_dump(mode="json")
+        return (
+            _validation_result(
+                action="out_of_corpus",
+                reason="out_of_range_year",
+                message=(
+                    f"Requested period **{yrs_str}** is outside the curated 10-K corpus range. "
+                    f"Indexed SEC Form 10-K filings span **FY{MIN_CORPUS_YEAR} through FY{MAX_CORPUS_YEAR}** "
+                    "(FY2026 is currently available for issuers whose fiscal year ended and whose 10-K has been filed)."
+                ),
+                suggested_followups=[
+                    f"Analyze {tk_label}'s revenue and net income from FY2020 to FY2025",
+                    f"Analyze {tk_label}'s financial performance from FY2024 to FY2026",
+                ],
+                pre_notices=[notice],
+            ),
+            None,
+        )
+    notice = CoverageNotice(
+        code="out_of_range_year",
+        severity="warning",
+        message=(
+            f"Excluded out-of-range fiscal year(s) {yrs_str}; corpus coverage spans "
+            f"FY{MIN_CORPUS_YEAR}–FY{MAX_CORPUS_YEAR}."
+        ),
+        missing_years=out_of_range,
+    ).model_dump(mode="json")
+    return None, notice
 
 
 def validate_query_scope_and_coverage(
@@ -559,203 +813,31 @@ def validate_query_scope_and_coverage(
       - `suggested_followups`: list of clickable suggested queries
       - `pre_notices`: list of `CoverageNotice` dicts to include even when proceeding
     """
-    pre_notices: list[dict[str, Any]] = []
+    if _CHUNK_HEALTH_RE.search(query):
+        return _validation_result(action="proceed")
 
-    # Check chunk-health operational intent first (never needs tickers or sector)
-    if re.search(
-        r"\b(?:chunk\s+health|embedding\s+coverage|vector\s+(?:db|database)\s+health)\b",
-        query,
-        re.IGNORECASE,
-    ):
-        return {
-            "action": "proceed",
-            "reason": None,
-            "message": "",
-            "suggested_followups": [],
-            "pre_notices": [],
-        }
-
-    # 1. Explicit UI tickers that do not exist in the S&P 500 catalog
-    missing_explicit: list[str] = []
-    if catalog.tickers and explicit_tickers:
-        for t in explicit_tickers:
-            if not catalog.contains_ticker(t):
-                missing_explicit.append(t)
-
+    missing_explicit = (
+        [t for t in explicit_tickers if not catalog.contains_ticker(t)]
+        if (catalog.tickers and explicit_tickers)
+        else []
+    )
     all_unknown = list(dict.fromkeys([*missing_explicit, *unknown_entities]))
     known_tickers = [
         t for t in scope.get("tickers") or [] if not catalog.tickers or catalog.contains_ticker(t)
     ]
 
-    # 2. Unsupported filing types (10-Q, 8-K, DEF 14A, transcripts, etc.)
-    unsupported_filings = [
-        label for pat, label in _UNSUPPORTED_FILING_PATTERNS if pat.search(query)
-    ]
-    mentions_10k = bool(re.search(r"\b10-?k\b|\bannual\s+report\b", query, re.IGNORECASE))
-    if unsupported_filings and not mentions_10k:
-        filing_str = ", ".join(unsupported_filings)
-        sample_tk = known_tickers[0] if known_tickers else "NVDA"
-        return {
-            "action": "out_of_corpus",
-            "reason": "unsupported_filing_type",
-            "message": (
-                f"This workspace only indexes annual **SEC Form 10-K filings** (Item 1A Risk Factors "
-                f"and Item 7 MD&A) for S&P 500 companies from **FY{MIN_CORPUS_YEAR}–FY{MAX_CORPUS_YEAR}**. "
-                f"It does not include **{filing_str}**."
-            ),
-            "suggested_followups": [
-                f"Analyze {sample_tk}'s annual 10-K revenue and operating income from FY2024 to FY2026",
-                f"What risk factors changed in {sample_tk}'s Item 1A 10-K filings since FY2024?",
-                "Compare NVIDIA and Apple's R&D spend from 2024 to 2026",
-            ],
-            "pre_notices": [
-                CoverageNotice(
-                    code="unsupported_filing_type",
-                    severity="warning",
-                    message=f"Unsupported filing type requested: {filing_str}. Only Form 10-K (Item 1A & Item 7) is indexed.",
-                    details={"requested_filing_types": unsupported_filings},
-                ).model_dump(mode="json")
-            ],
-        }
-    elif unsupported_filings:
-        pre_notices.append(
-            CoverageNotice(
-                code="unsupported_filing_type",
-                severity="warning",
-                message=(
-                    f"Only annual Form 10-K filings are indexed; {', '.join(unsupported_filings)} "
-                    "are excluded from this analysis."
-                ),
-                details={"requested_filing_types": unsupported_filings},
-            ).model_dump(mode="json")
-        )
+    pre_notices: list[dict[str, Any]] = []
+    for block_resp, notice in (
+        _check_unsupported_filings(query, known_tickers),
+        _check_unknown_issuers(all_unknown, known_tickers, scope, catalog),
+        _check_unsupported_metrics(query, known_tickers),
+        _check_out_of_range_years(query, known_tickers),
+    ):
+        if block_resp is not None:
+            return block_resp
+        if notice is not None:
+            pre_notices.append(notice)
 
-    # 3. Non-S&P 500 / unknown issuers
-    if all_unknown and not known_tickers and scope.get("gics_sector") == "ALL":
-        unknown_str = ", ".join(all_unknown)
-        return {
-            "action": "out_of_corpus",
-            "reason": "non_sp500_issuer",
-            "message": (
-                f"I could not find **{unknown_str}** in the curated **S&P 500** 10-K corpus. "
-                f"This tool covers the {len(catalog.tickers) or 500} S&P 500 constituents "
-                f"(FY{MIN_CORPUS_YEAR}–FY{MAX_CORPUS_YEAR} Form 10-K filings) and does not include "
-                "private companies, non-U.S. primary filers outside the S&P 500, or unindexed tickers."
-            ),
-            "suggested_followups": [
-                "Compare NVIDIA and Apple's R&D spend from 2024 to 2026",
-                "Analyze Tesla's revenue and operating margin trends from FY2024 to FY2026",
-                "How has AI risk wording changed across all tech companies in the S&P 500 since 2024?",
-            ],
-            "pre_notices": [
-                CoverageNotice(
-                    code="non_sp500_issuer",
-                    severity="warning",
-                    message=f"Issuer(s) outside the S&P 500 corpus: {unknown_str}.",
-                    tickers=all_unknown,
-                ).model_dump(mode="json")
-            ],
-        }
-    elif all_unknown:
-        unknown_str = ", ".join(all_unknown)
-        pre_notices.append(
-            CoverageNotice(
-                code="non_sp500_issuer",
-                severity="warning",
-                message=(
-                    f"Excluded out-of-corpus issuer(s) not in the S&P 500 snapshot: {unknown_str}. "
-                    f"Proceeding with in-corpus ticker(s): {', '.join(known_tickers) or scope.get('gics_sector')}."
-                ),
-                tickers=all_unknown,
-            ).model_dump(mode="json")
-        )
-
-    # 4. Unsupported financial metrics (EBITDA, EPS, FCF, debt, headcount, stock price, etc.)
-    unsupported_metrics = [
-        label for pat, label in _UNSUPPORTED_METRIC_PATTERNS if pat.search(query)
-    ]
-    has_supported_topic = bool(_SUPPORTED_TOPIC_RE.search(query))
-    if unsupported_metrics and not has_supported_topic:
-        metric_str = ", ".join(unsupported_metrics)
-        tk_label = ", ".join(known_tickers) if known_tickers else "NVDA"
-        return {
-            "action": "out_of_corpus",
-            "reason": "unsupported_metric",
-            "message": (
-                f"**{metric_str}** is not in the deterministic financial metrics table. "
-                f"To guarantee 100% mathematical accuracy without LLM estimation, this tool calculates "
-                f"deterministic figures only for **{SUPPORTED_METRICS_DISPLAY}** from XBRL 10-K filings."
-            ),
-            "suggested_followups": [
-                f"Analyze {tk_label}'s revenue, operating income, and net income from FY2024 to FY2026",
-                f"Compare {tk_label} and MSFT R&D spend and operating margin from FY2024 to FY2026",
-                f"Summarize MD&A key performance drivers for {tk_label} in FY2025",
-            ],
-            "pre_notices": [
-                CoverageNotice(
-                    code="unsupported_metric",
-                    severity="warning",
-                    message=f"Unsupported metric(s) requested: {metric_str}. Supported deterministic metrics: {SUPPORTED_METRICS_DISPLAY}.",
-                    details={"unsupported_metrics": unsupported_metrics},
-                ).model_dump(mode="json")
-            ],
-        }
-    elif unsupported_metrics:
-        pre_notices.append(
-            CoverageNotice(
-                code="unsupported_metric",
-                severity="warning",
-                message=(
-                    f"Deterministic data is unavailable for {', '.join(unsupported_metrics)}. "
-                    f"Reporting covers supported XBRL metrics ({SUPPORTED_METRICS_DISPLAY}) and 10-K narrative text."
-                ),
-                details={"unsupported_metrics": unsupported_metrics},
-            ).model_dump(mode="json")
-        )
-
-    # 5. Out-of-range fiscal years (< 2020 or > 2026)
-    all_years = sorted({int(y) for y in _ANY_4DIGIT_YEAR_RE.findall(query)})
-    out_of_range = [y for y in all_years if y < MIN_CORPUS_YEAR or y > MAX_CORPUS_YEAR]
-    in_range = [y for y in all_years if MIN_CORPUS_YEAR <= y <= MAX_CORPUS_YEAR]
-    if out_of_range and not in_range:
-        yrs_str = ", ".join(f"FY{y}" for y in out_of_range)
-        tk_label = ", ".join(known_tickers) if known_tickers else "Apple"
-        return {
-            "action": "out_of_corpus",
-            "reason": "out_of_range_year",
-            "message": (
-                f"Requested period **{yrs_str}** is outside the curated 10-K corpus range. "
-                f"Indexed SEC Form 10-K filings span **FY{MIN_CORPUS_YEAR} through FY{MAX_CORPUS_YEAR}** "
-                f"(FY2026 is currently available for issuers whose fiscal year ended and whose 10-K has been filed)."
-            ),
-            "suggested_followups": [
-                f"Analyze {tk_label}'s revenue and net income from FY2020 to FY2025",
-                f"Analyze {tk_label}'s financial performance from FY2024 to FY2026",
-            ],
-            "pre_notices": [
-                CoverageNotice(
-                    code="out_of_range_year",
-                    severity="warning",
-                    message=f"Requested year(s) {yrs_str} fall outside corpus coverage (FY{MIN_CORPUS_YEAR}–FY{MAX_CORPUS_YEAR}).",
-                    missing_years=out_of_range,
-                ).model_dump(mode="json")
-            ],
-        }
-    elif out_of_range:
-        yrs_str = ", ".join(f"FY{y}" for y in out_of_range)
-        pre_notices.append(
-            CoverageNotice(
-                code="out_of_range_year",
-                severity="warning",
-                message=(
-                    f"Excluded out-of-range fiscal year(s) {yrs_str}; corpus coverage spans "
-                    f"FY{MIN_CORPUS_YEAR}–FY{MAX_CORPUS_YEAR}."
-                ),
-                missing_years=out_of_range,
-            ).model_dump(mode="json")
-        )
-
-    # 6. Ambiguous scope -> ask a friendly clarifying question instead of silently guessing tickers!
     has_tickers = bool(known_tickers)
     has_sector = scope.get("gics_sector", "ALL") not in ("ALL", "", None)
     is_broad_corpus = bool(_BROAD_CORPUS_PHRASE_RE.search(query))
@@ -765,31 +847,24 @@ def validate_query_scope_and_coverage(
         and memory_context.get("remembered_tickers")
     )
     if not has_tickers and not has_sector and not is_broad_corpus and not has_memory:
-        return {
-            "action": "clarification",
-            "reason": "ambiguous_scope",
-            "message": (
+        return _validation_result(
+            action="clarification",
+            reason="ambiguous_scope",
+            message=(
                 "Could you clarify **which company (or S&P 500 GICS sector)** you would like me to analyze? "
                 "I can examine a single company over time, compare 2+ peers side by side, or track a theme "
                 "across an entire GICS sector (e.g., Information Technology, Health Care, Financials, Energy, "
                 "Industrials, Utilities, Real Estate, Materials)."
             ),
-            "suggested_followups": [
+            suggested_followups=[
                 "Analyze NVIDIA's revenue, operating income, and net income from FY2024 to FY2026",
                 "Compare NVIDIA and Apple's R&D spend from FY2024 to FY2026",
                 "How has AI risk wording changed across all Information Technology companies since 2024?",
                 "Compare Microsoft and Amazon's operating margins from FY2024 to FY2025",
             ],
-            "pre_notices": [],
-        }
+        )
 
-    return {
-        "action": "proceed",
-        "reason": None,
-        "message": "",
-        "suggested_followups": [],
-        "pre_notices": pre_notices,
-    }
+    return _validation_result(action="proceed", pre_notices=pre_notices)
 
 
 def is_additive_followup(query: str) -> bool:
@@ -802,9 +877,135 @@ def extract_removed_tickers(query: str, catalog: EntityCatalog) -> list[str]:
     m = _REMOVE_FOLLOWUP_RE.search(query)
     if not m:
         return []
-    tail = m.group(1)
-    detected, _ = catalog.detect_tickers_in_query(tail)
+    detected, _ = catalog.detect_tickers_in_query(m.group(1))
     return detected
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Coverage Notice Builders
+# ---------------------------------------------------------------------------
+
+
+def _missing_year_notices(variance_reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    notices: list[dict[str, Any]] = []
+    for rep in variance_reports:
+        missing_yrs = [int(y) for y in (rep.get("missing_fiscal_years") or [])]
+        if not missing_yrs:
+            continue
+        tk = str(rep.get("ticker") or "")
+        cname = str(rep.get("company_name") or tk)
+        avail = [int(y) for y in (rep.get("available_fiscal_years") or [])]
+        period_dates = rep.get("period_end_dates") or {}
+        latest_fy = avail[-1] if avail else rep.get("end_year")
+        latest_period = (
+            lookup_year_key(period_dates, int(latest_fy)) if latest_fy is not None else None
+        )
+        missing_str = ", ".join(f"FY{y}" for y in missing_yrs)
+        avail_str = (
+            f"FY{avail[0]}–FY{avail[-1]}"
+            if len(avail) >= 2
+            else (f"FY{avail[0]}" if avail else "none")
+        )
+        period_note = f" (latest period ended {latest_period})" if latest_period else ""
+        fy26_hint = (
+            " Most calendar-year filers file FY2026 Form 10-Ks in Q1 2027."
+            if 2026 in missing_yrs
+            else ""
+        )
+        notices.append(
+            CoverageNotice(
+                code="missing_fiscal_year",
+                severity="warning",
+                message=(
+                    f"{cname} ({tk}) does not have a filed 10-K in the corpus for {missing_str}; "
+                    f"showing available range {avail_str}{period_note}.{fy26_hint}"
+                ),
+                tickers=[tk],
+                missing_years=missing_yrs,
+                details={
+                    "available_fiscal_years": avail,
+                    "latest_period_of_report": latest_period,
+                },
+            ).model_dump(mode="json")
+        )
+    return notices
+
+
+def _calendar_misalignment_notice(variance_reports: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if len(variance_reports) < 2:
+        return None
+    month_by_ticker: dict[str, tuple[int, str, int]] = {}
+    for rep in variance_reports:
+        tk = str(rep.get("ticker") or "")
+        end_fy = int(rep.get("end_year") or 0)
+        p_dates = rep.get("period_end_dates") or {}
+        p_str = str(lookup_year_key(p_dates, end_fy) or "").strip()
+        if len(p_str) >= 7 and p_str[5:7].isdigit():
+            month_by_ticker[tk] = (int(p_str[5:7]), p_str, end_fy)
+    if len({m for m, _, _ in month_by_ticker.values()}) < 2:
+        return None
+    desc_parts = [
+        f"{tk}: FY{fy} ended {p_str} ({calendar.month_abbr[m]})"
+        for tk, (m, p_str, fy) in sorted(month_by_ticker.items())
+    ]
+    return CoverageNotice(
+        code="fiscal_calendar_misalignment",
+        severity="info",
+        message=(
+            "Fiscal calendar note: compared companies have different fiscal year-ends "
+            f"({'; '.join(desc_parts)}). Figures reflect each issuer's own fiscal year."
+        ),
+        tickers=sorted(month_by_ticker.keys()),
+        details={
+            "period_ends": {
+                tk: {"fiscal_year": fy, "period_of_report": p_str}
+                for tk, (_, p_str, fy) in month_by_ticker.items()
+            }
+        },
+    ).model_dump(mode="json")
+
+
+def _missing_rd_notice(query: str, variance_reports: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not variance_reports or not _ASKED_RD_RE.search(query):
+        return None
+    no_rd = [
+        str(r["ticker"])
+        for r in variance_reports
+        if (r.get("research_and_development_variance") or {}).get("direction") == "unavailable"
+    ]
+    if not no_rd:
+        return None
+    return CoverageNotice(
+        code="missing_metric",
+        severity="info",
+        message=(
+            "No standalone R&D expense line is reported in the XBRL 10-K filings for: "
+            f"{', '.join(no_rd)}."
+        ),
+        tickers=no_rd,
+    ).model_dump(mode="json")
+
+
+def _sector_coverage_notice(sector_coverage: dict[str, Any]) -> dict[str, Any]:
+    sec_name = str(sector_coverage.get("gics_sector") or "sector")
+    analyzed = int(sector_coverage.get("issuers_analyzed") or 0)
+    total = int(sector_coverage.get("issuers_in_sector") or analyzed)
+    matched = int(sector_coverage.get("issuers_with_theme_matches") or 0)
+    filings_by_yr = sector_coverage.get("filings_by_year") or {}
+    yr_parts = [f"FY{y}: {cnt} filings" for y, cnt in sorted(filings_by_yr.items())]
+    fy26_missing = int((sector_coverage.get("missing_fy_counts") or {}).get("2026", 0) or 0)
+    missing_note = (
+        f" ({fy26_missing} issuers have not yet filed FY2026 10-Ks)" if fy26_missing > 0 else ""
+    )
+    return CoverageNotice(
+        code="sector_coverage_summary",
+        severity="warning" if fy26_missing > 0 else "info",
+        message=(
+            f"Full-sector map-reduce analyzed {analyzed}/{total} {sec_name} issuers "
+            f"({matched} with theme matches; {', '.join(yr_parts)}){missing_note}."
+        ),
+        details=dict(sector_coverage),
+    ).model_dump(mode="json")
 
 
 def build_coverage_notices(
@@ -818,136 +1019,30 @@ def build_coverage_notices(
     """Deterministically build user-facing coverage & fiscal calendar notices."""
     notices: list[dict[str, Any]] = list(pre_notices or [])
 
-    # 1. Missing tickers
     if missing_tickers:
         notices.append(
             CoverageNotice(
                 code="missing_ticker",
                 severity="warning",
                 message=(
-                    f"No financial metric filings were found in the requested fiscal window for: "
+                    "No financial metric filings were found in the requested fiscal window for: "
                     f"{', '.join(missing_tickers)}."
                 ),
                 tickers=list(missing_tickers),
             ).model_dump(mode="json")
         )
 
-    # 2. Missing fiscal years (critical for FY2026: only ~84/501 issuers have filed FY2026 10-Ks!)
-    for rep in variance_reports:
-        missing_yrs = [int(y) for y in (rep.get("missing_fiscal_years") or [])]
-        if missing_yrs:
-            tk = str(rep.get("ticker") or "")
-            cname = str(rep.get("company_name") or tk)
-            avail = [int(y) for y in (rep.get("available_fiscal_years") or [])]
-            period_dates = rep.get("period_end_dates") or {}
-            latest_fy = avail[-1] if avail else rep.get("end_year")
-            latest_period = period_dates.get(latest_fy) or period_dates.get(str(latest_fy))
-            missing_str = ", ".join(f"FY{y}" for y in missing_yrs)
-            avail_str = (
-                f"FY{avail[0]}–FY{avail[-1]}"
-                if len(avail) >= 2
-                else (f"FY{avail[0]}" if avail else "none")
-            )
-            period_note = f" (latest period ended {latest_period})" if latest_period else ""
-            fy26_hint = (
-                " Most calendar-year filers file FY2026 Form 10-Ks in Q1 2027."
-                if 2026 in missing_yrs
-                else ""
-            )
-            notices.append(
-                CoverageNotice(
-                    code="missing_fiscal_year",
-                    severity="warning",
-                    message=(
-                        f"{cname} ({tk}) does not have a filed 10-K in the corpus for {missing_str}; "
-                        f"showing available range {avail_str}{period_note}.{fy26_hint}"
-                    ),
-                    tickers=[tk],
-                    missing_years=missing_yrs,
-                    details={
-                        "available_fiscal_years": avail,
-                        "latest_period_of_report": latest_period,
-                    },
-                ).model_dump(mode="json")
-            )
+    notices.extend(_missing_year_notices(variance_reports))
 
-    # 3. Fiscal calendar misalignment across compared peers (e.g., NVDA Jan vs AAPL Sep)
-    if len(variance_reports) >= 2:
-        month_by_ticker: dict[str, tuple[int, str, int]] = {}
-        for rep in variance_reports:
-            tk = str(rep.get("ticker") or "")
-            end_fy = int(rep.get("end_year") or 0)
-            p_dates = rep.get("period_end_dates") or {}
-            p_str = str(p_dates.get(end_fy) or p_dates.get(str(end_fy)) or "").strip()
-            if len(p_str) >= 7 and p_str[5:7].isdigit():
-                month_by_ticker[tk] = (int(p_str[5:7]), p_str, end_fy)
-        distinct_months = {m for m, _, _ in month_by_ticker.values()}
-        if len(distinct_months) >= 2:
-            desc_parts = [
-                f"{tk}: FY{fy} ended {p_str} ({calendar.month_abbr[m]})"
-                for tk, (m, p_str, fy) in sorted(month_by_ticker.items())
-            ]
-            notices.append(
-                CoverageNotice(
-                    code="fiscal_calendar_misalignment",
-                    severity="info",
-                    message=(
-                        "Fiscal calendar note: compared companies have different fiscal year-ends "
-                        f"({'; '.join(desc_parts)}). Figures reflect each issuer's own fiscal year."
-                    ),
-                    tickers=sorted(month_by_ticker.keys()),
-                    details={
-                        "period_ends": {
-                            tk: {"fiscal_year": fy, "period_of_report": p_str}
-                            for tk, (_, p_str, fy) in month_by_ticker.items()
-                        }
-                    },
-                ).model_dump(mode="json")
-            )
+    cal_notice = _calendar_misalignment_notice(variance_reports)
+    if cal_notice is not None:
+        notices.append(cal_notice)
 
-    # 4. Missing R&D when R&D was explicitly requested
-    asked_rd = bool(re.search(r"\b(?:r&d|research\s+and\s+development)\b", query, re.IGNORECASE))
-    if asked_rd and variance_reports:
-        no_rd = [
-            str(r["ticker"])
-            for r in variance_reports
-            if (r.get("research_and_development_variance") or {}).get("direction") == "unavailable"
-        ]
-        if no_rd:
-            notices.append(
-                CoverageNotice(
-                    code="missing_metric",
-                    severity="info",
-                    message=(
-                        f"No standalone R&D expense line is reported in the XBRL 10-K filings for: "
-                        f"{', '.join(no_rd)}."
-                    ),
-                    tickers=no_rd,
-                ).model_dump(mode="json")
-            )
+    rd_notice = _missing_rd_notice(query, variance_reports)
+    if rd_notice is not None:
+        notices.append(rd_notice)
 
-    # 5. Sector map-reduce coverage notice (exact counts of analyzed vs total issuers + FY2026 gap)
     if sector_coverage:
-        sec_name = str(sector_coverage.get("gics_sector") or "sector")
-        analyzed = int(sector_coverage.get("issuers_analyzed") or 0)
-        total = int(sector_coverage.get("issuers_in_sector") or analyzed)
-        matched = int(sector_coverage.get("issuers_with_theme_matches") or 0)
-        filings_by_yr = sector_coverage.get("filings_by_year") or {}
-        yr_parts = [f"FY{y}: {cnt} filings" for y, cnt in sorted(filings_by_yr.items())]
-        fy26_missing = int((sector_coverage.get("missing_fy_counts") or {}).get("2026", 0) or 0)
-        missing_note = (
-            f" ({fy26_missing} issuers have not yet filed FY2026 10-Ks)" if fy26_missing > 0 else ""
-        )
-        notices.append(
-            CoverageNotice(
-                code="sector_coverage_summary",
-                severity="warning" if fy26_missing > 0 else "info",
-                message=(
-                    f"Full-sector map-reduce analyzed {analyzed}/{total} {sec_name} issuers "
-                    f"({matched} with theme matches; {', '.join(yr_parts)}){missing_note}."
-                ),
-                details=dict(sector_coverage),
-            ).model_dump(mode="json")
-        )
+        notices.append(_sector_coverage_notice(sector_coverage))
 
     return notices

@@ -3,21 +3,22 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import google.auth
 import httpx
-from google.auth.transport.requests import Request as GoogleAuthRequest
+
+from edgar_capstone.gcp.defaults import DEFAULT_PROJECT_ID, resolve_gcp_project_id
+from edgar_capstone.gcp.rest_client import GcpRestClient
 
 logger = logging.getLogger(__name__)
-
-DEFAULT_PROJECT_ID = "iron-radio-514217-q7"
 
 
 @dataclass(frozen=True)
@@ -85,11 +86,14 @@ class RedactedSecret:
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, RedactedSecret):
-            return self._value == other._value
-        return False
+            return hmac.compare_digest(self._value, other._value)
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._value)
 
 
-class SecretManagerClient:
+class SecretManagerClient(GcpRestClient):
     """Retrieves secrets from Google Cloud Secret Manager without exposing credentials in code."""
 
     def __init__(
@@ -100,25 +104,18 @@ class SecretManagerClient:
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
     ) -> None:
-        self.project_id = (
-            project_id
-            or os.environ.get("GCP_PROJECT_ID")
-            or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or DEFAULT_PROJECT_ID
+        super().__init__(
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=10.0,
         )
+        self.project_id = resolve_gcp_project_id(project_id)
         self.cache_ttl_seconds = cache_ttl_seconds
-        self._http_client = http_client
-        self._credentials = credentials
+        self._cache_lock = threading.Lock()
         self._cache: dict[str, tuple[float, RedactedSecret]] = {}
 
     def _get_auth_token(self) -> str:
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-        if not self._credentials.valid or not getattr(self._credentials, "token", None):
-            self._credentials.refresh(GoogleAuthRequest())
-        return str(self._credentials.token)
+        return self._get_bearer_token()
 
     def get_secret(
         self,
@@ -130,35 +127,28 @@ class SecretManagerClient:
         """Retrieve a secret from Secret Manager (or Cloud Run Secret Manager env mount)."""
         cache_key = f"{self.project_id}/{secret_id}/{version}"
         now = time.monotonic()
-        cached = self._cache.get(cache_key)
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
         if cached is not None and (now - cached[0]) < self.cache_ttl_seconds:
             return cached[1]
 
         # If Cloud Run already mounted the Secret Manager secret into the environment, use it first
         if env_fallback and os.environ.get(env_fallback):
             secret_obj = RedactedSecret(os.environ[env_fallback], name=secret_id)
-            self._cache[cache_key] = (now, secret_obj)
+            with self._cache_lock:
+                self._cache[cache_key] = (now, secret_obj)
             return secret_obj
 
         url = (
             f"https://secretmanager.googleapis.com/v1/projects/{self.project_id}"
             f"/secrets/{secret_id}/versions/{version}:access"
         )
-        token = self._get_auth_token()
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-
-        if self._http_client is not None:
-            resp = self._http_client.get(url, headers=headers)
-        else:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.get(url, headers=headers)
-
-        resp.raise_for_status()
-        body = resp.json()
-        encoded_data = body.get("payload", {}).get("data", "")
+        body = self._request_json(
+            "GET",
+            url,
+            headers={"Content-Type": "application/json"},
+        )
+        encoded_data = body.get("payload", {}).get("data", "") if isinstance(body, dict) else ""
         if not encoded_data:
             raise ValueError(
                 f"Secret Manager returned empty payload for {secret_id} (version={version})"
@@ -166,7 +156,8 @@ class SecretManagerClient:
 
         decoded = base64.b64decode(encoded_data).decode("utf-8")
         secret_obj = RedactedSecret(decoded, name=secret_id)
-        self._cache[cache_key] = (now, secret_obj)
+        with self._cache_lock:
+            self._cache[cache_key] = (time.monotonic(), secret_obj)
         return secret_obj
 
     def load_managed_secrets(
@@ -240,6 +231,32 @@ _SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
+_MULTILINE_RULE_IDS: frozenset[str] = frozenset(
+    {"private_key_block", "gcp_service_account_json_key"}
+)
+_MULTILINE_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (rule_id, pat) for rule_id, pat in _SECRET_PATTERNS if rule_id in _MULTILINE_RULE_IDS
+)
+_LINE_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (rule_id, pat) for rule_id, pat in _SECRET_PATTERNS if rule_id not in _MULTILINE_RULE_IDS
+)
+
+_SKIPPED_DIR_PARTS: frozenset[str] = frozenset({".terraform", "__pycache__", ".git", ".venv"})
+
+_REPO_SCAN_GLOBS: tuple[str, ...] = (
+    ".github/workflows/*.yml",
+    ".github/workflows/*.yaml",
+    "cloudbuild.yaml",
+    "Dockerfile",
+    "terraform/**/*.tf",
+    "terraform/**/*.tfvars.example",
+    "prompts/**/*.yaml",
+    "prompts/**/*.yml",
+    "prompts/**/*.md",
+    "src/**/*.py",
+    "scripts/**/*.py",
+)
+
 
 @dataclass(frozen=True)
 class SecretFinding:
@@ -260,8 +277,7 @@ def scan_text_for_exposed_secrets(
     findings: list[SecretFinding] = []
 
     # Check multi-line patterns (e.g. JSON service account keys or PEM blocks)
-    for rule_id in ("private_key_block", "gcp_service_account_json_key"):
-        pattern = dict(_SECRET_PATTERNS)[rule_id]
+    for rule_id, pattern in _MULTILINE_SECRET_PATTERNS:
         for match in pattern.finditer(content):
             line_no = content[: match.start()].count("\n") + 1
             findings.append(
@@ -274,13 +290,8 @@ def scan_text_for_exposed_secrets(
             )
 
     # Check line-by-line patterns
-    line_rules = [
-        (r_id, pat)
-        for r_id, pat in _SECRET_PATTERNS
-        if r_id not in ("private_key_block", "gcp_service_account_json_key")
-    ]
     for idx, line in enumerate(content.splitlines(), start=1):
-        for rule_id, pattern in line_rules:
+        for rule_id, pattern in _LINE_SECRET_PATTERNS:
             if pattern.search(line):
                 findings.append(
                     SecretFinding(
@@ -296,28 +307,26 @@ def scan_text_for_exposed_secrets(
 
 def scan_repository_for_exposed_secrets(repo_root: Path) -> list[SecretFinding]:
     """Scan pipeline, infrastructure, and source files in the repository for exposed secrets."""
+    resolved_root = repo_root.resolve()
+    seen_paths: set[Path] = set()
     scan_targets: list[Path] = []
-    include_globs = (
-        ".github/workflows/*.yml",
-        ".github/workflows/*.yaml",
-        "cloudbuild.yaml",
-        "Dockerfile",
-        "terraform/*.tf",
-        "terraform/*.tfvars.example",
-        "prompts/**/*.yaml",
-        "prompts/**/*.yml",
-        "prompts/**/*.md",
-        "src/**/*.py",
-        "scripts/**/*.py",
-    )
-    for pattern in include_globs:
-        scan_targets.extend(sorted(repo_root.glob(pattern)))
+
+    for pattern in _REPO_SCAN_GLOBS:
+        for candidate in sorted(resolved_root.glob(pattern)):
+            if not candidate.is_file():
+                continue
+            rel_parts = candidate.relative_to(resolved_root).parts
+            if any(part in _SKIPPED_DIR_PARTS for part in rel_parts):
+                continue
+            resolved = candidate.resolve()
+            if resolved in seen_paths:
+                continue
+            seen_paths.add(resolved)
+            scan_targets.append(candidate)
 
     all_findings: list[SecretFinding] = []
     for path in scan_targets:
-        if not path.is_file():
-            continue
-        rel = str(path.relative_to(repo_root))
+        rel = str(path.relative_to(resolved_root))
         text = path.read_text(encoding="utf-8", errors="replace")
         all_findings.extend(scan_text_for_exposed_secrets(text, source_name=rel))
 

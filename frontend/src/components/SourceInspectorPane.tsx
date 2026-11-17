@@ -1,13 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import {
-  AlertTriangle,
-  Database,
-  ExternalLink,
-  FileText,
-  Loader2,
-  Search,
-  X,
-} from 'lucide-react'
+import { useMemo, useState } from 'react'
+import { Database, X } from 'lucide-react'
 import type {
   CachedSectionResponse,
   CompanySummary,
@@ -15,10 +7,12 @@ import type {
   XbrlFactSelection,
 } from '../types/edgar'
 import {
-  clean10kDocumentBlock,
-  clean10kExcerpt,
-  formatUsdCompact,
-} from '../utils/formatters'
+  CitationsTab,
+  type CitationSectionFilter,
+  type FilingTarget,
+} from './inspector/CitationsTab'
+import { FilingReaderTab } from './inspector/FilingReaderTab'
+import { XbrlFactTab } from './inspector/XbrlFactTab'
 
 interface SourceInspectorPaneProps {
   citations: GroundedCitation[]
@@ -41,55 +35,6 @@ interface SourceInspectorPaneProps {
   onCloseMobilePane: () => void
 }
 
-function highlightTextSnippet(
-  text: string,
-  targetSnippet: string | null,
-  searchKeyword: string
-): Array<{ text: string; active: boolean; matchedSearch: boolean }> {
-  const cleaned = clean10kDocumentBlock(text)
-  const cleanTarget = targetSnippet ? clean10kExcerpt(targetSnippet).slice(0, 95) : ''
-  const cleanKeyword = searchKeyword.trim()
-
-  if (cleanTarget && cleaned.toLowerCase().includes(cleanTarget.toLowerCase())) {
-    const idx = cleaned.toLowerCase().indexOf(cleanTarget.toLowerCase())
-    const matchLen = Math.min(
-      cleaned.length - idx,
-      Math.max(
-        cleanTarget.length,
-        targetSnippet ? clean10kExcerpt(targetSnippet).length : 0
-      )
-    )
-    return [
-      { text: cleaned.slice(0, idx), active: false, matchedSearch: false },
-      {
-        text: cleaned.slice(idx, idx + matchLen),
-        active: true,
-        matchedSearch: false,
-      },
-      {
-        text: cleaned.slice(idx + matchLen),
-        active: false,
-        matchedSearch: false,
-      },
-    ]
-  }
-
-  if (cleanKeyword.length >= 2) {
-    const escaped = cleanKeyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const regex = new RegExp(`(${escaped})`, 'gi')
-    const parts = cleaned.split(regex)
-    return parts
-      .filter((p) => p.length > 0)
-      .map((part) => ({
-        text: part,
-        active: false,
-        matchedSearch: part.toLowerCase() === cleanKeyword.toLowerCase(),
-      }))
-  }
-
-  return [{ text: cleaned, active: false, matchedSearch: false }]
-}
-
 export function SourceInspectorPane({
   citations,
   companies,
@@ -105,46 +50,12 @@ export function SourceInspectorPane({
   highlightedExcerpt,
   onCloseMobilePane,
 }: SourceInspectorPaneProps) {
-  const [citationSectionFilter, setCitationSectionFilter] = useState<
-    'ALL' | 'item_7' | 'item_1a'
-  >('ALL')
+  const [citationSectionFilter, setCitationSectionFilter] =
+    useState<CitationSectionFilter>('ALL')
   const [docKeyword, setDocKeyword] = useState('')
-  const citationCardRefs = useRef<Record<string, HTMLElement | null>>({})
-  const highlightedDocMarkRef = useRef<HTMLElement | null>(null)
 
-  useEffect(() => {
-    if (activeTab === 'citations' && activeChunkId) {
-      const targetEl = citationCardRefs.current[activeChunkId]
-      if (targetEl && typeof targetEl.scrollIntoView === 'function') {
-        targetEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
-      }
-    }
-  }, [activeChunkId, activeTab])
-
-  useEffect(() => {
-    if (activeTab === 'document' && highlightedExcerpt && !isLoadingSection) {
-      const timer = setTimeout(() => {
-        if (
-          highlightedDocMarkRef.current &&
-          typeof highlightedDocMarkRef.current.scrollIntoView === 'function'
-        ) {
-          highlightedDocMarkRef.current.scrollIntoView({
-            behavior: 'smooth',
-            block: 'center',
-          })
-        }
-      }, 80)
-      return () => clearTimeout(timer)
-    }
-  }, [activeTab, highlightedExcerpt, isLoadingSection, cachedSection?.cache_key])
-
-  const filteredCitations = useMemo(() => {
-    if (citationSectionFilter === 'ALL') return citations
-    return citations.filter((c) => c.section_id === citationSectionFilter)
-  }, [citations, citationSectionFilter])
-
-  const filingTargets = useMemo(() => {
-    const map = new Map<string, { ticker: string; fiscalYear: number }>()
+  const filingTargets = useMemo<FilingTarget[]>(() => {
+    const map = new Map<string, FilingTarget>()
     citations.forEach((c) => {
       const key = `${c.ticker}_${c.fiscal_year}`
       if (!map.has(key)) {
@@ -162,13 +73,15 @@ export function SourceInspectorPane({
     return Array.from(map.values())
   }, [citations, companies])
 
-  const documentParagraphs = useMemo(() => {
-    if (!cachedSection?.content) return []
-    return cachedSection.content
-      .split(/\n{2,}/)
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0)
-  }, [cachedSection?.content])
+  const handleOpenFilingSection = (
+    ticker: string,
+    fiscalYear: number,
+    sectionId: 'item_7' | 'item_1a',
+    highlightExcerpt?: string
+  ) => {
+    onChangeTab('document')
+    onRequestFilingSection(ticker, fiscalYear, sectionId, highlightExcerpt)
+  }
 
   return (
     <aside
@@ -243,662 +156,36 @@ export function SourceInspectorPane({
         </button>
       </div>
 
-      {/* TAB 1: Grounded Citations List */}
       {activeTab === 'citations' && (
-        <div className="flex-1 flex flex-col min-h-0">
-          <div className="px-3 py-1.5 border-b border-hairline flex items-center justify-between gap-2 surface-subtle tabular-nums-mono text-[10px] uppercase shrink-0">
-            <span className="text-ink-muted">SOURCE PASSAGES</span>
-            <div className="flex items-center gap-1">
-              {(['ALL', 'item_7', 'item_1a'] as const).map((secKey) => (
-                <button
-                  key={secKey}
-                  id={`btn-filter-cit-${secKey}`}
-                  type="button"
-                  onClick={() => setCitationSectionFilter(secKey)}
-                  className={`px-1.5 py-0.2 cursor-pointer transition-colors ${
-                    citationSectionFilter === secKey
-                      ? 'badge-amber font-semibold'
-                      : 'text-ink-muted hover:text-ink-primary'
-                  }`}
-                >
-                  {secKey === 'ALL'
-                    ? 'ALL'
-                    : secKey === 'item_7'
-                      ? 'ITEM 7'
-                      : 'ITEM 1A'}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="flex-1 overflow-y-auto divide-y divide-[var(--border-hairline)]">
-            {filteredCitations.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center px-6 py-10 tabular-nums-mono">
-                <FileText
-                  className="w-6 h-6 text-ink-muted mb-2 stroke-[1.5]"
-                  aria-hidden="true"
-                />
-                <p className="text-xs font-semibold uppercase tracking-wider text-ink-primary">
-                  NO 10-K PASSAGES LOADED
-                </p>
-                <p className="text-[11px] text-ink-muted mt-1 leading-relaxed max-w-xs font-sans">
-                  Execute a query or click an inline citation tag to inspect
-                  grounded Form 10-K excerpts here.
-                </p>
-                {filingTargets[0] && (
-                  <button
-                    id="btn-browse-sample-10k"
-                    type="button"
-                    onClick={() => {
-                      onChangeTab('document')
-                      onRequestFilingSection(
-                        filingTargets[0].ticker,
-                        filingTargets[0].fiscalYear,
-                        'item_7'
-                      )
-                    }}
-                    className="mt-3 px-2.5 py-1 text-[11px] uppercase tracking-wider btn-terminal-key cursor-pointer"
-                  >
-                    OPEN {filingTargets[0].ticker} FY{filingTargets[0].fiscalYear}{' '}
-                    10-K
-                  </button>
-                )}
-              </div>
-            ) : (
-              filteredCitations.map((cit, index) => {
-                const isSelected = activeChunkId === cit.chunk_id
-                const isRisk = cit.section_id === 'item_1a'
-                return (
-                  <div
-                    key={cit.chunk_id}
-                    id={`source-card-${cit.chunk_id}`}
-                    ref={(el) => {
-                      citationCardRefs.current[cit.chunk_id] = el
-                    }}
-                    onClick={() =>
-                      onSelectChunkId(isSelected ? null : cit.chunk_id)
-                    }
-                    className={`p-3 transition-colors cursor-pointer ${
-                      isSelected
-                        ? 'surface-elevated border-l-2 border-l-[var(--bb-amber)]'
-                        : 'hover:bg-[var(--bg-subtle)]'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between gap-2 mb-1 tabular-nums-mono">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <span className="text-[11px] text-ink-muted">
-                          #{index + 1}
-                        </span>
-                        <span className="text-[11px] font-bold text-bb-yellow">
-                          {cit.ticker}
-                        </span>
-                        <span className="text-[11px] text-ink-primary">
-                          FY{cit.fiscal_year}
-                        </span>
-                        {cit.period_of_report && (
-                          <span className="text-[10px] text-ink-muted">
-                            ({cit.period_of_report})
-                          </span>
-                        )}
-                        <span
-                          className={`px-1.5 py-0.2 text-[10px] font-semibold uppercase ${
-                            isRisk ? 'badge-amber' : 'badge-accent'
-                          }`}
-                        >
-                          {isRisk ? 'ITEM 1A · RISK' : 'ITEM 7 · MD&A'}
-                        </span>
-                      </div>
-
-                      <span
-                        className="text-[10px] text-ink-muted"
-                        title="Hybrid Retrieval Score"
-                      >
-                        REL {cit.score.toFixed(3)}
-                      </span>
-                    </div>
-
-                    <div className="text-[11px] font-medium text-ink-secondary mb-1.5 truncate tabular-nums-mono">
-                      {cit.section_title}
-                    </div>
-
-                    <blockquote
-                      className={`filing-prose text-xs leading-relaxed p-2 border-l-2 ${
-                        isSelected
-                          ? 'passage-highlight border-l-[var(--bb-amber)]'
-                          : 'surface-filing-sheet border-l-[var(--border-strong)]'
-                      }`}
-                    >
-                      &ldquo;{clean10kExcerpt(cit.excerpt)}&rdquo;
-                    </blockquote>
-
-                    <div className="mt-2 flex items-center justify-between gap-2 text-[11px] tabular-nums-mono">
-                      <span className="text-[10px] text-ink-muted truncate">
-                        {cit.chunk_id}
-                      </span>
-
-                      <div className="flex items-center gap-2.5 shrink-0">
-                        <button
-                          id={`btn-read-in-10k-${cit.chunk_id}`}
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            onSelectChunkId(cit.chunk_id)
-                            onChangeTab('document')
-                            onRequestFilingSection(
-                              cit.ticker,
-                              cit.fiscal_year,
-                              cit.section_id,
-                              cit.excerpt
-                            )
-                          }}
-                          className="text-[11px] font-medium text-bb-cyan hover:underline cursor-pointer"
-                        >
-                          Open in 10-K Section
-                        </button>
-
-                        {cit.sec_filing_url && (
-                          <a
-                            id={`link-edgar-cit-${cit.chunk_id}`}
-                            href={cit.sec_filing_url}
-                            target="_blank"
-                            rel="noreferrer"
-                            onClick={(e) => e.stopPropagation()}
-                            className="inline-flex items-center gap-0.5 text-[10px] uppercase text-ink-muted hover:text-ink-primary"
-                            title="Open official SEC EDGAR HTML archive"
-                          >
-                            <span>EDGAR</span>
-                            <ExternalLink className="w-2.5 h-2.5" />
-                          </a>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                )
-              })
-            )}
-          </div>
-        </div>
+        <CitationsTab
+          citations={citations}
+          activeChunkId={activeChunkId}
+          sectionFilter={citationSectionFilter}
+          onChangeSectionFilter={setCitationSectionFilter}
+          onSelectChunkId={onSelectChunkId}
+          filingTargets={filingTargets}
+          onOpenFilingSection={handleOpenFilingSection}
+        />
       )}
 
-      {/* TAB 2: Full Form 10-K Section Reader */}
       {activeTab === 'document' && (
-        <div className="flex-1 flex flex-col min-h-0">
-          <div className="px-3 py-2 border-b border-hairline surface-subtle space-y-1.5 shrink-0 tabular-nums-mono">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-1.5">
-                <label className="sr-only" htmlFor="select-doc-filing">
-                  Select Issuer &amp; Fiscal Year
-                </label>
-                <select
-                  id="select-doc-filing"
-                  value={
-                    cachedSection
-                      ? `${cachedSection.ticker}_${cachedSection.fiscal_year}`
-                      : filingTargets[0]
-                        ? `${filingTargets[0].ticker}_${filingTargets[0].fiscalYear}`
-                        : ''
-                  }
-                  onChange={(e) => {
-                    const [t, fyStr] = e.target.value.split('_')
-                    if (t && fyStr) {
-                      onRequestFilingSection(
-                        t,
-                        Number(fyStr),
-                        cachedSection?.section_id ?? 'item_7'
-                      )
-                    }
-                  }}
-                  className="px-2 py-0.5 text-[11px] font-semibold surface-input border border-hairline text-bb-yellow cursor-pointer focus:outline-none focus:border-[var(--bb-amber)]"
-                >
-                  {filingTargets.map((ft) => (
-                    <option
-                      key={`${ft.ticker}_${ft.fiscalYear}`}
-                      value={`${ft.ticker}_${ft.fiscalYear}`}
-                    >
-                      {ft.ticker} · FY{ft.fiscalYear} 10-K
-                    </option>
-                  ))}
-                  {cachedSection &&
-                    !filingTargets.some(
-                      (ft) =>
-                        ft.ticker === cachedSection.ticker &&
-                        ft.fiscalYear === cachedSection.fiscal_year
-                    ) && (
-                      <option
-                        value={`${cachedSection.ticker}_${cachedSection.fiscal_year}`}
-                      >
-                        {cachedSection.ticker} · FY{cachedSection.fiscal_year}{' '}
-                        10-K
-                      </option>
-                    )}
-                </select>
-
-                <div className="inline-flex border border-hairline surface-input">
-                  {(['item_7', 'item_1a'] as const).map((secId) => {
-                    const active =
-                      (cachedSection?.section_id ?? 'item_7') === secId
-                    return (
-                      <button
-                        key={secId}
-                        id={`btn-doc-section-${secId}`}
-                        type="button"
-                        onClick={() => {
-                          const targetTicker =
-                            cachedSection?.ticker ?? filingTargets[0]?.ticker
-                          const targetYear =
-                            cachedSection?.fiscal_year ??
-                            filingTargets[0]?.fiscalYear
-                          if (!targetTicker || targetYear === undefined) return
-                          onRequestFilingSection(targetTicker, targetYear, secId)
-                        }}
-                        className={`px-2 py-0.5 text-[10px] uppercase font-semibold cursor-pointer transition-colors ${
-                          active
-                            ? 'badge-amber'
-                            : 'text-ink-secondary hover:text-ink-primary'
-                        }`}
-                      >
-                        {secId === 'item_7' ? 'ITEM 7 MD&A' : 'ITEM 1A RISK'}
-                      </button>
-                    )
-                  })}
-                </div>
-              </div>
-
-              {cachedSection?.sec_filing_url && (
-                <a
-                  id="link-doc-official-sec"
-                  href={cachedSection.sec_filing_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-[10px] uppercase font-semibold text-bb-cyan hover:underline"
-                >
-                  <span>SEC.GOV</span>
-                  <ExternalLink className="w-2.5 h-2.5" />
-                </a>
-              )}
-            </div>
-
-            <div className="relative">
-              <Search
-                className="w-3 h-3 text-ink-muted absolute left-2 top-1/2 -translate-y-1/2"
-                aria-hidden="true"
-              />
-              <input
-                id="input-filing-keyword-search"
-                type="text"
-                value={docKeyword}
-                onChange={(e) => setDocKeyword(e.target.value)}
-                placeholder="FIND TERM IN 10-K SECTION..."
-                className="w-full pl-7 pr-6 py-0.5 text-[11px] surface-input border border-hairline text-ink-primary focus:outline-none focus:border-[var(--bb-amber)]"
-              />
-              {docKeyword && (
-                <button
-                  id="btn-clear-filing-keyword"
-                  type="button"
-                  onClick={() => setDocKeyword('')}
-                  className="absolute right-1.5 top-1/2 -translate-y-1/2 text-ink-muted hover:text-ink-primary cursor-pointer"
-                >
-                  <X className="w-3 h-3" />
-                </button>
-              )}
-            </div>
-          </div>
-
-          <div className="flex-1 overflow-y-auto p-3.5 surface-filing-sheet">
-            {isLoadingSection ? (
-              <div className="py-14 flex flex-col items-center justify-center gap-2 text-xs text-bb-amber tabular-nums-mono">
-                <Loader2 className="w-4 h-4 animate-spin" />
-                <span>LOADING SEC FORM 10-K SECTION...</span>
-              </div>
-            ) : sectionError ? (
-              <div
-                id="section-load-error"
-                role="alert"
-                className="p-2.5 badge-negative text-xs flex items-start gap-2 tabular-nums-mono"
-              >
-                <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" aria-hidden="true" />
-                <span>{sectionError}</span>
-              </div>
-            ) : cachedSection ? (
-              <div>
-                {/* Official Filing Metadata Masthead */}
-                <div className="pb-2.5 mb-3 border-b border-hairline tabular-nums-mono">
-                  <div className="flex items-center justify-between gap-2 flex-wrap mb-0.5">
-                    <span className="text-[10px] uppercase tracking-wider font-bold text-bb-amber">
-                      UNITED STATES SEC · FORM 10-K
-                    </span>
-                    <span className="text-[10px] uppercase text-ink-muted">
-                      {cachedSection.section_id === 'item_1a'
-                        ? 'ITEM 1A · RISK FACTORS'
-                        : 'ITEM 7 · MD&A'}
-                    </span>
-                  </div>
-
-                  <h3 className="text-sm font-semibold text-ink-primary">
-                    {cachedSection.company_name} (
-                    <span className="text-bb-yellow">{cachedSection.ticker}</span>
-                    ) — FY{cachedSection.fiscal_year}
-                  </h3>
-
-                  <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-ink-muted">
-                    {cachedSection.cik && <span>CIK: {cachedSection.cik}</span>}
-                    {cachedSection.accession_number && (
-                      <span>ACC: {cachedSection.accession_number}</span>
-                    )}
-                    {cachedSection.period_of_report && (
-                      <span>PERIOD: {cachedSection.period_of_report}</span>
-                    )}
-                    {cachedSection.filing_date && (
-                      <span>FILED: {cachedSection.filing_date}</span>
-                    )}
-                  </div>
-                </div>
-
-                {/* Terminal 10-K Section Prose */}
-                <div className="filing-prose space-y-3">
-                  {documentParagraphs.map((para, pIdx) => {
-                    const isHeading =
-                      para.startsWith('## ') ||
-                      para.startsWith('### ') ||
-                      (para.startsWith('**') &&
-                        para.endsWith('**') &&
-                        para.length < 140)
-
-                    if (isHeading) {
-                      const cleanTitle = para
-                        .replace(/^#{2,4}\s*/, '')
-                        .replace(/^\*\*|\*\*$/g, '')
-                      return (
-                        <h4
-                          key={`doc-h-${pIdx}`}
-                          className="tabular-nums-mono text-[11px] font-bold uppercase tracking-wider text-bb-amber pt-2 pb-0.5 border-b border-hairline"
-                        >
-                          {clean10kDocumentBlock(cleanTitle)}
-                        </h4>
-                      )
-                    }
-
-                    const spans = highlightTextSnippet(
-                      para,
-                      highlightedExcerpt,
-                      docKeyword
-                    )
-                    const containsActiveExcerpt = spans.some((s) => s.active)
-
-                    return (
-                      <p
-                        key={`doc-p-${pIdx}`}
-                        ref={
-                          containsActiveExcerpt
-                            ? (el) => {
-                                highlightedDocMarkRef.current = el
-                              }
-                            : undefined
-                        }
-                        className="leading-relaxed"
-                      >
-                        {spans.map((span, sIdx) =>
-                          span.active ? (
-                            <mark
-                              key={`sp-${pIdx}-${sIdx}`}
-                              className="passage-highlight-active"
-                            >
-                              {span.text}
-                            </mark>
-                          ) : span.matchedSearch ? (
-                            <mark
-                              key={`sp-${pIdx}-${sIdx}`}
-                              className="passage-highlight"
-                            >
-                              {span.text}
-                            </mark>
-                          ) : (
-                            <span key={`sp-${pIdx}-${sIdx}`}>{span.text}</span>
-                          )
-                        )}
-                      </p>
-                    )
-                  })}
-                </div>
-              </div>
-            ) : (
-              <p className="text-xs text-ink-muted text-center py-12 tabular-nums-mono uppercase">
-                SELECT AN EQUITY AND 10-K SECTION TO INSPECT FILING.
-              </p>
-            )}
-          </div>
-        </div>
+        <FilingReaderTab
+          filingTargets={filingTargets}
+          cachedSection={cachedSection}
+          isLoadingSection={isLoadingSection}
+          sectionError={sectionError}
+          highlightedExcerpt={highlightedExcerpt}
+          keyword={docKeyword}
+          onChangeKeyword={setDocKeyword}
+          onRequestFilingSection={onRequestFilingSection}
+        />
       )}
 
-      {/* TAB 3: XBRL Numeric Fact Provenance */}
       {activeTab === 'xbrl' && (
-        <div className="flex-1 overflow-y-auto p-3.5 surface-filing-sheet tabular-nums-mono">
-          {selectedXbrlFact ? (
-            <div id="xbrl-fact-inspector" className="space-y-3">
-              <div className="pb-2.5 border-b border-hairline">
-                <div className="flex items-center justify-between gap-2 mb-1">
-                  <span className="text-[10px] uppercase tracking-wider font-bold text-bb-amber">
-                    SEC XBRL NUMERIC PROVENANCE
-                  </span>
-                  <span className="px-1.5 py-0.2 text-[9.5px] uppercase font-semibold badge-accent">
-                    AUDITED 10-K FACT
-                  </span>
-                </div>
-                <h3 className="text-sm font-semibold text-ink-primary">
-                  {selectedXbrlFact.title}
-                </h3>
-                {selectedXbrlFact.companyName && (
-                  <p className="text-[11px] text-ink-secondary font-sans mt-0.5">
-                    {selectedXbrlFact.companyName} ({selectedXbrlFact.ticker})
-                  </p>
-                )}
-              </div>
-
-              {(selectedXbrlFact.valueFormatted ||
-                selectedXbrlFact.deltaFormatted) && (
-                <div className="grid grid-cols-2 gap-2">
-                  {selectedXbrlFact.valueFormatted && (
-                    <div className="p-2 border border-hairline surface-subtle">
-                      <div className="text-[9.5px] uppercase text-ink-muted">
-                        REPORTED VALUE
-                      </div>
-                      <div className="text-xs font-semibold text-ink-primary mt-0.5">
-                        {selectedXbrlFact.valueFormatted}
-                      </div>
-                    </div>
-                  )}
-                  {selectedXbrlFact.deltaFormatted && (
-                    <div className="p-2 border border-hairline surface-subtle">
-                      <div className="text-[9.5px] uppercase text-ink-muted">
-                        COMPUTED VARIANCE
-                      </div>
-                      <div className="text-xs font-semibold text-bb-amber mt-0.5">
-                        {selectedXbrlFact.deltaFormatted}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-
-              <div className="border border-hairline surface-panel divide-y divide-[var(--border-hairline)] text-[11px]">
-                <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
-                  <span className="text-ink-muted uppercase text-[10px]">
-                    Metric
-                  </span>
-                  <span className="text-ink-primary font-medium">
-                    {selectedXbrlFact.metricLabel}
-                  </span>
-                </div>
-                <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
-                  <span className="text-ink-muted uppercase text-[10px]">
-                    Fiscal Year / Period End
-                  </span>
-                  <span className="text-ink-primary">
-                    FY{selectedXbrlFact.fiscalYear}
-                    {selectedXbrlFact.periodOfReport
-                      ? ` (${selectedXbrlFact.periodOfReport})`
-                      : ''}
-                  </span>
-                </div>
-                {selectedXbrlFact.filingDate && (
-                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
-                    <span className="text-ink-muted uppercase text-[10px]">
-                      SEC Filing Date
-                    </span>
-                    <span className="text-ink-primary">
-                      {selectedXbrlFact.filingDate}
-                    </span>
-                  </div>
-                )}
-                {selectedXbrlFact.xbrlConcept && (
-                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
-                    <span className="text-ink-muted uppercase text-[10px]">
-                      XBRL Concept
-                    </span>
-                    <code className="text-bb-cyan text-[10.5px] break-all">
-                      {selectedXbrlFact.xbrlConcept}
-                    </code>
-                  </div>
-                )}
-                {selectedXbrlFact.accessionNumber && (
-                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
-                    <span className="text-ink-muted uppercase text-[10px]">
-                      Accession Number
-                    </span>
-                    <code className="text-ink-primary text-[10.5px]">
-                      {selectedXbrlFact.accessionNumber}
-                    </code>
-                  </div>
-                )}
-                {selectedXbrlFact.denominatorXbrlConcept && (
-                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
-                    <span className="text-ink-muted uppercase text-[10px]">
-                      Denominator Concept
-                    </span>
-                    <code className="text-bb-cyan text-[10.5px] break-all">
-                      {selectedXbrlFact.denominatorXbrlConcept}
-                    </code>
-                  </div>
-                )}
-                {selectedXbrlFact.priorFiscalYear && (
-                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
-                    <span className="text-ink-muted uppercase text-[10px]">
-                      Prior Period
-                    </span>
-                    <span className="text-ink-secondary">
-                      FY{selectedXbrlFact.priorFiscalYear}
-                      {selectedXbrlFact.priorPeriodOfReport
-                        ? ` (${selectedXbrlFact.priorPeriodOfReport})`
-                        : ''}
-                    </span>
-                  </div>
-                )}
-                {selectedXbrlFact.priorXbrlConcept && (
-                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
-                    <span className="text-ink-muted uppercase text-[10px]">
-                      Prior XBRL Concept
-                    </span>
-                    <code className="text-ink-secondary text-[10.5px] break-all">
-                      {selectedXbrlFact.priorXbrlConcept}
-                    </code>
-                  </div>
-                )}
-                {selectedXbrlFact.priorAccessionNumber && (
-                  <div className="px-2.5 py-1.5 flex items-center justify-between gap-2">
-                    <span className="text-ink-muted uppercase text-[10px]">
-                      Prior Accession Number
-                    </span>
-                    <code className="text-ink-secondary text-[10.5px]">
-                      {selectedXbrlFact.priorAccessionNumber}
-                    </code>
-                  </div>
-                )}
-              </div>
-
-              {selectedXbrlFact.derivedFrom &&
-                selectedXbrlFact.derivedFrom.length > 0 && (
-                  <div className="border border-hairline surface-panel overflow-hidden">
-                    <div className="px-2.5 py-1 surface-subtle border-b border-hairline text-[10px] uppercase text-ink-muted font-semibold">
-                      DERIVED CALCULATION INPUTS
-                    </div>
-                    <div className="divide-y divide-[var(--border-hairline)] text-[10.5px]">
-                      {selectedXbrlFact.derivedFrom.map((inp, idx) => (
-                        <div
-                          key={`${inp.ticker}-${inp.fiscal_year}-${inp.metric}-${idx}`}
-                          className="px-2.5 py-1.5 space-y-0.5"
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <span className="text-bb-yellow font-semibold">
-                              {inp.ticker} FY{inp.fiscal_year} · {inp.metric}
-                            </span>
-                            <span className="text-ink-primary font-semibold">
-                              {inp.value !== undefined && inp.value !== null
-                                ? formatUsdCompact(inp.value)
-                                : '—'}
-                            </span>
-                          </div>
-                          <div className="text-[9.5px] text-ink-muted flex flex-wrap gap-x-2">
-                            {inp.xbrl_concept && <span>{inp.xbrl_concept}</span>}
-                            {inp.accession_number && (
-                              <span>acc:{inp.accession_number}</span>
-                            )}
-                            {inp.period_of_report && (
-                              <span>ended {inp.period_of_report}</span>
-                            )}
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-              <div className="flex flex-wrap items-center gap-2 pt-1">
-                <button
-                  id="btn-xbrl-open-mdna"
-                  type="button"
-                  onClick={() => {
-                    onChangeTab('document')
-                    onRequestFilingSection(
-                      selectedXbrlFact.ticker,
-                      selectedXbrlFact.fiscalYear,
-                      'item_7'
-                    )
-                  }}
-                  className="px-2.5 py-1 text-[10.5px] uppercase btn-terminal-key cursor-pointer"
-                >
-                  Open FY{selectedXbrlFact.fiscalYear} Item 7 MD&amp;A
-                </button>
-                {selectedXbrlFact.secFilingUrl && (
-                  <a
-                    href={selectedXbrlFact.secFilingUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="inline-flex items-center gap-1 px-2.5 py-1 text-[10.5px] uppercase text-bb-cyan border border-hairline hover:underline"
-                  >
-                    <span>SEC EDGAR FY{selectedXbrlFact.fiscalYear}</span>
-                    <ExternalLink className="w-3 h-3" />
-                  </a>
-                )}
-                {selectedXbrlFact.priorSecFilingUrl &&
-                  selectedXbrlFact.priorFiscalYear && (
-                    <a
-                      href={selectedXbrlFact.priorSecFilingUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 px-2.5 py-1 text-[10.5px] uppercase text-ink-secondary border border-hairline hover:text-ink-primary"
-                    >
-                      <span>SEC EDGAR FY{selectedXbrlFact.priorFiscalYear}</span>
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
-                  )}
-              </div>
-            </div>
-          ) : (
-            <p className="text-xs text-ink-muted text-center py-12 uppercase">
-              CLICK ANY [XBRL] TAG OR NUMERIC CITATION TO INSPECT PROVENANCE.
-            </p>
-          )}
-        </div>
+        <XbrlFactTab
+          selectedXbrlFact={selectedXbrlFact}
+          onOpenFilingSection={handleOpenFilingSection}
+        />
       )}
     </aside>
   )

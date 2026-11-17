@@ -1,1675 +1,190 @@
 """ADK tools: MetricFetchTool, LookerQueryTool, VarianceCalculationTool, HybridSearchTool, and ContextCacheTool.
 
-Every tool reads live GCP data through the client adapters below: BigQuery (financial metrics,
-filing chunks, `VECTOR_SEARCH`, and sector-wide `ML.DISTANCE` ranking), Vertex AI Search /
-Discovery Engine, Vertex AI `text-embedding-005` embeddings, and the Cloud Storage SEC corpus
-bucket. There is no local or synthesized data backend, and no undeployed Vertex Vector Search
-runtime fallback.
+Every tool reads live GCP data through the modular client adapters under
+`edgar_capstone.agents.adapters`: BigQuery (`financial_metrics`, `filing_chunks`,
+`VECTOR_SEARCH`, and sector-wide `ML.DISTANCE` ranking), Vertex AI Search / Discovery Engine,
+Vertex AI `text-embedding-005` embeddings, and the Cloud Storage SEC corpus bucket.
 """
 
 from __future__ import annotations
 
-import contextvars
 import logging
-import os
 import re
 import threading
 import time
-import urllib.parse
-from collections import OrderedDict, defaultdict
-from collections.abc import Iterator, MutableMapping
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import dataclass, field
+from typing import Any
 
-import google.auth
-import httpx
 import numpy as np
 from google.adk.tools import FunctionTool, ToolContext
-from google.auth.exceptions import DefaultCredentialsError
-from google.auth.transport.requests import Request as GoogleAuthRequest
 
-from edgar_capstone.agents.resilience import (
-    RateLimitExceededError,
-    ToolExecutionError,
-    UpstreamTimeoutError,
-    with_tool_resilience,
+from edgar_capstone.agents.adapters import (
+    DEFAULT_BQ_CHUNK_HEALTH_VIEW,
+    DEFAULT_BQ_FILING_CHUNKS_TABLE,
+    DEFAULT_BQ_FINANCIAL_METRICS_TABLE,
+    DEFAULT_BQ_YOY_VARIANCES_VIEW,
+    BigQueryAdapter,
+    GcpAdapterHttpError,
+    GcpEndpointNotReadyError,
+    GcpToolAdapters,
+    GcpToolConfig,
+    GcsCorpusAdapter,
+    VertexAISearchAdapter,
+    _default_section_title,
+    _gcp_adapters,
+    _normalize_section_id,
+    configure_gcp_tool_adapters,
+    get_active_gcp_tool_adapters,
+    get_gcp_adapters_status_metadata,
+    register_adapter_reset_hook,
+    reset_gcp_tool_adapters,
 )
-from edgar_capstone.agents.schemas import (
-    AnnualStepVariance,
-    CompanyVarianceReport,
-    GroundedCitation,
-    MetricRecord,
-    MetricVariance,
-    NumericCitation,
+from edgar_capstone.agents.citations import merge_citations
+from edgar_capstone.agents.hybrid_rag import _execute_live_gcp_hybrid_rag
+from edgar_capstone.agents.resilience import with_tool_resilience
+from edgar_capstone.agents.schemas import GroundedCitation
+from edgar_capstone.agents.variance_engine import (
+    _build_variance_reports_from_profiles,
+    _compute_single_metric_variance,
+    _numeric_citation_for_profile,
+    _profile_to_metric_record,
+    _xbrl_concept_for_metric,
 )
-from edgar_capstone.dataset.gcs_storage import (
-    DEFAULT_BUCKET_NAME,
-    DEFAULT_LOCATION,
-    DEFAULT_PROJECT_ID,
+from edgar_capstone.common.cache import (
+    BoundedTTLCache,
+    CacheMetrics,
+    parse_10k_cache_key,
 )
-from edgar_capstone.dataset.models import FinancialDataProfile
+from edgar_capstone.common.domain import (
+    SECTION_TITLES,
+    canonicalize_gics_sector,
+    normalize_edgar_ticker,
+)
+from edgar_capstone.common.env import env_positive_float, env_positive_int
+from edgar_capstone.gcp.defaults import DEFAULT_BIGQUERY_DATASET_ID
+from edgar_capstone.gcp.discovery_engine import (
+    DEFAULT_VERTEX_AI_SEARCH_COLLECTION,
+    DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID,
+    DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID,
+    DEFAULT_VERTEX_AI_SEARCH_LOCATION,
+)
 from edgar_capstone.telemetry import get_telemetry_sink
 from edgar_capstone.vector_db.chunker import (
     estimate_token_count,
     extract_sections_from_combined_markdown,
 )
-from edgar_capstone.vector_db.embedder import (
-    DEFAULT_EMBEDDING_DIMENSIONS,
-    DEFAULT_EMBEDDING_MODEL,
-    VertexAIEmbedder,
-)
 
 logger = logging.getLogger(__name__)
 
 _WORD_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_SAFE_BQ_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-
-
-# Canonical GICS sector names for exact-match token restricts in Vertex AI Search / Vector Search
-_CANONICAL_GICS_SECTORS: dict[str, str] = {
-    "information technology": "Information Technology",
-    "financials": "Financials",
-    "health care": "Health Care",
-    "consumer discretionary": "Consumer Discretionary",
-    "communication services": "Communication Services",
-    "industrials": "Industrials",
-    "consumer staples": "Consumer Staples",
-    "energy": "Energy",
-    "utilities": "Utilities",
-    "real estate": "Real Estate",
-    "materials": "Materials",
-}
-
-DEFAULT_BIGQUERY_DATASET_ID = "sec_edgar"
-DEFAULT_BQ_FINANCIAL_METRICS_TABLE = "financial_metrics"
-DEFAULT_BQ_FILING_CHUNKS_TABLE = "filing_chunks"
-DEFAULT_BQ_YOY_VARIANCES_VIEW = "v_financial_variances_yoy"
-DEFAULT_BQ_CHUNK_HEALTH_VIEW = "v_chunk_health_metrics"
-DEFAULT_VERTEX_AI_SEARCH_LOCATION = "global"
-DEFAULT_VERTEX_AI_SEARCH_COLLECTION = "default_collection"
-DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID = "sec-edgar-10k-hybrid-search"
-DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID = "sec-edgar-10k-corpus-ds"
 
 DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES = 256
 DEFAULT_10K_SECTION_CACHE_TTL_SECONDS = 3600.0
-_10K_CACHE_KEY_RE = re.compile(
-    r"^(?P<ticker>.+)_(?P<fiscal_year>\d{4})_(?P<section_id>item_1a|item_7)$"
+
+_SECTION_CACHE_MAX_ENTRIES = env_positive_int(
+    "EDGAR_10K_SECTION_CACHE_MAX_ENTRIES", DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES
+)
+_SECTION_CACHE_TTL_SECONDS = env_positive_float(
+    "EDGAR_10K_SECTION_CACHE_TTL_SECONDS",
+    DEFAULT_10K_SECTION_CACHE_TTL_SECONDS,
+    minimum=1.0,
 )
 
-
-def _env_positive_number(name: str, default: float) -> float:
-    raw = os.environ.get(name, "").strip()
-    try:
-        value = float(raw) if raw else default
-    except ValueError:
-        return default
-    return value if value > 0 else default
-
-
-class _BoundedSectionCache(MutableMapping[str, dict[str, Any]]):
-    """Thread-safe, bounded LRU + TTL map for parsed 10-K sections (process-local L1 cache).
-
-    Bounding the map keeps memory flat when the full S&P 500 corpus (~500 issuers x 7 years
-    x 2 sections) is in play.
-    """
-
-    def __init__(self, *, max_entries: int, ttl_seconds: float) -> None:
-        self.max_entries = max(1, int(max_entries))
-        self.ttl_seconds = float(ttl_seconds)
-        self._data: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
-        self._lock = threading.RLock()
-        self.evictions = 0
-
-    def _expired(self, stored_at: float) -> bool:
-        return (time.monotonic() - stored_at) > self.ttl_seconds
-
-    def _purge_expired_locked(self) -> None:
-        expired = [k for k, (ts, _) in self._data.items() if self._expired(ts)]
-        for k in expired:
-            del self._data[k]
-            self.evictions += 1
-
-    def __getitem__(self, key: str) -> dict[str, Any]:
-        with self._lock:
-            stored_at, value = self._data[key]
-            if self._expired(stored_at):
-                del self._data[key]
-                self.evictions += 1
-                raise KeyError(key)
-            self._data.move_to_end(key)
-            return value
-
-    def __setitem__(self, key: str, value: dict[str, Any]) -> None:
-        with self._lock:
-            self._data[key] = (time.monotonic(), value)
-            self._data.move_to_end(key)
-            while len(self._data) > self.max_entries:
-                self._data.popitem(last=False)
-                self.evictions += 1
-
-    def __delitem__(self, key: str) -> None:
-        with self._lock:
-            del self._data[key]
-
-    def __contains__(self, key: object) -> bool:
-        with self._lock:
-            item = self._data.get(key)  # type: ignore[call-overload]
-            if item is None:
-                return False
-            if self._expired(item[0]):
-                del self._data[key]  # type: ignore[arg-type]
-                self.evictions += 1
-                return False
-            return True
-
-    def __iter__(self) -> Iterator[str]:
-        with self._lock:
-            self._purge_expired_locked()
-            return iter(list(self._data.keys()))
-
-    def __len__(self) -> int:
-        with self._lock:
-            self._purge_expired_locked()
-            return len(self._data)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._data.clear()
-
-
-# Process-local L1 cache of parsed 10-K sections (bounded LRU + TTL)
-_SESSION_10K_CONTEXT_CACHE: _BoundedSectionCache = _BoundedSectionCache(
-    max_entries=int(
-        _env_positive_number(
-            "EDGAR_10K_SECTION_CACHE_MAX_ENTRIES", DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES
-        )
-    ),
-    ttl_seconds=_env_positive_number(
-        "EDGAR_10K_SECTION_CACHE_TTL_SECONDS", DEFAULT_10K_SECTION_CACHE_TTL_SECONDS
-    ),
+_SUPPORTED_LOOKER_EXPLORES = frozenset(
+    {
+        "yoy_variances",
+        "sector_benchmarks",
+        "peer_comparison",
+        "chunk_health",
+        "llm_telemetry",
+        "session_analytics",
+        "audit_trail",
+    }
 )
-# Process-local L1 cache of BigQuery filing_chunks (with pre-computed 768-d embeddings) per section.
-# Eliminates redundant BigQuery section scans and avoids re-embedding paragraphs via Vertex AI.
-_SECTION_CHUNKS_CACHE: _BoundedSectionCache = _BoundedSectionCache(
-    max_entries=int(
-        _env_positive_number(
-            "EDGAR_10K_SECTION_CACHE_MAX_ENTRIES", DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES
-        )
-    ),
-    ttl_seconds=_env_positive_number(
-        "EDGAR_10K_SECTION_CACHE_TTL_SECONDS", DEFAULT_10K_SECTION_CACHE_TTL_SECONDS
-    ),
-)
-_CONTEXT_CACHE_RUNTIME_COUNTERS: dict[str, float | int] = {
-    "hits": 0,
-    "misses": 0,
-    "cached_tokens_saved": 0,
-    "total_hit_latency_ms": 0.0,
-    "total_miss_latency_ms": 0.0,
+_LOOKER_EXPLORE_ALIASES: dict[str, str] = {
+    "llm_telemetry_and_cost": "llm_telemetry",
+    "security_audit_logs": "audit_trail",
 }
 
 
-# ---------------------------------------------------------------------------
-# Live GCP Adapter Exceptions & Configuration
-# ---------------------------------------------------------------------------
-
-
-class GcpAdapterHttpError(ToolExecutionError):
-    """Raised when a GCP REST API returns a non-retryable HTTP 4xx response."""
-
-    def __init__(self, *, status_code: int, url: str, response_text: str) -> None:
-        super().__init__(f"GCP REST request failed (HTTP {status_code}) for {url}: {response_text}")
-        self.status_code = status_code
-        self.url = url
-        self.response_text = response_text
-
-
-class GcpEndpointNotReadyError(ToolExecutionError):
-    """Raised when a Vertex AI Vector Search endpoint or deployed index is not yet provisioned."""
-
-
-def _validate_bq_identifier(value: str, label: str) -> str:
-    """Validate a BigQuery project, dataset, or table identifier before SQL interpolation."""
-    cleaned = value.strip()
-    if not cleaned or not _SAFE_BQ_IDENTIFIER_RE.match(cleaned):
-        raise ValueError(f"Unsafe BigQuery {label} identifier: {value!r}")
-    return cleaned
-
-
-def _canonicalize_gics_sector(sector: str | None) -> str | None:
-    """Normalize a GICS sector filter to canonical casing when recognized."""
-    if not sector:
-        return None
-    stripped = sector.strip()
-    if not stripped or stripped.upper() in ("ALL", "*"):
-        return None
-    return _CANONICAL_GICS_SECTORS.get(stripped.lower(), stripped)
-
-
-@dataclass(frozen=True, slots=True)
-class GcpToolConfig:
-    """Runtime configuration for BigQuery, Vertex AI Search, and GCS adapters."""
-
-    project_id: str = DEFAULT_PROJECT_ID
-    location: str = DEFAULT_LOCATION
-    bq_dataset_id: str = DEFAULT_BIGQUERY_DATASET_ID
-    bq_financial_metrics_table: str = DEFAULT_BQ_FINANCIAL_METRICS_TABLE
-    bq_filing_chunks_table: str = DEFAULT_BQ_FILING_CHUNKS_TABLE
-    bq_yoy_view: str = DEFAULT_BQ_YOY_VARIANCES_VIEW
-    bq_chunk_health_view: str = DEFAULT_BQ_CHUNK_HEALTH_VIEW
-    sec_corpus_bucket: str = DEFAULT_BUCKET_NAME
-    vais_location: str = DEFAULT_VERTEX_AI_SEARCH_LOCATION
-    vais_collection_id: str = DEFAULT_VERTEX_AI_SEARCH_COLLECTION
-    vais_engine_id: str = DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID
-    vais_datastore_id: str = DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL
-    embedding_dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS
-
-    @classmethod
-    def from_env(cls) -> GcpToolConfig:
-        """Resolve live GCP tool adapter settings from environment variables."""
-        project_id = (
-            os.environ.get("GCP_PROJECT_ID")
-            or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or DEFAULT_PROJECT_ID
-        ).strip()
-        location = (
-            os.environ.get("GCP_REGION")
-            or os.environ.get("GOOGLE_CLOUD_LOCATION")
-            or DEFAULT_LOCATION
-        ).strip()
-
-        raw_dims = os.environ.get("VERTEX_EMBEDDING_DIMENSIONS", "").strip()
-        dims = int(raw_dims) if raw_dims.isdigit() else DEFAULT_EMBEDDING_DIMENSIONS
-
-        return cls(
-            project_id=project_id,
-            location=location,
-            bq_dataset_id=(
-                os.environ.get("BIGQUERY_DATASET_ID") or DEFAULT_BIGQUERY_DATASET_ID
-            ).strip(),
-            bq_financial_metrics_table=(
-                os.environ.get("BIGQUERY_FINANCIAL_METRICS_TABLE")
-                or DEFAULT_BQ_FINANCIAL_METRICS_TABLE
-            ).strip(),
-            bq_filing_chunks_table=(
-                os.environ.get("BIGQUERY_FILING_CHUNKS_TABLE") or DEFAULT_BQ_FILING_CHUNKS_TABLE
-            ).strip(),
-            bq_yoy_view=(
-                os.environ.get("BIGQUERY_YOY_VARIANCE_VIEW") or DEFAULT_BQ_YOY_VARIANCES_VIEW
-            ).strip(),
-            bq_chunk_health_view=(
-                os.environ.get("BIGQUERY_CHUNK_HEALTH_VIEW") or DEFAULT_BQ_CHUNK_HEALTH_VIEW
-            ).strip(),
-            sec_corpus_bucket=(os.environ.get("SEC_CORPUS_BUCKET") or DEFAULT_BUCKET_NAME).strip(),
-            vais_location=(
-                os.environ.get("VERTEX_AI_SEARCH_LOCATION") or DEFAULT_VERTEX_AI_SEARCH_LOCATION
-            ).strip(),
-            vais_collection_id=(
-                os.environ.get("VERTEX_AI_SEARCH_COLLECTION") or DEFAULT_VERTEX_AI_SEARCH_COLLECTION
-            ).strip(),
-            vais_engine_id=os.environ.get(
-                "VERTEX_AI_SEARCH_ENGINE_ID", DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID
-            ).strip(),
-            vais_datastore_id=os.environ.get(
-                "VERTEX_AI_SEARCH_DATASTORE_ID", DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID
-            ).strip(),
-            embedding_model=(
-                os.environ.get("VERTEX_EMBEDDING_MODEL") or DEFAULT_EMBEDDING_MODEL
-            ).strip(),
-            embedding_dimensions=dims,
-        )
-
-
-class _GcpAuthenticatedRestClient:
-    """Shared ADC bearer authentication and resilient pooled HTTP transport for GCP REST APIs."""
-
-    def __init__(
-        self,
-        *,
-        http_client: httpx.Client | None = None,
-        credentials: Any | None = None,
-        default_timeout: float = 30.0,
-    ) -> None:
-        self._http_client = http_client
-        self._pooled_http_client: httpx.Client | None = None
-        self._credentials = credentials
-        self._default_timeout = default_timeout
-        self._auth_lock = threading.Lock()
-        self._client_lock = threading.Lock()
-
-    def _get_http_client(self) -> httpx.Client:
-        if self._http_client is not None:
-            return self._http_client
-        with self._client_lock:
-            if self._pooled_http_client is None or self._pooled_http_client.is_closed:
-                self._pooled_http_client = httpx.Client(
-                    timeout=self._default_timeout,
-                    limits=httpx.Limits(max_connections=48, max_keepalive_connections=24),
-                )
-            return self._pooled_http_client
-
-    def _get_bearer_token(self) -> str:
-        """Obtain a valid OAuth2 bearer token from Application Default Credentials."""
-        with self._auth_lock:
-            if self._credentials is None:
-                self._credentials, _ = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                )
-            if not getattr(self._credentials, "valid", False) or not getattr(
-                self._credentials, "token", None
-            ):
-                self._credentials.refresh(GoogleAuthRequest())
-            bearer_tok = getattr(self._credentials, "token", None)
-        if not bearer_tok:
-            raise DefaultCredentialsError(
-                "Application Default Credentials did not return an OAuth2 bearer token."
-            )
-        return str(bearer_tok)
-
-    @staticmethod
-    def _parse_retry_after(resp: httpx.Response) -> float | None:
-        raw = resp.headers.get("Retry-After")
-        if not raw:
-            return None
-        try:
-            return max(0.0, float(raw))
-        except ValueError:
-            return None
-
-    def _send_request(
-        self,
-        method: str,
-        url: str,
-        *,
-        json_body: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> httpx.Response:
-        """Execute an authenticated HTTP request and translate 429/5xx/timeouts for resilience."""
-        bearer_tok = self._get_bearer_token()
-        headers: dict[str, str] = {"Authorization": f"Bearer {bearer_tok}"}
-        if json_body is not None:
-            headers["Content-Type"] = "application/json"
-
-        client = self._get_http_client()
-        try:
-            resp = client.request(
-                method,
-                url,
-                json=json_body,
-                params=params,
-                headers=headers,
-            )
-        except httpx.TimeoutException as exc:
-            raise UpstreamTimeoutError(f"Timed out calling GCP endpoint {url}: {exc}") from exc
-
-        if resp.status_code == 429:
-            raise RateLimitExceededError(
-                f"GCP API HTTP 429 Too Many Requests for {url}: {resp.text[:300]}",
-                retry_after_seconds=self._parse_retry_after(resp),
-            )
-        if resp.status_code in (500, 502, 503, 504):
-            resp.raise_for_status()
-        if resp.status_code >= 400:
-            raise GcpAdapterHttpError(
-                status_code=resp.status_code,
-                url=url,
-                response_text=resp.text[:500],
-            )
-        return resp
-
-    def _request_json(
-        self,
-        method: str,
-        url: str,
-        *,
-        json_body: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        resp = self._send_request(method, url, json_body=json_body, params=params)
-        if not resp.content:
-            return {}
-        data = resp.json()
-        return data if isinstance(data, dict) else {"items": data}
-
-    def _request_text(
-        self,
-        method: str,
-        url: str,
-        *,
-        params: dict[str, Any] | None = None,
-    ) -> str:
-        resp = self._send_request(method, url, params=params)
-        return resp.text
-
-
-# ---------------------------------------------------------------------------
-# 1. BigQuery Live Client Adapter (Structured Metrics, Variances, & VECTOR_SEARCH)
-# ---------------------------------------------------------------------------
-
-
-def _bq_scalar_param(name: str, bq_type: str, value: Any) -> dict[str, Any]:
-    """Construct a named scalar QueryParameter for BigQuery REST v2."""
-    return {
-        "name": name,
-        "parameterType": {"type": bq_type},
-        "parameterValue": {"value": None if value is None else str(value)},
-    }
-
-
-def _bq_array_param(name: str, elem_type: str, values: list[Any]) -> dict[str, Any]:
-    """Construct a named ARRAY QueryParameter for BigQuery REST v2."""
-    return {
-        "name": name,
-        "parameterType": {
-            "type": "ARRAY",
-            "arrayType": {"type": elem_type},
-        },
-        "parameterValue": {
-            "arrayValues": [{"value": None if v is None else str(v)} for v in values]
-        },
-    }
-
-
-def _decode_bq_cell(raw_val: Any, field_schema: dict[str, Any]) -> Any:
-    """Recursively decode a BigQuery REST v2 cell (`f`/`v` wire format) into Python types."""
-    mode = str(field_schema.get("mode") or "NULLABLE").upper()
-    field_type = str(field_schema.get("type") or "STRING").upper()
-
-    if mode == "REPEATED":
-        if raw_val is None:
-            return []
-        elem_schema = {**field_schema, "mode": "NULLABLE"}
-        decoded_items: list[Any] = []
-        if isinstance(raw_val, list):
-            for item in raw_val:
-                inner = item.get("v") if isinstance(item, dict) and "v" in item else item
-                decoded_items.append(_decode_bq_cell(inner, elem_schema))
-        return decoded_items
-
-    if raw_val is None:
-        return None
-
-    if field_type in ("RECORD", "STRUCT"):
-        subfields = field_schema.get("fields") or []
-        if isinstance(raw_val, dict) and "f" in raw_val and isinstance(raw_val["f"], list):
-            return _decode_bq_row(raw_val, subfields)
-        if isinstance(raw_val, dict):
-            return raw_val
-        return {}
-
-    if field_type in ("INTEGER", "INT64"):
-        return int(raw_val)
-    if field_type in ("FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC"):
-        return float(raw_val)
-    if field_type in ("BOOLEAN", "BOOL"):
-        if isinstance(raw_val, bool):
-            return raw_val
-        return str(raw_val).strip().lower() == "true"
-    return str(raw_val)
-
-
-def _decode_bq_row(row_obj: dict[str, Any], schema_fields: list[dict[str, Any]]) -> dict[str, Any]:
-    """Decode a single BigQuery `{"f": [{"v": ...}, ...]}` row using `schema.fields`."""
-    cells = row_obj.get("f")
-    if not isinstance(cells, list):
-        return dict(row_obj)
-    decoded: dict[str, Any] = {}
-    for idx, field_schema in enumerate(schema_fields):
-        col_name = str(field_schema.get("name") or f"col_{idx}")
-        cell = cells[idx] if idx < len(cells) else {"v": None}
-        raw_val = cell.get("v") if isinstance(cell, dict) and "v" in cell else cell
-        decoded[col_name] = _decode_bq_cell(raw_val, field_schema)
-    return decoded
-
-
-class BigQueryAdapter(_GcpAuthenticatedRestClient):
-    """Live BigQuery REST v2 adapter for SEC 10-K metrics, BI views, and `VECTOR_SEARCH`."""
-
-    def __init__(
-        self,
-        config: GcpToolConfig,
-        *,
-        http_client: httpx.Client | None = None,
-        credentials: Any | None = None,
-    ) -> None:
-        super().__init__(http_client=http_client, credentials=credentials, default_timeout=45.0)
-        self.project_id = _validate_bq_identifier(config.project_id, "project_id")
-        self.location = config.location
-        self.dataset_id = _validate_bq_identifier(config.bq_dataset_id, "dataset_id")
-        self.financial_metrics_table = _validate_bq_identifier(
-            config.bq_financial_metrics_table, "financial_metrics_table"
-        )
-        self.filing_chunks_table = _validate_bq_identifier(
-            config.bq_filing_chunks_table, "filing_chunks_table"
-        )
-        self.yoy_view = _validate_bq_identifier(config.bq_yoy_view, "yoy_view")
-        self.chunk_health_view = _validate_bq_identifier(
-            config.bq_chunk_health_view, "chunk_health_view"
-        )
-        self.sec_corpus_bucket = config.sec_corpus_bucket
-        self.embedding_dimensions = config.embedding_dimensions
-
-    def _table_ref(self, table_or_view: str) -> str:
-        safe_table = _validate_bq_identifier(table_or_view, "table_or_view")
-        return f"`{self.project_id}.{self.dataset_id}.{safe_table}`"
-
-    def run_query(
-        self,
-        sql: str,
-        query_parameters: list[dict[str, Any]] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Execute a parameterized Standard SQL query on BigQuery and return decoded rows."""
-        base_url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{self.project_id}/queries"
-        payload: dict[str, Any] = {
-            "query": sql,
-            "useLegacySql": False,
-            "location": self.location,
-            "timeoutMs": 30000,
-        }
-        if query_parameters:
-            payload["parameterMode"] = "NAMED"
-            payload["queryParameters"] = query_parameters
-
-        data = self._request_json("POST", base_url, json_body=payload)
-        job_ref = data.get("jobReference") or {}
-        job_id = str(job_ref.get("jobId") or "")
-        job_location = str(job_ref.get("location") or self.location)
-
-        polls = 0
-        while not data.get("jobComplete", True):
-            if not job_id or polls >= 20:
-                raise UpstreamTimeoutError(
-                    f"BigQuery query job {job_id or '<unknown>'} did not complete within poll budget."
-                )
-            polls += 1
-            time.sleep(min(1.0, 0.1 * polls))
-            data = self._request_json(
-                "GET",
-                f"{base_url}/{urllib.parse.quote(job_id, safe='')}",
-                params={"location": job_location, "timeoutMs": 10000},
-            )
-
-        schema_fields = (data.get("schema") or {}).get("fields") or []
-        raw_rows: list[dict[str, Any]] = list(data.get("rows") or [])
-        page_token = data.get("pageToken")
-
-        while page_token and job_id:
-            page_data = self._request_json(
-                "GET",
-                f"{base_url}/{urllib.parse.quote(job_id, safe='')}",
-                params={"location": job_location, "pageToken": str(page_token)},
-            )
-            if not schema_fields:
-                schema_fields = (page_data.get("schema") or {}).get("fields") or []
-            raw_rows.extend(page_data.get("rows") or [])
-            page_token = page_data.get("pageToken")
-
-        return [_decode_bq_row(r, schema_fields) for r in raw_rows]
-
-    def _row_to_profile(self, row: dict[str, Any]) -> FinancialDataProfile:
-        """Convert a decoded `financial_metrics` BigQuery row into `FinancialDataProfile`."""
-        ticker = str(row["ticker"])
-        fy = int(row["fiscal_year"])
-        unstructured_blob = str(
-            row.get("unstructured_blob_path") or f"unstructured/{ticker}/{fy}_10k.md"
-        )
-        structured_blob = str(
-            row.get("structured_blob_path") or f"structured/{ticker}/{fy}_financials.json"
-        )
-        prov = row.get("metric_provenance")
-        if not isinstance(prov, dict):
-            prov = {}
-        else:
-            prov = {
-                "revenue": prov.get("revenue"),
-                "operating_income": prov.get("operating_income"),
-                "net_income": prov.get("net_income"),
-                "research_and_development": prov.get("research_and_development"),
-                "notes": list(prov.get("notes") or []),
-            }
-
-        payload: dict[str, Any] = {
-            "profile_id": str(row.get("profile_id") or f"{ticker}_{fy}"),
-            "ticker": ticker,
-            "cik": str(row.get("cik") or "0000000000"),
-            "company_name": str(row.get("company_name") or ticker),
-            "gics_sector": str(row.get("gics_sector") or "Unknown"),
-            "gics_sub_industry": str(row.get("gics_sub_industry") or "Unknown"),
-            "form_type": str(row.get("form_type") or "10-K"),
-            "fiscal_year": fy,
-            "fiscal_period": str(row.get("fiscal_period") or "FY"),
-            "period_of_report": str(row.get("period_of_report") or ""),
-            "filing_date": str(row.get("filing_date") or ""),
-            "accession_number": str(row.get("accession_number") or ""),
-            "currency": str(row.get("currency") or "USD"),
-            "revenue": row.get("revenue"),
-            "operating_income": row.get("operating_income"),
-            "net_income": row.get("net_income"),
-            "research_and_development": row.get("research_and_development"),
-            "metric_provenance": prov,
-            "extracted_sections": list(row.get("extracted_sections") or []),
-            "unstructured_blob_path": unstructured_blob,
-            "structured_blob_path": structured_blob,
-            "unstructured_gcs_uri": str(
-                row.get("unstructured_gcs_uri")
-                or f"gs://{self.sec_corpus_bucket}/{unstructured_blob}"
-            ),
-            "structured_gcs_uri": str(
-                row.get("structured_gcs_uri") or f"gs://{self.sec_corpus_bucket}/{structured_blob}"
-            ),
-            "sec_filing_url": str(row.get("sec_filing_url") or ""),
-        }
-        if row.get("ingested_at"):
-            payload["ingested_at"] = str(row["ingested_at"])
-        return FinancialDataProfile.model_validate(payload)
-
-    def fetch_profiles(
-        self,
-        *,
-        tickers: set[str],
-        start_year: int,
-        end_year: int,
-        gics_sector: str | None = None,
-    ) -> list[FinancialDataProfile]:
-        """Query `sec_edgar.financial_metrics` with partition (`fiscal_year`) & cluster pruning."""
-        clauses = ["fiscal_year BETWEEN @start_year AND @end_year"]
-        params: list[dict[str, Any]] = [
-            _bq_scalar_param("start_year", "INT64", int(start_year)),
-            _bq_scalar_param("end_year", "INT64", int(end_year)),
-        ]
-        if tickers:
-            clauses.append("UPPER(REPLACE(ticker, '.', '-')) IN UNNEST(@tickers)")
-            params.append(_bq_array_param("tickers", "STRING", sorted(tickers)))
-        if gics_sector:
-            clauses.append("LOWER(gics_sector) = @gics_sector")
-            params.append(_bq_scalar_param("gics_sector", "STRING", gics_sector.lower()))
-
-        where_sql = " AND ".join(clauses)
-        sql = (
-            f"SELECT * FROM {self._table_ref(self.financial_metrics_table)} "
-            f"WHERE {where_sql} "
-            f"ORDER BY ticker ASC, fiscal_year ASC"
-        )
-        rows = self.run_query(sql, params)
-        return [self._row_to_profile(r) for r in rows]
-
-    def query_yoy_variances(
-        self,
-        *,
-        tickers: set[str],
-        gics_sector: str | None,
-        start_year: int,
-        end_year: int,
-    ) -> list[dict[str, Any]]:
-        """Query `sec_edgar.v_financial_variances_yoy` for Looker YoY & peer comparison explores."""
-        clauses = ["fiscal_year BETWEEN @start_year AND @end_year"]
-        params: list[dict[str, Any]] = [
-            _bq_scalar_param("start_year", "INT64", int(start_year)),
-            _bq_scalar_param("end_year", "INT64", int(end_year)),
-        ]
-        if tickers:
-            clauses.append("UPPER(REPLACE(ticker, '.', '-')) IN UNNEST(@tickers)")
-            params.append(_bq_array_param("tickers", "STRING", sorted(tickers)))
-        if gics_sector:
-            clauses.append("LOWER(gics_sector) = @gics_sector")
-            params.append(_bq_scalar_param("gics_sector", "STRING", gics_sector.lower()))
-
-        sql = (
-            "SELECT "
-            "profile_id, ticker, company_name, gics_sector, fiscal_year, prev_fiscal_year, "
-            "period_of_report, filing_date, accession_number, "
-            "revenue, revenue_yoy_delta, revenue_yoy_pct, "
-            "operating_income, operating_income_yoy_delta, operating_income_yoy_pct, "
-            "net_income, net_income_yoy_delta, net_income_yoy_pct, "
-            "research_and_development, research_and_development_yoy_delta, "
-            "research_and_development_yoy_pct, sec_filing_url "
-            f"FROM {self._table_ref(self.yoy_view)} "
-            f"WHERE {' AND '.join(clauses)} "
-            "ORDER BY ticker ASC, fiscal_year ASC"
-        )
-        raw_rows = self.run_query(sql, params)
-        formatted: list[dict[str, Any]] = []
-        for r in raw_rows:
-            rev = r.get("revenue")
-            op = r.get("operating_income")
-            ni = r.get("net_income")
-            rd = r.get("research_and_development")
-            op_margin = (
-                round((float(op) / abs(float(rev))) * 100.0, 2) if rev and op is not None else None
-            )
-            net_margin = (
-                round((float(ni) / abs(float(rev))) * 100.0, 2) if rev and ni is not None else None
-            )
-            formatted.append(
-                {
-                    "profile_id": r.get("profile_id"),
-                    "ticker": r.get("ticker"),
-                    "company_name": r.get("company_name"),
-                    "gics_sector": r.get("gics_sector") or "Unknown",
-                    "fiscal_year": int(r["fiscal_year"]),
-                    "prev_fiscal_year": (
-                        int(r["prev_fiscal_year"])
-                        if r.get("prev_fiscal_year") is not None
-                        else None
-                    ),
-                    "period_of_report": str(r.get("period_of_report") or "") or None,
-                    "filing_date": str(r.get("filing_date") or "") or None,
-                    "accession_number": str(r.get("accession_number") or "") or None,
-                    "revenue": rev,
-                    "revenue_yoy_delta": (
-                        round(float(r["revenue_yoy_delta"]), 2)
-                        if r.get("revenue_yoy_delta") is not None
-                        else None
-                    ),
-                    "revenue_yoy_pct": (
-                        round(float(r["revenue_yoy_pct"]), 2)
-                        if r.get("revenue_yoy_pct") is not None
-                        else None
-                    ),
-                    "operating_income": op,
-                    "operating_income_yoy_delta": (
-                        round(float(r["operating_income_yoy_delta"]), 2)
-                        if r.get("operating_income_yoy_delta") is not None
-                        else None
-                    ),
-                    "operating_income_yoy_pct": (
-                        round(float(r["operating_income_yoy_pct"]), 2)
-                        if r.get("operating_income_yoy_pct") is not None
-                        else None
-                    ),
-                    "net_income": ni,
-                    "net_income_yoy_delta": (
-                        round(float(r["net_income_yoy_delta"]), 2)
-                        if r.get("net_income_yoy_delta") is not None
-                        else None
-                    ),
-                    "net_income_yoy_pct": (
-                        round(float(r["net_income_yoy_pct"]), 2)
-                        if r.get("net_income_yoy_pct") is not None
-                        else None
-                    ),
-                    "research_and_development": rd,
-                    "research_and_development_yoy_delta": (
-                        round(float(r["research_and_development_yoy_delta"]), 2)
-                        if r.get("research_and_development_yoy_delta") is not None
-                        else None
-                    ),
-                    "research_and_development_yoy_pct": (
-                        round(float(r["research_and_development_yoy_pct"]), 2)
-                        if r.get("research_and_development_yoy_pct") is not None
-                        else None
-                    ),
-                    "operating_margin_pct": op_margin,
-                    "net_margin_pct": net_margin,
-                    "rd_intensity_pct": (
-                        round((float(rd) / abs(float(rev))) * 100.0, 2)
-                        if rev and rd is not None
-                        else None
-                    ),
-                    "sec_filing_url": r.get("sec_filing_url") or "",
-                }
-            )
-        return formatted
-
-    def query_sector_benchmarks(
-        self,
-        *,
-        tickers: set[str],
-        gics_sector: str | None,
-        start_year: int,
-        end_year: int,
-    ) -> list[dict[str, Any]]:
-        """Aggregate sector-level revenue, operating income, net income, and R&D benchmarks in BigQuery."""
-        clauses = ["fiscal_year BETWEEN @start_year AND @end_year"]
-        params: list[dict[str, Any]] = [
-            _bq_scalar_param("start_year", "INT64", int(start_year)),
-            _bq_scalar_param("end_year", "INT64", int(end_year)),
-        ]
-        if tickers:
-            clauses.append("UPPER(REPLACE(ticker, '.', '-')) IN UNNEST(@tickers)")
-            params.append(_bq_array_param("tickers", "STRING", sorted(tickers)))
-        if gics_sector:
-            clauses.append("LOWER(gics_sector) = @gics_sector")
-            params.append(_bq_scalar_param("gics_sector", "STRING", gics_sector.lower()))
-
-        sql = (
-            "SELECT "
-            "COALESCE(gics_sector, 'Unknown') AS gics_sector, "
-            "fiscal_year, "
-            "COUNT(*) AS company_count, "
-            "ARRAY_AGG(DISTINCT ticker ORDER BY ticker) AS tickers, "
-            "ROUND(SUM(revenue), 2) AS total_sector_revenue, "
-            "ROUND(AVG(revenue), 2) AS avg_company_revenue, "
-            "ROUND(SUM(operating_income), 2) AS total_sector_operating_income, "
-            "ROUND(SUM(net_income), 2) AS total_sector_net_income, "
-            "ROUND(SUM(research_and_development), 2) AS total_sector_research_and_development "
-            f"FROM {self._table_ref(self.financial_metrics_table)} "
-            f"WHERE {' AND '.join(clauses)} "
-            "GROUP BY 1, 2 "
-            "ORDER BY gics_sector ASC, fiscal_year ASC"
-        )
-        raw_rows = self.run_query(sql, params)
-        return [
-            {
-                "gics_sector": str(r.get("gics_sector") or "Unknown"),
-                "fiscal_year": int(r["fiscal_year"]),
-                "company_count": int(r.get("company_count") or 0),
-                "tickers": list(r.get("tickers") or []),
-                "total_sector_revenue": r.get("total_sector_revenue"),
-                "avg_company_revenue": r.get("avg_company_revenue"),
-                "total_sector_operating_income": r.get("total_sector_operating_income"),
-                "total_sector_net_income": r.get("total_sector_net_income"),
-                "total_sector_research_and_development": r.get(
-                    "total_sector_research_and_development"
-                ),
-            }
-            for r in raw_rows
-        ]
-
-    def query_chunk_health(self) -> dict[str, Any]:
-        """Query `sec_edgar.v_chunk_health_metrics` and format Looker `chunk_health` response."""
-        sql = (
-            f"SELECT * FROM {self._table_ref(self.chunk_health_view)} "
-            "ORDER BY gics_sector ASC, section_id ASC"
-        )
-        rows = self.run_query(sql)
-        if not rows:
-            raise ToolExecutionError(
-                f"BigQuery view {self.dataset_id}.{self.chunk_health_view} returned 0 rows."
-            )
-
-        overall: dict[str, Any] = {}
-        by_sector: dict[str, dict[str, Any]] = {}
-        by_section: dict[str, dict[str, Any]] = {}
-        section_cells: dict[str, list[dict[str, Any]]] = defaultdict(list)
-
-        def _summary_entry(group_key: str, row: dict[str, Any]) -> dict[str, Any]:
-            return {
-                "group_key": group_key,
-                "total_chunks": int(row.get("total_chunks") or 0),
-                "distinct_profiles": int(row.get("distinct_profiles") or 0),
-                "distinct_tickers": int(row.get("distinct_tickers") or 0),
-                "valid_embedding_count": int(row.get("valid_embedding_count") or 0),
-                "embedding_coverage_ratio": float(row.get("embedding_coverage_ratio") or 0.0),
-                "avg_char_count": float(row.get("avg_char_count") or 0.0),
-                "avg_token_estimate": float(row.get("avg_token_estimate") or 0.0),
-                "min_token_estimate": int(row.get("min_token_estimate") or 0),
-                "max_token_estimate": int(row.get("max_token_estimate") or 0),
-                "p50_token_estimate": float(row.get("p50_token_estimate") or 0.0),
-                "p95_token_estimate": float(row.get("p95_token_estimate") or 0.0),
-                "undersized_chunk_count": int(row.get("undersized_chunk_count") or 0),
-                "oversized_chunk_count": int(row.get("oversized_chunk_count") or 0),
-                "missing_metadata_count": int(row.get("missing_metadata_count") or 0),
-            }
-
-        for r in rows:
-            sec_sector = str(r.get("gics_sector") or "")
-            sec_id = str(r.get("section_id") or "")
-            if sec_sector == "ALL_SECTORS" and sec_id == "ALL_SECTIONS":
-                overall = r
-            elif sec_sector != "ALL_SECTORS" and sec_id == "ALL_SECTIONS":
-                by_sector[sec_sector] = _summary_entry(sec_sector, r)
-            elif sec_sector == "ALL_SECTORS" and sec_id != "ALL_SECTIONS":
-                by_section[sec_id] = _summary_entry(sec_id, r)
-            elif sec_sector != "ALL_SECTORS" and sec_id != "ALL_SECTIONS":
-                section_cells[sec_id].append(r)
-
-        if not by_section and section_cells:
-            for sec_id, cells in sorted(section_cells.items()):
-                tot_chunks = sum(int(c.get("total_chunks") or 0) for c in cells)
-                valid_embs = sum(int(c.get("valid_embedding_count") or 0) for c in cells)
-                weighted_chars = sum(
-                    float(c.get("avg_char_count") or 0.0) * int(c.get("total_chunks") or 0)
-                    for c in cells
-                )
-                weighted_tokens = sum(
-                    float(c.get("avg_token_estimate") or 0.0) * int(c.get("total_chunks") or 0)
-                    for c in cells
-                )
-                by_section[sec_id] = {
-                    "group_key": sec_id,
-                    "total_chunks": tot_chunks,
-                    "distinct_profiles": sum(int(c.get("distinct_profiles") or 0) for c in cells),
-                    "distinct_tickers": sum(int(c.get("distinct_tickers") or 0) for c in cells),
-                    "valid_embedding_count": valid_embs,
-                    "embedding_coverage_ratio": (
-                        round(valid_embs / tot_chunks, 4) if tot_chunks > 0 else 0.0
-                    ),
-                    "avg_char_count": (
-                        round(weighted_chars / tot_chunks, 2) if tot_chunks > 0 else 0.0
-                    ),
-                    "avg_token_estimate": (
-                        round(weighted_tokens / tot_chunks, 2) if tot_chunks > 0 else 0.0
-                    ),
-                    "min_token_estimate": min(
-                        (int(c.get("min_token_estimate") or 0) for c in cells), default=0
-                    ),
-                    "max_token_estimate": max(
-                        (int(c.get("max_token_estimate") or 0) for c in cells), default=0
-                    ),
-                    "undersized_chunk_count": sum(
-                        int(c.get("undersized_chunk_count") or 0) for c in cells
-                    ),
-                    "oversized_chunk_count": sum(
-                        int(c.get("oversized_chunk_count") or 0) for c in cells
-                    ),
-                    "missing_metadata_count": sum(
-                        int(c.get("missing_metadata_count") or 0) for c in cells
-                    ),
-                }
-
-        if not overall:
-            overall = rows[0]
-
-        return {
-            "status": "success",
-            "explore_name": "chunk_health",
-            "health_status": overall.get("health_status", "HEALTHY"),
-            "health_score": overall.get("health_score"),
-            "total_chunks": overall.get("total_chunks"),
-            "embedding_coverage_ratio": overall.get("embedding_coverage_ratio"),
-            "full_section_coverage_ratio": overall.get(
-                "full_section_coverage_ratio",
-                overall.get("filing_coverage_ratio"),
-            ),
-            "by_section": by_section,
-            "by_sector": by_sector,
-        }
-
-    def vector_search_chunks(
-        self,
-        query_embedding: list[float],
-        *,
-        tickers: set[str],
-        gics_sector: str | None,
-        section_id: str | None,
-        start_year: int,
-        end_year: int,
-        top_k: int,
-    ) -> list[dict[str, Any]]:
-        """Execute metadata-prefiltered BigQuery `VECTOR_SEARCH` over `sec_edgar.filing_chunks`."""
-        clauses = [
-            "fiscal_year BETWEEN @start_year AND @end_year",
-            "ARRAY_LENGTH(embedding) = @embedding_dim",
-        ]
-        params: list[dict[str, Any]] = [
-            _bq_scalar_param("start_year", "INT64", int(start_year)),
-            _bq_scalar_param("end_year", "INT64", int(end_year)),
-            _bq_scalar_param("embedding_dim", "INT64", int(len(query_embedding))),
-            _bq_array_param("query_embedding", "FLOAT64", query_embedding),
-            _bq_scalar_param("top_k", "INT64", int(max(1, min(top_k, 500)))),
-        ]
-        if tickers:
-            clauses.append("UPPER(REPLACE(ticker, '.', '-')) IN UNNEST(@tickers)")
-            params.append(_bq_array_param("tickers", "STRING", sorted(tickers)))
-        if gics_sector:
-            clauses.append("LOWER(gics_sector) = @gics_sector")
-            params.append(_bq_scalar_param("gics_sector", "STRING", gics_sector.lower()))
-        if section_id:
-            clauses.append("LOWER(section_id) = @section_id")
-            params.append(_bq_scalar_param("section_id", "STRING", section_id.lower()))
-
-        sql = (
-            "SELECT "
-            "base.chunk_id, base.profile_id, base.ticker, base.company_name, "
-            "base.gics_sector, base.fiscal_year, base.period_of_report, base.filing_date, "
-            "base.accession_number, base.section_id, base.section_title, "
-            "base.chunk_index, base.chunk_text, base.sec_filing_url, "
-            "base.unstructured_gcs_uri, distance "
-            "FROM VECTOR_SEARCH("
-            "  ("
-            "    SELECT chunk_id, profile_id, ticker, company_name, gics_sector, "
-            "           fiscal_year, period_of_report, filing_date, accession_number, "
-            "           section_id, section_title, chunk_index, "
-            "           chunk_text, embedding, sec_filing_url, unstructured_gcs_uri "
-            f"   FROM {self._table_ref(self.filing_chunks_table)} "
-            f"   WHERE {' AND '.join(clauses)}"
-            "  ), "
-            "  'embedding', "
-            "  (SELECT @query_embedding AS embedding), "
-            "  top_k => @top_k, "
-            "  distance_type => 'COSINE'"
-            ") "
-            "ORDER BY distance ASC"
-        )
-        rows = self.run_query(sql, params)
-        results: list[dict[str, Any]] = []
-        for r in rows:
-            dist = float(r.get("distance") or 0.0)
-            sim = max(0.0, min(1.0, 1.0 - dist))
-            results.append(
-                {
-                    **r,
-                    "similarity": sim,
-                    "source_backend": "bigquery_vector_search",
-                }
-            )
-        return results
-
-    def vector_search_sector_top_per_ticker(
-        self,
-        query_embedding: list[float],
-        *,
-        gics_sector: str,
-        start_year: int,
-        end_year: int,
-        section_id: str | None = None,
-        per_company_year: int = 3,
-    ) -> list[dict[str, Any]]:
-        """Retrieve top-N cosine-ranked chunks for EVERY issuer and fiscal year in a GICS sector.
-
-        Uses one BigQuery SQL query (`ML.DISTANCE` + `QUALIFY ROW_NUMBER()`) so sector-wide
-        thematic queries cover all ~76 Information Technology (or other GICS sector) issuers
-        in ~2-3 seconds instead of issuing hundreds of per-company RPCs.
-        """
-        clauses = [
-            "LOWER(gics_sector) = @gics_sector",
-            "fiscal_year BETWEEN @start_year AND @end_year",
-            "ARRAY_LENGTH(embedding) = @embedding_dim",
-        ]
-        params: list[dict[str, Any]] = [
-            _bq_scalar_param("gics_sector", "STRING", gics_sector.strip().lower()),
-            _bq_scalar_param("start_year", "INT64", int(start_year)),
-            _bq_scalar_param("end_year", "INT64", int(end_year)),
-            _bq_scalar_param("embedding_dim", "INT64", int(len(query_embedding))),
-            _bq_array_param("query_embedding", "FLOAT64", query_embedding),
-            _bq_scalar_param("per_company_year", "INT64", int(max(1, min(per_company_year, 10)))),
-        ]
-        if section_id and section_id.strip().lower() in ("item_1a", "item_7"):
-            clauses.append("LOWER(section_id) = @section_id")
-            params.append(_bq_scalar_param("section_id", "STRING", section_id.strip().lower()))
-
-        sql = (
-            "SELECT "
-            "chunk_id, profile_id, ticker, company_name, gics_sector, fiscal_year, "
-            "period_of_report, filing_date, accession_number, section_id, section_title, "
-            "chunk_index, chunk_text, sec_filing_url, unstructured_gcs_uri, "
-            "ML.DISTANCE(embedding, @query_embedding, 'COSINE') AS distance "
-            f"FROM {self._table_ref(self.filing_chunks_table)} "
-            f"WHERE {' AND '.join(clauses)} "
-            "QUALIFY ROW_NUMBER() OVER ("
-            "  PARTITION BY ticker, fiscal_year "
-            "  ORDER BY ML.DISTANCE(embedding, @query_embedding, 'COSINE') ASC"
-            ") <= @per_company_year "
-            "ORDER BY ticker ASC, fiscal_year ASC, distance ASC"
-        )
-        rows = self.run_query(sql, params)
-        results: list[dict[str, Any]] = []
-        for r in rows:
-            dist = float(r.get("distance") or 0.0)
-            sim = max(0.0, min(1.0, 1.0 - dist))
-            results.append(
-                {
-                    **r,
-                    "similarity": sim,
-                    "source_backend": "bigquery_sector_vector_search",
-                }
-            )
-        return results
-
-    def fetch_chunks_by_ids(self, chunk_ids: list[str]) -> dict[str, dict[str, Any]]:
-        """Hydrate full `chunk_text` and metadata from `filing_chunks` by chunk_id."""
-        unique_ids = sorted({cid.strip() for cid in chunk_ids if cid and cid.strip()})
-        if not unique_ids:
-            return {}
-        sql = (
-            "SELECT chunk_id, profile_id, ticker, company_name, gics_sector, "
-            "fiscal_year, period_of_report, filing_date, accession_number, "
-            "section_id, section_title, chunk_index, chunk_text, "
-            "sec_filing_url, unstructured_gcs_uri "
-            f"FROM {self._table_ref(self.filing_chunks_table)} "
-            "WHERE chunk_id IN UNNEST(@chunk_ids)"
-        )
-        rows = self.run_query(sql, [_bq_array_param("chunk_ids", "STRING", unique_ids)])
-        return {str(r["chunk_id"]): r for r in rows if r.get("chunk_id")}
-
-    def fetch_section_chunks(
-        self,
-        *,
-        ticker: str,
-        fiscal_year: int,
-        section_id: str,
-        include_embedding: bool = True,
-    ) -> list[dict[str, Any]]:
-        """Fetch canonical chunks (and optionally pre-computed embeddings) for one filing section."""
-        emb_col = ", embedding" if include_embedding else ""
-        sql = (
-            "SELECT chunk_id, profile_id, ticker, company_name, gics_sector, "
-            "fiscal_year, period_of_report, filing_date, accession_number, "
-            f"section_id, section_title, chunk_index, chunk_text{emb_col}, "
-            "sec_filing_url, unstructured_gcs_uri "
-            f"FROM {self._table_ref(self.filing_chunks_table)} "
-            "WHERE UPPER(REPLACE(ticker, '.', '-')) = @ticker "
-            "  AND fiscal_year = @fiscal_year "
-            "  AND LOWER(section_id) = @section_id "
-            "ORDER BY chunk_index ASC"
-        )
-        params = [
-            _bq_scalar_param("ticker", "STRING", ticker.upper().replace(".", "-")),
-            _bq_scalar_param("fiscal_year", "INT64", int(fiscal_year)),
-            _bq_scalar_param("section_id", "STRING", section_id.lower()),
-        ]
-        return self.run_query(sql, params)
-
-
-# ---------------------------------------------------------------------------
-# 2. Vertex AI Search (Discovery Engine / GEAP) Live Client Adapter
-# ---------------------------------------------------------------------------
-
-
-def _normalize_section_id(
-    raw_section: str | None,
-    *,
-    requested_section: str | None = None,
-    passage_text: str = "",
-) -> Literal["item_1a", "item_7"]:
-    """Coerce section identifiers to `GroundedCitation`'s `Literal['item_1a', 'item_7']`."""
-    if raw_section:
-        low = raw_section.strip().lower()
-        if "1a" in low or "risk" in low:
-            return "item_1a"
-        if "7" in low or "md&a" in low or "management" in low:
-            return "item_7"
-
-    probe = passage_text[:320].lower()
-    if "item 1a" in probe or "risk factor" in probe:
-        return "item_1a"
-    if "item 7" in probe or "results of operations" in probe or "executive overview" in probe:
-        return "item_7"
-
-    if requested_section in ("item_1a", "item_7"):
-        return requested_section  # type: ignore[return-value]
-
-    risk_cues = ("risk", "regulatory", "restriction", "litigation", "cybersecurity", "adversely")
-    mda_cues = ("revenue", "operating income", "margin", "cash flow", "fiscal year", "segment")
-    risk_hits = sum(1 for cue in risk_cues if cue in passage_text.lower())
-    mda_hits = sum(1 for cue in mda_cues if cue in passage_text.lower())
-    return "item_1a" if risk_hits > mda_hits else "item_7"
-
-
-def _default_section_title(sec_id: Literal["item_1a", "item_7"]) -> str:
-    return (
-        "Item 1A. Risk Factors"
-        if sec_id == "item_1a"
-        else "Item 7. Management's Discussion and Analysis"
-    )
-
-
-class VertexAISearchAdapter(_GcpAuthenticatedRestClient):
-    """Live Discovery Engine (`servingConfigs/default_search:search`) hybrid search adapter."""
-
-    def __init__(
-        self,
-        config: GcpToolConfig,
-        *,
-        http_client: httpx.Client | None = None,
-        credentials: Any | None = None,
-    ) -> None:
-        super().__init__(http_client=http_client, credentials=credentials, default_timeout=30.0)
-        self.project_id = config.project_id
-        self.location = config.vais_location or "global"
-        self.collection_id = config.vais_collection_id or "default_collection"
-        self.engine_id = config.vais_engine_id
-        self.datastore_id = config.vais_datastore_id
-        self._resolved_url: str | None = None
-        self._url_lock = threading.Lock()
-
-    def _api_host(self) -> str:
-        if self.location == "global":
-            return "https://discoveryengine.googleapis.com"
-        return f"https://{self.location}-discoveryengine.googleapis.com"
-
-    def _serving_config_urls(self) -> list[str]:
-        host = self._api_host()
-        prefix = (
-            f"{host}/v1/projects/{self.project_id}/locations/{self.location}/"
-            f"collections/{self.collection_id}"
-        )
-        urls: list[str] = []
-        if self.engine_id:
-            urls.append(f"{prefix}/engines/{self.engine_id}/servingConfigs/default_search:search")
-        if self.datastore_id:
-            urls.append(
-                f"{prefix}/dataStores/{self.datastore_id}/servingConfigs/default_search:search"
-            )
-        return urls
-
-    @staticmethod
-    def build_filter_expression(
-        *,
-        tickers: set[str],
-        gics_sector: str | None,
-        section_id: str | None,
-        start_year: int,
-        end_year: int,
-    ) -> str:
-        """Build a Discovery Engine filter expression over `VertexAISearchManifestRecord.structData`."""
-        clauses: list[str] = [
-            f"fiscal_year >= {int(start_year)}",
-            f"fiscal_year <= {int(end_year)}",
-        ]
-        if tickers:
-            quoted_tickers = ", ".join(f'"{t.replace(chr(34), "")}"' for t in sorted(tickers))
-            clauses.append(f"ticker: ANY({quoted_tickers})")
-        canon_sector = _canonicalize_gics_sector(gics_sector)
-        if canon_sector:
-            safe_sec = canon_sector.replace('"', '\\"')
-            clauses.append(f'gics_sector: ANY("{safe_sec}")')
-        if section_id in ("item_1a", "item_7"):
-            clauses.append(f'extracted_sections: ANY("{section_id}")')
-        return " AND ".join(clauses)
-
-    def search_documents(
-        self,
-        query: str,
-        *,
-        tickers: set[str],
-        gics_sector: str | None,
-        section_id: str | None,
-        start_year: int,
-        end_year: int,
-        page_size: int = 10,
-    ) -> list[dict[str, Any]]:
-        """Execute a metadata-filtered hybrid search against Vertex AI Search (Discovery Engine)."""
-        urls = self._serving_config_urls()
-        if not urls:
-            raise GcpEndpointNotReadyError(
-                "Neither VERTEX_AI_SEARCH_ENGINE_ID nor VERTEX_AI_SEARCH_DATASTORE_ID is configured."
-            )
-
-        filter_expr = self.build_filter_expression(
-            tickers=tickers,
-            gics_sector=gics_sector,
-            section_id=section_id,
-            start_year=start_year,
-            end_year=end_year,
-        )
-        payload: dict[str, Any] = {
-            "query": query,
-            "pageSize": max(1, min(int(page_size), 25)),
-            "queryExpansionSpec": {"condition": "AUTO"},
-            "spellCorrectionSpec": {"mode": "AUTO"},
-            "contentSearchSpec": {
-                "snippetSpec": {"returnSnippet": True, "maxSnippetCount": 3},
-                "extractiveContentSpec": {
-                    "maxExtractiveSegmentCount": 5,
-                    "maxExtractiveAnswerCount": 3,
-                    "returnExtractiveSegmentScore": True,
-                },
-            },
-        }
-        if filter_expr:
-            payload["filter"] = filter_expr
-
-        data: dict[str, Any] | None = None
-        last_err: Exception | None = None
-        with self._url_lock:
-            cached_url = self._resolved_url
-        candidate_urls = [cached_url] + [u for u in urls if u != cached_url] if cached_url else urls
-        for idx, url in enumerate(candidate_urls):
+class _TrackedSectionCache(BoundedTTLCache[str, dict[str, Any]]):
+    """Thread-safe LRU + TTL section cache extending `BoundedTTLCache` with eviction tracking."""
+
+    def __init__(self, *, max_entries: int, ttl_seconds: float) -> None:
+        super().__init__(max_entries=max_entries, ttl_seconds=ttl_seconds)
+        self.evictions: int = 0
+
+    def _prune_expired_unlocked(self, now: float) -> None:
+        before = len(self._data)
+        super()._prune_expired_unlocked(now)
+        self.evictions += max(0, before - len(self._data))
+
+    def __getitem__(self, key: str) -> dict[str, Any]:
+        with self._lock:
+            before = len(self._data)
             try:
-                data = self._request_json("POST", url, json_body=payload)
-                if url != cached_url:
-                    with self._url_lock:
-                        self._resolved_url = url
-                break
-            except GcpAdapterHttpError as exc:
-                last_err = exc
-                if exc.status_code == 404 and idx + 1 < len(candidate_urls):
-                    logger.info(
-                        "Vertex AI Search endpoint returned 404; caching next servingConfig endpoint."
-                    )
-                    continue
+                return super().__getitem__(key)
+            except KeyError:
+                if len(self._data) < before:
+                    self.evictions += before - len(self._data)
                 raise
 
-        if data is None:
-            if last_err is not None:
-                raise last_err
-            return []
-
-        passages: list[dict[str, Any]] = []
-        results = data.get("results") or []
-        for doc_rank, item in enumerate(results):
-            doc = item.get("document") or {}
-            doc_id = str(doc.get("id") or f"vais_doc_{doc_rank}")
-            struct_data = doc.get("structData") or {}
-            derived = doc.get("derivedStructData") or {}
-            content_obj = doc.get("content") or {}
-
-            ticker = str(struct_data.get("ticker") or "").strip().upper()
-            fy_raw = struct_data.get("fiscal_year")
-            if not ticker or fy_raw is None:
-                # Fallback parse from document ID `{TICKER}_{FY}_10K`
-                id_parts = doc_id.split("_")
-                if len(id_parts) >= 2 and id_parts[1].isdigit():
-                    ticker = ticker or id_parts[0].upper()
-                    fy_raw = fy_raw if fy_raw is not None else int(id_parts[1])
-            if not ticker or fy_raw is None:
-                continue
-
-            fy = int(fy_raw)
-            if fy < start_year or fy > end_year:
-                continue
-            if tickers and ticker.replace(".", "-") not in tickers:
-                continue
-            doc_sector = str(struct_data.get("gics_sector") or "Unknown")
-            if gics_sector and doc_sector.lower() != gics_sector.lower():
-                continue
-
-            profile_id = str(struct_data.get("profile_id") or f"{ticker}_{fy}")
-            company_name = str(struct_data.get("company_name") or ticker)
-            sec_url = str(struct_data.get("sec_filing_url") or "")
-            gcs_uri = str(
-                content_obj.get("uri")
-                or derived.get("link")
-                or struct_data.get("unstructured_gcs_uri")
-                or ""
-            )
-
-            extracted_candidates: list[tuple[str, float, str | None, str | None]] = []
-            for seg in derived.get("extractive_segments") or []:
-                if isinstance(seg, dict) and seg.get("content"):
-                    rel = float(seg.get("relevanceScore") or max(0.35, 0.92 - 0.05 * doc_rank))
-                    extracted_candidates.append(
-                        (
-                            str(seg["content"]).strip(),
-                            rel,
-                            seg.get("section_id"),
-                            seg.get("section_title"),
-                        )
-                    )
-
-            for ans in derived.get("extractive_answers") or []:
-                if isinstance(ans, dict) and ans.get("content"):
-                    extracted_candidates.append(
-                        (
-                            str(ans["content"]).strip(),
-                            max(0.30, 0.85 - 0.05 * doc_rank),
-                            ans.get("section_id"),
-                            ans.get("section_title"),
-                        )
-                    )
-
-            for snip in derived.get("snippets") or []:
-                if isinstance(snip, dict) and snip.get("snippet"):
-                    clean_snip = _HTML_TAG_RE.sub("", str(snip["snippet"])).strip()
-                    if clean_snip:
-                        extracted_candidates.append(
-                            (
-                                clean_snip,
-                                max(0.25, 0.75 - 0.05 * doc_rank),
-                                None,
-                                None,
-                            )
-                        )
-
-            if struct_data.get("chunk_text"):
-                extracted_candidates.append(
-                    (
-                        str(struct_data["chunk_text"]).strip(),
-                        max(0.35, 0.88 - 0.05 * doc_rank),
-                        struct_data.get("section_id"),
-                        struct_data.get("section_title"),
-                    )
-                )
-
-            for seg_idx, (seg_text, rel_score, raw_sec, raw_title) in enumerate(
-                extracted_candidates
-            ):
-                if not seg_text:
-                    continue
-                resolved_sec = _normalize_section_id(
-                    raw_sec,
-                    requested_section=section_id,
-                    passage_text=seg_text,
-                )
-                if section_id in ("item_1a", "item_7") and resolved_sec != section_id:
-                    continue
-                chunk_id = str(
-                    struct_data.get("chunk_id") or f"{profile_id}_{resolved_sec}_vais_{seg_idx:04d}"
-                )
-                passages.append(
-                    {
-                        "chunk_id": chunk_id,
-                        "profile_id": profile_id,
-                        "ticker": ticker,
-                        "company_name": company_name,
-                        "gics_sector": doc_sector,
-                        "fiscal_year": fy,
-                        "period_of_report": str(struct_data.get("period_of_report") or "") or None,
-                        "filing_date": str(struct_data.get("filing_date") or "") or None,
-                        "accession_number": str(struct_data.get("accession_number") or "") or None,
-                        "section_id": resolved_sec,
-                        "section_title": str(raw_title or _default_section_title(resolved_sec)),
-                        "chunk_text": seg_text,
-                        "sec_filing_url": sec_url,
-                        "unstructured_gcs_uri": gcs_uri,
-                        "similarity": max(0.0, min(1.0, rel_score)),
-                        "source_backend": "vertex_ai_search",
-                    }
-                )
-
-        return passages
+    def __setitem__(self, key: str, value: dict[str, Any]) -> None:
+        with self._lock:
+            existed = key in self._data
+            before = len(self._data)
+            super().__setitem__(key, value)
+            expected = before + (0 if existed else 1)
+            self.evictions += max(0, expected - len(self._data))
 
 
-# ---------------------------------------------------------------------------
-# 3. GCS Corpus Adapter (Unstructured 10-K Markdown Context Cache Loader)
-# ---------------------------------------------------------------------------
+@dataclass(slots=True)
+class _ContextCacheRuntimeStats:
+    """Thread-safe runtime hit/miss, token-savings, and latency metrics backed by `CacheMetrics`."""
+
+    metrics: CacheMetrics = field(default_factory=CacheMetrics)
+    cached_tokens_saved: int = 0
+    total_hit_latency_ms: float = 0.0
+    total_miss_latency_ms: float = 0.0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def record_hit(self, *, token_estimate: int, latency_ms: float) -> int:
+        saved_delta = int(token_estimate * 0.75)
+        self.metrics.record_hit(token_estimate)
+        with self._lock:
+            self.cached_tokens_saved += saved_delta
+            self.total_hit_latency_ms += latency_ms
+        return saved_delta
+
+    def record_miss(self, *, token_estimate: int, latency_ms: float) -> None:
+        self.metrics.record_miss(token_estimate)
+        with self._lock:
+            self.total_miss_latency_ms += latency_ms
+
+    def snapshot(self) -> dict[str, Any]:
+        base = self.metrics.snapshot()
+        with self._lock:
+            return {
+                **base,
+                "cached_tokens_saved": self.cached_tokens_saved,
+                "total_hit_latency_ms": self.total_hit_latency_ms,
+                "total_miss_latency_ms": self.total_miss_latency_ms,
+            }
 
 
-class GcsCorpusAdapter(_GcpAuthenticatedRestClient):
-    """Live Google Cloud Storage object reader for unstructured 10-K Markdown filings."""
+# Process-local L1 cache of parsed 10-K sections (bounded LRU + TTL)
+_SESSION_10K_CONTEXT_CACHE: _TrackedSectionCache = _TrackedSectionCache(
+    max_entries=_SECTION_CACHE_MAX_ENTRIES,
+    ttl_seconds=_SECTION_CACHE_TTL_SECONDS,
+)
+# Process-local L1 cache of BigQuery filing_chunks (with pre-computed 768-d embeddings) per section.
+_SECTION_CHUNKS_CACHE: _TrackedSectionCache = _TrackedSectionCache(
+    max_entries=_SECTION_CACHE_MAX_ENTRIES,
+    ttl_seconds=_SECTION_CACHE_TTL_SECONDS,
+)
+_CONTEXT_CACHE_STATS = _ContextCacheRuntimeStats()
 
-    def __init__(
-        self,
-        config: GcpToolConfig,
-        *,
-        http_client: httpx.Client | None = None,
-        credentials: Any | None = None,
-    ) -> None:
-        super().__init__(http_client=http_client, credentials=credentials, default_timeout=30.0)
-        self.default_bucket = config.sec_corpus_bucket
-
-    def parse_gcs_uri(self, uri_or_blob_path: str) -> tuple[str, str]:
-        """Split `gs://bucket/path/to/blob` or relative blob path into `(bucket, object_name)`."""
-        cleaned = uri_or_blob_path.strip()
-        if cleaned.startswith("gs://"):
-            without_scheme = cleaned[5:]
-            slash_idx = without_scheme.find("/")
-            if slash_idx <= 0:
-                raise ValueError(f"Invalid GCS URI: {uri_or_blob_path!r}")
-            return without_scheme[:slash_idx], without_scheme[slash_idx + 1 :]
-        return self.default_bucket, cleaned.lstrip("/")
-
-    def fetch_markdown(self, uri_or_blob_path: str) -> str:
-        """Download UTF-8 10-K Markdown content from Google Cloud Storage."""
-        bucket, object_name = self.parse_gcs_uri(uri_or_blob_path)
-        encoded_obj = urllib.parse.quote(object_name, safe="")
-        url = (
-            f"https://storage.googleapis.com/storage/v1/b/"
-            f"{urllib.parse.quote(bucket, safe='')}/o/{encoded_obj}"
-        )
-        return self._request_text("GET", url, params={"alt": "media"})
-
-
-# ---------------------------------------------------------------------------
-# 5. Unified GCP Adapter Registry & Dispatch Policy
-# ---------------------------------------------------------------------------
-
-
-class GcpToolAdapters:
-    """Bundle of live GCP tool adapters shared across ADK tool invocations."""
-
-    def __init__(
-        self,
-        config: GcpToolConfig | None = None,
-        *,
-        bigquery: BigQueryAdapter | None = None,
-        vertex_ai_search: VertexAISearchAdapter | None = None,
-        gcs_corpus: GcsCorpusAdapter | None = None,
-        embedder: VertexAIEmbedder | None = None,
-        http_client: httpx.Client | None = None,
-        credentials: Any | None = None,
-    ) -> None:
-        self.config = config or GcpToolConfig.from_env()
-        self.bigquery = bigquery or BigQueryAdapter(
-            self.config, http_client=http_client, credentials=credentials
-        )
-        self.vertex_ai_search = vertex_ai_search or VertexAISearchAdapter(
-            self.config, http_client=http_client, credentials=credentials
-        )
-        self.gcs_corpus = gcs_corpus or GcsCorpusAdapter(
-            self.config, http_client=http_client, credentials=credentials
-        )
-        self.embedder = embedder or VertexAIEmbedder(
-            project_id=self.config.project_id,
-            location=self.config.location,
-            model_name=self.config.embedding_model,
-            dimensions=self.config.embedding_dimensions,
-            max_retries=1,
-            max_workers=4,
-            http_client=http_client,
-            credentials=credentials,
-        )
-        self._query_embedding_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
-        self._embed_cache_lock = threading.Lock()
-
-    def embed_texts(
-        self,
-        texts: list[str],
-        *,
-        task_type: str = "RETRIEVAL_QUERY",
-    ) -> list[list[float]]:
-        """Generate 768-d `text-embedding-005` vectors, translating transient 429/timeout errors."""
-        if not texts:
-            return []
-        if len(texts) == 1:
-            cache_key = (task_type, texts[0])
-            with self._embed_cache_lock:
-                cached = self._query_embedding_cache.get(cache_key)
-                if cached is not None:
-                    self._query_embedding_cache.move_to_end(cache_key)
-                    return [cached]
-
-        try:
-            vectors = self.embedder.embed_texts(texts, task_type=task_type)
-        except httpx.TimeoutException as exc:
-            raise UpstreamTimeoutError(f"Timed out generating Vertex AI embeddings: {exc}") from exc
-        except RuntimeError as exc:
-            msg = str(exc)
-            if "HTTP 429" in msg:
-                raise RateLimitExceededError(msg) from exc
-            if any(code in msg for code in ("HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")):
-                raise UpstreamTimeoutError(msg) from exc
-            raise ToolExecutionError(msg) from exc
-
-        if len(texts) == 1 and vectors:
-            cache_key = (task_type, texts[0])
-            with self._embed_cache_lock:
-                self._query_embedding_cache[cache_key] = vectors[0]
-                if len(self._query_embedding_cache) > 256:
-                    self._query_embedding_cache.popitem(last=False)
-        return vectors
-
-    def embed_query(self, query: str) -> list[float]:
-        """Embed a single search query with `task_type='RETRIEVAL_QUERY'`."""
-        return self.embed_texts([query], task_type="RETRIEVAL_QUERY")[0]
-
-
-_CUSTOM_GCP_ADAPTERS: GcpToolAdapters | None = None
-_ENV_GCP_ADAPTERS_CACHE: tuple[GcpToolConfig, GcpToolAdapters] | None = None
-
-
-def configure_gcp_tool_adapters(adapters: GcpToolAdapters | None) -> None:
-    """Explicitly inject a `GcpToolAdapters` bundle (used for custom transport or integration tests)."""
-    global _CUSTOM_GCP_ADAPTERS
-    _CUSTOM_GCP_ADAPTERS = adapters
-    _SECTION_CHUNKS_CACHE.clear()
-
-
-def reset_gcp_tool_adapters() -> None:
-    """Clear any injected or cached `GcpToolAdapters` instance."""
-    global _CUSTOM_GCP_ADAPTERS, _ENV_GCP_ADAPTERS_CACHE
-    _CUSTOM_GCP_ADAPTERS = None
-    _ENV_GCP_ADAPTERS_CACHE = None
-    _SECTION_CHUNKS_CACHE.clear()
-
-
-def _gcp_adapters() -> GcpToolAdapters:
-    """Return the live GCP adapter bundle: an injected one, or one built from the environment.
-
-    There is no local data backend: every tool reads BigQuery, Vertex AI Search,
-    Vertex AI embeddings, and the GCS corpus bucket.
-    """
-    global _ENV_GCP_ADAPTERS_CACHE
-    if _CUSTOM_GCP_ADAPTERS is not None:
-        return _CUSTOM_GCP_ADAPTERS
-    cfg = GcpToolConfig.from_env()
-    if _ENV_GCP_ADAPTERS_CACHE is None or _ENV_GCP_ADAPTERS_CACHE[0] != cfg:
-        _ENV_GCP_ADAPTERS_CACHE = (cfg, GcpToolAdapters(cfg))
-    return _ENV_GCP_ADAPTERS_CACHE[1]
-
-
-def get_active_gcp_tool_adapters() -> GcpToolAdapters:
-    """Return the active live `GcpToolAdapters` bundle."""
-    return _gcp_adapters()
-
-
-def get_gcp_adapters_status_metadata() -> dict[str, Any]:
-    """Return secret-free diagnostic metadata describing configured GCP tool adapters."""
-    cfg = (
-        _CUSTOM_GCP_ADAPTERS.config
-        if _CUSTOM_GCP_ADAPTERS is not None
-        else GcpToolConfig.from_env()
-    )
-    return {
-        "data_backend": "gcp",
-        "project_id": cfg.project_id,
-        "location": cfg.location,
-        "hybrid_retrieval_backends": ["bigquery_vector_search", "vertex_ai_search"],
-        "bigquery": {
-            "dataset_id": cfg.bq_dataset_id,
-            "financial_metrics_table": cfg.bq_financial_metrics_table,
-            "filing_chunks_table": cfg.bq_filing_chunks_table,
-            "yoy_variance_view": cfg.bq_yoy_view,
-            "chunk_health_view": cfg.bq_chunk_health_view,
-        },
-        "vertex_ai_search": {
-            "location": cfg.vais_location,
-            "collection_id": cfg.vais_collection_id,
-            "engine_id": cfg.vais_engine_id,
-            "datastore_id": cfg.vais_datastore_id,
-        },
-        "gcs_corpus_bucket": cfg.sec_corpus_bucket,
-        "embedding_model": cfg.embedding_model,
-        "embedding_dimensions": cfg.embedding_dimensions,
-    }
-
-
-def _is_transient_gcp_error(exc: BaseException) -> bool:
-    """Return True if `exc` should propagate to `@with_tool_resilience` for backoff retry."""
-    if isinstance(
-        exc,
-        (
-            RateLimitExceededError,
-            UpstreamTimeoutError,
-            TimeoutError,
-            httpx.TimeoutException,
-        ),
-    ):
-        return True
-    if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (
-        429,
-        500,
-        502,
-        503,
-        504,
-    ):
-        return True
-    return False
+register_adapter_reset_hook(_SECTION_CHUNKS_CACHE.clear)
 
 
 def _record_gcp_backend_invocation(
@@ -1696,19 +211,15 @@ def _record_gcp_backend_invocation(
         logger.debug("Skipping gcp_backend_calls telemetry update: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# Context Cache Telemetry
-# ---------------------------------------------------------------------------
-
-
 def get_context_cache_runtime_stats() -> dict[str, Any]:
     """Return runtime Context Cache hit/miss counters, cached keys, and latency telemetry."""
-    hits = int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("hits", 0))
-    misses = int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("misses", 0))
+    counters = _CONTEXT_CACHE_STATS.snapshot()
+    hits = int(counters["hits"])
+    misses = int(counters["misses"])
     total = hits + misses
-    hit_ms = float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_hit_latency_ms", 0.0))
-    miss_ms = float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_miss_latency_ms", 0.0))
-    resident = dict(_SESSION_10K_CONTEXT_CACHE.items())
+    hit_ms = float(counters["total_hit_latency_ms"])
+    miss_ms = float(counters["total_miss_latency_ms"])
+    resident = _SESSION_10K_CONTEXT_CACHE.snapshot()
     return {
         "cached_sections_count": len(resident),
         "cached_keys": sorted(resident.keys()),
@@ -1721,7 +232,7 @@ def get_context_cache_runtime_stats() -> dict[str, Any]:
         "hits": hits,
         "misses": misses,
         "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
-        "cached_tokens_saved": int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("cached_tokens_saved", 0)),
+        "cached_tokens_saved": int(counters["cached_tokens_saved"]),
         "mean_hit_lookup_latency_ms": round(hit_ms / hits, 3) if hits > 0 else 0.0,
         "mean_miss_load_latency_ms": round(miss_ms / misses, 3) if misses > 0 else 0.0,
     }
@@ -1732,585 +243,133 @@ def _parse_ticker_list(tickers_csv: str) -> set[str]:
     if not tickers_csv or tickers_csv.strip().upper() in ("*", "ALL", ""):
         return set()
     parts = re.split(r"[,;\s]+", tickers_csv.strip())
-    return {p.strip().upper().replace(".", "-") for p in parts if p.strip()}
+    return {normalize_edgar_ticker(p) for p in parts if p.strip()}
 
 
-def _profile_to_metric_record(p: FinancialDataProfile) -> MetricRecord:
-    """Convert a `FinancialDataProfile` into a `MetricRecord` with computed margins."""
-    op_margin = (
-        round((p.operating_income / abs(p.revenue)) * 100.0, 2)
-        if p.revenue and p.operating_income is not None
-        else None
-    )
-    net_margin = (
-        round((p.net_income / abs(p.revenue)) * 100.0, 2)
-        if p.revenue and p.net_income is not None
-        else None
-    )
-    rd_intensity = (
-        round((p.research_and_development / abs(p.revenue)) * 100.0, 2)
-        if p.revenue and p.research_and_development is not None
-        else None
-    )
-    return MetricRecord(
-        profile_id=p.profile_id,
-        ticker=p.ticker,
-        cik=p.cik,
-        company_name=p.company_name,
-        gics_sector=p.gics_sector,
-        gics_sub_industry=p.gics_sub_industry,
-        fiscal_year=p.fiscal_year,
-        period_of_report=p.period_of_report,
-        filing_date=p.filing_date,
-        accession_number=p.accession_number,
-        currency=p.currency,
-        revenue=p.revenue,
-        operating_income=p.operating_income,
-        net_income=p.net_income,
-        research_and_development=p.research_and_development,
-        operating_margin_pct=op_margin,
-        net_margin_pct=net_margin,
-        rd_intensity_pct=rd_intensity,
-        sec_filing_url=p.sec_filing_url,
-        unstructured_gcs_uri=p.unstructured_gcs_uri,
-        structured_gcs_uri=p.structured_gcs_uri,
-        provenance=p.metric_provenance.model_dump(mode="json"),
-    )
+def _normalize_sector_filter(gics_sector: str | None) -> str | None:
+    canon = canonicalize_gics_sector(gics_sector)
+    return canon.lower() if canon else None
 
 
-def _xbrl_concept_for_metric(profile: FinancialDataProfile, metric_name: str) -> str | None:
-    """Return the XBRL concept name recorded in `metric_provenance` for a metric."""
-    val = getattr(profile.metric_provenance, metric_name, None)
-    return str(val).strip() if val else None
+def _l2_normalize_rows(matrix: np.ndarray) -> np.ndarray:
+    """L2-normalize each row of a 2D embedding matrix, guarding against zero-norm vectors."""
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    norms[norms == 0.0] = 1.0
+    return matrix / norms
 
 
-def _numeric_citation_for_profile(
-    profile: FinancialDataProfile, metric_name: str, value: float | None
-) -> NumericCitation:
-    """Build a traceable `NumericCitation` from a company-year `FinancialDataProfile`."""
-    return NumericCitation(
-        ticker=profile.ticker,
-        fiscal_year=profile.fiscal_year,
-        period_of_report=profile.period_of_report or None,
-        filing_date=profile.filing_date or None,
-        accession_number=profile.accession_number or None,
-        sec_filing_url=profile.sec_filing_url or None,
-        metric=metric_name,
-        xbrl_concept=_xbrl_concept_for_metric(profile, metric_name),
-        value=value,
-    )
-
-
-def _compute_single_metric_variance(
-    metric_name: str,
-    start_year: int,
-    end_year: int,
-    start_val: float | None,
-    end_val: float | None,
+def _update_context_cache_state(
+    tool_context: ToolContext | None,
     *,
-    start_profile: FinancialDataProfile | None = None,
-    end_profile: FinancialDataProfile | None = None,
-) -> MetricVariance:
-    """Deterministically compute USD delta, percentage delta, CAGR, and XBRL provenance."""
-    start_period = (start_profile.period_of_report or None) if start_profile else None
-    end_period = (end_profile.period_of_report or None) if end_profile else None
-    start_acc = (start_profile.accession_number or None) if start_profile else None
-    end_acc = (end_profile.accession_number or None) if end_profile else None
-    start_url = (start_profile.sec_filing_url or None) if start_profile else None
-    end_url = (end_profile.sec_filing_url or None) if end_profile else None
-    start_concept = _xbrl_concept_for_metric(start_profile, metric_name) if start_profile else None
-    end_concept = _xbrl_concept_for_metric(end_profile, metric_name) if end_profile else None
-
-    derived_from: list[NumericCitation] = []
-    if start_profile is not None and start_val is not None:
-        derived_from.append(_numeric_citation_for_profile(start_profile, metric_name, start_val))
-    if end_profile is not None and end_val is not None and end_profile is not start_profile:
-        derived_from.append(_numeric_citation_for_profile(end_profile, metric_name, end_val))
-
-    if start_val is None or end_val is None:
-        return MetricVariance(
-            metric_name=metric_name,  # type: ignore[arg-type]
-            start_year=start_year,
-            end_year=end_year,
-            start_value=start_val,
-            end_value=end_val,
-            direction="unavailable",
-            start_period_of_report=start_period,
-            end_period_of_report=end_period,
-            start_accession_number=start_acc,
-            end_accession_number=end_acc,
-            start_sec_filing_url=start_url,
-            end_sec_filing_url=end_url,
-            start_xbrl_concept=start_concept,
-            end_xbrl_concept=end_concept,
-            derived_from=derived_from,
+    cache_hit: bool,
+    saved_tokens_delta: int,
+    lookup_latency_ms: float,
+    cache_key: str,
+) -> None:
+    if tool_context is None or not hasattr(tool_context, "state"):
+        return
+    stats = dict(
+        tool_context.state.get(
+            "context_cache_stats",
+            {"hits": 0, "misses": 0, "cached_tokens_saved": 0},
         )
-
-    abs_delta = round(end_val - start_val, 2)
-    pct_delta = (
-        round(((end_val - start_val) / abs(start_val)) * 100.0, 2) if start_val != 0 else None
     )
-    years_span = max(0, end_year - start_year)
-    cagr_pct: float | None = None
-    if years_span >= 1 and start_val > 0 and end_val > 0:
-        cagr_pct = round((((end_val / start_val) ** (1.0 / years_span)) - 1.0) * 100.0, 2)
-
-    if abs_delta > 0:
-        direction = "increase"
-    elif abs_delta < 0:
-        direction = "decrease"
+    if cache_hit:
+        stats["hits"] = int(stats.get("hits", 0)) + 1
+        stats["cached_tokens_saved"] = int(stats.get("cached_tokens_saved", 0)) + saved_tokens_delta
     else:
-        direction = "flat"
-
-    return MetricVariance(
-        metric_name=metric_name,  # type: ignore[arg-type]
-        start_year=start_year,
-        end_year=end_year,
-        start_value=start_val,
-        end_value=end_val,
-        absolute_delta=abs_delta,
-        percentage_delta=pct_delta,
-        cagr_pct=cagr_pct,
-        direction=direction,  # type: ignore[arg-type]
-        start_period_of_report=start_period,
-        end_period_of_report=end_period,
-        start_accession_number=start_acc,
-        end_accession_number=end_acc,
-        start_sec_filing_url=start_url,
-        end_sec_filing_url=end_url,
-        start_xbrl_concept=start_concept,
-        end_xbrl_concept=end_concept,
-        derived_from=derived_from,
-    )
+        stats["misses"] = int(stats.get("misses", 0)) + 1
+    stats["last_lookup_latency_ms"] = lookup_latency_ms
+    stats["last_cache_key"] = cache_key
+    tool_context.state["context_cache_stats"] = stats
 
 
-def _build_variance_reports_from_profiles(
-    profiles: list[FinancialDataProfile],
-    *,
-    ticker_filter: set[str],
-    start_year: int,
-    end_year: int,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    """Compute deterministic `CompanyVarianceReport` dicts with full XBRL & fiscal-period provenance."""
-    by_ticker: dict[str, dict[int, FinancialDataProfile]] = defaultdict(dict)
-    for p in profiles:
-        norm_t = p.ticker.upper().replace(".", "-")
-        if norm_t in ticker_filter:
-            by_ticker[p.ticker][p.fiscal_year] = p
+# ---------------------------------------------------------------------------
+# Looker Explore Dispatch Helpers
+# ---------------------------------------------------------------------------
 
-    reports: list[dict[str, Any]] = []
-    found_norm_tickers: set[str] = set()
-    requested_years = list(range(int(start_year), int(end_year) + 1))
 
-    for ticker, fy_map in sorted(by_ticker.items()):
-        avail_years = sorted(fy for fy in fy_map if start_year <= fy <= end_year)
-        if not avail_years:
-            continue
-        found_norm_tickers.add(ticker.upper().replace(".", "-"))
-        missing_years = [fy for fy in requested_years if fy not in avail_years]
-
-        eff_start = avail_years[0]
-        eff_end = avail_years[-1]
-        start_prof = fy_map[eff_start]
-        end_prof = fy_map[eff_end]
-
-        rev_var = _compute_single_metric_variance(
-            "revenue",
-            eff_start,
-            eff_end,
-            start_prof.revenue,
-            end_prof.revenue,
-            start_profile=start_prof,
-            end_profile=end_prof,
-        )
-        op_var = _compute_single_metric_variance(
-            "operating_income",
-            eff_start,
-            eff_end,
-            start_prof.operating_income,
-            end_prof.operating_income,
-            start_profile=start_prof,
-            end_profile=end_prof,
-        )
-        ni_var = _compute_single_metric_variance(
-            "net_income",
-            eff_start,
-            eff_end,
-            start_prof.net_income,
-            end_prof.net_income,
-            start_profile=start_prof,
-            end_profile=end_prof,
-        )
-        rd_var = _compute_single_metric_variance(
-            "research_and_development",
-            eff_start,
-            eff_end,
-            start_prof.research_and_development,
-            end_prof.research_and_development,
-            start_profile=start_prof,
-            end_profile=end_prof,
-        )
-
-        start_rec = _profile_to_metric_record(start_prof)
-        end_rec = _profile_to_metric_record(end_prof)
-
-        op_margin_bps = (
-            round((end_rec.operating_margin_pct - start_rec.operating_margin_pct) * 100.0, 1)
-            if start_rec.operating_margin_pct is not None
-            and end_rec.operating_margin_pct is not None
-            else None
-        )
-        net_margin_bps = (
-            round((end_rec.net_margin_pct - start_rec.net_margin_pct) * 100.0, 1)
-            if start_rec.net_margin_pct is not None and end_rec.net_margin_pct is not None
-            else None
-        )
-        rd_intensity_bps = (
-            round((end_rec.rd_intensity_pct - start_rec.rd_intensity_pct) * 100.0, 1)
-            if start_rec.rd_intensity_pct is not None and end_rec.rd_intensity_pct is not None
-            else None
-        )
-
-        derived_margin_inputs: dict[str, list[NumericCitation]] = {}
-        if op_margin_bps is not None:
-            derived_margin_inputs["operating_margin_bps_delta"] = [
-                _numeric_citation_for_profile(
-                    start_prof, "operating_income", start_prof.operating_income
-                ),
-                _numeric_citation_for_profile(start_prof, "revenue", start_prof.revenue),
-                _numeric_citation_for_profile(
-                    end_prof, "operating_income", end_prof.operating_income
-                ),
-                _numeric_citation_for_profile(end_prof, "revenue", end_prof.revenue),
-            ]
-        if net_margin_bps is not None:
-            derived_margin_inputs["net_margin_bps_delta"] = [
-                _numeric_citation_for_profile(start_prof, "net_income", start_prof.net_income),
-                _numeric_citation_for_profile(start_prof, "revenue", start_prof.revenue),
-                _numeric_citation_for_profile(end_prof, "net_income", end_prof.net_income),
-                _numeric_citation_for_profile(end_prof, "revenue", end_prof.revenue),
-            ]
-        if rd_intensity_bps is not None:
-            derived_margin_inputs["rd_intensity_bps_delta"] = [
-                _numeric_citation_for_profile(
-                    start_prof, "research_and_development", start_prof.research_and_development
-                ),
-                _numeric_citation_for_profile(start_prof, "revenue", start_prof.revenue),
-                _numeric_citation_for_profile(
-                    end_prof, "research_and_development", end_prof.research_and_development
-                ),
-                _numeric_citation_for_profile(end_prof, "revenue", end_prof.revenue),
-            ]
-
-        annual_series: list[AnnualStepVariance] = []
-        source_urls: dict[int, str] = {}
-        period_end_dates: dict[int, str] = {}
-        filing_dates: dict[int, str] = {}
-        accession_numbers: dict[int, str] = {}
-        metric_provenance_by_year: dict[int, dict[str, str | None]] = {}
-        for fy in avail_years:
-            curr = fy_map[fy]
-            source_urls[fy] = curr.sec_filing_url
-            if curr.period_of_report:
-                period_end_dates[fy] = curr.period_of_report
-            if curr.filing_date:
-                filing_dates[fy] = curr.filing_date
-            if curr.accession_number:
-                accession_numbers[fy] = curr.accession_number
-            prov_dict: dict[str, str | None] = {
-                "revenue": _xbrl_concept_for_metric(curr, "revenue"),
-                "operating_income": _xbrl_concept_for_metric(curr, "operating_income"),
-                "net_income": _xbrl_concept_for_metric(curr, "net_income"),
-                "research_and_development": _xbrl_concept_for_metric(
-                    curr, "research_and_development"
-                ),
-            }
-            metric_provenance_by_year[fy] = prov_dict
-
-            prev = fy_map.get(fy - 1)
-            rev_yoy_d = rev_yoy_p = op_yoy_d = op_yoy_p = ni_yoy_d = ni_yoy_p = None
-            rd_yoy_d = rd_yoy_p = None
-            if prev is not None:
-                if curr.revenue is not None and prev.revenue is not None:
-                    rev_yoy_d = round(curr.revenue - prev.revenue, 2)
-                    if prev.revenue != 0:
-                        rev_yoy_p = round((rev_yoy_d / abs(prev.revenue)) * 100.0, 2)
-                if curr.operating_income is not None and prev.operating_income is not None:
-                    op_yoy_d = round(curr.operating_income - prev.operating_income, 2)
-                    if prev.operating_income != 0:
-                        op_yoy_p = round((op_yoy_d / abs(prev.operating_income)) * 100.0, 2)
-                if curr.net_income is not None and prev.net_income is not None:
-                    ni_yoy_d = round(curr.net_income - prev.net_income, 2)
-                    if prev.net_income != 0:
-                        ni_yoy_p = round((ni_yoy_d / abs(prev.net_income)) * 100.0, 2)
-                curr_rd, prev_rd = curr.research_and_development, prev.research_and_development
-                if curr_rd is not None and prev_rd is not None:
-                    rd_yoy_d = round(curr_rd - prev_rd, 2)
-                    if prev_rd != 0:
-                        rd_yoy_p = round((rd_yoy_d / abs(prev_rd)) * 100.0, 2)
-
-            annual_series.append(
-                AnnualStepVariance(
-                    fiscal_year=fy,
-                    prev_fiscal_year=prev.fiscal_year if prev else None,
-                    period_of_report=curr.period_of_report or None,
-                    filing_date=curr.filing_date or None,
-                    accession_number=curr.accession_number or None,
-                    prior_period_of_report=(prev.period_of_report or None) if prev else None,
-                    prior_accession_number=(prev.accession_number or None) if prev else None,
-                    prior_sec_filing_url=(prev.sec_filing_url or None) if prev else None,
-                    revenue=curr.revenue,
-                    revenue_yoy_delta=rev_yoy_d,
-                    revenue_yoy_pct=rev_yoy_p,
-                    operating_income=curr.operating_income,
-                    operating_income_yoy_delta=op_yoy_d,
-                    operating_income_yoy_pct=op_yoy_p,
-                    net_income=curr.net_income,
-                    net_income_yoy_delta=ni_yoy_d,
-                    net_income_yoy_pct=ni_yoy_p,
-                    research_and_development=curr.research_and_development,
-                    research_and_development_yoy_delta=rd_yoy_d,
-                    research_and_development_yoy_pct=rd_yoy_p,
-                    metric_provenance=prov_dict,
-                    sec_filing_url=curr.sec_filing_url,
+def _query_telemetry_explore(explore_key: str, ticker_filter: set[str]) -> dict[str, Any]:
+    sink = get_telemetry_sink()
+    if explore_key == "llm_telemetry":
+        rows = sink.query_llm_telemetry_explore(limit=50)
+        return {
+            "status": "success",
+            "explore_name": "llm_telemetry",
+            "lookml_model": "sec_edgar_analytics",
+            "lookml_explore": "llm_telemetry_and_cost",
+            "row_count": len(rows),
+            "rows": rows,
+        }
+    if explore_key == "session_analytics":
+        rows = sink.query_session_telemetry(limit=50)
+        if ticker_filter:
+            rows = [
+                r
+                for r in rows
+                if ticker_filter.intersection(
+                    {normalize_edgar_ticker(str(t)) for t in (r.get("tickers_analyzed") or [])}
                 )
+            ]
+        return {
+            "status": "success",
+            "explore_name": "session_analytics",
+            "lookml_model": "sec_edgar_analytics",
+            "lookml_explore": "session_analytics",
+            "summary": sink.summarize_session_telemetry(),
+            "row_count": len(rows),
+            "rows": rows,
+        }
+    rows = sink.query_security_audit_logs(limit=50)
+    if ticker_filter:
+        rows = [
+            r
+            for r in rows
+            if ticker_filter.intersection(
+                {normalize_edgar_ticker(str(t)) for t in (r.get("tickers") or [])}
             )
-
-        report = CompanyVarianceReport(
-            ticker=ticker,
-            company_name=end_prof.company_name,
-            cik=end_prof.cik,
-            gics_sector=end_prof.gics_sector,
-            gics_sub_industry=end_prof.gics_sub_industry,
-            start_year=eff_start,
-            end_year=eff_end,
-            requested_start_year=int(start_year),
-            requested_end_year=int(end_year),
-            available_fiscal_years=avail_years,
-            missing_fiscal_years=missing_years,
-            currency=end_prof.currency,
-            revenue_variance=rev_var,
-            operating_income_variance=op_var,
-            net_income_variance=ni_var,
-            research_and_development_variance=rd_var,
-            operating_margin_bps_delta=op_margin_bps,
-            net_margin_bps_delta=net_margin_bps,
-            rd_intensity_bps_delta=rd_intensity_bps,
-            annual_series=annual_series,
-            source_urls=source_urls,
-            period_end_dates=period_end_dates,
-            filing_dates=filing_dates,
-            accession_numbers=accession_numbers,
-            metric_provenance=metric_provenance_by_year,
-            derived_margin_inputs=derived_margin_inputs,
-        )
-        reports.append(report.model_dump(mode="json"))
-
-    missing_tickers = sorted(t for t in ticker_filter if t not in found_norm_tickers)
-    return reports, missing_tickers
+        ]
+    return {
+        "status": "success",
+        "explore_name": "audit_trail",
+        "lookml_model": "sec_edgar_analytics",
+        "lookml_explore": "security_audit_logs",
+        "row_count": len(rows),
+        "rows": rows,
+    }
 
 
-def _execute_live_gcp_hybrid_rag(
-    adapters: GcpToolAdapters,
+def _query_bigquery_explore(
+    explore_key: str,
     *,
-    query: str,
     ticker_filter: set[str],
     sector_norm: str | None,
-    sec_norm: str | None,
     start_year: int,
     end_year: int,
-    effective_top_k: int,
-) -> tuple[list[dict[str, Any]], int, list[str]]:
-    """Run parallel hybrid retrieval across BigQuery `VECTOR_SEARCH` and Vertex AI Search."""
-    candidate_k = min(25, max(effective_top_k * 2, 10))
-    services_hit: list[str] = []
-    backend_errors: list[Exception] = []
-
-    def _run_bq_vector_branch() -> tuple[list[dict[str, Any]], list[str]]:
-        local_services: list[str] = []
-        q_emb = adapters.embed_query(query)
-        local_services.append("vertex_ai_embeddings")
-        hits = adapters.bigquery.vector_search_chunks(
-            q_emb,
+) -> dict[str, Any]:
+    adapters = _gcp_adapters()
+    if explore_key == "chunk_health":
+        return adapters.bigquery.query_chunk_health()
+    if explore_key in ("yoy_variances", "peer_comparison"):
+        bq_rows = adapters.bigquery.query_yoy_variances(
             tickers=ticker_filter,
             gics_sector=sector_norm,
-            section_id=sec_norm,
             start_year=start_year,
             end_year=end_year,
-            top_k=candidate_k,
         )
-        local_services.append("bigquery_vector_search")
-        return hits, local_services
-
-    def _run_vais_branch() -> list[dict[str, Any]]:
-        return adapters.vertex_ai_search.search_documents(
-            query,
+    else:
+        bq_rows = adapters.bigquery.query_sector_benchmarks(
             tickers=ticker_filter,
             gics_sector=sector_norm,
-            section_id=sec_norm,
             start_year=start_year,
             end_year=end_year,
-            page_size=candidate_k,
         )
-
-    bq_vector_hits: list[dict[str, Any]] = []
-    vais_hits: list[dict[str, Any]] = []
-
-    ctx_bq = contextvars.copy_context()
-    ctx_vais = contextvars.copy_context()
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_bq = pool.submit(ctx_bq.run, _run_bq_vector_branch)
-        fut_vais = pool.submit(ctx_vais.run, _run_vais_branch)
-
-        try:
-            bq_vector_hits, bq_services = fut_bq.result()
-            services_hit.extend(bq_services)
-        except Exception as exc:
-            if _is_transient_gcp_error(exc):
-                raise
-            backend_errors.append(exc)
-            logger.warning("BigQuery VECTOR_SEARCH branch failed: %s", exc)
-
-        try:
-            vais_hits = fut_vais.result()
-            services_hit.append("vertex_ai_search")
-        except Exception as exc:
-            if _is_transient_gcp_error(exc):
-                raise
-            backend_errors.append(exc)
-            logger.info("Vertex AI Search (Discovery Engine) unavailable: %s", exc)
-
-    retrieval_backends = {
-        s for s in services_hit if s in ("vertex_ai_search", "bigquery_vector_search")
+    return {
+        "status": "success",
+        "explore_name": explore_key,
+        "row_count": len(bq_rows),
+        "rows": bq_rows,
     }
-    if not retrieval_backends:
-        if backend_errors:
-            raise backend_errors[0]
-        raise ToolExecutionError(
-            "No live GCP RAG retrieval backends (BigQuery VECTOR_SEARCH or Vertex AI Search) succeeded."
-        )
-
-    # Reciprocal Rank Fusion (RRF) + semantic similarity + lexical keyword scoring
-    fused: dict[str, dict[str, Any]] = {}
-
-    def _upsert_canonical_hit(hit: dict[str, Any], rank: int) -> None:
-        cid = str(hit.get("chunk_id") or "").strip()
-        if not cid:
-            return
-        text = str(hit.get("chunk_text") or "").strip()
-        if not text:
-            return
-        ticker = str(hit.get("ticker") or "").strip()
-        fy_val = hit.get("fiscal_year")
-        if not ticker or fy_val is None:
-            return
-        fy = int(fy_val)
-        if fy < start_year or fy > end_year:
-            return
-        if ticker_filter and ticker.upper().replace(".", "-") not in ticker_filter:
-            return
-        sector_val = str(hit.get("gics_sector") or "Unknown")
-        if sector_norm and sector_val.lower() != sector_norm:
-            return
-        resolved_sec = _normalize_section_id(
-            str(hit.get("section_id") or ""),
-            requested_section=sec_norm,
-            passage_text=text,
-        )
-        if sec_norm and resolved_sec != sec_norm:
-            return
-
-        rrf_inc = 1.0 / (60.0 + rank)
-        sim = float(hit.get("similarity") or 0.0)
-
-        if cid in fused:
-            fused[cid]["rrf_score"] += rrf_inc
-            fused[cid]["max_similarity"] = max(fused[cid]["max_similarity"], sim)
-            return
-
-        fused[cid] = {
-            "chunk_id": cid,
-            "profile_id": str(hit.get("profile_id") or f"{ticker}_{fy}"),
-            "ticker": ticker,
-            "company_name": str(hit.get("company_name") or ticker),
-            "gics_sector": sector_val,
-            "fiscal_year": fy,
-            "period_of_report": str(hit.get("period_of_report") or "") or None,
-            "filing_date": str(hit.get("filing_date") or "") or None,
-            "accession_number": str(hit.get("accession_number") or "") or None,
-            "section_id": resolved_sec,
-            "section_title": str(hit.get("section_title") or _default_section_title(resolved_sec)),
-            "chunk_text": text,
-            "sec_filing_url": str(hit.get("sec_filing_url") or ""),
-            "unstructured_gcs_uri": str(hit.get("unstructured_gcs_uri") or ""),
-            "rrf_score": rrf_inc,
-            "max_similarity": sim,
-        }
-
-    for rank, bq_hit in enumerate(bq_vector_hits, start=1):
-        _upsert_canonical_hit(bq_hit, rank)
-
-    # Reconcile Discovery Engine extractive segments with canonical chunks where overlapping
-    for rank, vais_hit in enumerate(vais_hits, start=1):
-        seg_text = str(vais_hit.get("chunk_text") or "").strip()
-        if not seg_text:
-            continue
-        seg_probe = seg_text[:64].lower()
-        vais_prof = str(vais_hit.get("profile_id") or "")
-        matched_cid: str | None = None
-        for cid, cand in fused.items():
-            if cand["profile_id"] != vais_prof:
-                continue
-            cand_lower = cand["chunk_text"].lower()
-            if seg_probe in cand_lower or cand_lower[:64] in seg_text.lower():
-                matched_cid = cid
-                break
-        if matched_cid is not None:
-            fused[matched_cid]["rrf_score"] += 1.0 / (60.0 + rank)
-            fused[matched_cid]["max_similarity"] = max(
-                fused[matched_cid]["max_similarity"],
-                float(vais_hit.get("similarity") or 0.0),
-            )
-        else:
-            _upsert_canonical_hit(vais_hit, rank)
-
-    query_terms = set(_WORD_TOKEN_RE.findall(query.lower()))
-    scored_candidates: list[tuple[float, dict[str, Any]]] = []
-    for cand in fused.values():
-        text_lower = cand["chunk_text"].lower()
-        lexical_boost = 0.0
-        if query_terms:
-            matched_terms = sum(1 for term in query_terms if term in text_lower)
-            lexical_boost = 0.35 * (matched_terms / len(query_terms))
-        rrf_norm = min(1.0, cand["rrf_score"] * 30.0)
-        hybrid_score = 0.55 * float(cand["max_similarity"]) + 0.30 * rrf_norm + lexical_boost
-        scored_candidates.append((hybrid_score, cand))
-
-    scored_candidates.sort(key=lambda item: item[0], reverse=True)
-    top_items = scored_candidates[:effective_top_k]
-
-    citations: list[dict[str, Any]] = []
-    for score, cand in top_items:
-        cit = GroundedCitation(
-            chunk_id=cand["chunk_id"],
-            profile_id=cand["profile_id"],
-            ticker=cand["ticker"],
-            company_name=cand["company_name"],
-            gics_sector=cand["gics_sector"],
-            fiscal_year=cand["fiscal_year"],
-            period_of_report=cand.get("period_of_report"),
-            filing_date=cand.get("filing_date"),
-            accession_number=cand.get("accession_number"),
-            section_id=cand["section_id"],
-            section_title=cand["section_title"],
-            excerpt=cand["chunk_text"],
-            sec_filing_url=cand["sec_filing_url"],
-            unstructured_gcs_uri=cand["unstructured_gcs_uri"],
-            score=round(score, 4),
-        )
-        citations.append(cit.model_dump(mode="json"))
-
-    return citations, len(fused), services_hit
 
 
 # ---------------------------------------------------------------------------
@@ -2338,11 +397,7 @@ def fetch_financial_metrics(
         Dictionary with 'status', 'record_count', and 'metrics' list of structured financial records.
     """
     ticker_filter = _parse_ticker_list(tickers)
-    sector_norm = (
-        gics_sector.strip().lower()
-        if gics_sector and gics_sector.strip().upper() not in ("ALL", "*", "")
-        else None
-    )
+    sector_norm = _normalize_sector_filter(gics_sector)
 
     adapters = _gcp_adapters()
     bq_profiles = adapters.bigquery.fetch_profiles(
@@ -2395,20 +450,8 @@ def query_looker_financial_explore(
         Dictionary with 'status', 'explore_name', 'row_count', and 'rows' from the requested BI explore.
     """
     raw_explore_key = explore_name.strip().lower()
-    alias_map = {
-        "llm_telemetry_and_cost": "llm_telemetry",
-        "security_audit_logs": "audit_trail",
-    }
-    explore_key = alias_map.get(raw_explore_key, raw_explore_key)
-    if explore_key not in (
-        "yoy_variances",
-        "sector_benchmarks",
-        "peer_comparison",
-        "chunk_health",
-        "llm_telemetry",
-        "session_analytics",
-        "audit_trail",
-    ):
+    explore_key = _LOOKER_EXPLORE_ALIASES.get(raw_explore_key, raw_explore_key)
+    if explore_key not in _SUPPORTED_LOOKER_EXPLORES:
         return {
             "status": "error",
             "explore_name": explore_name,
@@ -2420,109 +463,31 @@ def query_looker_financial_explore(
         }
 
     ticker_filter = _parse_ticker_list(tickers)
-    sector_norm = (
-        gics_sector.strip().lower()
-        if gics_sector and gics_sector.strip().upper() not in ("ALL", "*", "")
-        else None
-    )
-
     if explore_key in ("llm_telemetry", "session_analytics", "audit_trail"):
-        sink = get_telemetry_sink()
-        if explore_key == "llm_telemetry":
-            tel_rows = sink.query_llm_telemetry_explore(limit=50)
-            tel_result: dict[str, Any] = {
-                "status": "success",
-                "explore_name": "llm_telemetry",
-                "lookml_model": "sec_edgar_analytics",
-                "lookml_explore": "llm_telemetry_and_cost",
-                "row_count": len(tel_rows),
-                "rows": tel_rows,
-            }
-        elif explore_key == "session_analytics":
-            sess_rows = sink.query_session_telemetry(limit=50)
-            if ticker_filter:
-                sess_rows = [
-                    r
-                    for r in sess_rows
-                    if ticker_filter.intersection(
-                        {str(t).upper() for t in (r.get("tickers_analyzed") or [])}
-                    )
-                ]
-            tel_result = {
-                "status": "success",
-                "explore_name": "session_analytics",
-                "lookml_model": "sec_edgar_analytics",
-                "lookml_explore": "session_analytics",
-                "summary": sink.summarize_session_telemetry(),
-                "row_count": len(sess_rows),
-                "rows": sess_rows,
-            }
-        else:
-            aud_rows = sink.query_security_audit_logs(limit=50)
-            if ticker_filter:
-                aud_rows = [
-                    r
-                    for r in aud_rows
-                    if ticker_filter.intersection(
-                        {str(t).upper() for t in (r.get("tickers") or [])}
-                    )
-                ]
-            tel_result = {
-                "status": "success",
-                "explore_name": "audit_trail",
-                "lookml_model": "sec_edgar_analytics",
-                "lookml_explore": "security_audit_logs",
-                "row_count": len(aud_rows),
-                "rows": aud_rows,
-            }
-        if tool_context is not None and hasattr(tool_context, "state"):
-            history = list(tool_context.state.get("looker_query_results", []))
-            history.append(tel_result)
-            tool_context.state["looker_query_results"] = history
-        return tel_result
-
-    adapters = _gcp_adapters()
-    if explore_key == "chunk_health":
-        health_res = adapters.bigquery.query_chunk_health()
+        result = _query_telemetry_explore(explore_key, ticker_filter)
+    else:
+        result = _query_bigquery_explore(
+            explore_key,
+            ticker_filter=ticker_filter,
+            sector_norm=_normalize_sector_filter(gics_sector),
+            start_year=start_year,
+            end_year=end_year,
+        )
         _record_gcp_backend_invocation(
             tool_context,
             tool_name="query_looker_financial_explore",
             data_source="gcp",
             services_hit=["bigquery"],
         )
-        return health_res
 
-    if explore_key in ("yoy_variances", "peer_comparison"):
-        bq_rows = adapters.bigquery.query_yoy_variances(
-            tickers=ticker_filter,
-            gics_sector=sector_norm,
-            start_year=start_year,
-            end_year=end_year,
-        )
-    else:
-        bq_rows = adapters.bigquery.query_sector_benchmarks(
-            tickers=ticker_filter,
-            gics_sector=sector_norm,
-            start_year=start_year,
-            end_year=end_year,
-        )
-
-    result = {
-        "status": "success",
-        "explore_name": explore_key,
-        "row_count": len(bq_rows),
-        "rows": bq_rows,
-    }
-    if tool_context is not None and hasattr(tool_context, "state"):
+    if (
+        tool_context is not None
+        and hasattr(tool_context, "state")
+        and explore_key != "chunk_health"
+    ):
         history = list(tool_context.state.get("looker_query_results", []))
         history.append(result)
         tool_context.state["looker_query_results"] = history
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="query_looker_financial_explore",
-        data_source="gcp",
-        services_hit=["bigquery"],
-    )
     return result
 
 
@@ -2616,11 +581,7 @@ def search_10k_chunks_rag(
         Dictionary with 'status', 'citation_count', and 'citations' list of GroundedCitation records.
     """
     ticker_filter = _parse_ticker_list(tickers)
-    sector_norm = (
-        gics_sector.strip().lower()
-        if gics_sector and gics_sector.strip().upper() not in ("ALL", "*", "")
-        else None
-    )
+    sector_norm = _normalize_sector_filter(gics_sector)
     sec_norm = (
         section_id.strip().lower()
         if section_id and section_id.strip().upper() not in ("ALL", "*", "")
@@ -2640,8 +601,7 @@ def search_10k_chunks_rag(
     )
     if tool_context is not None and hasattr(tool_context, "state"):
         existing_cits = list(tool_context.state.get("retrieved_citations", []))
-        existing_cits.extend(gcp_citations)
-        tool_context.state["retrieved_citations"] = existing_cits
+        tool_context.state["retrieved_citations"] = merge_citations(existing_cits, gcp_citations)
     _record_gcp_backend_invocation(
         tool_context,
         tool_name="search_10k_chunks_rag",
@@ -2685,7 +645,7 @@ def load_cached_10k_section(
         Dictionary with 'status', 'cache_hit', 'token_estimate', 'lookup_latency_ms', 'sec_filing_url', and grounded Markdown 'content'.
     """
     t0 = time.perf_counter()
-    norm_ticker = ticker.strip().upper().replace(".", "-")
+    norm_ticker = normalize_edgar_ticker(ticker)
     sec_key = section_id.strip().lower()
     if sec_key not in ("item_1a", "item_7"):
         return {
@@ -2712,7 +672,6 @@ def load_cached_10k_section(
             }
         gcs_target = matched_prof.unstructured_gcs_uri or matched_prof.unstructured_blob_path
         md_content = adapters.gcs_corpus.fetch_markdown(gcs_target)
-        content_source = "gcs"
         _record_gcp_backend_invocation(
             tool_context,
             tool_name="load_cached_10k_section",
@@ -2733,7 +692,7 @@ def load_cached_10k_section(
             "unstructured_gcs_uri": matched_prof.unstructured_gcs_uri,
             "token_estimate": token_est,
             "full_text": sec_text,
-            "content_source": content_source,
+            "content_source": "gcs",
         }
         _SESSION_10K_CONTEXT_CACHE[cache_id] = entry
 
@@ -2741,44 +700,25 @@ def load_cached_10k_section(
     excerpt = str(entry["full_text"])[:effective_max]
     lookup_latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
 
-    saved_tokens_delta = int(entry["token_estimate"] * 0.75) if cache_hit else 0
+    saved_tokens_delta = 0
     if cache_hit:
-        _CONTEXT_CACHE_RUNTIME_COUNTERS["hits"] = (
-            int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("hits", 0)) + 1
-        )
-        _CONTEXT_CACHE_RUNTIME_COUNTERS["cached_tokens_saved"] = (
-            int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("cached_tokens_saved", 0)) + saved_tokens_delta
-        )
-        _CONTEXT_CACHE_RUNTIME_COUNTERS["total_hit_latency_ms"] = (
-            float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_hit_latency_ms", 0.0))
-            + lookup_latency_ms
+        saved_tokens_delta = _CONTEXT_CACHE_STATS.record_hit(
+            token_estimate=int(entry["token_estimate"]),
+            latency_ms=lookup_latency_ms,
         )
     else:
-        _CONTEXT_CACHE_RUNTIME_COUNTERS["misses"] = (
-            int(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("misses", 0)) + 1
-        )
-        _CONTEXT_CACHE_RUNTIME_COUNTERS["total_miss_latency_ms"] = (
-            float(_CONTEXT_CACHE_RUNTIME_COUNTERS.get("total_miss_latency_ms", 0.0))
-            + lookup_latency_ms
+        _CONTEXT_CACHE_STATS.record_miss(
+            token_estimate=int(entry["token_estimate"]),
+            latency_ms=lookup_latency_ms,
         )
 
-    if tool_context is not None and hasattr(tool_context, "state"):
-        stats = dict(
-            tool_context.state.get(
-                "context_cache_stats",
-                {"hits": 0, "misses": 0, "cached_tokens_saved": 0},
-            )
-        )
-        if cache_hit:
-            stats["hits"] = int(stats.get("hits", 0)) + 1
-            stats["cached_tokens_saved"] = (
-                int(stats.get("cached_tokens_saved", 0)) + saved_tokens_delta
-            )
-        else:
-            stats["misses"] = int(stats.get("misses", 0)) + 1
-        stats["last_lookup_latency_ms"] = lookup_latency_ms
-        stats["last_cache_key"] = cache_id
-        tool_context.state["context_cache_stats"] = stats
+    _update_context_cache_state(
+        tool_context,
+        cache_hit=cache_hit,
+        saved_tokens_delta=saved_tokens_delta,
+        lookup_latency_ms=lookup_latency_ms,
+        cache_key=cache_id,
+    )
 
     return {
         "status": "success",
@@ -2799,14 +739,6 @@ def load_cached_10k_section(
     }
 
 
-def parse_10k_cache_key(cache_key: str) -> tuple[str, int, str] | None:
-    """Split a `{TICKER}_{FY}_{item_1a|item_7}` section cache key into its parts."""
-    match = _10K_CACHE_KEY_RE.match(str(cache_key).strip())
-    if match is None:
-        return None
-    return match["ticker"].upper(), int(match["fiscal_year"]), match["section_id"]
-
-
 def get_full_10k_section(cache_key: str) -> dict[str, Any] | None:
     """Return the full parsed 10-K section entry for a cache key, hydrating the L1 cache on miss.
 
@@ -2817,11 +749,12 @@ def get_full_10k_section(cache_key: str) -> dict[str, Any] | None:
     if parsed is None:
         return None
     ticker, fiscal_year, section_id = parsed
-    norm_key = f"{ticker}_{fiscal_year}_{section_id}"
+    norm_ticker = normalize_edgar_ticker(ticker)
+    norm_key = f"{norm_ticker}_{fiscal_year}_{section_id}"
     entry = _SESSION_10K_CONTEXT_CACHE.get(norm_key)
     if entry is None:
         res = load_cached_10k_section(
-            ticker=ticker,
+            ticker=norm_ticker,
             fiscal_year=fiscal_year,
             section_id=section_id,
             max_chars=500,
@@ -2862,7 +795,7 @@ def query_cached_10k_context(
         'content_source', and 'matched_citations'.
     """
     t0 = time.perf_counter()
-    norm_ticker = ticker.strip().upper().replace(".", "-")
+    norm_ticker = normalize_edgar_ticker(ticker)
     sec_key = section_id.strip().lower()
     if sec_key not in ("item_1a", "item_7"):
         return {
@@ -2876,8 +809,7 @@ def query_cached_10k_context(
     services_hit: list[str] = []
 
     cached_chunks_entry = _SECTION_CHUNKS_CACHE.get(cache_key)
-    section_text_entry = _SESSION_10K_CONTEXT_CACHE.get(cache_key)
-    cache_hit = (cached_chunks_entry is not None) or (section_text_entry is not None)
+    cache_hit = cached_chunks_entry is not None
 
     if cached_chunks_entry is None:
         section_chunks = adapters.bigquery.fetch_section_chunks(
@@ -2895,25 +827,19 @@ def query_cached_10k_context(
                     f"{norm_ticker} FY{fy_int} {sec_key}."
                 ),
             }
-        # Build normalized embedding matrix from BigQuery's pre-computed embeddings when present.
         raw_embs = [c.get("embedding") for c in section_chunks]
         has_precomputed = all(isinstance(e, list) and len(e) > 0 for e in raw_embs)
         if has_precomputed:
-            mat = np.asarray([[float(v) for v in e] for e in raw_embs], dtype=np.float32)
-            norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            norms[norms == 0.0] = 1.0
-            mat = mat / norms
+            mat = _l2_normalize_rows(
+                np.asarray([[float(v) for v in e] for e in raw_embs], dtype=np.float32)
+            )
             emb_source = "bigquery_precomputed"
         else:
-            # Mock transports without embedding column: embed canonical chunk texts once.
             embedded = adapters.embed_texts(
                 [str(c.get("chunk_text") or "")[:600] for c in section_chunks],
                 task_type="RETRIEVAL_DOCUMENT",
             )
-            mat = np.asarray(embedded, dtype=np.float32)
-            norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            norms[norms == 0.0] = 1.0
-            mat = mat / norms
+            mat = _l2_normalize_rows(np.asarray(embedded, dtype=np.float32))
             emb_source = "vertex_ai_embedded"
             services_hit.append("vertex_ai_embeddings")
 
@@ -2989,43 +915,47 @@ def query_cached_10k_context(
         )
         if cid not in matched_chunk_ids:
             matched_chunk_ids.append(cid)
-            cit = GroundedCitation(
-                chunk_id=cid,
-                profile_id=str(chunk.get("profile_id") or f"{norm_ticker}_{fy_int}"),
-                ticker=str(chunk.get("ticker") or norm_ticker),
-                company_name=str(chunk.get("company_name") or norm_ticker),
-                gics_sector=str(chunk.get("gics_sector") or "Unknown"),
-                fiscal_year=int(chunk.get("fiscal_year") or fy_int),
-                period_of_report=str(chunk.get("period_of_report") or "") or None,
-                filing_date=str(chunk.get("filing_date") or "") or None,
-                accession_number=str(chunk.get("accession_number") or "") or None,
-                section_id=_normalize_section_id(
-                    str(chunk.get("section_id") or sec_key),
-                    requested_section=sec_key,
-                ),
-                section_title=str(chunk.get("section_title") or _default_section_title(sec_key)),  # type: ignore[arg-type]
+            resolved_sec = _normalize_section_id(
+                str(chunk.get("section_id") or sec_key),
+                requested_section=sec_key,
+            )
+            cit = GroundedCitation.from_row(
+                {**chunk, "section_id": resolved_sec},
+                score=float(score_val),
                 excerpt=chunk_text,
-                sec_filing_url=str(chunk.get("sec_filing_url") or ""),
-                unstructured_gcs_uri=str(chunk.get("unstructured_gcs_uri") or ""),
-                score=round(max(0.0, min(1.0, float(score_val))), 4),
+                fallback_ticker=norm_ticker,
+                fallback_fiscal_year=fy_int,
+                fallback_section_id=resolved_sec,
+                clamp_score=True,
             )
             matched_citations.append(cit.model_dump(mode="json"))
 
     if tool_context is not None and hasattr(tool_context, "state") and matched_citations:
         existing_cits = list(tool_context.state.get("retrieved_citations", []))
-        seen_ids = {c.get("chunk_id") for c in existing_cits}
-        for mc in matched_citations:
-            if mc["chunk_id"] not in seen_ids:
-                existing_cits.append(mc)
-                seen_ids.add(mc["chunk_id"])
-        tool_context.state["retrieved_citations"] = existing_cits
+        tool_context.state["retrieved_citations"] = merge_citations(
+            existing_cits, matched_citations
+        )
 
     total_lookup_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-    section_title = (
-        "Item 7. Management's Discussion and Analysis"
-        if sec_key == "item_7"
-        else "Item 1A. Risk Factors"
+    saved_tokens_delta = 0
+    if cache_hit:
+        saved_tokens_delta = _CONTEXT_CACHE_STATS.record_hit(
+            token_estimate=int(cached_chunks_entry["token_estimate"]),
+            latency_ms=total_lookup_ms,
+        )
+    else:
+        _CONTEXT_CACHE_STATS.record_miss(
+            token_estimate=int(cached_chunks_entry["token_estimate"]),
+            latency_ms=total_lookup_ms,
+        )
+    _update_context_cache_state(
+        tool_context,
+        cache_hit=cache_hit,
+        saved_tokens_delta=saved_tokens_delta,
+        lookup_latency_ms=total_lookup_ms,
+        cache_key=cache_key,
     )
+
     return {
         "status": "success",
         "cache_key": cache_key,
@@ -3037,7 +967,7 @@ def query_cached_10k_context(
         "period_of_report": cached_chunks_entry["period_of_report"],
         "accession_number": cached_chunks_entry["accession_number"],
         "section_id": sec_key,
-        "section_title": section_title,
+        "section_title": SECTION_TITLES[sec_key],
         "token_estimate": cached_chunks_entry["token_estimate"],
         "lookup_latency_ms": total_lookup_ms,
         "sec_filing_url": cached_chunks_entry["sec_filing_url"],
@@ -3057,3 +987,56 @@ VarianceCalculationTool = FunctionTool(calculate_period_variances)
 HybridSearchTool = FunctionTool(search_10k_chunks_rag)
 ContextCacheTool = FunctionTool(load_cached_10k_section)
 QueryCached10KTool = FunctionTool(query_cached_10k_context)
+
+__all__ = [
+    "BigQueryAdapter",
+    "ContextCacheTool",
+    "DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES",
+    "DEFAULT_10K_SECTION_CACHE_TTL_SECONDS",
+    "DEFAULT_BIGQUERY_DATASET_ID",
+    "DEFAULT_BQ_CHUNK_HEALTH_VIEW",
+    "DEFAULT_BQ_FILING_CHUNKS_TABLE",
+    "DEFAULT_BQ_FINANCIAL_METRICS_TABLE",
+    "DEFAULT_BQ_YOY_VARIANCES_VIEW",
+    "DEFAULT_VERTEX_AI_SEARCH_COLLECTION",
+    "DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID",
+    "DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID",
+    "DEFAULT_VERTEX_AI_SEARCH_LOCATION",
+    "GcpAdapterHttpError",
+    "GcpEndpointNotReadyError",
+    "GcpToolAdapters",
+    "GcpToolConfig",
+    "GcsCorpusAdapter",
+    "HybridSearchTool",
+    "LookerQueryTool",
+    "MetricFetchTool",
+    "QueryCached10KTool",
+    "VarianceCalculationTool",
+    "VertexAISearchAdapter",
+    "_SECTION_CHUNKS_CACHE",
+    "_SESSION_10K_CONTEXT_CACHE",
+    "_build_variance_reports_from_profiles",
+    "_compute_single_metric_variance",
+    "_default_section_title",
+    "_execute_live_gcp_hybrid_rag",
+    "_gcp_adapters",
+    "_normalize_section_id",
+    "_numeric_citation_for_profile",
+    "_parse_ticker_list",
+    "_profile_to_metric_record",
+    "_record_gcp_backend_invocation",
+    "_xbrl_concept_for_metric",
+    "calculate_period_variances",
+    "configure_gcp_tool_adapters",
+    "fetch_financial_metrics",
+    "get_active_gcp_tool_adapters",
+    "get_context_cache_runtime_stats",
+    "get_full_10k_section",
+    "get_gcp_adapters_status_metadata",
+    "load_cached_10k_section",
+    "parse_10k_cache_key",
+    "query_cached_10k_context",
+    "query_looker_financial_explore",
+    "reset_gcp_tool_adapters",
+    "search_10k_chunks_rag",
+]

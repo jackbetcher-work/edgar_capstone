@@ -28,26 +28,32 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import sys
 from datetime import date
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+try:
+    from scripts._cli import (
+        add_gcp_args,
+        add_logging_args,
+        configure_script_logging,
+        parse_ticker_args,
+    )
+except ImportError:  # pragma: no cover - direct script execution without editable install
+    from _cli import (  # type: ignore[import-not-found,no-redef]
+        add_gcp_args,
+        add_logging_args,
+        configure_script_logging,
+        parse_ticker_args,
+    )
 
-from edgar_capstone.dataset.extractor import DEFAULT_SEC_USER_AGENT  # noqa: E402
-from edgar_capstone.dataset.gcs_storage import (  # noqa: E402
-    DEFAULT_BUCKET_NAME,
+from edgar_capstone.dataset.gcs_storage import GCSAccessError
+from edgar_capstone.dataset.paths import resolve_curated_dataset_dir
+from edgar_capstone.dataset.pipeline import DatasetBuildConfig, run_dataset_pipeline
+from edgar_capstone.gcp.defaults import (
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
-    GCSAccessError,
-)
-from edgar_capstone.dataset.pipeline import (  # noqa: E402
-    DEFAULT_OUTPUT_DIR,
-    DatasetBuildConfig,
-    run_dataset_pipeline,
+    resolve_corpus_bucket,
+    resolve_sec_user_agent,
 )
 
 
@@ -102,23 +108,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # Google Cloud Storage settings
-    parser.add_argument(
-        "--project-id",
-        type=str,
-        default=os.environ.get("EDGAR_GCP_PROJECT_ID", DEFAULT_PROJECT_ID),
-        help="Google Cloud project ID (override via --project-id or EDGAR_GCP_PROJECT_ID).",
-    )
-    parser.add_argument(
-        "--bucket",
-        type=str,
-        default=os.environ.get("EDGAR_GCS_BUCKET", DEFAULT_BUCKET_NAME),
-        help="Target GCS bucket name (with or without gs:// prefix).",
-    )
-    parser.add_argument(
-        "--location",
-        type=str,
-        default=os.environ.get("EDGAR_GCP_REGION", DEFAULT_LOCATION),
-        help="GCS bucket location when creating the bucket if missing.",
+    # Deliberately ignores unrelated global $GCP_PROJECT_ID so sandbox defaults aren't hijacked.
+    add_gcp_args(
+        parser,
+        include_project=True,
+        include_bucket=True,
+        include_location=True,
+        project_default=os.environ.get("EDGAR_GCP_PROJECT_ID") or DEFAULT_PROJECT_ID,
+        bucket_default=resolve_corpus_bucket(),
+        location_default=os.environ.get("EDGAR_GCP_REGION") or DEFAULT_LOCATION,
+        project_help="Google Cloud project ID (override via --project-id or EDGAR_GCP_PROJECT_ID).",
+        bucket_help="Target GCS bucket name (with or without gs:// prefix).",
+        location_help="GCS bucket location when creating the bucket if missing.",
     )
     parser.add_argument(
         "--no-create-bucket",
@@ -127,10 +128,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # Execution & staging controls
+    default_output_dir = Path(
+        os.environ.get("EDGAR_DATASET_OUTPUT_DIR") or str(resolve_curated_dataset_dir())
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path(os.environ.get("EDGAR_DATASET_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR))),
+        default=default_output_dir,
         help="Local staging directory mirroring the GCS object layout.",
     )
     mode_group = parser.add_mutually_exclusive_group()
@@ -152,7 +156,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--user-agent",
         type=str,
-        default=os.environ.get("SEC_USER_AGENT", DEFAULT_SEC_USER_AGENT),
+        default=resolve_sec_user_agent(),
         help="SEC EDGAR User-Agent header ('Organization Name email@domain.com').",
     )
     parser.add_argument(
@@ -161,13 +165,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=8,
         help="Maximum concurrent threads when uploading files to GCS.",
     )
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity.",
-    )
+    add_logging_args(parser, restricted_choices=True)
 
     args = parser.parse_args(argv)
     if args.start_year > args.end_year:
@@ -178,11 +176,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint."""
     args = parse_args(argv)
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    configure_script_logging(level=args.log_level)
 
     config = DatasetBuildConfig(
         project_id=args.project_id,
@@ -192,7 +186,7 @@ def main(argv: list[str] | None = None) -> int:
         start_year=args.start_year,
         end_year=args.end_year,
         full_sp500=args.sp500,
-        tickers=args.tickers,
+        tickers=parse_ticker_args(args.tickers),
         sector_filter=args.sector,
         refresh_sp500=args.refresh_sp500,
         sec_user_agent=args.user_agent,

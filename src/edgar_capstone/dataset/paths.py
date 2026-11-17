@@ -1,9 +1,10 @@
 """Filesystem layout of the local ingestion staging area (`data/`).
 
-The ingestion scripts (`build-sec-dataset`, `build-vector-db`, `backfill-rd-metric`) stage
-10-K profiles, Markdown, and manifests under `data/curated_dataset/` before publishing
-them to GCS, BigQuery, and Vertex AI Search. The serving runtime never reads this
-directory; it queries those GCP services directly.
+Used dynamically by `dataset.pipeline`, `dataset.constituents`, `vector_db.pipeline`,
+and the ingestion scripts (`build-sec-dataset`, `build-vector-db`, `backfill-rd-metric`)
+to stage 10-K profiles, Markdown, and manifests under `data/curated_dataset/` before
+publishing them to GCS, BigQuery, and Vertex AI Search. The serving runtime never reads
+this directory; it queries those GCP services directly.
 
 The data root is resolved from (in order) the `EDGAR_DATA_ROOT` override, the source
 checkout (`<repo>/data`), `/app/data`, or `<cwd>/data`, so the scripts work from an

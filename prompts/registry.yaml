@@ -28,24 +28,6 @@ prompts:
       "1.0.0":
         semver: "1.0.0"
         path: "v1/financial_analyst.yaml"
-      v2:
-        semver: "2.0.0"
-        path: "v2/financial_analyst.yaml"
-      "2.0.0":
-        semver: "2.0.0"
-        path: "v2/financial_analyst.yaml"
-      v3:
-        semver: "3.0.0"
-        path: "v3/financial_analyst.yaml"
-      "3.0.0":
-        semver: "3.0.0"
-        path: "v3/financial_analyst.yaml"
-      v4:
-        semver: "4.0.0"
-        path: "v4/financial_analyst.yaml"
-      "4.0.0":
-        semver: "4.0.0"
-        path: "v4/financial_analyst.yaml"
       v5:
         semver: "5.0.0"
         path: "v5/financial_analyst.yaml"

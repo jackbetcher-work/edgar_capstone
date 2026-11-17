@@ -5,37 +5,42 @@ code in a version-controlled, integrity-hashed prompt store supporting three bac
 
 1. **`local`** (`prompts/` directory with `registry.yaml` and `<version>/<prompt_id>.yaml`).
 2. **`gcs`** (`gs://<bucket>/<prefix>/<version>/<prompt_id>.yaml` with optional GCS object
-   generation pinning via Google Cloud Storage REST / SDK).
+   generation pinning via Google Cloud Storage REST API).
 3. **`vertex`** (Google Cloud Vertex AI Prompt Management REST endpoint
    `projects/{project}/locations/{location}/datasets/{prompt_resource_id}` with version tags).
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
 
-import google.auth
 import httpx
 import yaml
-from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.auth.exceptions import DefaultCredentialsError
 
 from edgar_capstone.agents.resilience import (
     RateLimitExceededError,
     ToolExecutionError,
     UpstreamTimeoutError,
-    with_tool_resilience,
+    retry_transient_errors,
 )
-from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID
+from edgar_capstone.common.cache import BoundedTTLCache
+from edgar_capstone.common.domain import sha256_text
+from edgar_capstone.gcp.defaults import (
+    DEFAULT_PROJECT_ID,
+    resolve_gcp_location,
+    resolve_gcp_project_id,
+)
+from edgar_capstone.gcp.paths import resolve_asset_dir
+from edgar_capstone.gcp.rest_client import GcpRestClient, GcpRestError, parse_retry_after
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,16 @@ PromptBackendMode = Literal["auto", "local", "gcs", "vertex"]
 ResolvedPromptBackend = Literal["local", "gcs", "vertex"]
 
 DEFAULT_PROMPT_VERSION = "v1"
+_GCS_READ_SCOPE = "https://www.googleapis.com/auth/devstorage.read_only"
+_REMOTE_FETCH_ERRORS = (
+    httpx.HTTPError,
+    GcpRestError,
+    ToolExecutionError,
+    DefaultCredentialsError,
+    OSError,
+    KeyError,
+    ValueError,
+)
 
 
 def _resolve_default_prompts_dir() -> Path:
@@ -50,22 +65,24 @@ def _resolve_default_prompts_dir() -> Path:
     env_dir = os.environ.get("EDGAR_PROMPTS_DIR", "").strip()
     if env_dir:
         return Path(env_dir).expanduser().resolve()
-
-    # Source tree layout: <repo_root>/src/edgar_capstone/agents/prompt_store.py -> <repo_root>/prompts
-    repo_candidate = Path(__file__).resolve().parents[3] / "prompts"
-    if repo_candidate.is_dir():
-        return repo_candidate
-
-    container_candidate = Path("/app/prompts")
-    if container_candidate.is_dir():
-        return container_candidate
-
-    cwd_candidate = Path.cwd() / "prompts"
-    return cwd_candidate
+    return resolve_asset_dir("prompts", env_var="EDGAR_PROMPTS_DIR")
 
 
-def _compute_sha256(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+def _resolve_latest_from_registry(
+    prompt_id: str,
+    registry: dict[str, Any] | None,
+) -> str | None:
+    """Resolve the concrete version tag for `prompt_id` when `'latest'` is requested."""
+    if not isinstance(registry, dict) or not registry:
+        return None
+    prompts_map = registry.get("prompts")
+    entry = prompts_map.get(prompt_id) if isinstance(prompts_map, dict) else None
+    if isinstance(entry, dict) and entry.get("latest"):
+        return str(entry["latest"]).strip() or None
+    default_ver = registry.get("default_version")
+    if default_ver:
+        return str(default_ver).strip() or None
+    return None
 
 
 def _render_mustache_variables(template: str, variables: dict[str, Any]) -> str:
@@ -98,7 +115,6 @@ class PromptArtifact:
     source_uri: str
     description: str = ""
     variables: dict[str, Any] = field(default_factory=dict)
-    safety_policy: dict[str, Any] = field(default_factory=dict)
     raw_metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_public_metadata(self) -> dict[str, Any]:
@@ -112,6 +128,51 @@ class PromptArtifact:
             "source_backend": self.source_backend,
             "source_uri": self.source_uri,
         }
+
+
+def _verify_sha256(
+    rendered: str,
+    *,
+    prompt_id: str,
+    requested_version: str,
+    expected_sha256: str | None,
+) -> str:
+    digest = sha256_text(rendered)
+    if expected_sha256 and digest != expected_sha256.strip().lower():
+        raise ValueError(
+            f"Prompt integrity check failed for '{prompt_id}@{requested_version}': "
+            f"expected sha256={expected_sha256}, actual={digest}"
+        )
+    return digest
+
+
+def _extract_template_str(parsed: dict[str, Any]) -> str:
+    """Extract the template text from a YAML prompt spec or Vertex AI prompt resource."""
+    if isinstance(parsed.get("template"), str):
+        return parsed["template"]
+    if isinstance(parsed.get("promptData"), dict) or isinstance(parsed.get("prompt_data"), dict):
+        pdata = parsed.get("promptData") or parsed.get("prompt_data") or {}
+        sys_inst = pdata.get("systemInstruction") or pdata.get("system_instruction") or {}
+        parts = sys_inst.get("parts") or []
+        if parts:
+            return "\n".join(
+                str(p.get("text", "")) for p in parts if isinstance(p, dict) and p.get("text")
+            )
+        contents = pdata.get("contents") or []
+        chunks = [
+            str(p["text"])
+            for c in contents
+            if isinstance(c, dict)
+            for p in (c.get("parts") or [])
+            if isinstance(p, dict) and p.get("text")
+        ]
+        return "\n".join(chunks)
+    if isinstance(parsed.get("systemInstruction"), dict):
+        parts = parsed["systemInstruction"].get("parts") or []
+        return "\n".join(
+            str(p.get("text", "")) for p in parts if isinstance(p, dict) and p.get("text")
+        )
+    return ""
 
 
 def _parse_prompt_document(
@@ -146,23 +207,21 @@ def _parse_prompt_document(
             parsed = None
 
     if parsed is None:
-        # Plain Markdown / text prompt file
-        template = raw_text
         merged_vars = dict(override_variables or {})
-        rendered = _render_mustache_variables(template, merged_vars)
-        digest = _compute_sha256(rendered)
-        if expected_sha256 and digest != expected_sha256.strip().lower():
-            raise ValueError(
-                f"Prompt integrity check failed for '{prompt_id}@{requested_version}': "
-                f"expected sha256={expected_sha256}, actual={digest}"
-            )
+        rendered = _render_mustache_variables(raw_text, merged_vars)
+        digest = _verify_sha256(
+            rendered,
+            prompt_id=prompt_id,
+            requested_version=requested_version,
+            expected_sha256=expected_sha256,
+        )
         return PromptArtifact(
             prompt_id=prompt_id,
             version=requested_version,
             release_tag=requested_version,
             agent_name=prompt_id,
             model="",
-            template=template,
+            template=raw_text,
             rendered_text=rendered,
             sha256=digest,
             source_backend=source_backend,
@@ -170,44 +229,18 @@ def _parse_prompt_document(
             variables=merged_vars,
         )
 
-    # Support Vertex AI Prompt resource schema (`promptData` / `systemInstruction` / `contents`)
-    template_str = ""
-    if isinstance(parsed.get("template"), str):
-        template_str = parsed["template"]
-    elif isinstance(parsed.get("promptData"), dict) or isinstance(parsed.get("prompt_data"), dict):
-        pdata = parsed.get("promptData") or parsed.get("prompt_data") or {}
-        sys_inst = pdata.get("systemInstruction") or pdata.get("system_instruction") or {}
-        parts = sys_inst.get("parts") or []
-        if parts:
-            template_str = "\n".join(
-                str(p.get("text", "")) for p in parts if isinstance(p, dict) and p.get("text")
-            )
-        if not template_str:
-            contents = pdata.get("contents") or []
-            chunks: list[str] = []
-            for c in contents:
-                if isinstance(c, dict):
-                    for p in c.get("parts") or []:
-                        if isinstance(p, dict) and p.get("text"):
-                            chunks.append(str(p["text"]))
-            template_str = "\n".join(chunks)
-    elif isinstance(parsed.get("systemInstruction"), dict):
-        parts = parsed["systemInstruction"].get("parts") or []
-        template_str = "\n".join(
-            str(p.get("text", "")) for p in parts if isinstance(p, dict) and p.get("text")
-        )
-
+    template_str = _extract_template_str(parsed)
     default_vars = dict(parsed.get("variables") or {})
     if override_variables:
         default_vars.update(override_variables)
 
     rendered = _render_mustache_variables(template_str, default_vars)
-    digest = _compute_sha256(rendered)
-    if expected_sha256 and digest != expected_sha256.strip().lower():
-        raise ValueError(
-            f"Prompt integrity check failed for '{prompt_id}@{requested_version}': "
-            f"expected sha256={expected_sha256}, actual={digest}"
-        )
+    digest = _verify_sha256(
+        rendered,
+        prompt_id=prompt_id,
+        requested_version=requested_version,
+        expected_sha256=expected_sha256,
+    )
 
     version_str = str(
         parsed.get("version")
@@ -219,7 +252,6 @@ def _parse_prompt_document(
     agent_name = str(parsed.get("agent_name") or parsed.get("displayName") or prompt_id)
     model_name = str(parsed.get("model") or (parsed.get("promptData") or {}).get("model") or "")
     description = str(parsed.get("description") or "").strip()
-    safety_policy = dict(parsed.get("safety_policy") or {})
     extra_meta: dict[str, Any] = {}
     if isinstance(parsed.get("policy"), dict):
         extra_meta["policy"] = parsed["policy"]
@@ -237,7 +269,6 @@ def _parse_prompt_document(
         source_uri=source_uri,
         description=description,
         variables=default_vars,
-        safety_policy=safety_policy,
         raw_metadata=extra_meta,
     )
 
@@ -247,14 +278,17 @@ def _raise_for_prompt_http_status(resp: httpx.Response, service_label: str) -> N
         return
     snippet = resp.text[:300]
     if resp.status_code == 429:
-        raise RateLimitExceededError(f"{service_label} HTTP 429 rate limited: {snippet}")
-    if resp.status_code in (408, 502, 503, 504):
+        raise RateLimitExceededError(
+            f"{service_label} HTTP 429 rate limited: {snippet}",
+            retry_after_seconds=parse_retry_after(resp),
+        )
+    if resp.status_code in (408, 500, 502, 503, 504):
         raise UpstreamTimeoutError(f"{service_label} transient HTTP {resp.status_code}: {snippet}")
     raise ToolExecutionError(f"{service_label} HTTP {resp.status_code}: {snippet}")
 
 
 class LocalPromptStoreBackend:
-    """Loads versioned prompt specs from the local `prompts/` directory."""
+    """Loads versioned prompt specs from the local `prompts/` directory with mtime-cached registry."""
 
     def __init__(self, prompts_dir: Path | str | None = None) -> None:
         self.prompts_dir = (
@@ -262,13 +296,28 @@ class LocalPromptStoreBackend:
             if prompts_dir is not None
             else _resolve_default_prompts_dir()
         )
+        self._registry_lock = threading.Lock()
+        self._registry_mtime_ns: int | None = None
+        self._registry_cache: dict[str, Any] = {}
 
     def load_registry(self) -> dict[str, Any]:
+        """Load `prompts/registry.yaml`, caching the parsed dict keyed by file `mtime_ns`."""
         reg_path = self.prompts_dir / "registry.yaml"
-        if not reg_path.is_file():
+        try:
+            stat = reg_path.stat()
+        except OSError:
+            with self._registry_lock:
+                self._registry_mtime_ns = None
+                self._registry_cache = {}
             return {}
-        loaded = yaml.safe_load(reg_path.read_text(encoding="utf-8"))
-        return loaded if isinstance(loaded, dict) else {}
+
+        with self._registry_lock:
+            if self._registry_mtime_ns == stat.st_mtime_ns:
+                return self._registry_cache
+            loaded = yaml.safe_load(reg_path.read_text(encoding="utf-8"))
+            self._registry_cache = loaded if isinstance(loaded, dict) else {}
+            self._registry_mtime_ns = stat.st_mtime_ns
+            return self._registry_cache
 
     def resolve_relative_path(self, prompt_id: str, version: str) -> tuple[str, str]:
         registry = self.load_registry()
@@ -276,10 +325,9 @@ class LocalPromptStoreBackend:
         entry = prompts_map.get(prompt_id) if isinstance(prompts_map, dict) else None
         eff_version = version.strip() if version and version.strip() else DEFAULT_PROMPT_VERSION
         if eff_version == "latest":
-            if isinstance(entry, dict) and entry.get("latest"):
-                eff_version = str(entry["latest"])
-            else:
-                eff_version = str(registry.get("default_version") or DEFAULT_PROMPT_VERSION)
+            eff_version = (
+                _resolve_latest_from_registry(prompt_id, registry) or DEFAULT_PROMPT_VERSION
+            )
 
         if isinstance(entry, dict) and isinstance(entry.get("versions"), dict):
             ver_meta = entry["versions"].get(eff_version)
@@ -307,7 +355,7 @@ class LocalPromptStoreBackend:
         return full_path.read_text(encoding="utf-8"), f"file://{full_path}", eff_version
 
 
-class GcsPromptStoreBackend:
+class GcsPromptStoreBackend(GcpRestClient):
     """Loads versioned prompt specs from Google Cloud Storage (`gs://<bucket>/<prefix>`)."""
 
     def __init__(
@@ -316,9 +364,15 @@ class GcsPromptStoreBackend:
         *,
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
-        storage_client: Any | None = None,
         timeout_seconds: float = 10.0,
+        registry_loader: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
+        super().__init__(
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=timeout_seconds,
+            scopes=(_GCS_READ_SCOPE,),
+        )
         cleaned = gcs_base_uri.strip()
         if cleaned.startswith("gs://"):
             cleaned = cleaned[5:]
@@ -327,51 +381,60 @@ class GcsPromptStoreBackend:
             raise ValueError(f"Invalid GCS prompt store URI: {gcs_base_uri!r}")
         self.bucket_name = parts[0]
         self.prefix = parts[1].strip("/") if len(parts) > 1 else "prompts"
-        self._http_client = http_client
-        self._credentials = credentials
-        self._storage_client = storage_client
         self.timeout_seconds = timeout_seconds
+        self._registry_loader = registry_loader
 
-    def _get_auth_token(self) -> str:
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/devstorage.read_only"]
-            )
-        if not self._credentials.valid or not getattr(self._credentials, "token", None):
-            self._credentials.refresh(GoogleAuthRequest())
-        return str(self._credentials.token)
-
-    @with_tool_resilience(tool_name="gcs_prompt_store_fetch", max_retries=3, base_delay_seconds=0.1)
+    @retry_transient_errors(
+        operation_name="gcs_prompt_store_fetch", max_retries=3, base_delay_seconds=0.1
+    )
     def _download_object_text(self, object_name: str, *, generation: str | None = None) -> str:
-        if self._storage_client is not None:
-            bucket = self._storage_client.bucket(self.bucket_name)
-            blob = (
-                bucket.blob(object_name, generation=int(generation))
-                if generation
-                else bucket.blob(object_name)
-            )
-            return str(blob.download_as_text(encoding="utf-8"))
-
         encoded_obj = quote(object_name, safe="")
         url = f"https://storage.googleapis.com/storage/v1/b/{self.bucket_name}/o/{encoded_obj}?alt=media"
         if generation:
             url += f"&generation={quote(str(generation), safe='')}"
-        headers = {"Authorization": f"Bearer {self._get_auth_token()}"}
-        if self._http_client is not None:
-            resp = self._http_client.get(url, headers=headers)
-        else:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
-                resp = client.get(url, headers=headers)
+        try:
+            resp = self._raw_request("GET", url, timeout=self.timeout_seconds)
+        except httpx.TimeoutException as exc:
+            raise UpstreamTimeoutError(
+                f"GCS Prompt Store timeout for {object_name}: {exc}"
+            ) from exc
         _raise_for_prompt_http_status(resp, "GCS Prompt Store")
         return resp.text
 
-    def fetch(self, prompt_id: str, version: str) -> tuple[str, str, str]:
+    def _load_remote_registry(self) -> dict[str, Any]:
+        reg_obj = f"{self.prefix}/registry.yaml" if self.prefix else "registry.yaml"
+        try:
+            raw = self._download_object_text(reg_obj)
+            loaded = yaml.safe_load(raw)
+            return loaded if isinstance(loaded, dict) else {}
+        except (*_REMOTE_FETCH_ERRORS, yaml.YAMLError) as exc:
+            logger.debug("Remote GCS prompt registry unavailable (%s): %s", reg_obj, exc)
+            return {}
+
+    def _resolve_latest_version(self, prompt_id: str, registry: dict[str, Any] | None) -> str:
+        resolved = _resolve_latest_from_registry(prompt_id, registry)
+        if resolved:
+            return resolved
+        if self._registry_loader is not None:
+            resolved = _resolve_latest_from_registry(prompt_id, self._registry_loader())
+            if resolved:
+                return resolved
+        remote_reg = self._load_remote_registry()
+        return _resolve_latest_from_registry(prompt_id, remote_reg) or DEFAULT_PROMPT_VERSION
+
+    def fetch(
+        self,
+        prompt_id: str,
+        version: str,
+        *,
+        registry: dict[str, Any] | None = None,
+    ) -> tuple[str, str, str]:
         eff_version = version.strip() if version and version.strip() else DEFAULT_PROMPT_VERSION
-        if eff_version == "latest":
-            eff_version = DEFAULT_PROMPT_VERSION
         generation: str | None = None
         if "#" in eff_version:
             eff_version, generation = eff_version.split("#", 1)
+        if eff_version == "latest":
+            eff_version = self._resolve_latest_version(prompt_id, registry)
 
         rel_obj = f"{eff_version}/{prompt_id}.yaml"
         object_name = f"{self.prefix}/{rel_obj}" if self.prefix else rel_obj
@@ -380,7 +443,7 @@ class GcsPromptStoreBackend:
         return raw_text, uri, eff_version
 
 
-class VertexPromptStoreBackend:
+class VertexPromptStoreBackend(GcpRestClient):
     """Loads versioned prompts from Google Cloud Vertex AI Prompt Management REST API."""
 
     def __init__(
@@ -392,33 +455,18 @@ class VertexPromptStoreBackend:
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
         timeout_seconds: float = 10.0,
+        registry_loader: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
-        self.project_id = (
-            (project_id or "").strip()
-            or os.environ.get("GCP_PROJECT_ID", "").strip()
-            or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
-            or DEFAULT_PROJECT_ID
+        super().__init__(
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=timeout_seconds,
         )
-        raw_loc = (
-            (location or "").strip()
-            or os.environ.get("GCP_REGION", "").strip()
-            or os.environ.get("GOOGLE_CLOUD_LOCATION", "").strip()
-            or "us-central1"
-        )
-        self.location = "us-central1" if raw_loc.lower() == "global" else raw_loc
+        self.project_id = resolve_gcp_project_id(project_id, default=DEFAULT_PROJECT_ID)
+        self.location = resolve_gcp_location(location, allow_global=False)
         self.prompt_resource_map = dict(prompt_resource_map or {})
-        self._http_client = http_client
-        self._credentials = credentials
         self.timeout_seconds = timeout_seconds
-
-    def _get_auth_token(self) -> str:
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-        if not self._credentials.valid or not getattr(self._credentials, "token", None):
-            self._credentials.refresh(GoogleAuthRequest())
-        return str(self._credentials.token)
+        self._registry_loader = registry_loader
 
     def _resolve_resource_id(self, prompt_id: str, version: str) -> str:
         keyed = f"{prompt_id}:{version}"
@@ -428,13 +476,23 @@ class VertexPromptStoreBackend:
             return self.prompt_resource_map[prompt_id]
         return prompt_id
 
-    @with_tool_resilience(
-        tool_name="vertex_prompt_store_fetch", max_retries=3, base_delay_seconds=0.1
+    @retry_transient_errors(
+        operation_name="vertex_prompt_store_fetch", max_retries=3, base_delay_seconds=0.1
     )
-    def fetch(self, prompt_id: str, version: str) -> tuple[str, str, str]:
+    def fetch(
+        self,
+        prompt_id: str,
+        version: str,
+        *,
+        registry: dict[str, Any] | None = None,
+    ) -> tuple[str, str, str]:
         eff_version = version.strip() if version and version.strip() else DEFAULT_PROMPT_VERSION
         if eff_version == "latest":
-            eff_version = DEFAULT_PROMPT_VERSION
+            resolved = _resolve_latest_from_registry(prompt_id, registry)
+            if not resolved and self._registry_loader is not None:
+                resolved = _resolve_latest_from_registry(prompt_id, self._registry_loader())
+            eff_version = resolved or DEFAULT_PROMPT_VERSION
+
         resource_ref = self._resolve_resource_id(prompt_id, eff_version)
         if resource_ref.startswith("projects/"):
             resource_path = resource_ref
@@ -448,15 +506,17 @@ class VertexPromptStoreBackend:
         else:
             url_with_ver = url
 
-        headers = {
-            "Authorization": f"Bearer {self._get_auth_token()}",
-            "Content-Type": "application/json",
-        }
-        if self._http_client is not None:
-            resp = self._http_client.get(url_with_ver, headers=headers)
-        else:
-            with httpx.Client(timeout=self.timeout_seconds) as client:
-                resp = client.get(url_with_ver, headers=headers)
+        try:
+            resp = self._raw_request(
+                "GET",
+                url_with_ver,
+                headers={"Content-Type": "application/json"},
+                timeout=self.timeout_seconds,
+            )
+        except httpx.TimeoutException as exc:
+            raise UpstreamTimeoutError(
+                f"Vertex AI Prompt Store timeout for {resource_path}: {exc}"
+            ) from exc
         _raise_for_prompt_http_status(resp, "Vertex AI Prompt Store")
         uri = f"vertexai://{resource_path}@{eff_version}"
         return resp.text, uri, eff_version
@@ -479,7 +539,6 @@ class VersionedPromptStore:
         fallback_to_local: bool | None = None,
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
-        storage_client: Any | None = None,
     ) -> None:
         raw_mode = (
             (backend_mode or os.environ.get("EDGAR_PROMPT_STORE_BACKEND", "auto")).strip().lower()
@@ -495,7 +554,10 @@ class VersionedPromptStore:
         ).strip() or DEFAULT_PROMPT_VERSION
         self.cache_ttl_seconds = cache_ttl_seconds
         self._lock = threading.Lock()
-        self._cache: dict[str, tuple[float, PromptArtifact]] = {}
+        self._cache: BoundedTTLCache[str, PromptArtifact] = BoundedTTLCache(
+            max_entries=256,
+            ttl_seconds=cache_ttl_seconds,
+        )
         self._loaded_versions: dict[str, dict[str, Any]] = {}
 
         self.local_backend = LocalPromptStoreBackend(prompts_dir=prompts_dir)
@@ -506,7 +568,7 @@ class VersionedPromptStore:
                 eff_gcs_uri,
                 http_client=http_client,
                 credentials=credentials,
-                storage_client=storage_client,
+                registry_loader=self.local_backend.load_registry,
             )
             if eff_gcs_uri
             else None
@@ -526,6 +588,7 @@ class VersionedPromptStore:
                 prompt_resource_map=eff_vertex_map,
                 http_client=http_client,
                 credentials=credentials,
+                registry_loader=self.local_backend.load_registry,
             )
             if (eff_vertex_map or self.backend_mode == "vertex")
             else None
@@ -535,6 +598,13 @@ class VersionedPromptStore:
             self.fallback_to_local = self.backend_mode == "auto"
         else:
             self.fallback_to_local = fallback_to_local
+
+    def close(self) -> None:
+        """Close pooled HTTP transports held by remote prompt store backends."""
+        if self.gcs_backend is not None:
+            self.gcs_backend.close()
+        if self.vertex_backend is not None:
+            self.vertex_backend.close()
 
     def resolve_active_backend(self) -> ResolvedPromptBackend:
         if self.backend_mode == "local":
@@ -568,22 +638,27 @@ class VersionedPromptStore:
         vars_key = json.dumps(variables or {}, sort_keys=True, default=str)
         cache_key = f"{active_backend}:{prompt_id}:{eff_version}:{vars_key}:{expected_sha256 or ''}"
 
-        now = time.monotonic()
-        with self._lock:
-            cached = self._cache.get(cache_key)
-            if cached is not None and (now - cached[0]) < self.cache_ttl_seconds:
-                return cached[1]
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         used_backend: ResolvedPromptBackend = active_backend
+        local_registry = (
+            self.local_backend.load_registry() if eff_version.split("#", 1)[0] == "latest" else None
+        )
         try:
             if active_backend == "gcs" and self.gcs_backend is not None:
-                raw_text, uri, resolved_ver = self.gcs_backend.fetch(prompt_id, eff_version)
+                raw_text, uri, resolved_ver = self.gcs_backend.fetch(
+                    prompt_id, eff_version, registry=local_registry
+                )
             elif active_backend == "vertex" and self.vertex_backend is not None:
-                raw_text, uri, resolved_ver = self.vertex_backend.fetch(prompt_id, eff_version)
+                raw_text, uri, resolved_ver = self.vertex_backend.fetch(
+                    prompt_id, eff_version, registry=local_registry
+                )
             else:
                 used_backend = "local"
                 raw_text, uri, resolved_ver = self.local_backend.fetch(prompt_id, eff_version)
-        except Exception as exc:
+        except _REMOTE_FETCH_ERRORS as exc:
             if used_backend != "local" and self.fallback_to_local:
                 logger.warning(
                     "Remote prompt store (%s) failed for '%s@%s' (%s); falling back to local prompts/.",
@@ -607,8 +682,8 @@ class VersionedPromptStore:
             expected_sha256=expected_sha256,
         )
 
+        self._cache[cache_key] = artifact
         with self._lock:
-            self._cache[cache_key] = (now, artifact)
             self._loaded_versions[prompt_id] = artifact.to_public_metadata()
 
         return artifact
@@ -681,16 +756,24 @@ def configure_prompt_store(
 ) -> VersionedPromptStore:
     """Configure or replace the process-wide `VersionedPromptStore` instance."""
     global _GLOBAL_PROMPT_STORE
+    previous: VersionedPromptStore | None = None
     with _PROMPT_STORE_LOCK:
+        previous = _GLOBAL_PROMPT_STORE
         _GLOBAL_PROMPT_STORE = store if store is not None else VersionedPromptStore(**kwargs)
-        return _GLOBAL_PROMPT_STORE
+        current = _GLOBAL_PROMPT_STORE
+    if previous is not None and previous is not current:
+        previous.close()
+    return current
 
 
 def reset_prompt_store() -> None:
     """Reset the process-wide `VersionedPromptStore` so env changes take effect cleanly."""
     global _GLOBAL_PROMPT_STORE
     with _PROMPT_STORE_LOCK:
+        previous = _GLOBAL_PROMPT_STORE
         _GLOBAL_PROMPT_STORE = None
+    if previous is not None:
+        previous.close()
 
 
 def load_agent_prompt(

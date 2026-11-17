@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import platform
 import subprocess
@@ -46,6 +47,8 @@ from edgar_capstone.evals.metrics import (
     score_wording_delta_accuracy,
 )
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_THRESHOLDS_PATH = REPO_ROOT / "evals" / "thresholds.yaml"
 
 
@@ -73,16 +76,29 @@ class EvalThresholds:
 
     @classmethod
     def load(cls, path: Path | str | None = None) -> EvalThresholds:
-        resolved = Path(path) if path else DEFAULT_THRESHOLDS_PATH
-        if not resolved.exists():
-            return cls()
+        """Load threshold overrides from YAML.
+
+        Raises `FileNotFoundError` when an explicit `path` argument is supplied and does not
+        exist; falls back to `cls()` defaults only when `path is None` and the default repo
+        file is absent.
+        """
+        if path is not None:
+            resolved = Path(path)
+            if not resolved.exists():
+                raise FileNotFoundError(f"Eval thresholds file not found: {resolved}")
+        else:
+            resolved = DEFAULT_THRESHOLDS_PATH
+            if not resolved.exists():
+                return cls()
+
         raw = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
         gates = raw.get("gates", raw)
-        known = {f for f in cls.__dataclass_fields__}
+        defaults = cls()
+        known = set(cls.__dataclass_fields__)
         unknown = set(gates) - known
         if unknown:
             raise ValueError(f"Unknown threshold keys in {resolved}: {sorted(unknown)}")
-        return cls(**{k: type(getattr(cls(), k))(v) for k, v in gates.items()})
+        return cls(**{k: type(getattr(defaults, k))(v) for k, v in gates.items()})
 
 
 @dataclass
@@ -305,84 +321,43 @@ def _supports_kwarg(fn: Callable[..., Any], name: str) -> bool:
     return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
 
-def evaluate_item(
+def _mark_scored_failure(
+    res: ItemResult,
     item: GoldenEvalItem,
     *,
-    run_id: str,
+    score_chunk_ids: bool,
+) -> None:
+    """Populate deterministic denominators on failed/errored items so aggregates aren't inflated."""
+    if item.is_safety:
+        res.safety_blocked = False
+        return
+    if item.is_scope_early_exit:
+        res.scope_check_ok = False
+        return
+
+    res.numeric_agreement = False if item.expected_variances else None
+    res.citation_coverage = False
+    res.numeric_citation_coverage = False if item.expected_variances else None
+    res.routing_ok = False
+    res.metadata_filter_ok = False
+    res.metadata_filter_ratio = 0.0
+    res.retrieval_precision_at_10 = 0.0
+    _, res.grounding_expected, _ = score_grounding(item, {}, score_chunk_ids=score_chunk_ids)
+    res.delta_expected = len(item.expected_deltas)
+    res.flag_expected = len(item.expected_flags)
+    if item.category == SCOPE_CATEGORY or item.expected_coverage_notice_codes:
+        res.scope_check_ok = False
+
+
+def _score_deterministic_checks(
+    res: ItemResult,
+    item: GoldenEvalItem,
+    response: dict[str, Any],
+    *,
     thresholds: EvalThresholds,
     score_chunk_ids: bool,
-    turn_fn: TurnFn,
-    judge_fn: JudgeFn,
-) -> ItemResult:
-    res = ItemResult(
-        item_id=item.id,
-        category=item.category,
-        query=item.query,
-        is_scope_early_exit=item.is_scope_early_exit,
-    )
-    f = item.filters
-    turn_kwargs: dict[str, Any] = {
-        "query": item.query,
-        "tickers": f.tickers,
-        "gics_sector": f.gics_sector,
-        "section_id": f.section_id,
-        "start_year": f.start_year,
-        "end_year": f.end_year,
-        "top_k": f.top_k,
-        "session_id": f"golden-eval-{run_id}-{item.id}",
-        "user_id": "golden-eval-runner",
-    }
-    if _supports_kwarg(turn_fn, "skip_background_judge"):
-        turn_kwargs["skip_background_judge"] = True
-
-    try:
-        response = turn_fn(**turn_kwargs)
-    except Exception as exc:  # noqa: BLE001 - one broken item must not abort the run
-        res.error = f"{type(exc).__name__}: {exc}"
-        res.failure_reasons.append(f"turn raised {res.error}")
-        res.status = "error"
-        if os.environ.get("EDGAR_EVAL_TRACEBACKS"):
-            traceback.print_exc()
-        return res
-
-    res.status = str(response.get("status"))
-    res.intent = response.get("intent")
-    res.execution_mode = response.get("execution_mode")
-    res.total_latency_ms = response.get("total_latency_ms")
-    res.citations_count = len(response.get("citations") or [])
-    ttft = (response.get("react_execution") or {}).get("observed_ttft_ms")
-    res.ttft_ms = float(ttft) if ttft is not None else None
-
-    if item.is_safety:
-        ok, reasons = score_safety(item, response)
-        res.safety_blocked = response.get("status") == "blocked"
-        res.failure_reasons.extend(reasons)
-        res.passed = ok
-        return res
-
-    if item.is_scope_early_exit:
-        ok, reasons = score_scope_or_coverage(item, response)
-        res.scope_check_ok = ok
-        res.failure_reasons.extend(reasons)
-        res.passed = ok
-        return res
-
-    if res.status != "success":
-        res.failure_reasons.append(f"unexpected status={res.status} (intent={res.intent})")
-        res.numeric_agreement = False if item.expected_variances else None
-        res.citation_coverage = False
-        res.numeric_citation_coverage = False if item.expected_variances else None
-        res.routing_ok = False
-        res.metadata_filter_ok = False
-        res.metadata_filter_ratio = 0.0
-        res.retrieval_precision_at_10 = 0.0
-        _, res.grounding_expected, _ = score_grounding(item, {}, score_chunk_ids=score_chunk_ids)
-        res.delta_expected = len(item.expected_deltas)
-        res.flag_expected = len(item.expected_flags)
-        if item.category == SCOPE_CATEGORY or item.expected_coverage_notice_codes:
-            res.scope_check_ok = False
-        return res
-
+) -> None:
+    """Populate all pure deterministic metrics on `res` for a successful scored RAG turn."""
     res.routing_ok, reasons = score_routing(item, response)
     res.failure_reasons.extend(reasons)
 
@@ -429,6 +404,15 @@ def evaluate_item(
     res.unsupported_claims_count, unsup_reasons = score_unsupported_claims(response)
     res.failure_reasons.extend(unsup_reasons)
 
+
+def _score_with_judge(
+    res: ItemResult,
+    item: GoldenEvalItem,
+    response: dict[str, Any],
+    *,
+    judge_fn: JudgeFn,
+) -> None:
+    """Invoke the LLM judge and populate quality/faithfulness scores on `res`."""
     try:
         cached_count = len(
             (response.get("react_execution") or {}).get("cached_10k_explanations") or []
@@ -457,8 +441,87 @@ def evaluate_item(
         res.judge_model = judged.get("evaluator_model")
         if res.judge_grade == "fail":
             res.failure_reasons.append(f"judge grade=fail: {judged.get('rationale', '')[:200]}")
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         res.failure_reasons.append(f"judge raised {type(exc).__name__}: {exc}")
+
+
+def evaluate_item(
+    item: GoldenEvalItem,
+    *,
+    run_id: str,
+    thresholds: EvalThresholds,
+    score_chunk_ids: bool,
+    turn_fn: TurnFn,
+    judge_fn: JudgeFn,
+) -> ItemResult:
+    res = ItemResult(
+        item_id=item.id,
+        category=item.category,
+        query=item.query,
+        is_scope_early_exit=item.is_scope_early_exit,
+    )
+    f = item.filters
+    turn_kwargs: dict[str, Any] = {
+        "query": item.query,
+        "tickers": f.tickers,
+        "gics_sector": f.gics_sector,
+        "section_id": f.section_id,
+        "start_year": f.start_year,
+        "end_year": f.end_year,
+        "top_k": f.top_k,
+        "session_id": f"golden-eval-{run_id}-{item.id}",
+        "user_id": "golden-eval-runner",
+    }
+    if _supports_kwarg(turn_fn, "skip_background_judge"):
+        turn_kwargs["skip_background_judge"] = True
+
+    try:
+        response = turn_fn(**turn_kwargs)
+    except Exception as exc:
+        # One broken item must not abort the run, and its failure must count in every denominator.
+        res.error = f"{type(exc).__name__}: {exc}"
+        res.failure_reasons.append(f"turn raised {res.error}")
+        res.status = "error"
+        _mark_scored_failure(res, item, score_chunk_ids=score_chunk_ids)
+        if os.environ.get("EDGAR_EVAL_TRACEBACKS"):
+            traceback.print_exc()
+        return res
+
+    res.status = str(response.get("status"))
+    res.intent = response.get("intent")
+    res.execution_mode = response.get("execution_mode")
+    res.total_latency_ms = response.get("total_latency_ms")
+    res.citations_count = len(response.get("citations") or [])
+    ttft = (response.get("react_execution") or {}).get("observed_ttft_ms")
+    res.ttft_ms = float(ttft) if ttft is not None else None
+
+    if item.is_safety:
+        ok, reasons = score_safety(item, response)
+        res.safety_blocked = response.get("status") == "blocked"
+        res.failure_reasons.extend(reasons)
+        res.passed = ok
+        return res
+
+    if item.is_scope_early_exit:
+        ok, reasons = score_scope_or_coverage(item, response)
+        res.scope_check_ok = ok
+        res.failure_reasons.extend(reasons)
+        res.passed = ok
+        return res
+
+    if res.status != "success":
+        res.failure_reasons.append(f"unexpected status={res.status} (intent={res.intent})")
+        _mark_scored_failure(res, item, score_chunk_ids=score_chunk_ids)
+        return res
+
+    _score_deterministic_checks(
+        res,
+        item,
+        response,
+        thresholds=thresholds,
+        score_chunk_ids=score_chunk_ids,
+    )
+    _score_with_judge(res, item, response, judge_fn=judge_fn)
 
     res.passed = (
         bool(res.routing_ok)
@@ -644,7 +707,8 @@ def run_golden_evals(
         from edgar_capstone.agents.context_memory import resolve_model_for_task
 
         analyst_model: str | None = resolve_model_for_task("financial_reasoning")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:
+        logger.warning("Unable to resolve analyst model name for eval report: %s", exc)
         analyst_model = None
 
     return EvalRunReport(

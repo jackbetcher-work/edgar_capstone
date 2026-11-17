@@ -6,7 +6,6 @@ fails loudly when it is unavailable, so every stored vector is a real model embe
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import random
@@ -17,10 +16,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import google.auth
 import httpx
-from google.auth.transport.requests import Request as GoogleAuthRequest
 
+from edgar_capstone.common.domain import sha256_text
+from edgar_capstone.common.jsonl import iter_jsonl
+from edgar_capstone.gcp.defaults import DEFAULT_LOCATION
+from edgar_capstone.gcp.rest_client import GcpRestClient
 from edgar_capstone.vector_db.models import FilingChunk
 
 logger = logging.getLogger(__name__)
@@ -43,21 +44,25 @@ def _retry_backoff_seconds(attempt: int) -> float:
     return min(30.0, 1.5 * (2 ** (attempt - 1))) * (0.75 + random.random() * 0.5)
 
 
-class VertexAIEmbedder:
+class VertexAIEmbedder(GcpRestClient):
     """Client for generating dense embeddings via Vertex AI (`text-embedding-005`).
+
+    Inherits thread-safe ADC bearer authentication, empty-token guards, and pooled
+    `httpx.Client` lifecycle management (`close()` / context manager) from `GcpRestClient`.
 
     Requests are packed by both instance count (`batch_size`) and total characters
     (`max_batch_chars`) so a batch stays under the per-request input-token limit
     (20,000 tokens for `text-embedding-005`). A batch the API still rejects as too
     large is split in half and retried. With `max_workers > 1`, batches are sent
-    concurrently and results are returned in input order.
+    concurrently over the shared thread-safe HTTP pool and results are returned in
+    input order.
     """
 
     def __init__(
         self,
         *,
         project_id: str,
-        location: str = "us-central1",
+        location: str = DEFAULT_LOCATION,
         model_name: str = DEFAULT_EMBEDDING_MODEL,
         dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
         batch_size: int = 50,
@@ -67,6 +72,14 @@ class VertexAIEmbedder:
         max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
         max_workers: int = 1,
     ) -> None:
+        workers = max(1, max_workers)
+        super().__init__(
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=60.0,
+            max_connections=max(32, workers * 2),
+            max_keepalive_connections=max(16, workers),
+        )
         self.project_id = project_id
         self.location = location
         self.model_name = model_name
@@ -74,37 +87,14 @@ class VertexAIEmbedder:
         self.batch_size = max(1, min(batch_size, 250))
         self.max_retries = max_retries
         self.max_batch_chars = max(1, max_batch_chars)
-        self.max_workers = max(1, max_workers)
-        self._http_client = http_client
-        self._pooled_http_client: httpx.Client | None = None
-        self._credentials = credentials
-        self._credentials_lock = threading.Lock()
-        self._http_lock = threading.Lock()
+        self.max_workers = workers
         self._query_cache_lock = threading.Lock()
         self._query_cache: dict[tuple[str, str], list[float]] = {}
         self._query_cache_max = 512
 
-    def _get_http_client(self) -> httpx.Client:
-        if self._http_client is not None:
-            return self._http_client
-        with self._http_lock:
-            if self._pooled_http_client is None or self._pooled_http_client.is_closed:
-                self._pooled_http_client = httpx.Client(
-                    timeout=60.0,
-                    limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
-                )
-            return self._pooled_http_client
-
     def _get_access_token(self) -> str:
         """Obtain a valid OAuth2 bearer token from Application Default Credentials."""
-        with self._credentials_lock:
-            if self._credentials is None:
-                self._credentials, _ = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                )
-            if not self._credentials.valid:
-                self._credentials.refresh(GoogleAuthRequest())
-            return str(self._credentials.token)
+        return self._get_bearer_token()
 
     def _plan_batches(self, texts: list[str]) -> list[tuple[int, int]]:
         """Split `texts` into `(start, end)` ranges bounded by count and total characters."""
@@ -154,18 +144,9 @@ class VertexAIEmbedder:
             },
         }
 
-        client = self._get_http_client()
         for attempt in range(1, self.max_retries + 1):
-            token = self._get_access_token()
             try:
-                resp = client.post(
-                    url,
-                    json=payload,
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                    },
-                )
+                resp = self._raw_request("POST", url, json_body=payload)
             except httpx.TransportError as exc:
                 if attempt < self.max_retries:
                     backoff = _retry_backoff_seconds(attempt)
@@ -247,6 +228,7 @@ class VertexAIEmbedder:
 
         `on_batch_complete(start, end, vectors)` is called after each batch finishes
         (from the calling thread), which lets callers checkpoint progress.
+        Thread-safe for concurrent callers: never mutates `self._http_client`.
         """
         # Cache live single/repeated query embeddings (bypassed when a custom http_client is
         # injected so unit tests always exercise their mock transport).
@@ -291,26 +273,17 @@ class VertexAIEmbedder:
             for bounds in batches:
                 record(*run(bounds))
         else:
-            owns_client = self._http_client is None
-            if owns_client:
-                self._http_client = httpx.Client(
-                    timeout=60.0,
-                    limits=httpx.Limits(max_connections=self.max_workers * 2),
-                )
-            try:
-                with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-                    futures = [pool.submit(run, bounds) for bounds in batches]
-                    try:
-                        for fut in as_completed(futures):
-                            record(*fut.result())
-                    except BaseException:
-                        for f in futures:
-                            f.cancel()
-                        raise
-            finally:
-                if owns_client and self._http_client is not None:
-                    self._http_client.close()
-                    self._http_client = None
+            # Ensure the shared pooled httpx.Client is initialized safely under lock before fan-out.
+            _ = self._get_http_client()
+            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                futures = [pool.submit(run, bounds) for bounds in batches]
+                try:
+                    for fut in as_completed(futures):
+                        record(*fut.result())
+                except BaseException:
+                    for f in futures:
+                        f.cancel()
+                    raise
 
         missing = [i for i, vec in enumerate(results) if vec is None]
         if missing:
@@ -328,25 +301,16 @@ def load_embedding_checkpoint(
     if not checkpoint_path.exists():
         return {}
     cached: dict[str, tuple[str, list[float]]] = {}
-    with checkpoint_path.open(encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except json.JSONDecodeError:
-                # A partially written trailing line from an interrupted run.
-                continue
-            emb = row.get("embedding")
-            if (
-                row.get("model") == model_name
-                and isinstance(emb, list)
-                and len(emb) == dimensions
-                and row.get("chunk_id")
-                and row.get("text_sha256")
-            ):
-                cached[str(row["chunk_id"])] = (str(row["text_sha256"]), emb)
+    for row in iter_jsonl(checkpoint_path, skip_corrupt=True):
+        emb = row.get("embedding")
+        if (
+            row.get("model") == model_name
+            and isinstance(emb, list)
+            and len(emb) == dimensions
+            and row.get("chunk_id")
+            and row.get("text_sha256")
+        ):
+            cached[str(row["chunk_id"])] = (str(row["text_sha256"]), emb)
     return cached
 
 
@@ -354,7 +318,7 @@ def populate_chunk_embeddings(
     chunks: list[FilingChunk],
     *,
     project_id: str,
-    location: str = "us-central1",
+    location: str = DEFAULT_LOCATION,
     model_name: str = DEFAULT_EMBEDDING_MODEL,
     dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
     batch_size: int = 50,
@@ -392,7 +356,7 @@ def populate_chunk_embeddings(
                 checkpoint_path,
             )
 
-    hashes = [hashlib.sha256(c.chunk_text.encode("utf-8")).hexdigest() for c in chunks]
+    hashes = [sha256_text(c.chunk_text) for c in chunks]
     to_embed_indices: list[int] = []
     reused_from_checkpoint = 0
     for idx, chunk in enumerate(chunks):
@@ -417,6 +381,7 @@ def populate_chunk_embeddings(
         logger.info("Reused all %d cached chunk embeddings.", len(chunks))
         return chunks, "vertex_ai" if reused_from_checkpoint == len(chunks) else "cached"
 
+    owns_embedder = vertex_embedder is None
     embedder = vertex_embedder or VertexAIEmbedder(
         project_id=project_id,
         location=location,
@@ -491,4 +456,6 @@ def populate_chunk_embeddings(
     finally:
         if ckpt_fh is not None:
             ckpt_fh.close()
+        if owns_embedder:
+            embedder.close()
     return chunks, "vertex_ai"

@@ -57,35 +57,27 @@ from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
+from edgar_capstone.common.env import env_bool
+from edgar_capstone.gcp.defaults import DEFAULT_PROJECT_ID, resolve_gcp_project_id
+
 logger = logging.getLogger(__name__)
 
 TRACER_NAME = "edgar_capstone"
 DEFAULT_SERVICE_NAME = "sec-edgar-analyst"
 DEFAULT_SERVICE_NAMESPACE = "sec-edgar"
 DEFAULT_EXCLUDED_URLS = r"/health$,/healthz$,/assets/,/favicon\.ico$,/vite\.svg$"
-# Fallback only; Cloud Run always injects GCP_PROJECT_ID / GOOGLE_CLOUD_PROJECT.
-DEFAULT_TRACE_PROJECT_ID = "iron-radio-514217-q7"
+# Fallback alias retained for backward compatibility; canonical default lives in gcp.defaults.
+DEFAULT_TRACE_PROJECT_ID = DEFAULT_PROJECT_ID
 ADK_CAPTURE_CONTENT_ENV = "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"
 
 TraceExporterMode = Literal["auto", "gcp", "console", "otlp", "none"]
 _VALID_EXPORTERS: frozenset[str] = frozenset({"auto", "gcp", "console", "otlp", "none"})
-_TRUTHY = frozenset({"1", "true", "yes", "on"})
-_FALSY = frozenset({"0", "false", "no", "off"})
 _MAX_ATTR_STR_LEN = 512
 
 _TRACEPARENT_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
 _CLOUD_TRACE_CONTEXT_RE = re.compile(r"^([0-9a-fA-F]{32})(?:/(\d+))?(?:;o=([01]))?$")
 
 _F = TypeVar("_F", bound=Callable[..., Any])
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if raw in _TRUTHY:
-        return True
-    if raw in _FALSY:
-        return False
-    return default
 
 
 def _env_ratio(name: str, default: float) -> float:
@@ -98,15 +90,6 @@ def _env_ratio(name: str, default: float) -> float:
         logger.warning("Ignoring invalid %s=%r; using %.2f", name, raw, default)
         return default
     return min(1.0, max(0.0, value))
-
-
-def resolve_gcp_project_id() -> str:
-    """Return the GCP project that owns traces and logs for this process."""
-    for env_name in ("GCP_PROJECT_ID", "GOOGLE_CLOUD_PROJECT", "GCLOUD_PROJECT"):
-        value = os.environ.get(env_name, "").strip()
-        if value:
-            return value
-    return DEFAULT_TRACE_PROJECT_ID
 
 
 def running_on_cloud_run() -> bool:
@@ -131,7 +114,7 @@ class TracingConfig:
 
     @classmethod
     def from_env(cls) -> TracingConfig:
-        enabled = _env_bool("EDGAR_TRACING_ENABLED", True) and not _env_bool(
+        enabled = env_bool("EDGAR_TRACING_ENABLED", True) and not env_bool(
             "OTEL_SDK_DISABLED", False
         )
         raw_exporter = os.environ.get("EDGAR_TRACE_EXPORTER", "auto").strip().lower() or "auto"
@@ -140,10 +123,10 @@ class TracingConfig:
             raw_exporter = "auto"
         exporter: TraceExporterMode = raw_exporter  # type: ignore[assignment]
         resolved: TraceExporterMode = exporter
-        if exporter == "auto":
-            resolved = "gcp" if running_on_cloud_run() else "none"
-
         on_cloud_run = running_on_cloud_run()
+        if exporter == "auto":
+            resolved = "gcp" if on_cloud_run else "none"
+
         return cls(
             enabled=enabled,
             exporter=exporter,
@@ -161,9 +144,9 @@ class TracingConfig:
             environment=(
                 os.environ.get("EDGAR_ENVIRONMENT") or ("cloud_run" if on_cloud_run else "local")
             ).strip(),
-            capture_message_content=_env_bool("EDGAR_TRACE_CAPTURE_CONTENT", False),
+            capture_message_content=env_bool("EDGAR_TRACE_CAPTURE_CONTENT", False),
             excluded_urls=os.environ.get("EDGAR_TRACE_EXCLUDED_URLS", DEFAULT_EXCLUDED_URLS),
-            instrument_httpx=_env_bool("EDGAR_TRACE_INSTRUMENT_HTTPX", True),
+            instrument_httpx=env_bool("EDGAR_TRACE_INSTRUMENT_HTTPX", True),
         )
 
 
@@ -187,6 +170,7 @@ class _TracingState:
         self.exporter_name: str = "none"
         self.fastapi_instrumented: bool = False
         self.httpx_instrumented: bool = False
+        self.propagators: tuple[str, ...] = ()
         self.last_error: str | None = None
 
 
@@ -244,7 +228,7 @@ def _build_exporter(config: TracingConfig) -> tuple[SpanExporter | None, str]:
             return None, "none"
         return OTLPSpanExporter(), "otlp"
 
-    # mode == "gcp"
+    # Default remaining mode exports spans to Google Cloud Trace.
     try:
         from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
     except ImportError:
@@ -260,17 +244,21 @@ def _build_exporter(config: TracingConfig) -> tuple[SpanExporter | None, str]:
     return exporter, "gcp"
 
 
-def _configure_propagators() -> None:
+def _configure_propagators() -> tuple[str, ...]:
     propagators: list[TextMapPropagator] = []
+    installed_names: list[str] = []
     try:
         from opentelemetry.propagators.cloud_trace_propagator import CloudTraceFormatPropagator
 
         # Listed first so the W3C `traceparent` (added last) wins when both headers exist.
         propagators.append(CloudTraceFormatPropagator())
+        installed_names.append("x-cloud-trace-context")
     except ImportError:  # pragma: no cover - optional dependency
         logger.debug("opentelemetry-propagator-gcp unavailable; X-Cloud-Trace-Context ignored")
     propagators.extend([W3CBaggagePropagator(), TraceContextTextMapPropagator()])
+    installed_names.extend(["baggage", "traceparent"])
     set_global_textmap(CompositePropagator(propagators))
+    return tuple(installed_names)
 
 
 def _instrument_httpx(provider: TracerProvider) -> bool:
@@ -338,7 +326,7 @@ def configure_tracing(
         for extra in extra_span_exporters:
             provider.add_span_processor(SimpleSpanProcessor(extra))
 
-        _configure_propagators()
+        _STATE.propagators = _configure_propagators()
         if cfg.instrument_httpx:
             _STATE.httpx_instrumented = _instrument_httpx(provider)
 
@@ -387,7 +375,8 @@ def instrument_fastapi_app(app: Any) -> bool:
 
 def flush_tracing(timeout_millis: int = 5000) -> bool:
     """Flush buffered spans (call on shutdown; Cloud Run may freeze CPU between requests)."""
-    provider = _STATE.provider
+    with _STATE.lock:
+        provider = _STATE.provider
     if provider is None:
         return True
     try:
@@ -402,20 +391,27 @@ def get_tracer(name: str = TRACER_NAME) -> trace.Tracer:
 
 
 def tracing_status_metadata() -> dict[str, Any]:
-    cfg = _STATE.config or TracingConfig.from_env()
+    with _STATE.lock:
+        cfg = _STATE.config or TracingConfig.from_env()
+        provider_ready = _STATE.provider is not None
+        exporter_name = _STATE.exporter_name
+        fastapi_instrumented = _STATE.fastapi_instrumented
+        httpx_instrumented = _STATE.httpx_instrumented
+        propagators = list(_STATE.propagators)
+        last_error = _STATE.last_error
     return {
-        "enabled": cfg.enabled and _STATE.provider is not None,
-        "exporter": _STATE.exporter_name,
+        "enabled": cfg.enabled and provider_ready,
+        "exporter": exporter_name,
         "configured_exporter": cfg.exporter,
         "sample_ratio": cfg.sample_ratio,
         "service_name": cfg.service_name,
         "service_version": cfg.service_version,
         "project_id": cfg.project_id,
-        "fastapi_instrumented": _STATE.fastapi_instrumented,
-        "httpx_instrumented": _STATE.httpx_instrumented,
+        "fastapi_instrumented": fastapi_instrumented,
+        "httpx_instrumented": httpx_instrumented,
         "capture_message_content": cfg.capture_message_content,
-        "propagators": ["x-cloud-trace-context", "baggage", "traceparent"],
-        "last_error": _STATE.last_error,
+        "propagators": propagators,
+        "last_error": last_error,
     }
 
 
@@ -431,8 +427,8 @@ def parse_traceparent(header: str | None) -> TraceCorrelation | None:
     match = _TRACEPARENT_RE.match(header.strip().lower())
     if not match:
         return None
-    _version, trace_id, span_id, flags = match.groups()
-    if trace_id == "0" * 32 or span_id == "0" * 16:
+    version, trace_id, span_id, flags = match.groups()
+    if version == "ff" or trace_id == "0" * 32 or span_id == "0" * 16:
         return None
     return TraceCorrelation(trace_id=trace_id, span_id=span_id, sampled=bool(int(flags, 16) & 1))
 
@@ -448,7 +444,13 @@ def parse_cloud_trace_context(header: str | None) -> TraceCorrelation | None:
     trace_id = trace_id.lower()
     if trace_id == "0" * 32:
         return None
-    span_hex = format(int(span_dec), "016x")[-16:] if span_dec else "0" * 16
+    if span_dec is None:
+        span_hex = "0" * 16
+    else:
+        span_int = int(span_dec)
+        if not (1 <= span_int < (1 << 64)):
+            return None
+        span_hex = format(span_int, "016x")
     return TraceCorrelation(trace_id=trace_id, span_id=span_hex, sampled=sampled == "1")
 
 
@@ -489,7 +491,9 @@ def current_trace_metadata() -> dict[str, Any] | None:
     corr = current_trace_correlation()
     if corr is None:
         return None
-    project_id = (_STATE.config.project_id if _STATE.config else None) or resolve_gcp_project_id()
+    with _STATE.lock:
+        configured_project = _STATE.config.project_id if _STATE.config else None
+    project_id = configured_project or resolve_gcp_project_id()
     return {
         "trace_id": corr.trace_id,
         "span_id": corr.span_id,

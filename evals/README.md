@@ -60,9 +60,9 @@ Field names match the BigQuery columns (`terraform/schemas/golden_eval_set.json`
 | `expected_intent` | RootOrchestrator intent |
 | `expected_variances[]` | `ticker`, `metric` (`revenue`, `operating_income`, `net_income`, `research_and_development`), effective `start_year`/`end_year`, golden `start_value`/`end_value`/`absolute_delta`/`percentage_delta`, and `required_in_narrative` |
 | `expected_sections[]` | `{ticker, fiscal_year, section_id}`; any field left out matches anything. Each one must be retrieved and cited |
-| `expected_deltas[]` | Annotated wording-delta expectations (`ticker`, `prior_fiscal_year`, `current_fiscal_year`, `change_type`: `added`/`removed`/`modified`, `phrase_hint`) for `thematic_shift` items |
+| `expected_deltas[]` | Annotated wording-delta expectations (`ticker`, `prior_fiscal_year`, `current_fiscal_year`, `change_type`: `added`/`removed`/`modified`, `keyword_hint`) for `thematic_shift` items |
 | `expected_flags[]` | Expected deterministic anomaly flags (`ticker`, `fiscal_year`, `metric`, `rule`, `flag_id`) for `anomaly_explanation` items |
-| `expected_status` | Optional status assertion (`out_of_corpus`, `clarification_needed`) for early-exit scope validation probes |
+| `expected_status` | Optional status assertion (`out_of_corpus`, `clarification`) for early-exit scope validation probes |
 | `expected_coverage_notice_codes[]` | Required deterministic notice codes (e.g. `missing_fiscal_year`, `fiscal_calendar_misalignment`, `non_sp500_issuer`, `unsupported_filing_type`, `unsupported_metric`) |
 | `expected_chunk_ids[]` | Exact chunk IDs from BigQuery `filing_chunks`; always scored |
 | `reference_explanation` | Ground-truth explanation of the drivers, used by the live judge |

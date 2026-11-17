@@ -1,10 +1,6 @@
 import { Fragment, useState } from 'react'
 import { Calendar, ChevronDown, ChevronRight, ExternalLink } from 'lucide-react'
-import type {
-  CompanyVarianceReport,
-  MetricVariance,
-  XbrlFactSelection,
-} from '../types/edgar'
+import type { CompanyVarianceReport, XbrlFactSelection } from '../types/edgar'
 import {
   formatPeriodEndShort,
   formatSignedBps,
@@ -12,6 +8,10 @@ import {
   formatSignedPercent,
   formatUsdCompact,
 } from '../utils/formatters'
+import {
+  buildXbrlFactFromAnnualStep,
+  buildXbrlFactFromVariance,
+} from '../utils/xbrlFactSelection'
 
 interface VarianceTableCardProps {
   turnId: string
@@ -33,50 +33,6 @@ function extractMonth(isoDate: string | null | undefined): string | null {
   if (!isoDate) return null
   const m = /^\d{4}-(\d{2})-\d{2}/.exec(isoDate.trim())
   return m ? m[1] : null
-}
-
-function buildVarianceXbrlSelection(
-  rep: CompanyVarianceReport,
-  mv: MetricVariance,
-  metricLabel: string
-): XbrlFactSelection {
-  const startKey = String(mv.start_year || rep.start_year)
-  const endKey = String(mv.end_year || rep.end_year)
-  return {
-    title: `${rep.ticker} ${metricLabel} (FY${mv.start_year}→FY${mv.end_year})`,
-    ticker: rep.ticker,
-    companyName: rep.company_name,
-    fiscalYear: mv.end_year || rep.end_year,
-    priorFiscalYear: mv.start_year || rep.start_year,
-    metricLabel,
-    valueFormatted: `${formatUsdCompact(mv.start_value)} → ${formatUsdCompact(mv.end_value)}`,
-    deltaFormatted:
-      mv.percentage_delta !== null
-        ? `${formatSignedPercent(mv.percentage_delta)} (${formatSignedDeltaUsd(mv.absolute_delta)})`
-        : undefined,
-    periodOfReport:
-      mv.end_period_of_report ?? rep.period_end_dates?.[endKey] ?? null,
-    priorPeriodOfReport:
-      mv.start_period_of_report ?? rep.period_end_dates?.[startKey] ?? null,
-    filingDate: rep.filing_dates?.[endKey] ?? null,
-    accessionNumber:
-      mv.end_accession_number ?? rep.accession_numbers?.[endKey] ?? null,
-    priorAccessionNumber:
-      mv.start_accession_number ?? rep.accession_numbers?.[startKey] ?? null,
-    xbrlConcept:
-      mv.end_xbrl_concept ??
-      rep.metric_provenance?.[endKey]?.[mv.metric_name] ??
-      null,
-    priorXbrlConcept:
-      mv.start_xbrl_concept ??
-      rep.metric_provenance?.[startKey]?.[mv.metric_name] ??
-      null,
-    secFilingUrl:
-      mv.end_sec_filing_url ?? rep.source_urls?.[endKey] ?? null,
-    priorSecFilingUrl:
-      mv.start_sec_filing_url ?? rep.source_urls?.[startKey] ?? null,
-    derivedFrom: mv.derived_from,
-  }
 }
 
 export function VarianceTableCard({
@@ -315,7 +271,7 @@ export function VarianceTableCard({
                             type="button"
                             onClick={() =>
                               onInspectXbrlFact(
-                                buildVarianceXbrlSelection(rep, rev, 'Revenue')
+                                buildXbrlFactFromVariance(rep, rev, 'Revenue')
                               )
                             }
                             className="text-bb-amber hover:underline text-[10px] font-semibold uppercase cursor-pointer"
@@ -431,35 +387,9 @@ export function VarianceTableCard({
                                 <button
                                   type="button"
                                   onClick={() =>
-                                    onInspectXbrlFact({
-                                      title: `${rep.ticker} FY${step.fiscal_year} Annual Filing Facts`,
-                                      ticker: rep.ticker,
-                                      companyName: rep.company_name,
-                                      fiscalYear: step.fiscal_year,
-                                      priorFiscalYear: step.prev_fiscal_year,
-                                      metricLabel: 'Revenue',
-                                      valueFormatted: formatUsdCompact(step.revenue),
-                                      deltaFormatted:
-                                        step.revenue_yoy_pct !== null
-                                          ? `${formatSignedPercent(step.revenue_yoy_pct)} YoY`
-                                          : undefined,
-                                      periodOfReport: stepPeriod,
-                                      priorPeriodOfReport:
-                                        step.prior_period_of_report ?? null,
-                                      filingDate:
-                                        step.filing_date ??
-                                        rep.filing_dates?.[
-                                          String(step.fiscal_year)
-                                        ] ??
-                                        null,
-                                      accessionNumber: stepAcc,
-                                      priorAccessionNumber:
-                                        step.prior_accession_number ?? null,
-                                      xbrlConcept: stepRevConcept,
-                                      secFilingUrl: step.sec_filing_url,
-                                      priorSecFilingUrl:
-                                        step.prior_sec_filing_url ?? null,
-                                    })
+                                    onInspectXbrlFact(
+                                      buildXbrlFactFromAnnualStep(rep, step)
+                                    )
                                   }
                                   className="text-[9.5px] text-bb-amber hover:underline cursor-pointer"
                                   title={`XBRL acc:${stepAcc ?? 'n/a'} · ${stepRevConcept ?? 'XBRL'}`}

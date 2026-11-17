@@ -8,10 +8,11 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any, TypeVar
+from typing import Any, ParamSpec, TypeVar
 
 import httpx
 
+from edgar_capstone.gcp.rest_client import GcpRateLimitError, GcpTimeoutError, parse_retry_after
 from edgar_capstone.observability.tracing import (
     add_span_event,
     mark_span_error,
@@ -21,6 +22,8 @@ from edgar_capstone.observability.tracing import (
 
 logger = logging.getLogger(__name__)
 
+P = ParamSpec("P")
+R = TypeVar("R")
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -41,24 +44,19 @@ class UpstreamTimeoutError(ToolExecutionError):
 
 
 def _is_retryable_exception(exc: BaseException) -> tuple[bool, float | None]:
-    """Determine if an exception is a transient rate limit (HTTP 429) or timeout."""
-    if isinstance(exc, RateLimitExceededError):
+    """Determine if an exception is a transient rate limit (HTTP 429), 5xx, or timeout."""
+    if isinstance(exc, (RateLimitExceededError, GcpRateLimitError)):
         return True, exc.retry_after_seconds
     if hasattr(exc, "retry_after_seconds"):
         return True, getattr(exc, "retry_after_seconds", None)
-    if isinstance(exc, (UpstreamTimeoutError, TimeoutError, httpx.TimeoutException)):
+    if isinstance(
+        exc, (UpstreamTimeoutError, GcpTimeoutError, TimeoutError, httpx.TimeoutException)
+    ):
         return True, None
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         if status in (429, 500, 502, 503, 504):
-            retry_after = exc.response.headers.get("Retry-After")
-            delay: float | None = None
-            if retry_after:
-                try:
-                    delay = float(retry_after)
-                except ValueError:
-                    delay = None
-            return True, delay
+            return True, parse_retry_after(exc.response)
     return False, None
 
 
@@ -71,7 +69,7 @@ def _record_tool_telemetry(
     attempts: int,
     error_message: str | None = None,
 ) -> None:
-    """Append tool execution telemetry to `tool_context.state['tool_telemetry']`."""
+    """Append tool execution telemetry to ``tool_context.state['tool_telemetry']``."""
     if tool_context is None or not hasattr(tool_context, "state"):
         return
     try:
@@ -92,6 +90,83 @@ def _record_tool_telemetry(
         logger.debug("Skipping tool telemetry state update: %s", exc)
 
 
+def retry_transient_errors(
+    *,
+    operation_name: str | None = None,
+    max_retries: int = 3,
+    base_delay_seconds: float = 0.25,
+    max_delay_seconds: float = 8.0,
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Retry transient HTTP 429/5xx/timeout errors with exponential backoff and re-raise on failure.
+
+    Unlike ``with_tool_resilience`` (which converts final failures into ADK tool error dicts),
+    this decorator preserves the wrapped function's return type and propagates exceptions to
+    callers (e.g., internal RPC clients such as Model Armor, DLP, GCS/Vertex prompt stores).
+    """
+    eff_retries = max(1, int(max_retries))
+
+    def decorator(func: Callable[P, R]) -> Callable[P, R]:
+        resolved_name = operation_name or func.__name__
+
+        @functools.wraps(func)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
+            with start_span(
+                f"rpc.{resolved_name}",
+                attributes={"edgar.rpc.name": resolved_name, "code.function": func.__qualname__},
+            ) as span:
+                for attempt in range(1, eff_retries + 1):
+                    try:
+                        result = func(*args, **kwargs)
+                        set_span_attributes(
+                            span,
+                            **{"edgar.rpc.attempts": attempt, "edgar.rpc.status": "success"},
+                        )
+                        return result
+                    except Exception as exc:
+                        retryable, explicit_delay = _is_retryable_exception(exc)
+                        if retryable and attempt < eff_retries:
+                            backoff = (
+                                explicit_delay
+                                if explicit_delay is not None
+                                else min(
+                                    max_delay_seconds,
+                                    base_delay_seconds * (2 ** (attempt - 1)),
+                                )
+                            )
+                            logger.warning(
+                                "RPC '%s' encountered transient error on attempt %d/%d (%s); "
+                                "retrying in %.2fs...",
+                                resolved_name,
+                                attempt,
+                                eff_retries,
+                                exc,
+                                backoff,
+                            )
+                            add_span_event(
+                                "rpc.retry",
+                                attempt=attempt,
+                                backoff_seconds=backoff,
+                                error_type=type(exc).__name__,
+                            )
+                            time.sleep(backoff)
+                            continue
+                        set_span_attributes(
+                            span,
+                            **{"edgar.rpc.attempts": attempt, "edgar.rpc.status": "error"},
+                        )
+                        mark_span_error(
+                            str(exc),
+                            span,
+                            **{"edgar.rpc.error_type": type(exc).__name__},
+                        )
+                        raise
+                raise AssertionError("unreachable")  # pragma: no cover
+
+        return wrapper
+
+    return decorator
+
+
 def with_tool_resilience(
     *,
     tool_name: str | None = None,
@@ -101,13 +176,14 @@ def with_tool_resilience(
 ) -> Callable[[F], F]:
     """Decorator wrapping an ADK tool function with HTTP 429/timeout retries and telemetry.
 
-    Each invocation runs inside an OpenTelemetry `tool.<name>` span (child of the ADK
-    `execute_tool` span in live mode, or of the chat-turn span in deterministic mode) that
-    records attempts, retry events, and the final status for Cloud Trace.
+    Each invocation runs inside an OpenTelemetry ``tool.<name>`` span (child of the ADK
+    ``execute_tool`` span or of the chat-turn span) that records attempts, retry events,
+    and the final status for Cloud Trace.
 
-    Preserves the original function signature (`__signature__`, `__name__`, `__doc__`)
-    so Google ADK's `FunctionTool` schema introspection works without alteration.
+    Preserves the original function signature (``__signature__``, ``__name__``, ``__doc__``)
+    so Google ADK's ``FunctionTool`` schema introspection works without alteration.
     """
+    eff_retries = max(1, int(max_retries))
 
     def decorator(func: F) -> F:
         resolved_name = tool_name or func.__name__
@@ -140,7 +216,7 @@ def with_tool_resilience(
                         tool_ctx = arg
                         break
 
-            for attempt in range(1, max_retries + 1):
+            for attempt in range(1, eff_retries + 1):
                 try:
                     result = func(*args, **kwargs)
                     elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
@@ -155,7 +231,7 @@ def with_tool_resilience(
                     return result
                 except Exception as exc:
                     retryable, explicit_delay = _is_retryable_exception(exc)
-                    if retryable and attempt < max_retries:
+                    if retryable and attempt < eff_retries:
                         backoff = (
                             explicit_delay
                             if explicit_delay is not None
@@ -166,7 +242,7 @@ def with_tool_resilience(
                             "retrying in %.2fs...",
                             resolved_name,
                             attempt,
-                            max_retries,
+                            eff_retries,
                             exc,
                             backoff,
                         )
@@ -206,13 +282,7 @@ def with_tool_resilience(
                         "message": err_msg,
                         "attempts": attempt,
                     }
-
-            return {
-                "status": "error",
-                "tool_name": resolved_name,
-                "error_type": "MaxRetriesExceeded",
-                "message": f"Exhausted {max_retries} retries for {resolved_name}",
-            }
+            raise AssertionError("unreachable")  # pragma: no cover
 
         wrapper.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
         return wrapper  # type: ignore[return-value]

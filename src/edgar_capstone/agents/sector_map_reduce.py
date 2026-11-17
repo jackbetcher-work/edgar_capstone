@@ -1,42 +1,29 @@
-"""Full-sector batched map-reduce pipeline for GICS sector-wide thematic queries (Gap 1).
+"""Full-sector batched map-reduce pipeline for GICS sector-wide thematic queries.
 
 When a user asks a sector-wide question (e.g. "How has AI risk wording changed across all
-Information Technology companies in the S&P 500 since 2024?"), the naive approach either:
-- caps retrieval at 5 companies / 16 chunks (missing ~70 of 76 IT issuers), or
-- issues 76+ sequential LLM calls and hundreds of BigQuery RPCs (slow & expensive).
-
-Instead, this module executes a principled, verifiable batched map-reduce:
+Information Technology companies in the S&P 500 since 2024?"), this module executes a
+principled, verifiable batched map-reduce:
 1. **Enumerate sector issuers** from the live BigQuery `financial_metrics` catalog (reports exact
    counts of total issuers, issuers with filings per year, and missing fiscal years like FY2026).
 2. **Single-query sector retrieval** via `BigQueryAdapter.vector_search_sector_top_per_ticker`
-   (`ML.DISTANCE(embedding, @query_embedding, 'COSINE')` + `QUALIFY ROW_NUMBER() OVER (PARTITION BY
-   ticker, fiscal_year ORDER BY dist ASC) <= per_company_year`). Retrieves top theme-relevant chunks
-   for EVERY company-year in the entire sector (~76 companies x 3 years) in one ~2-3 s SQL query.
+   (`ML.DISTANCE(embedding, @query_embedding, 'COSINE')` + `QUALIFY ROW_NUMBER()`).
 3. **Deterministic per-company alignment & mention counts**: Uses the word-trigram algorithm from
-   `disclosure_deltas.py` across every issuer's retrieved passages to compute added/removed/modified
-   counts, theme mentions per year, and missing fiscal years across the entire sector.
+   `disclosure_deltas.py` across every issuer's retrieved passages.
 4. **Parallel batched map (`gemini-3.5-flash`)**: Groups matching companies into batches of ~14
-   issuers (~6 batches for 76 IT companies) and summarizes each batch concurrently with constrained
-   JSON (`SectorBatchSummary`), verifying every cited `chunk_id` against the real batch chunks.
-   Streams live progress callbacks (`"Map-reduce: 28/76 Information Technology companies analyzed"`)
-   so TTFT holds well under 3.0 seconds on `/api/v1/chat/stream`.
+   issuers and summarizes each batch concurrently with constrained JSON (`SectorBatchSummary`),
+   verifying every cited `chunk_id` and verbatim quote against the real batch chunks.
 5. **Reduce-ready output**: Returns verified batch digests, deterministic sector coverage metadata,
-   merged Disclosure Delta structures, and full `citations` (covering every cited `chunk_id` across
-   all batches) so `FinancialAnalystAgent` (`gemini-3.8-flash`) reduces them into one verified
-   `AnalystReport` whose claims are 100% traceable back to real company-level 10-K filings.
+   merged Disclosure Delta structures, and prioritized `citations` traceable to real 10-K filings.
 """
 
 from __future__ import annotations
 
-import contextvars
-import hashlib
 import json
 import logging
 import threading
 import uuid
 from collections import defaultdict
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from google.adk.agents import Agent
@@ -60,6 +47,9 @@ from edgar_capstone.agents.live_runtime import (
     run_adk_agent_stream,
 )
 from edgar_capstone.agents.tools import _gcp_adapters
+from edgar_capstone.common.concurrency import run_parallel_with_context
+from edgar_capstone.common.domain import normalize_edgar_ticker, sha256_text
+from edgar_capstone.common.formatting import normalize_quote_text, parse_model_output
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.observability.tracing import set_span_attributes, traced
 
@@ -105,20 +95,10 @@ class SectorBatchSummary(BaseModel):
     )
 
 
-def _normalize_quote_text(text: str) -> str:
-    cleaned = (text or "").replace("\\", "")
-    for old, new in (
-        ("\u2019", "'"),
-        ("\u2018", "'"),
-        ("\u201c", '"'),
-        ("\u201d", '"'),
-        ("\u2014", "-"),
-        ("\u2013", "-"),
-        ("*", ""),
-        ("_", " "),
-    ):
-        cleaned = cleaned.replace(old, new)
-    return " ".join(cleaned.lower().split())
+def _normalize_for_quote_match(text: str) -> str:
+    """Normalize smart punctuation, dashes, markdown escapes/emphasis, and underscores for matching."""
+    cleaned = normalize_quote_text((text or "").replace("\\", ""))
+    return " ".join(cleaned.replace("*", "").replace("_", " ").split())
 
 
 def _create_sector_map_agent(model: str | BaseLlm) -> Agent:
@@ -146,6 +126,66 @@ def _create_sector_map_agent(model: str | BaseLlm) -> Agent:
     )
 
 
+def _verify_batch_evidence(
+    evidence_items: list[BatchEvidenceItem],
+    chunk_lookup: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Filter batch evidence down to items whose `chunk_id` and verbatim quote exist in the batch."""
+    verified: list[dict[str, Any]] = []
+    dropped = 0
+    for item in evidence_items[:6]:
+        cit = chunk_lookup.get(item.chunk_id)
+        if cit is None:
+            dropped += 1
+            continue
+        excerpt_norm = _normalize_for_quote_match(
+            str(cit.get("excerpt") or cit.get("chunk_text") or "")
+        )
+        quote_norm = _normalize_for_quote_match(item.verbatim_quote)
+        if len(quote_norm) < 16 or quote_norm not in excerpt_norm:
+            dropped += 1
+            continue
+        verified.append(
+            {
+                "ticker": str(cit["ticker"]),
+                "fiscal_year": int(cit["fiscal_year"]),
+                "period_of_report": cit.get("period_of_report"),
+                "accession_number": cit.get("accession_number"),
+                "section_id": cit.get("section_id"),
+                "chunk_id": item.chunk_id,
+                "verbatim_quote": item.verbatim_quote.strip(),
+                "takeaway": item.takeaway.strip(),
+            }
+        )
+    return verified, dropped
+
+
+def _build_batch_prompt(
+    *,
+    batch_index: int,
+    total_batches: int,
+    gics_sector: str,
+    theme: str,
+    start_year: int,
+    end_year: int,
+    tickers_in_batch: list[str],
+    company_payloads: list[dict[str, Any]],
+) -> str:
+    return (
+        f"## Sector Map Batch {batch_index + 1}/{total_batches}\n"
+        f"- GICS Sector: `{gics_sector}`\n"
+        f"- Theme / Question: {theme}\n"
+        f"- Fiscal Window: FY{start_year}–FY{end_year}\n"
+        f"- Companies in batch ({len(tickers_in_batch)}): {', '.join(tickers_in_batch)}\n\n"
+        "Summarize the recurring themes and year-over-year wording changes across these companies, "
+        "returning JSON matching `SectorBatchSummary` (`batch_index`, `tickers_covered`, "
+        "`dominant_themes`, `wording_shifts`, `evidence`). Pick up to 6 strong representative "
+        "`evidence` items spanning different companies and years, copying `verbatim_quote` exactly "
+        "from the chunk's `excerpt`.\n\n"
+        f"```json\n{json.dumps(company_payloads, default=str)}\n```"
+    )
+
+
 def _summarize_batch_via_flash(
     *,
     batch_index: int,
@@ -160,37 +200,34 @@ def _summarize_batch_via_flash(
 ) -> dict[str, Any]:
     """Run one map batch through Gemini 3.5 Flash and filter out any unverifiable citations."""
     tickers_in_batch = [str(c["ticker"]) for c in company_payloads]
-    prompt = (
-        f"## Sector Map Batch {batch_index + 1}/{total_batches}\n"
-        f"- GICS Sector: `{gics_sector}`\n"
-        f"- Theme / Question: {theme}\n"
-        f"- Fiscal Window: FY{start_year}–FY{end_year}\n"
-        f"- Companies in batch ({len(tickers_in_batch)}): {', '.join(tickers_in_batch)}\n\n"
-        "Summarize the recurring themes and year-over-year wording changes across these companies, "
-        "returning JSON matching `SectorBatchSummary` (`batch_index`, `tickers_covered`, "
-        "`dominant_themes`, `wording_shifts`, `evidence`). Pick up to 6 strong representative "
-        "`evidence` items spanning different companies and years, copying `verbatim_quote` exactly "
-        "from the chunk's `excerpt`.\n\n"
-        f"```json\n{json.dumps(company_payloads, default=str)}\n```"
+    prompt = _build_batch_prompt(
+        batch_index=batch_index,
+        total_batches=total_batches,
+        gics_sector=gics_sector,
+        theme=theme,
+        start_year=start_year,
+        end_year=end_year,
+        tickers_in_batch=tickers_in_batch,
+        company_payloads=company_payloads,
     )
 
     resolved = resolve_live_adk_runtime(custom_llm=map_llm)
     if map_llm is not None:
         model_obj: str | BaseLlm = map_llm
+        model_used = map_llm.model
     else:
         from edgar_capstone.agents.live_runtime import build_adk_llm_for_task
 
         model_obj = build_adk_llm_for_task("context_compaction", resolution=resolved)
+        model_used = resolve_model_for_task("context_compaction")
 
-    agent = _create_sector_map_agent(model_obj)
-    prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     stream_res = run_adk_agent_stream(
-        agent=agent,
+        agent=_create_sector_map_agent(model_obj),
         prompt_text=prompt,
         user_id="sector_mapper",
         session_id=f"sector-map-{batch_index}-{uuid.uuid4().hex[:8]}",
         app_name="edgar_sector_map_app",
-        state_delta={"_model_armor_verified_prompt_sha256": prompt_hash},
+        state_delta={"_model_armor_verified_prompt_sha256": sha256_text(prompt)},
         use_adk_app=False,
         backend=resolved.backend,
         max_llm_calls=2,
@@ -198,20 +235,7 @@ def _summarize_batch_via_flash(
     )
 
     raw_obj = stream_res.session_state.get("sector_batch_summary")
-    parsed: SectorBatchSummary | None = None
-    if isinstance(raw_obj, SectorBatchSummary):
-        parsed = raw_obj
-    elif isinstance(raw_obj, dict):
-        try:
-            parsed = SectorBatchSummary.model_validate(raw_obj)
-        except Exception:
-            parsed = None
-    elif stream_res.final_text.strip():
-        try:
-            parsed = SectorBatchSummary.model_validate_json(stream_res.final_text.strip())
-        except Exception:
-            parsed = None
-
+    parsed = parse_model_output(raw_obj, SectorBatchSummary, fallback_text=stream_res.final_text)
     if parsed is None:
         logger.warning(
             "Sector map batch %d/%d did not parse into SectorBatchSummary; dropping unparsed output.",
@@ -226,34 +250,10 @@ def _summarize_batch_via_flash(
             "evidence": [],
             "verified_evidence_count": 0,
             "dropped_evidence_count": 0,
-            "model_used": resolve_model_for_task("context_compaction"),
+            "model_used": model_used,
         }
 
-    verified_evidence: list[dict[str, Any]] = []
-    dropped = 0
-    for item in parsed.evidence[:6]:
-        cit = chunk_lookup.get(item.chunk_id)
-        if cit is None:
-            dropped += 1
-            continue
-        excerpt_norm = _normalize_quote_text(str(cit.get("excerpt") or cit.get("chunk_text") or ""))
-        quote_norm = _normalize_quote_text(item.verbatim_quote)
-        if len(quote_norm) < 16 or quote_norm not in excerpt_norm:
-            dropped += 1
-            continue
-        verified_evidence.append(
-            {
-                "ticker": str(cit["ticker"]),
-                "fiscal_year": int(cit["fiscal_year"]),
-                "period_of_report": cit.get("period_of_report"),
-                "accession_number": cit.get("accession_number"),
-                "section_id": cit.get("section_id"),
-                "chunk_id": item.chunk_id,
-                "verbatim_quote": item.verbatim_quote.strip(),
-                "takeaway": item.takeaway.strip(),
-            }
-        )
-
+    verified_evidence, dropped = _verify_batch_evidence(parsed.evidence, chunk_lookup)
     return {
         "batch_index": batch_index,
         "tickers_covered": tickers_in_batch,
@@ -262,118 +262,55 @@ def _summarize_batch_via_flash(
         "evidence": verified_evidence,
         "verified_evidence_count": len(verified_evidence),
         "dropped_evidence_count": dropped,
-        "model_used": (
-            map_llm.model if map_llm is not None else resolve_model_for_task("context_compaction")
-        ),
+        "model_used": model_used,
     }
 
 
-@traced("sector.map_reduce", record_args=("gics_sector", "start_year", "end_year"))
-def run_sector_thematic_map_reduce(
-    *,
-    theme: str,
+def _load_sector_issuer_catalog(
     gics_sector: str,
-    section_id: str,
     start_year: int,
     end_year: int,
-    sector_profiles: list[FinancialDataProfile] | None = None,
-    batch_size: int = DEFAULT_BATCH_SIZE,
-    per_company_year: int = DEFAULT_PER_COMPANY_YEAR,
-    max_workers: int = DEFAULT_MAX_MAP_WORKERS,
-    map_llm: BaseLlm | None = None,
-    on_progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
-) -> dict[str, Any]:
-    """Run full-sector batched map-reduce thematic analysis across ALL issuers in `gics_sector`.
-
-    Emits incremental `on_progress(stage, message, meta)` events so SSE callers stream progress
-    to the user within the 3.0 s TTFT window (e.g. `"28/76 Information Technology companies analyzed"`).
-    """
-    start_year, end_year = sorted((int(start_year), int(end_year)))
-    window = list(range(start_year, end_year + 1))
-    sec_norm = (section_id or "ALL").strip().lower()
-    sec_filter = sec_norm if sec_norm in ("item_1a", "item_7") else None
-
-    adapters = _gcp_adapters()
-
-    # 1. Enumerate every issuer in the target GICS sector and its available filing years.
+    sector_profiles: list[FinancialDataProfile] | None,
+) -> tuple[dict[str, set[int]], dict[str, str]]:
+    """Load sector profiles (or filter injected profiles) into `(issuer_years, issuer_names)`."""
     if sector_profiles is None:
-        sector_profiles = adapters.bigquery.fetch_profiles(
+        profiles = _gcp_adapters().bigquery.fetch_profiles(
             tickers=set(),
             start_year=start_year,
             end_year=end_year,
             gics_sector=gics_sector,
         )
     else:
-        sector_profiles = [
+        target = gics_sector.strip().lower()
+        profiles = [
             p
             for p in sector_profiles
-            if str(p.gics_sector or "").strip().lower() == gics_sector.strip().lower()
+            if str(p.gics_sector or "").strip().lower() == target
             and start_year <= p.fiscal_year <= end_year
         ]
 
     issuer_years: dict[str, set[int]] = defaultdict(set)
     issuer_names: dict[str, str] = {}
-    for p in sector_profiles:
-        t = p.ticker.upper().replace(".", "-")
-        issuer_years[t].add(int(p.fiscal_year))
-        issuer_names[t] = p.company_name or t
+    for p in profiles:
+        tk = normalize_edgar_ticker(p.ticker)
+        issuer_years[tk].add(int(p.fiscal_year))
+        issuer_names[tk] = p.company_name or tk
+    return issuer_years, issuer_names
 
-    all_sector_tickers = sorted(issuer_years.keys())
-    issuers_in_sector = len(all_sector_tickers)
-    filings_by_year = {
-        str(fy): sum(1 for yrs in issuer_years.values() if fy in yrs) for fy in window
-    }
-    missing_fy_counts = {
-        str(fy): sum(1 for yrs in issuer_years.values() if fy not in yrs) for fy in window
-    }
 
-    if on_progress is not None:
-        on_progress(
-            "sector_retrieval",
-            f"Scanning {issuers_in_sector} {gics_sector} companies (FY{start_year}–FY{end_year})...",
-            {
-                "gics_sector": gics_sector,
-                "issuers_in_sector": issuers_in_sector,
-                "analyzed": 0,
-                "total": issuers_in_sector,
-            },
-        )
-
-    # 2. Single BigQuery ML.DISTANCE query covering EVERY company-year in the entire sector.
-    q_emb = adapters.embed_query(theme)
-    raw_rows = adapters.bigquery.vector_search_sector_top_per_ticker(
-        q_emb,
-        gics_sector=gics_sector,
-        start_year=start_year,
-        end_year=end_year,
-        section_id=sec_filter,
-        per_company_year=per_company_year,
-    )
-
-    theme_terms = extract_theme_terms(theme)
-    rows_by_ticker_fy: dict[str, dict[int, list[dict[str, Any]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    all_citations_by_id: dict[str, dict[str, Any]] = {}
-
-    for row in raw_rows:
-        tk = str(row.get("ticker") or "").upper().replace(".", "-")
-        fy = int(row["fiscal_year"])
-        score = float(row.get("similarity") or 0.0)
-        cit = chunk_row_to_citation(row, score=score)
-        rows_by_ticker_fy[tk][fy].append(cit)
-        all_citations_by_id[str(cit["chunk_id"])] = cit
-        if tk not in issuer_names:
-            issuer_names[tk] = str(row.get("company_name") or tk)
-        issuer_years[tk].add(fy)
-
-    analyzed_tickers = sorted(rows_by_ticker_fy.keys())
-    if not all_sector_tickers:
-        all_sector_tickers = list(analyzed_tickers)
-        issuers_in_sector = len(all_sector_tickers)
-
-    # 3. Deterministic per-company alignment & theme mentions across ALL analyzed issuers.
+def _compute_sector_evolutions(
+    *,
+    analyzed_tickers: list[str],
+    rows_by_ticker_fy: dict[str, dict[int, list[dict[str, Any]]]],
+    issuer_names: dict[str, str],
+    gics_sector: str,
+    window: list[int],
+    theme_terms: list[str],
+    issuers_in_sector: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int], dict[str, int], int]:
+    """Compute per-company disclosure evolutions, mention totals, and compact Flash payloads."""
     evolutions: list[dict[str, Any]] = []
+    company_map_inputs: list[dict[str, Any]] = []
     delta_summary = {
         "added": 0,
         "removed": 0,
@@ -383,9 +320,8 @@ def run_sector_thematic_map_reduce(
         "companies_analyzed": len(analyzed_tickers),
         "issuers_in_sector": issuers_in_sector,
     }
-    theme_mentions_totals_by_year: dict[str, int] = {str(fy): 0 for fy in window}
+    mentions_by_year: dict[str, int] = {str(fy): 0 for fy in window}
     issuers_with_theme_matches = 0
-    company_map_inputs: list[dict[str, Any]] = []
 
     for tk in analyzed_tickers:
         fy_dict = rows_by_ticker_fy[tk]
@@ -424,35 +360,27 @@ def run_sector_thematic_map_reduce(
             sections=sections,
             theme_passages=theme_passages,
         )
-        evo_dict = evo.model_dump(mode="json")
-        evolutions.append(evo_dict)
+        evolutions.append(evo.model_dump(mode="json"))
 
         for yr_str, cnt in evo.theme_mentions.items():
-            theme_mentions_totals_by_year[yr_str] = theme_mentions_totals_by_year.get(
-                yr_str, 0
-            ) + int(cnt)
+            mentions_by_year[yr_str] = mentions_by_year.get(yr_str, 0) + int(cnt)
         for pair in evo.year_pairs:
             delta_summary["year_pairs"] += 1
             for kind in ("added", "removed", "modified", "unchanged"):
                 delta_summary[kind] += pair.counts.get(kind, 0)
 
-        # Build compact per-company payload for the Flash map step (preserving real chunk_ids).
-        compact_passages = []
-        for fy in avail_yrs:
-            for c in fy_dict[fy][:2]:
-                compact_passages.append(
-                    {
-                        "fiscal_year": fy,
-                        "period_of_report": c.get("period_of_report"),
-                        "section_id": c.get("section_id"),
-                        "chunk_id": c["chunk_id"],
-                        "score": c.get("score"),
-                        "excerpt": " ".join(str(c.get("excerpt") or "").split())[:520],
-                    }
-                )
-        delta_counts = {
-            f"FY{p.prior_fiscal_year}->FY{p.current_fiscal_year}": p.counts for p in evo.year_pairs
-        }
+        compact_passages = [
+            {
+                "fiscal_year": fy,
+                "period_of_report": c.get("period_of_report"),
+                "section_id": c.get("section_id"),
+                "chunk_id": c["chunk_id"],
+                "score": c.get("score"),
+                "excerpt": " ".join(str(c.get("excerpt") or "").split())[:520],
+            }
+            for fy in avail_yrs
+            for c in fy_dict[fy][:2]
+        ]
         company_map_inputs.append(
             {
                 "ticker": tk,
@@ -460,31 +388,228 @@ def run_sector_thematic_map_reduce(
                 "fiscal_years_available": avail_yrs,
                 "missing_fiscal_years": evo.missing_fiscal_years,
                 "theme_mentions": evo.theme_mentions,
-                "delta_counts": delta_counts,
+                "delta_counts": {
+                    f"FY{p.prior_fiscal_year}->FY{p.current_fiscal_year}": p.counts
+                    for p in evo.year_pairs
+                },
                 "top_similarity": round(best_sim, 4),
                 "passages": compact_passages,
             }
         )
 
-    # Order most-relevant issuers first inside evolutions & representative delta cards.
     company_rank = {
         c["ticker"]: (sum(c["theme_mentions"].values()), c["top_similarity"])
         for c in company_map_inputs
     }
     evolutions.sort(key=lambda e: company_rank.get(e["ticker"], (0, 0.0)), reverse=True)
     company_map_inputs.sort(key=lambda c: company_rank.get(c["ticker"], (0, 0.0)), reverse=True)
+    return (
+        evolutions,
+        company_map_inputs,
+        delta_summary,
+        mentions_by_year,
+        issuers_with_theme_matches,
+    )
+
+
+def _run_parallel_map_batches(
+    *,
+    batches: list[list[dict[str, Any]]],
+    analyzed_count: int,
+    issuers_in_sector: int,
+    gics_sector: str,
+    theme: str,
+    start_year: int,
+    end_year: int,
+    all_citations_by_id: dict[str, dict[str, Any]],
+    max_workers: int,
+    map_llm: BaseLlm | None,
+    on_progress: Callable[[str, str, dict[str, Any] | None], None] | None,
+) -> list[dict[str, Any]]:
+    """Execute Flash map batches concurrently while streaming progress as each batch completes."""
+    total_batches = len(batches)
+    if total_batches == 0:
+        return []
+
+    progress_lock = threading.Lock()
+    state = {"analyzed": 0, "done": 0}
+
+    def _run_one(item: tuple[int, list[dict[str, Any]]]) -> dict[str, Any]:
+        idx, batch = item
+        summary = _summarize_batch_via_flash(
+            batch_index=idx,
+            total_batches=total_batches,
+            gics_sector=gics_sector,
+            theme=theme,
+            start_year=start_year,
+            end_year=end_year,
+            company_payloads=batch,
+            chunk_lookup=all_citations_by_id,
+            map_llm=map_llm,
+        )
+        with progress_lock:
+            state["analyzed"] += len(batch)
+            state["done"] += 1
+            snap_analyzed = state["analyzed"]
+            snap_done = state["done"]
+        if on_progress is not None:
+            on_progress(
+                "sector_map_progress",
+                (
+                    f"{snap_analyzed}/{analyzed_count} {gics_sector} companies analyzed "
+                    f"(batch {snap_done}/{total_batches})"
+                ),
+                {
+                    "analyzed": snap_analyzed,
+                    "total": analyzed_count,
+                    "issuers_in_sector": issuers_in_sector,
+                    "batch_completed": snap_done,
+                    "total_batches": total_batches,
+                },
+            )
+        return summary
+
+    return run_parallel_with_context(
+        list(enumerate(batches)),
+        _run_one,
+        max_workers=min(max_workers, total_batches),
+    )
+
+
+def _collect_prioritized_citations(
+    batch_summaries: list[dict[str, Any]],
+    company_map_inputs: list[dict[str, Any]],
+    all_citations_by_id: dict[str, dict[str, Any]],
+    *,
+    max_citations: int = 60,
+) -> list[dict[str, Any]]:
+    """Collect all verified batch citations first, then fill with top representative passages."""
+    prioritized: list[dict[str, Any]] = []
+    seen_cids: set[str] = set()
+    for bs in batch_summaries:
+        for ev in bs.get("evidence") or []:
+            cid = str(ev.get("chunk_id") or "")
+            if cid and cid in all_citations_by_id and cid not in seen_cids:
+                prioritized.append(all_citations_by_id[cid])
+                seen_cids.add(cid)
+
+    for c_in in company_map_inputs[:20]:
+        for p in c_in["passages"]:
+            if len(prioritized) >= max_citations:
+                return prioritized
+            cid = str(p["chunk_id"])
+            if cid in all_citations_by_id and cid not in seen_cids:
+                prioritized.append(all_citations_by_id[cid])
+                seen_cids.add(cid)
+    return prioritized
+
+
+@traced("sector.map_reduce", record_args=("gics_sector", "start_year", "end_year"))
+def run_sector_thematic_map_reduce(
+    *,
+    theme: str,
+    gics_sector: str,
+    section_id: str,
+    start_year: int,
+    end_year: int,
+    sector_profiles: list[FinancialDataProfile] | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    per_company_year: int = DEFAULT_PER_COMPANY_YEAR,
+    max_workers: int = DEFAULT_MAX_MAP_WORKERS,
+    map_llm: BaseLlm | None = None,
+    on_progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
+) -> dict[str, Any]:
+    """Run full-sector batched map-reduce thematic analysis across ALL issuers in `gics_sector`.
+
+    Emits incremental `on_progress(stage, message, meta)` events so SSE callers stream progress
+    to the user within the 3.0 s TTFT window (e.g. `"28/76 Information Technology companies analyzed"`).
+    """
+    start_year, end_year = sorted((int(start_year), int(end_year)))
+    window = list(range(start_year, end_year + 1))
+    sec_norm = (section_id or "ALL").strip().lower()
+    sec_filter = sec_norm if sec_norm in ("item_1a", "item_7") else None
+
+    adapters = _gcp_adapters()
+
+    # 1. Enumerate every issuer in the target GICS sector and its available filing years.
+    issuer_years, issuer_names = _load_sector_issuer_catalog(
+        gics_sector, start_year, end_year, sector_profiles
+    )
+    all_sector_tickers = sorted(issuer_years.keys())
+    issuers_in_sector = len(all_sector_tickers)
+    filings_by_year = {
+        str(fy): sum(1 for yrs in issuer_years.values() if fy in yrs) for fy in window
+    }
+    missing_fy_counts = {
+        str(fy): sum(1 for yrs in issuer_years.values() if fy not in yrs) for fy in window
+    }
+
+    if on_progress is not None:
+        on_progress(
+            "sector_retrieval",
+            f"Scanning {issuers_in_sector} {gics_sector} companies (FY{start_year}–FY{end_year})...",
+            {
+                "gics_sector": gics_sector,
+                "issuers_in_sector": issuers_in_sector,
+                "analyzed": 0,
+                "total": issuers_in_sector,
+            },
+        )
+
+    # 2. Single BigQuery ML.DISTANCE query covering EVERY company-year in the entire sector.
+    q_emb = adapters.embed_query(theme)
+    raw_rows = adapters.bigquery.vector_search_sector_top_per_ticker(
+        q_emb,
+        gics_sector=gics_sector,
+        start_year=start_year,
+        end_year=end_year,
+        section_id=sec_filter,
+        per_company_year=per_company_year,
+    )
+
+    theme_terms = extract_theme_terms(theme)
+    rows_by_ticker_fy: dict[str, dict[int, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    all_citations_by_id: dict[str, dict[str, Any]] = {}
+    for row in raw_rows:
+        tk = normalize_edgar_ticker(str(row.get("ticker") or ""))
+        fy = int(row["fiscal_year"])
+        cit = chunk_row_to_citation(row, score=float(row.get("similarity") or 0.0))
+        rows_by_ticker_fy[tk][fy].append(cit)
+        all_citations_by_id[str(cit["chunk_id"])] = cit
+        issuer_names.setdefault(tk, str(row.get("company_name") or tk))
+        issuer_years[tk].add(fy)
+
+    analyzed_tickers = sorted(rows_by_ticker_fy.keys())
+    if not all_sector_tickers:
+        all_sector_tickers = list(analyzed_tickers)
+        issuers_in_sector = len(all_sector_tickers)
+
+    # 3. Deterministic per-company alignment & theme mentions across ALL analyzed issuers.
+    (
+        evolutions,
+        company_map_inputs,
+        delta_summary,
+        theme_mentions_totals_by_year,
+        issuers_with_theme_matches,
+    ) = _compute_sector_evolutions(
+        analyzed_tickers=analyzed_tickers,
+        rows_by_ticker_fy=rows_by_ticker_fy,
+        issuer_names=issuer_names,
+        gics_sector=gics_sector,
+        window=window,
+        theme_terms=theme_terms,
+        issuers_in_sector=issuers_in_sector,
+    )
 
     # 4. Parallel batched Map phase across ALL analyzed companies.
     eff_batch_size = max(1, int(batch_size))
-    batches: list[list[dict[str, Any]]] = [
+    batches = [
         company_map_inputs[i : i + eff_batch_size]
         for i in range(0, len(company_map_inputs), eff_batch_size)
     ]
     total_batches = len(batches)
-    analyzed_so_far = 0
-    progress_lock = threading.Lock()
-    batch_summaries: list[dict[str, Any]] = [{}] * total_batches
-
     if on_progress is not None and total_batches > 0:
         on_progress(
             "sector_map_start",
@@ -501,94 +626,24 @@ def run_sector_thematic_map_reduce(
             },
         )
 
-    if total_batches == 1:
-        batch_summaries[0] = _summarize_batch_via_flash(
-            batch_index=0,
-            total_batches=1,
-            gics_sector=gics_sector,
-            theme=theme,
-            start_year=start_year,
-            end_year=end_year,
-            company_payloads=batches[0],
-            chunk_lookup=all_citations_by_id,
-            map_llm=map_llm,
-        )
-        if on_progress is not None:
-            on_progress(
-                "sector_map_progress",
-                f"{len(analyzed_tickers)}/{len(analyzed_tickers)} {gics_sector} companies analyzed (batch 1/1)",
-                {
-                    "analyzed": len(analyzed_tickers),
-                    "total": len(analyzed_tickers),
-                    "issuers_in_sector": issuers_in_sector,
-                    "batch_completed": 1,
-                    "total_batches": 1,
-                },
-            )
-    elif total_batches > 1:
-        with ThreadPoolExecutor(max_workers=min(max_workers, total_batches)) as pool:
-            fut_map = {
-                pool.submit(
-                    contextvars.copy_context().run,
-                    _summarize_batch_via_flash,
-                    batch_index=idx,
-                    total_batches=total_batches,
-                    gics_sector=gics_sector,
-                    theme=theme,
-                    start_year=start_year,
-                    end_year=end_year,
-                    company_payloads=batch,
-                    chunk_lookup=all_citations_by_id,
-                    map_llm=map_llm,
-                ): (idx, len(batch))
-                for idx, batch in enumerate(batches)
-            }
-            done_batches = 0
-            for fut in as_completed(fut_map):
-                idx, b_len = fut_map[fut]
-                batch_summaries[idx] = fut.result()
-                with progress_lock:
-                    analyzed_so_far += b_len
-                    done_batches += 1
-                    snap_analyzed = analyzed_so_far
-                    snap_done = done_batches
-                if on_progress is not None:
-                    on_progress(
-                        "sector_map_progress",
-                        (
-                            f"{snap_analyzed}/{len(analyzed_tickers)} {gics_sector} companies analyzed "
-                            f"(batch {snap_done}/{total_batches})"
-                        ),
-                        {
-                            "analyzed": snap_analyzed,
-                            "total": len(analyzed_tickers),
-                            "issuers_in_sector": issuers_in_sector,
-                            "batch_completed": snap_done,
-                            "total_batches": total_batches,
-                        },
-                    )
+    batch_summaries = _run_parallel_map_batches(
+        batches=batches,
+        analyzed_count=len(analyzed_tickers),
+        issuers_in_sector=issuers_in_sector,
+        gics_sector=gics_sector,
+        theme=theme,
+        start_year=start_year,
+        end_year=end_year,
+        all_citations_by_id=all_citations_by_id,
+        max_workers=max_workers,
+        map_llm=map_llm,
+        on_progress=on_progress,
+    )
 
     # 5. Collect ALL verified cited chunk_ids across every batch + top representative citations.
-    prioritized_citations: list[dict[str, Any]] = []
-    seen_cids: set[str] = set()
-    for bs in batch_summaries:
-        for ev in bs.get("evidence") or []:
-            cid = str(ev.get("chunk_id") or "")
-            if cid and cid in all_citations_by_id and cid not in seen_cids:
-                prioritized_citations.append(all_citations_by_id[cid])
-                seen_cids.add(cid)
-
-    # Add top delta/theme citations across top issuers so every requested year is well represented.
-    for c_in in company_map_inputs[:20]:
-        for p in c_in["passages"]:
-            cid = str(p["chunk_id"])
-            if cid in all_citations_by_id and cid not in seen_cids:
-                prioritized_citations.append(all_citations_by_id[cid])
-                seen_cids.add(cid)
-            if len(prioritized_citations) >= 60:
-                break
-        if len(prioritized_citations) >= 60:
-            break
+    prioritized_citations = _collect_prioritized_citations(
+        batch_summaries, company_map_inputs, all_citations_by_id
+    )
 
     sector_coverage = {
         "gics_sector": gics_sector,
@@ -627,7 +682,6 @@ def run_sector_thematic_map_reduce(
         "missing_tickers": [],
         "summary": delta_summary,
         "sector_coverage": sector_coverage,
-        # Return top 12 detailed evolutions for the DisclosureDeltaCard UI while preserving full-sector summary stats!
         "companies": evolutions[:12],
         "total_companies_evaluated": len(evolutions),
         "citations": prioritized_citations,

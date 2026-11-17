@@ -14,9 +14,18 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 
-from edgar_capstone.dataset.gcs_storage import DEFAULT_LOCATION, DEFAULT_PROJECT_ID
-from edgar_capstone.evals.bigquery_io import EvalBigQueryClient, EvalBigQueryError
+try:
+    from scripts._cli import add_gcp_args
+except ImportError:  # pragma: no cover - direct script execution without editable install
+    from _cli import add_gcp_args  # type: ignore[import-not-found,no-redef]
+
+from edgar_capstone.evals.bigquery_io import (
+    GOLDEN_EVAL_SET_TABLE,
+    EvalBigQueryClient,
+    EvalBigQueryError,
+)
 from edgar_capstone.evals.golden import (
     DEFAULT_GOLDEN_DATASET_PATH,
     GoldenDatasetError,
@@ -24,15 +33,27 @@ from edgar_capstone.evals.golden import (
     load_golden_dataset,
     validate_golden_dataset,
 )
+from edgar_capstone.gcp.defaults import (
+    resolve_bq_dataset_id,
+    resolve_gcp_location,
+    resolve_gcp_project_id,
+)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
-    p.add_argument("--dataset", default=str(DEFAULT_GOLDEN_DATASET_PATH))
-    p.add_argument("--project-id", default=DEFAULT_PROJECT_ID)
-    p.add_argument("--bq-dataset", default="sec_edgar")
-    p.add_argument("--table", default="golden_eval_set")
-    p.add_argument("--location", default=DEFAULT_LOCATION)
+    p.add_argument("--dataset", type=Path, default=DEFAULT_GOLDEN_DATASET_PATH)
+    add_gcp_args(
+        p,
+        include_project=True,
+        include_dataset=True,
+        include_location=True,
+        dataset_flag="--bq-dataset",
+        project_default=resolve_gcp_project_id(),
+        dataset_default=resolve_bq_dataset_id(),
+        location_default=resolve_gcp_location(allow_global=False),
+    )
+    p.add_argument("--table", default=GOLDEN_EVAL_SET_TABLE)
     p.add_argument("--dry-run", action="store_true", help="Validate the file without loading.")
     return p.parse_args(argv)
 
@@ -51,14 +72,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         return 0
 
-    client = EvalBigQueryClient(
-        project_id=args.project_id, dataset_id=args.bq_dataset, location=args.location
-    )
-    try:
-        result = client.load_golden_dataset(items, table_id=args.table)
-    except EvalBigQueryError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 3
+    with EvalBigQueryClient(
+        project_id=args.project_id,
+        dataset_id=args.bq_dataset,
+        location=args.location,
+    ) as client:
+        try:
+            result = client.load_golden_dataset(items, table_id=args.table)
+        except EvalBigQueryError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 3
     print(f"Loaded {result['rows_loaded']} rows into {result['table']} (job {result['job_id']})")
     return 0
 

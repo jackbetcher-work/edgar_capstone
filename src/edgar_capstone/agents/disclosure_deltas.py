@@ -19,19 +19,17 @@ summarizes changes it did not have to detect itself, and the analyst can open bo
 
 from __future__ import annotations
 
-import contextvars
 import difflib
 import functools
-import os
+import itertools
 import re
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from google.adk.tools import FunctionTool, ToolContext
 
-from edgar_capstone.agents.citations import clean_excerpt
+from edgar_capstone.agents.citations import clean_excerpt, merge_citations
 from edgar_capstone.agents.resilience import with_tool_resilience
 from edgar_capstone.agents.schemas import (
     CompanyDisclosureEvolution,
@@ -46,6 +44,13 @@ from edgar_capstone.agents.tools import (
     get_full_10k_section,
     search_10k_chunks_rag,
 )
+from edgar_capstone.common.concurrency import run_parallel_with_context
+from edgar_capstone.common.domain import (
+    SECTION_TITLES,
+    SectionId,
+    normalize_edgar_ticker,
+)
+from edgar_capstone.common.env import env_positive_int
 
 UNCHANGED_MIN = 0.90
 MODIFIED_MIN = 0.40
@@ -56,29 +61,210 @@ DEFAULT_MAX_DELTAS_PER_PAIR = 6
 _MAX_PHRASES = 5
 _MAX_PHRASE_WORDS = 18
 _EXCERPT_CHARS = 420
-_SECTIONS = ("item_1a", "item_7")
-_SECTION_TITLES = {"item_1a": "Item 1A. Risk Factors", "item_7": "Item 7. MD&A"}
-_CHANGE_ORDER = {"modified": 0, "added": 1, "removed": 2, "unchanged": 3}
+
+ChangeType = Literal["added", "removed", "modified", "unchanged"]
+
+_SECTIONS: tuple[SectionId, ...] = ("item_1a", "item_7")
+_CHANGE_ORDER: dict[ChangeType, int] = {"modified": 0, "added": 1, "removed": 2, "unchanged": 3}
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
 _MD_ESCAPE_RE = re.compile(r"\\([^\w\s])")
+_NON_WORD_RE = re.compile(r"[^\w]")
 
-_STOPWORDS = frozenset(
-    """a about above across after again against all also am an and any are as at be been before
-    being below between both but by can could did do does doing down during each few for from
-    further had has have having he her here hers how i if in into is it its itself just me more
-    most my no nor not now of off on once only or other our ours out over own same she should so
-    some such than that the their theirs them then there these they this those through to too
-    under until up very was we were what when where which while who whom why will with would you
-    your since past last year years fiscal fy""".split()
+_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "a",
+        "about",
+        "above",
+        "across",
+        "after",
+        "again",
+        "against",
+        "all",
+        "also",
+        "am",
+        "an",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "before",
+        "being",
+        "below",
+        "between",
+        "both",
+        "but",
+        "by",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "doing",
+        "down",
+        "during",
+        "each",
+        "few",
+        "for",
+        "from",
+        "further",
+        "fy",
+        "had",
+        "has",
+        "have",
+        "having",
+        "he",
+        "her",
+        "here",
+        "hers",
+        "how",
+        "i",
+        "if",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "itself",
+        "just",
+        "last",
+        "me",
+        "more",
+        "most",
+        "my",
+        "no",
+        "nor",
+        "not",
+        "now",
+        "of",
+        "off",
+        "on",
+        "once",
+        "only",
+        "or",
+        "other",
+        "our",
+        "ours",
+        "out",
+        "over",
+        "own",
+        "past",
+        "same",
+        "she",
+        "should",
+        "since",
+        "so",
+        "some",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "theirs",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "to",
+        "too",
+        "under",
+        "until",
+        "up",
+        "very",
+        "was",
+        "we",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "who",
+        "whom",
+        "why",
+        "will",
+        "with",
+        "would",
+        "year",
+        "years",
+        "you",
+        "your",
+        "fiscal",
+    }
 )
 # Words that describe the question rather than the theme being tracked.
-_GENERIC_THEME_TERMS = frozenset(
-    """risk risks factor factors disclosure disclosures wording language word words change changed
-    changes changing shift shifted evolve evolved evolution trend trends company companies firm
-    firms issuer issuers tech technology sector sectors industry s&p sp 500 compare comparison
-    compared tracking track filings filing 10-k 10k item 1a md&a mda section sections discussed
-    discuss describe described mention mentioned mentions talk talked across between how""".split()
+_GENERIC_THEME_TERMS: frozenset[str] = frozenset(
+    {
+        "10-k",
+        "10k",
+        "1a",
+        "500",
+        "across",
+        "between",
+        "change",
+        "changed",
+        "changes",
+        "changing",
+        "companies",
+        "company",
+        "compare",
+        "compared",
+        "comparison",
+        "describe",
+        "described",
+        "disclosure",
+        "disclosures",
+        "discuss",
+        "discussed",
+        "evolution",
+        "evolve",
+        "evolved",
+        "factor",
+        "factors",
+        "filing",
+        "filings",
+        "firm",
+        "firms",
+        "how",
+        "industry",
+        "issuer",
+        "issuers",
+        "item",
+        "language",
+        "md&a",
+        "mda",
+        "mention",
+        "mentioned",
+        "mentions",
+        "risk",
+        "risks",
+        "s&p",
+        "section",
+        "sections",
+        "sector",
+        "sectors",
+        "shift",
+        "shifted",
+        "sp",
+        "talk",
+        "talked",
+        "tech",
+        "technology",
+        "track",
+        "tracking",
+        "trend",
+        "trends",
+        "word",
+        "wording",
+        "words",
+    }
 )
 _THEME_SYNONYMS: dict[str, tuple[str, ...]] = {
     "ai": ("ai", "artificial intelligence", "generative ai", "genai"),
@@ -98,9 +284,12 @@ _THEME_SYNONYMS: dict[str, tuple[str, ...]] = {
 
 
 def _clean_text(text: str | None) -> str:
-    cleaned = _MD_ESCAPE_RE.sub(r"\1", text or "")
-    cleaned = cleaned.replace("\u2019", "'").replace("\u2018", "'").replace("*", " ")
-    return cleaned
+    return (
+        _MD_ESCAPE_RE.sub(r"\1", text or "")
+        .replace("\u2019", "'")
+        .replace("\u2018", "'")
+        .replace("*", " ")
+    )
 
 
 _CHUNK_HEADER_RE = re.compile(r"^\s*\[[^\n]*\bForm 10-K\b[^\n]*\]\s*")
@@ -142,7 +331,7 @@ def wording_changes(prior_text: str, current_text: str) -> tuple[list[str], list
     curr_words = _clean_text(current_text).split()
 
     def _key(word: str) -> str:
-        return re.sub(r"[^\w]", "", word.lower())
+        return _NON_WORD_RE.sub("", word.lower())
 
     matcher = difflib.SequenceMatcher(
         None, [_key(w) for w in prior_words], [_key(w) for w in curr_words], autojunk=False
@@ -157,11 +346,11 @@ def wording_changes(prior_text: str, current_text: str) -> tuple[list[str], list
     removed: list[str] = []
 
     def _phrase(words: list[str]) -> str | None:
-        words = [w for w in words if _key(w)]
-        if not words:
+        kept_words = [w for w in words if _key(w)]
+        if not kept_words:
             return None
-        text = " ".join(words[:_MAX_PHRASE_WORDS])
-        return text + (" …" if len(words) > _MAX_PHRASE_WORDS else "")
+        text = " ".join(kept_words[:_MAX_PHRASE_WORDS])
+        return text + (" …" if len(kept_words) > _MAX_PHRASE_WORDS else "")
 
     for tag, i1, i2, j1, j2 in opcodes:
         if tag in ("insert", "replace") and len(added) < _MAX_PHRASES:
@@ -189,7 +378,8 @@ def extract_theme_terms(theme: str) -> list[str]:
     return terms
 
 
-def _terms_regex(terms: list[str]) -> re.Pattern[str] | None:
+@functools.lru_cache(maxsize=256)
+def _terms_regex_cached(terms: tuple[str, ...]) -> re.Pattern[str] | None:
     if not terms:
         return None
     alternation = "|".join(
@@ -198,12 +388,20 @@ def _terms_regex(terms: list[str]) -> re.Pattern[str] | None:
     return re.compile(rf"\b(?:{alternation})(?:s|es)?\b", re.IGNORECASE)
 
 
-def count_theme_mentions(text: str | None, terms: list[str]) -> int:
+def _terms_regex(terms: Sequence[str]) -> re.Pattern[str] | None:
+    return _terms_regex_cached(tuple(terms))
+
+
+def count_theme_mentions(text: str | None, terms: Sequence[str]) -> int:
     """Count non-overlapping theme-term occurrences (longest phrase wins, plurals included)."""
     pattern = _terms_regex(terms)
     if pattern is None or not text:
         return 0
     return len(pattern.findall(_clean_text(text)))
+
+
+def _coerce_section_id(raw: str) -> SectionId:
+    return "item_7" if str(raw).strip().lower() == "item_7" else "item_1a"
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +419,13 @@ class SectionMaterial:
     section_id: str
     full_text: str = ""
     chunks: list[dict[str, Any]] = field(default_factory=list)
+
+    def effective_text(self) -> str:
+        """Return full section text, falling back to concatenated chunk excerpts when empty."""
+        if self.full_text:
+            return self.full_text
+        parts = [_passage_text(c) for c in self.chunks]
+        return " ".join(p for p in parts if p)
 
     @functools.cached_property
     def all_shingles(self) -> set[tuple[str, ...]]:
@@ -244,27 +449,8 @@ class SectionMaterial:
 
 
 def chunk_row_to_citation(row: dict[str, Any], score: float = 0.0) -> dict[str, Any]:
-    """Normalize a `filing_chunks` row (local manifest or BigQuery) into a GroundedCitation dict."""
-    section_id = str(row.get("section_id") or "item_1a").lower()
-    if section_id not in _SECTIONS:
-        section_id = "item_1a"
-    return GroundedCitation(
-        chunk_id=str(row["chunk_id"]),
-        profile_id=str(row.get("profile_id") or f"{row['ticker']}_{row['fiscal_year']}"),
-        ticker=str(row["ticker"]),
-        company_name=str(row.get("company_name") or row["ticker"]),
-        gics_sector=str(row.get("gics_sector") or "Unknown"),
-        fiscal_year=int(row["fiscal_year"]),
-        period_of_report=str(row.get("period_of_report") or "") or None,
-        filing_date=str(row.get("filing_date") or "") or None,
-        accession_number=str(row.get("accession_number") or "") or None,
-        section_id=section_id,  # type: ignore[arg-type]
-        section_title=str(row.get("section_title") or _SECTION_TITLES[section_id]),
-        excerpt=str(row.get("chunk_text") or row.get("excerpt") or ""),
-        sec_filing_url=str(row.get("sec_filing_url") or ""),
-        unstructured_gcs_uri=str(row.get("unstructured_gcs_uri") or ""),
-        score=round(float(score), 4),
-    ).model_dump(mode="json")
+    """Normalize a BigQuery `filing_chunks` row into a `GroundedCitation` dict."""
+    return GroundedCitation.from_row(row, score=score).model_dump(mode="json")
 
 
 def _passage_text(cit: dict[str, Any]) -> str:
@@ -273,6 +459,165 @@ def _passage_text(cit: dict[str, Any]) -> str:
     The header embeds the fiscal year, which would otherwise surface as a wording change.
     """
     return strip_chunk_header(str(cit.get("excerpt") or cit.get("chunk_text") or ""))
+
+
+def _classify_current_passages(
+    *,
+    ticker: str,
+    company_name: str,
+    section_id: SectionId,
+    section_title: str,
+    py: int,
+    cy: int,
+    prior: SectionMaterial,
+    current_passages: list[dict[str, Any]],
+    cited: dict[str, dict[str, Any]],
+    pair_keys: set[tuple[str | None, str | None]],
+    deltas: list[DisclosureDelta],
+) -> None:
+    """Classify current-year theme passages as unchanged, modified, or added against `prior`."""
+    for cit in current_passages:
+        text = _passage_text(cit)
+        sh = shingles(word_tokens(text))
+        if not sh:
+            continue
+        sec_cov = coverage(sh, prior.all_shingles)
+        counterpart, best_cov = prior.best_counterpart(sh)
+        cp_cit = chunk_row_to_citation(counterpart) if counterpart is not None else None
+        relevance = float(cit.get("score") or 0.0)
+        kind: ChangeType
+        if sec_cov >= UNCHANGED_MIN:
+            kind = "unchanged"
+            added_p: list[str] = []
+            removed_p: list[str] = []
+        elif counterpart is not None and best_cov >= MODIFIED_MIN:
+            kind = "modified"
+            added_p, removed_p = wording_changes(_passage_text(counterpart), text)
+        else:
+            kind, cp_cit, added_p, removed_p = "added", None, [], []
+        if kind == "unchanged" and best_cov < MODIFIED_MIN:
+            cp_cit = None
+
+        prior_cid = str(cp_cit["chunk_id"]) if cp_cit else None
+        curr_cid = str(cit["chunk_id"])
+        cited.setdefault(curr_cid, cit)
+        if cp_cit is not None and prior_cid is not None:
+            cited.setdefault(prior_cid, cp_cit)
+        key = (prior_cid, curr_cid)
+        if key in pair_keys:
+            continue
+        pair_keys.add(key)
+        deltas.append(
+            DisclosureDelta(
+                delta_id=f"{ticker}_{section_id}_{py}_{cy}_{kind}_{curr_cid}",
+                ticker=ticker,
+                company_name=company_name,
+                section_id=section_id,
+                section_title=section_title,
+                change_type=kind,
+                prior_fiscal_year=py,
+                current_fiscal_year=cy,
+                prior_chunk_id=prior_cid,
+                current_chunk_id=curr_cid,
+                prior_excerpt=clean_excerpt(_passage_text(cp_cit), _EXCERPT_CHARS)
+                if cp_cit
+                else None,
+                current_excerpt=clean_excerpt(text, _EXCERPT_CHARS),
+                similarity=round(sec_cov, 3),
+                added_phrases=added_p,
+                removed_phrases=removed_p,
+                theme_relevance=round(relevance, 4),
+            )
+        )
+
+
+def _classify_prior_passages(
+    *,
+    ticker: str,
+    company_name: str,
+    section_id: SectionId,
+    section_title: str,
+    py: int,
+    cy: int,
+    current: SectionMaterial,
+    prior_passages: list[dict[str, Any]],
+    cited: dict[str, dict[str, Any]],
+    pair_keys: set[tuple[str | None, str | None]],
+    deltas: list[DisclosureDelta],
+) -> None:
+    """Classify unmatched prior-year theme passages as removed or modified against `current`."""
+    used_current = {d.current_chunk_id for d in deltas}
+    used_prior = {d.prior_chunk_id for d in deltas if d.prior_chunk_id}
+    for cit in prior_passages:
+        prior_cid = str(cit["chunk_id"])
+        if prior_cid in used_prior:
+            continue
+        text = _passage_text(cit)
+        sh = shingles(word_tokens(text))
+        if not sh:
+            continue
+        sec_cov = coverage(sh, current.all_shingles)
+        if sec_cov >= UNCHANGED_MIN:
+            continue  # still present; nothing new to report from the prior side
+        counterpart, best_cov = current.best_counterpart(sh)
+        relevance = float(cit.get("score") or 0.0)
+        if counterpart is not None and best_cov >= MODIFIED_MIN:
+            curr_cid = str(counterpart["chunk_id"])
+            if curr_cid in used_current:
+                continue
+            cp_cit = chunk_row_to_citation(counterpart)
+            added_p, removed_p = wording_changes(text, _passage_text(counterpart))
+            cited.setdefault(prior_cid, cit)
+            cited.setdefault(curr_cid, cp_cit)
+            key = (prior_cid, curr_cid)
+            if key in pair_keys:
+                continue
+            pair_keys.add(key)
+            deltas.append(
+                DisclosureDelta(
+                    delta_id=f"{ticker}_{section_id}_{py}_{cy}_modified_{curr_cid}",
+                    ticker=ticker,
+                    company_name=company_name,
+                    section_id=section_id,
+                    section_title=section_title,
+                    change_type="modified",
+                    prior_fiscal_year=py,
+                    current_fiscal_year=cy,
+                    prior_chunk_id=prior_cid,
+                    current_chunk_id=curr_cid,
+                    prior_excerpt=clean_excerpt(text, _EXCERPT_CHARS),
+                    current_excerpt=clean_excerpt(_passage_text(cp_cit), _EXCERPT_CHARS),
+                    similarity=round(sec_cov, 3),
+                    added_phrases=added_p,
+                    removed_phrases=removed_p,
+                    theme_relevance=round(relevance, 4),
+                )
+            )
+            continue
+
+        cited.setdefault(prior_cid, cit)
+        key = (prior_cid, None)
+        if key in pair_keys:
+            continue
+        pair_keys.add(key)
+        deltas.append(
+            DisclosureDelta(
+                delta_id=f"{ticker}_{section_id}_{py}_{cy}_removed_{prior_cid}",
+                ticker=ticker,
+                company_name=company_name,
+                section_id=section_id,
+                section_title=section_title,
+                change_type="removed",
+                prior_fiscal_year=py,
+                current_fiscal_year=cy,
+                prior_chunk_id=prior_cid,
+                current_chunk_id=None,
+                prior_excerpt=clean_excerpt(text, _EXCERPT_CHARS),
+                current_excerpt=None,
+                similarity=round(sec_cov, 3),
+                theme_relevance=round(relevance, 4),
+            )
+        )
 
 
 def align_year_pair(
@@ -287,136 +632,41 @@ def align_year_pair(
     max_deltas: int = DEFAULT_MAX_DELTAS_PER_PAIR,
 ) -> tuple[DisclosureYearPair, list[dict[str, Any]]]:
     """Classify theme passages of two consecutive filings; return the pair and cited chunks."""
+    sec_id = _coerce_section_id(section_id)
+    section_title = SECTION_TITLES[sec_id]
+    py, cy = prior.fiscal_year, current.fiscal_year
     deltas: list[DisclosureDelta] = []
     cited: dict[str, dict[str, Any]] = {}
     pair_keys: set[tuple[str | None, str | None]] = set()
-    section_title = _SECTION_TITLES.get(section_id, section_id)
-    py, cy = prior.fiscal_year, current.fiscal_year
 
-    def _cite(cit: dict[str, Any] | None) -> None:
-        if cit is not None:
-            cited.setdefault(str(cit["chunk_id"]), cit)
+    _classify_current_passages(
+        ticker=ticker,
+        company_name=company_name,
+        section_id=sec_id,
+        section_title=section_title,
+        py=py,
+        cy=cy,
+        prior=prior,
+        current_passages=current_passages,
+        cited=cited,
+        pair_keys=pair_keys,
+        deltas=deltas,
+    )
+    _classify_prior_passages(
+        ticker=ticker,
+        company_name=company_name,
+        section_id=sec_id,
+        section_title=section_title,
+        py=py,
+        cy=cy,
+        current=current,
+        prior_passages=prior_passages,
+        cited=cited,
+        pair_keys=pair_keys,
+        deltas=deltas,
+    )
 
-    def _add(delta: DisclosureDelta) -> None:
-        key = (delta.prior_chunk_id, delta.current_chunk_id)
-        if key in pair_keys:
-            return
-        pair_keys.add(key)
-        deltas.append(delta)
-
-    def _delta_id(kind: str, cid: str | None) -> str:
-        return f"{ticker}_{section_id}_{py}_{cy}_{kind}_{cid or 'none'}"
-
-    # Current-year theme passages: unchanged / modified / added
-    for cit in current_passages:
-        text = _passage_text(cit)
-        sh = shingles(word_tokens(text))
-        if not sh:
-            continue
-        sec_cov = coverage(sh, prior.all_shingles)
-        counterpart, best_cov = prior.best_counterpart(sh)
-        cp_cit = chunk_row_to_citation(counterpart) if counterpart is not None else None
-        relevance = float(cit.get("score") or 0.0)
-        if sec_cov >= UNCHANGED_MIN:
-            kind = "unchanged"
-            added_p: list[str] = []
-            removed_p: list[str] = []
-        elif counterpart is not None and best_cov >= MODIFIED_MIN:
-            kind = "modified"
-            added_p, removed_p = wording_changes(_passage_text(counterpart), text)
-        else:
-            kind, cp_cit, added_p, removed_p = "added", None, [], []
-        if kind == "unchanged" and best_cov < MODIFIED_MIN:
-            cp_cit = None
-        _cite(cit)
-        _cite(cp_cit)
-        _add(
-            DisclosureDelta(
-                delta_id=_delta_id(kind, str(cit["chunk_id"])),
-                ticker=ticker,
-                company_name=company_name,
-                section_id=section_id,  # type: ignore[arg-type]
-                section_title=section_title,
-                change_type=kind,  # type: ignore[arg-type]
-                prior_fiscal_year=py,
-                current_fiscal_year=cy,
-                prior_chunk_id=str(cp_cit["chunk_id"]) if cp_cit else None,
-                current_chunk_id=str(cit["chunk_id"]),
-                prior_excerpt=clean_excerpt(_passage_text(cp_cit), _EXCERPT_CHARS)
-                if cp_cit
-                else None,
-                current_excerpt=clean_excerpt(text, _EXCERPT_CHARS),
-                similarity=round(sec_cov, 3),
-                added_phrases=added_p,
-                removed_phrases=removed_p,
-                theme_relevance=round(relevance, 4),
-            )
-        )
-
-    # Prior-year theme passages: removed, or modified when the counterpart wasn't retrieved
-    used_current = {d.current_chunk_id for d in deltas}
-    used_prior = {d.prior_chunk_id for d in deltas if d.prior_chunk_id}
-    for cit in prior_passages:
-        if str(cit["chunk_id"]) in used_prior:
-            continue
-        text = _passage_text(cit)
-        sh = shingles(word_tokens(text))
-        if not sh:
-            continue
-        sec_cov = coverage(sh, current.all_shingles)
-        counterpart, best_cov = current.best_counterpart(sh)
-        relevance = float(cit.get("score") or 0.0)
-        if sec_cov >= UNCHANGED_MIN:
-            continue  # still present; nothing new to report from the prior side
-        if counterpart is not None and best_cov >= MODIFIED_MIN:
-            if str(counterpart["chunk_id"]) in used_current:
-                continue
-            cp_cit = chunk_row_to_citation(counterpart)
-            added_p, removed_p = wording_changes(text, _passage_text(counterpart))
-            _cite(cit)
-            _cite(cp_cit)
-            _add(
-                DisclosureDelta(
-                    delta_id=_delta_id("modified", str(cp_cit["chunk_id"])),
-                    ticker=ticker,
-                    company_name=company_name,
-                    section_id=section_id,  # type: ignore[arg-type]
-                    section_title=section_title,
-                    change_type="modified",
-                    prior_fiscal_year=py,
-                    current_fiscal_year=cy,
-                    prior_chunk_id=str(cit["chunk_id"]),
-                    current_chunk_id=str(cp_cit["chunk_id"]),
-                    prior_excerpt=clean_excerpt(text, _EXCERPT_CHARS),
-                    current_excerpt=clean_excerpt(_passage_text(cp_cit), _EXCERPT_CHARS),
-                    similarity=round(sec_cov, 3),
-                    added_phrases=added_p,
-                    removed_phrases=removed_p,
-                    theme_relevance=round(relevance, 4),
-                )
-            )
-            continue
-        _cite(cit)
-        _add(
-            DisclosureDelta(
-                delta_id=_delta_id("removed", str(cit["chunk_id"])),
-                ticker=ticker,
-                company_name=company_name,
-                section_id=section_id,  # type: ignore[arg-type]
-                section_title=section_title,
-                change_type="removed",
-                prior_fiscal_year=py,
-                current_fiscal_year=cy,
-                prior_chunk_id=str(cit["chunk_id"]),
-                current_chunk_id=None,
-                prior_excerpt=clean_excerpt(text, _EXCERPT_CHARS),
-                current_excerpt=None,
-                similarity=round(sec_cov, 3),
-                theme_relevance=round(relevance, 4),
-            )
-        )
-
-    counts = {kind: 0 for kind in _CHANGE_ORDER}
+    counts: dict[str, int] = {kind: 0 for kind in _CHANGE_ORDER}
     for d in deltas:
         counts[d.change_type] += 1
     deltas.sort(key=lambda d: (_CHANGE_ORDER[d.change_type], -d.theme_relevance, d.delta_id))
@@ -447,11 +697,13 @@ def build_company_evolution(
 
     mentions: dict[str, int] = {}
     for fy in years:
-        texts = [m.full_text for (y, _sec), m in sections.items() if y == fy and m.full_text]
+        texts = [
+            text for (y, _sec), m in sections.items() if y == fy and (text := m.effective_text())
+        ]
         if texts:
             mentions[str(fy)] = sum(count_theme_mentions(t, theme_terms) for t in texts)
 
-    for py, cy in zip(years, years[1:], strict=False):
+    for py, cy in itertools.pairwise(years):
         merged_pair: DisclosureYearPair | None = None
         for section_id in _SECTIONS:
             prior = sections.get((py, section_id))
@@ -511,7 +763,7 @@ def build_company_evolution(
 
 def _section_chunks(ticker: str, fiscal_year: int, section_id: str) -> list[dict[str, Any]]:
     return _gcp_adapters().bigquery.fetch_section_chunks(
-        ticker=ticker.upper().replace(".", "-"),
+        ticker=normalize_edgar_ticker(ticker),
         fiscal_year=int(fiscal_year),
         section_id=section_id,
         include_embedding=False,
@@ -521,12 +773,13 @@ def _section_chunks(ticker: str, fiscal_year: int, section_id: str) -> list[dict
 def _load_section_material(
     ticker: str, company_name: str, fiscal_year: int, section_id: str
 ) -> SectionMaterial | None:
-    entry = get_full_10k_section(f"{ticker.upper()}_{fiscal_year}_{section_id}")
-    chunks = _section_chunks(ticker, fiscal_year, section_id)
+    norm_ticker = normalize_edgar_ticker(ticker)
+    entry = get_full_10k_section(f"{norm_ticker}_{fiscal_year}_{section_id}")
+    chunks = _section_chunks(norm_ticker, fiscal_year, section_id)
     if entry is None and not chunks:
         return None
     return SectionMaterial(
-        ticker=ticker,
+        ticker=norm_ticker,
         company_name=str((entry or {}).get("company_name") or company_name),
         fiscal_year=int(fiscal_year),
         section_id=section_id,
@@ -539,13 +792,13 @@ def _company_years(
     tickers: list[str], start_year: int, end_year: int
 ) -> dict[str, tuple[str, str, list[int]]]:
     """ticker -> (company_name, gics_sector, fiscal years with a filing in the window)."""
-    wanted = {t.upper().replace(".", "-") for t in tickers}
+    wanted = {normalize_edgar_ticker(t) for t in tickers}
     profiles = _gcp_adapters().bigquery.fetch_profiles(
         tickers=wanted, start_year=start_year, end_year=end_year
     )
     out: dict[str, tuple[str, str, list[int]]] = {}
     for p in profiles:
-        norm = p.ticker.upper().replace(".", "-")
+        norm = normalize_edgar_ticker(p.ticker)
         if norm not in wanted:
             continue
         name, sector, years = out.get(norm, (p.company_name, p.gics_sector, []))
@@ -554,18 +807,87 @@ def _company_years(
     return out
 
 
-def _run_parallel(tasks: list[Callable[[], Any]], max_workers: int = 8) -> list[Any]:
-    """Run callables concurrently, preserving trace context and result order."""
-    if len(tasks) <= 1:
-        return [t() for t in tasks]
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(tasks))) as pool:
-        futures = [pool.submit(contextvars.copy_context().run, t) for t in tasks]
-        return [f.result() for f in futures]
+def _resolve_target_tickers(
+    *,
+    theme: str,
+    tickers: str,
+    gics_sector: str,
+    sec_filter: str,
+    start_year: int,
+    end_year: int,
+    max_companies: int,
+) -> tuple[list[str], list[str], str]:
+    explicit = sorted(_parse_ticker_list(tickers))
+    if explicit:
+        return explicit, explicit[:max_companies], "explicit"
+    broad = search_10k_chunks_rag(
+        query=theme,
+        tickers="ALL",
+        gics_sector=gics_sector or "ALL",
+        section_id=sec_filter,
+        start_year=start_year,
+        end_year=end_year,
+        top_k=25,
+    )
+    selected: list[str] = []
+    for cit in broad.get("citations") or []:
+        sym = normalize_edgar_ticker(str(cit["ticker"]))
+        if sym not in selected:
+            selected.append(sym)
+        if len(selected) >= max_companies:
+            break
+    return explicit, selected, "theme_relevance"
 
 
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    return int(raw) if raw.isdigit() and int(raw) > 0 else default
+def _retrieve_passages_and_materials(
+    *,
+    theme: str,
+    selected: list[str],
+    company_meta: dict[str, tuple[str, str, list[int]]],
+    sec_filter: str,
+    per_year_k: int,
+) -> tuple[
+    dict[tuple[str, int], list[dict[str, Any]]], dict[tuple[str, int, str], SectionMaterial | None]
+]:
+    retrieval_keys = [(t, fy) for t in selected for fy in company_meta.get(t, ("", "", []))[2]]
+
+    def _search(item: tuple[str, int]) -> list[dict[str, Any]]:
+        tk, fy = item
+        res = search_10k_chunks_rag(
+            query=theme,
+            tickers=tk,
+            gics_sector="ALL",
+            section_id=sec_filter,
+            start_year=fy,
+            end_year=fy,
+            top_k=per_year_k,
+        )
+        return list(res.get("citations") or [])
+
+    passages_list = run_parallel_with_context(retrieval_keys, _search, max_workers=8)
+    passages = dict(zip(retrieval_keys, passages_list, strict=True))
+
+    section_keys = sorted(
+        {
+            (t, fy, str(c.get("section_id")))
+            for (t, fy), cits in passages.items()
+            for c in cits
+            if c.get("section_id") in _SECTIONS
+        }
+    )
+    expanded: set[tuple[str, int, str]] = set(section_keys)
+    for t, _fy, sec in section_keys:
+        for y in company_meta.get(t, ("", "", []))[2]:
+            expanded.add((t, y, sec))
+    material_keys = sorted(expanded)
+
+    def _load(item: tuple[str, int, str]) -> SectionMaterial | None:
+        tk, fy, sec = item
+        return _load_section_material(tk, company_meta.get(tk, (tk, "", []))[0], fy, sec)
+
+    materials_list = run_parallel_with_context(material_keys, _load, max_workers=8)
+    materials = dict(zip(material_keys, materials_list, strict=True))
+    return passages, materials
 
 
 @with_tool_resilience(tool_name="compare_disclosures_across_years")
@@ -608,80 +930,31 @@ def compare_disclosures_across_years(
         }
     sec_norm = (section_id or "ALL").strip().lower()
     sec_filter = sec_norm if sec_norm in _SECTIONS else "ALL"
-    max_companies = _env_int("EDGAR_DISCLOSURE_DELTA_MAX_COMPANIES", DEFAULT_MAX_COMPANIES)
-    per_year_k = _env_int("EDGAR_DISCLOSURE_DELTA_PASSAGES_PER_YEAR", DEFAULT_PASSAGES_PER_YEAR)
+    max_companies = env_positive_int("EDGAR_DISCLOSURE_DELTA_MAX_COMPANIES", DEFAULT_MAX_COMPANIES)
+    per_year_k = env_positive_int(
+        "EDGAR_DISCLOSURE_DELTA_PASSAGES_PER_YEAR", DEFAULT_PASSAGES_PER_YEAR
+    )
 
-    explicit = sorted(_parse_ticker_list(tickers))
-    selected_by = "explicit"
-    if explicit:
-        selected = explicit[:max_companies]
-    else:
-        selected_by = "theme_relevance"
-        broad = search_10k_chunks_rag(
-            query=theme,
-            tickers="ALL",
-            gics_sector=gics_sector or "ALL",
-            section_id=sec_filter,
-            start_year=start_year,
-            end_year=end_year,
-            top_k=25,
-        )
-        selected = []
-        for cit in broad.get("citations") or []:
-            sym = str(cit["ticker"]).upper().replace(".", "-")
-            if sym not in selected:
-                selected.append(sym)
-            if len(selected) >= max_companies:
-                break
+    explicit, selected, selected_by = _resolve_target_tickers(
+        theme=theme,
+        tickers=tickers,
+        gics_sector=gics_sector,
+        sec_filter=sec_filter,
+        start_year=start_year,
+        end_year=end_year,
+        max_companies=max_companies,
+    )
 
     window = list(range(start_year, end_year + 1))
     company_meta = _company_years(selected, start_year, end_year)
     theme_terms = extract_theme_terms(theme)
-
-    # Theme passages per (ticker, year), retrieved concurrently.
-    retrieval_keys = [(t, fy) for t in selected for fy in company_meta.get(t, ("", "", []))[2]]
-
-    def _search(t: str, fy: int) -> list[dict[str, Any]]:
-        res = search_10k_chunks_rag(
-            query=theme,
-            tickers=t,
-            gics_sector="ALL",
-            section_id=sec_filter,
-            start_year=fy,
-            end_year=fy,
-            top_k=per_year_k,
-        )
-        return list(res.get("citations") or [])
-
-    passages_list = _run_parallel([functools.partial(_search, t, fy) for t, fy in retrieval_keys])
-    passages: dict[tuple[str, int], list[dict[str, Any]]] = dict(
-        zip(retrieval_keys, passages_list, strict=True)
+    passages, materials = _retrieve_passages_and_materials(
+        theme=theme,
+        selected=selected,
+        company_meta=company_meta,
+        sec_filter=sec_filter,
+        per_year_k=per_year_k,
     )
-
-    # Section material only for sections that produced theme passages.
-    section_keys = sorted(
-        {
-            (t, fy, str(c.get("section_id")))
-            for (t, fy), cits in passages.items()
-            for c in cits
-            if c.get("section_id") in _SECTIONS
-        }
-    )
-    # A section needs its neighbour years too, so a passage can be classified as removed/added.
-    expanded: set[tuple[str, int, str]] = set(section_keys)
-    for t, _fy, sec in section_keys:
-        for y in company_meta.get(t, ("", "", []))[2]:
-            expanded.add((t, y, sec))
-    material_keys = sorted(expanded)
-    materials_list = _run_parallel(
-        [
-            functools.partial(
-                _load_section_material, t, company_meta.get(t, (t, "", []))[0], fy, sec
-            )
-            for t, fy, sec in material_keys
-        ]
-    )
-    materials = dict(zip(material_keys, materials_list, strict=True))
 
     companies: list[dict[str, Any]] = []
     all_citations: dict[str, dict[str, Any]] = {}
@@ -713,9 +986,7 @@ def compare_disclosures_across_years(
     citations = list(all_citations.values())
     if tool_context is not None and hasattr(tool_context, "state"):
         existing = list(tool_context.state.get("retrieved_citations", []))
-        seen = {c.get("chunk_id") for c in existing}
-        existing.extend(c for c in citations if c["chunk_id"] not in seen)
-        tool_context.state["retrieved_citations"] = existing
+        tool_context.state["retrieved_citations"] = merge_citations(existing, citations)
         tool_context.state["disclosure_delta_summary"] = summary
     _record_gcp_backend_invocation(
         tool_context,

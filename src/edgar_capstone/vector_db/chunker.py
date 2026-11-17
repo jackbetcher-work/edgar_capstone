@@ -6,6 +6,7 @@ import math
 import re
 from typing import Literal
 
+from edgar_capstone.common.domain import SECTION_TITLES
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.vector_db.models import FilingChunk
 
@@ -15,7 +16,7 @@ _ITEM_1A_HEADER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _ITEM_7_HEADER_RE = re.compile(
-    r"^##\s+Item\s+7\.?\s+Management['’]?s\s+Discussion[^\n]*$",
+    r"^##\s+Item\s+7\.?\s+Management['\u2019]?s\s+Discussion[^\n]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _HORIZONTAL_RULE_RE = re.compile(r"^\s*---\s*$", re.MULTILINE)
@@ -27,10 +28,7 @@ _MISSING_SECTION_MARKERS: tuple[str, ...] = (
     "*Item 7 (MD&A) could not be extracted",
 )
 
-SECTION_BASE_TITLES: dict[Literal["item_1a", "item_7"], str] = {
-    "item_1a": "Item 1A. Risk Factors",
-    "item_7": "Item 7. MD&A",
-}
+SECTION_BASE_TITLES: dict[str, str] = dict(SECTION_TITLES)
 
 
 def estimate_token_count(text: str) -> int:
@@ -38,9 +36,9 @@ def estimate_token_count(text: str) -> int:
     cleaned = text.strip()
     if not cleaned:
         return 0
-    word_est = int(math.ceil(len(cleaned.split()) * 1.33))
-    char_est = int(math.ceil(len(cleaned) / 4.0))
-    return max(1, int(round((word_est + char_est) / 2.0)))
+    word_est = math.ceil(len(cleaned.split()) * 1.33)
+    char_est = math.ceil(len(cleaned) / 4.0)
+    return max(1, round((word_est + char_est) / 2.0))
 
 
 def extract_sections_from_combined_markdown(
@@ -92,6 +90,38 @@ def _detect_subheading(block: str) -> str | None:
     return None
 
 
+def _split_long_text(text: str, max_chars: int) -> list[str]:
+    """Split a single long paragraph/line into <= max_chars pieces by sentences then chars."""
+    if len(text) <= max_chars:
+        stripped = text.strip()
+        return [stripped] if stripped else []
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    pieces: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for sent in sentences:
+        if current and current_len + len(sent) + 1 > max_chars:
+            pieces.append(" ".join(current).strip())
+            current = []
+            current_len = 0
+        if len(sent) > max_chars:
+            if current:
+                pieces.append(" ".join(current).strip())
+                current = []
+                current_len = 0
+            for start in range(0, len(sent), max_chars):
+                chunk = sent[start : start + max_chars].strip()
+                if chunk:
+                    pieces.append(chunk)
+        else:
+            current.append(sent)
+            current_len += len(sent) + 1
+    if current:
+        pieces.append(" ".join(current).strip())
+    return [p for p in pieces if p]
+
+
 def _split_oversized_block(block: str, max_chars: int) -> list[str]:
     """Split a single huge paragraph or table into sub-blocks <= max_chars."""
     if len(block) <= max_chars:
@@ -102,16 +132,37 @@ def _split_oversized_block(block: str, max_chars: int) -> list[str]:
     if len(lines) > 2:
         table_header: list[str] = []
         if lines[0].lstrip().startswith("|") and len(lines) >= 2 and "---" in lines[1]:
-            table_header = [lines[0], lines[1]]
-            content_lines = lines[2:]
+            candidate_header = [lines[0], lines[1]]
+            header_len = sum(len(x) + 1 for x in candidate_header)
+            if header_len < max_chars:
+                table_header = candidate_header
+                content_lines = lines[2:]
+            else:
+                content_lines = lines
         else:
             content_lines = lines
 
         pieces: list[str] = []
         current_lines: list[str] = list(table_header)
         current_len = sum(len(x) + 1 for x in current_lines)
+        header_len = current_len
 
         for line in content_lines:
+            if len(line) + header_len > max_chars:
+                # Flush buffered lines before splitting an individual oversized line cleanly.
+                if len(current_lines) > len(table_header):
+                    pieces.append("\n".join(current_lines).strip())
+                    current_lines = list(table_header)
+                    current_len = header_len
+                if table_header and max_chars - header_len >= max(64, max_chars // 4):
+                    budget = max_chars - header_len
+                    header_prefix = "\n".join(table_header)
+                    for sub in _split_long_text(line, budget):
+                        pieces.append(f"{header_prefix}\n{sub}".strip())
+                else:
+                    pieces.extend(_split_long_text(line, max_chars))
+                continue
+
             if (
                 current_lines
                 and current_len + len(line) + 1 > max_chars
@@ -119,7 +170,7 @@ def _split_oversized_block(block: str, max_chars: int) -> list[str]:
             ):
                 pieces.append("\n".join(current_lines).strip())
                 current_lines = list(table_header)
-                current_len = sum(len(x) + 1 for x in current_lines)
+                current_len = header_len
             current_lines.append(line)
             current_len += len(line) + 1
 
@@ -129,24 +180,7 @@ def _split_oversized_block(block: str, max_chars: int) -> list[str]:
             return pieces
 
     # Sentence-level fallback for single giant paragraphs
-    sentences = re.split(r"(?<=[.!?])\s+", block)
-    pieces = []
-    current: list[str] = []
-    current_len = 0
-    for sent in sentences:
-        if current and current_len + len(sent) + 1 > max_chars:
-            pieces.append(" ".join(current).strip())
-            current = []
-            current_len = 0
-        if len(sent) > max_chars:
-            for start in range(0, len(sent), max_chars):
-                pieces.append(sent[start : start + max_chars].strip())
-        else:
-            current.append(sent)
-            current_len += len(sent) + 1
-    if current:
-        pieces.append(" ".join(current).strip())
-    return [p for p in pieces if p]
+    return _split_long_text(block, max_chars)
 
 
 def split_section_into_passages(
@@ -175,11 +209,11 @@ def split_section_into_passages(
         detected = _detect_subheading(block)
         if detected is not None:
             current_subheading = detected
-            full_title = f"{base_title} — {current_subheading}"
+            full_title = f"{base_title} \u2014 {current_subheading}"
             tagged_blocks.append((full_title, block, True))
         else:
             full_title = (
-                f"{base_title} — {current_subheading}" if current_subheading else base_title
+                f"{base_title} \u2014 {current_subheading}" if current_subheading else base_title
             )
             for sub_block in _split_oversized_block(block, max_chars=max_chars):
                 tagged_blocks.append((full_title, sub_block, False))

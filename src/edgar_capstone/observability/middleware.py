@@ -70,18 +70,18 @@ class RequestTelemetryMiddleware:
             fallback_token = bind_fallback_trace(extract_trace_correlation(headers))
 
         corr = current_trace_correlation()
-        request_id = (
-            headers.get("x-request-id", "").strip()[:128]
-            or (corr.trace_id if corr else "")
-            or uuid.uuid4().hex
-        )
+        raw_request_id = headers.get(REQUEST_ID_HEADER, "").strip()
+        sanitized_request_id = "".join(ch for ch in raw_request_id if 0x20 <= ord(ch) <= 0x7E)[:128]
+        request_id = sanitized_request_id or (corr.trace_id if corr else "") or uuid.uuid4().hex
         ctx_token = bind_request_context(request_id=request_id, method=method, path=path)
         set_span_attributes(**{"edgar.request_id": request_id})
         status_code = 500
+        response_started = False
 
         async def send_with_headers(message: Message) -> None:
-            nonlocal status_code
+            nonlocal status_code, response_started
             if message["type"] == "http.response.start":
+                response_started = True
                 status_code = int(message["status"])
                 elapsed_ms = (time.perf_counter() - start) * 1000.0
                 response_headers = MutableHeaders(scope=message)
@@ -102,12 +102,21 @@ class RequestTelemetryMiddleware:
             await self.app(scope, receive, send_with_headers)
         except Exception:
             failed = True
-            status_code = 500
+            # Preserve already-sent HTTP status (e.g. 200 on mid-stream SSE failure) rather than
+            # misreporting 500 for headers already flushed to the wire.
+            if not response_started:
+                status_code = 500
             access_logger.exception(
                 "Unhandled exception while serving %s %s",
                 method,
                 path,
-                extra={"json_fields": {"event": "http_request_failed"}},
+                extra={
+                    "json_fields": {
+                        "event": "http_request_failed",
+                        "http_status": status_code,
+                        "response_started": response_started,
+                    }
+                },
             )
             raise
         finally:
@@ -123,6 +132,7 @@ class RequestTelemetryMiddleware:
                     status_code=status_code,
                     latency_ms=latency_ms,
                     failed=failed,
+                    response_started=response_started,
                 )
             reset_request_context(ctx_token)
             if fallback_token is not None:
@@ -139,14 +149,20 @@ class RequestTelemetryMiddleware:
         status_code: int,
         latency_ms: float,
         failed: bool = False,
+        response_started: bool = False,
     ) -> None:
-        if status_code >= 500:
+        if failed or status_code >= 500:
             level = logging.ERROR
         elif status_code >= 400:
             level = logging.WARNING
         else:
             level = logging.INFO
         client = scope.get("client")
+        # Note: X-Forwarded-For left-most entry can be spoofed by untrusted clients unless
+        # stripped by the edge load balancer. Cloud Run / GCLB appends `<client_ip>, <lb_ip>`
+        # at the right-most hops; keep first entry for diagnostics alongside client socket IP.
+        xff_parts = [p.strip() for p in headers.get("x-forwarded-for", "").split(",") if p.strip()]
+        remote_ip = xff_parts[0] if xff_parts else (client[0] if client else "")
         fields: dict[str, Any] = {
             "event": "http_request_completed",
             "http_method": method,
@@ -155,11 +171,9 @@ class RequestTelemetryMiddleware:
             "http_status": status_code,
             "latency_ms": latency_ms,
             "unhandled_exception": failed,
+            "stream_aborted": failed and response_started,
             "user_agent": headers.get("user-agent", "")[:256],
-            "remote_ip": (
-                headers.get("x-forwarded-for", "").split(",")[0].strip()
-                or (client[0] if client else "")
-            ),
+            "remote_ip": remote_ip,
         }
         access_logger.log(
             level,

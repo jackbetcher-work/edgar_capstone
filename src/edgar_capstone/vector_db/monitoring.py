@@ -5,15 +5,17 @@ from __future__ import annotations
 import json
 import logging
 from collections import defaultdict
-from datetime import UTC, datetime
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
-import google.auth
 import httpx
 import numpy as np
-from google.auth.transport.requests import Request as GoogleAuthRequest
 
+from edgar_capstone.common.formatting import utc_now_iso
 from edgar_capstone.dataset.models import FinancialDataProfile
+from edgar_capstone.gcp.defaults import DEFAULT_BIGQUERY_DATASET_ID, DEFAULT_PROJECT_ID
+from edgar_capstone.gcp.rest_client import GcpRestClient
 from edgar_capstone.vector_db.models import (
     ChunkAnomalyCounts,
     ChunkHealthReport,
@@ -27,6 +29,16 @@ METRIC_PREFIX = "custom.googleapis.com/sec_edgar/chunk_health"
 MIN_HEALTHY_CHARS = 100
 MAX_HEALTHY_CHARS = 8000
 MAX_HEALTHY_TOKENS = 2048
+
+
+@dataclass(slots=True)
+class _ChunkHealthFlags:
+    """Precomputed per-chunk validity flags avoiding redundant NumPy norm/isfinite scans."""
+
+    valid_embedding: bool
+    undersized: bool
+    oversized: bool
+    missing_metadata: bool
 
 
 def _is_valid_finite_embedding(vec: list[float], expected_dim: int) -> tuple[bool, bool, bool]:
@@ -54,15 +66,15 @@ def _has_complete_metadata(chunk: FilingChunk) -> bool:
         return False
     if not chunk.section_title or not chunk.sec_filing_url or not chunk.unstructured_gcs_uri:
         return False
-    if chunk.fiscal_year < 1990 or chunk.fiscal_year > 2100:
-        return False
-    return True
+    return 1990 <= chunk.fiscal_year <= 2100
 
 
 def _compute_group_breakdown(
     group_key: str,
     group_chunks: list[FilingChunk],
     expected_dim: int,
+    *,
+    flags: Sequence[_ChunkHealthFlags] | None = None,
 ) -> SectionHealthBreakdown:
     """Compute health breakdown stats for a slice of chunks (by section or GICS sector)."""
     if not group_chunks:
@@ -79,18 +91,31 @@ def _compute_group_breakdown(
     char_counts: list[int] = []
     token_counts: list[int] = []
 
-    for c in group_chunks:
-        has_emb, dim_ok, finite_ok = _is_valid_finite_embedding(c.embedding, expected_dim)
-        if has_emb and dim_ok and finite_ok:
-            valid_emb += 1
-        if c.char_count < MIN_HEALTHY_CHARS or not c.chunk_text.strip():
-            undersized += 1
-        if c.char_count > MAX_HEALTHY_CHARS or c.token_estimate > MAX_HEALTHY_TOKENS:
-            oversized += 1
-        if not _has_complete_metadata(c):
-            missing_meta += 1
-        char_counts.append(c.char_count)
-        token_counts.append(c.token_estimate)
+    if flags is not None:
+        for c, f in zip(group_chunks, flags, strict=True):
+            if f.valid_embedding:
+                valid_emb += 1
+            if f.undersized:
+                undersized += 1
+            if f.oversized:
+                oversized += 1
+            if f.missing_metadata:
+                missing_meta += 1
+            char_counts.append(c.char_count)
+            token_counts.append(c.token_estimate)
+    else:
+        for c in group_chunks:
+            has_emb, dim_ok, finite_ok = _is_valid_finite_embedding(c.embedding, expected_dim)
+            if has_emb and dim_ok and finite_ok:
+                valid_emb += 1
+            if c.char_count < MIN_HEALTHY_CHARS or not c.chunk_text.strip():
+                undersized += 1
+            if c.char_count > MAX_HEALTHY_CHARS or c.token_estimate > MAX_HEALTHY_TOKENS:
+                oversized += 1
+            if not _has_complete_metadata(c):
+                missing_meta += 1
+            char_counts.append(c.char_count)
+            token_counts.append(c.token_estimate)
 
     tok_arr = np.asarray(token_counts, dtype=np.float64)
     char_arr = np.asarray(char_counts, dtype=np.float64)
@@ -118,8 +143,8 @@ def evaluate_chunk_health(
     chunks: list[FilingChunk],
     *,
     profiles: list[FinancialDataProfile] | None = None,
-    project_id: str = "iron-radio-514217-q7",
-    dataset_id: str = "sec_edgar",
+    project_id: str = DEFAULT_PROJECT_ID,
+    dataset_id: str = DEFAULT_BIGQUERY_DATASET_ID,
     table_id: str = "filing_chunks",
     expected_embedding_dim: int = 768,
     embedding_model: str = "text-embedding-005",
@@ -171,13 +196,15 @@ def evaluate_chunk_health(
 
     valid_embedding_count = 0
     by_section_chunks: dict[str, list[FilingChunk]] = defaultdict(list)
+    by_section_flags: dict[str, list[_ChunkHealthFlags]] = defaultdict(list)
     by_sector_chunks: dict[str, list[FilingChunk]] = defaultdict(list)
+    by_sector_flags: dict[str, list[_ChunkHealthFlags]] = defaultdict(list)
 
+    # Evaluate each chunk's embedding norm/finiteness and metadata ONCE, then reuse the
+    # precomputed flags for both section and GICS-sector breakdowns (3x speedup on full corpus).
     for c in chunks:
-        by_section_chunks[c.section_id].append(c)
-        by_sector_chunks[c.gics_sector or "Unknown"].append(c)
-
         has_emb, dim_ok, finite_ok = _is_valid_finite_embedding(c.embedding, expected_embedding_dim)
+        valid_emb = has_emb and dim_ok and finite_ok
         if not has_emb:
             anomalies.missing_embedding += 1
         elif not dim_ok:
@@ -187,12 +214,28 @@ def evaluate_chunk_health(
         else:
             valid_embedding_count += 1
 
-        if c.char_count < MIN_HEALTHY_CHARS or not c.chunk_text.strip():
+        is_undersized = c.char_count < MIN_HEALTHY_CHARS or not c.chunk_text.strip()
+        is_oversized = c.char_count > MAX_HEALTHY_CHARS or c.token_estimate > MAX_HEALTHY_TOKENS
+        is_missing_meta = not _has_complete_metadata(c)
+
+        if is_undersized:
             anomalies.undersized_chunk += 1
-        if c.char_count > MAX_HEALTHY_CHARS or c.token_estimate > MAX_HEALTHY_TOKENS:
+        if is_oversized:
             anomalies.oversized_chunk += 1
-        if not _has_complete_metadata(c):
+        if is_missing_meta:
             anomalies.missing_metadata += 1
+
+        chunk_flags = _ChunkHealthFlags(
+            valid_embedding=valid_emb,
+            undersized=is_undersized,
+            oversized=is_oversized,
+            missing_metadata=is_missing_meta,
+        )
+        sector_key = c.gics_sector or "Unknown"
+        by_section_chunks[c.section_id].append(c)
+        by_section_flags[c.section_id].append(chunk_flags)
+        by_sector_chunks[sector_key].append(c)
+        by_sector_flags[sector_key].append(chunk_flags)
 
     total_chunks = len(chunks)
     embedding_coverage_ratio = (
@@ -213,11 +256,15 @@ def evaluate_chunk_health(
         min_tok = max_tok = 0
 
     by_section = {
-        sec: _compute_group_breakdown(sec, sec_chunks, expected_embedding_dim)
+        sec: _compute_group_breakdown(
+            sec, sec_chunks, expected_embedding_dim, flags=by_section_flags[sec]
+        )
         for sec, sec_chunks in sorted(by_section_chunks.items())
     }
     by_sector = {
-        sector: _compute_group_breakdown(sector, sec_chunks, expected_embedding_dim)
+        sector: _compute_group_breakdown(
+            sector, sec_chunks, expected_embedding_dim, flags=by_sector_flags[sector]
+        )
         for sector, sec_chunks in sorted(by_sector_chunks.items())
     }
 
@@ -289,7 +336,7 @@ def build_cloud_monitoring_timeseries(
     Aligns 1:1 with the custom metric descriptors and dashboard widgets provisioned
     in `terraform/monitoring.tf`.
     """
-    end_time = timestamp_rfc3339 or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_time = timestamp_rfc3339 or utc_now_iso()
     resource = {
         "type": "global",
         "labels": {"project_id": report.project_id},
@@ -434,28 +481,25 @@ def format_structured_health_log(report: ChunkHealthReport) -> dict[str, Any]:
     }
 
 
-class CloudMonitoringHealthPublisher:
+class CloudMonitoringHealthPublisher(GcpRestClient):
     """Publishes chunk health time-series metrics to Google Cloud Monitoring v3 API."""
 
     def __init__(
         self,
         *,
-        project_id: str,
+        project_id: str = DEFAULT_PROJECT_ID,
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
     ) -> None:
+        super().__init__(
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=30.0,
+        )
         self.project_id = project_id
-        self._http_client = http_client
-        self._credentials = credentials
 
     def _get_access_token(self) -> str:
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-        if not self._credentials.valid:
-            self._credentials.refresh(GoogleAuthRequest())
-        return str(self._credentials.token)
+        return self._get_bearer_token()
 
     def publish_report(self, report: ChunkHealthReport) -> int:
         """Write custom chunk health time series to Cloud Monitoring and emit structured log."""
@@ -467,30 +511,15 @@ class CloudMonitoringHealthPublisher:
             return 0
 
         url = f"https://monitoring.googleapis.com/v3/projects/{self.project_id}/timeSeries"
-        token = self._get_access_token()
-
-        client = self._http_client or httpx.Client(timeout=30.0)
-        close_client = self._http_client is None
-        try:
-            # Cloud Monitoring allows up to 200 timeSeries per createTimeSeries request
-            for start in range(0, len(all_series), 200):
-                batch = all_series[start : start + 200]
-                resp = client.post(
-                    url,
-                    json={"timeSeries": batch},
-                    headers={
-                        "Authorization": f"Bearer {token}",
-                        "Content-Type": "application/json",
-                    },
+        # Cloud Monitoring allows up to 200 timeSeries per createTimeSeries request
+        for start in range(0, len(all_series), 200):
+            batch = all_series[start : start + 200]
+            resp = self._raw_request("POST", url, json_body={"timeSeries": batch})
+            if resp.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"Cloud Monitoring createTimeSeries failed (HTTP {resp.status_code}): "
+                    f"{resp.text[:400]}"
                 )
-                if resp.status_code not in (200, 201):
-                    raise RuntimeError(
-                        f"Cloud Monitoring createTimeSeries failed (HTTP {resp.status_code}): "
-                        f"{resp.text[:400]}"
-                    )
-        finally:
-            if close_client:
-                client.close()
 
         report.published_to_cloud_monitoring = True
         report.published_timeseries_count = len(all_series)

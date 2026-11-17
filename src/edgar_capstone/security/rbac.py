@@ -17,10 +17,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-from edgar_capstone.security.secrets import DEFAULT_PROJECT_ID
+from edgar_capstone.common.env import split_csv_env
+from edgar_capstone.gcp.defaults import (
+    DEFAULT_PROJECT_ID,
+    DEFAULT_PROJECT_NAME,
+    resolve_gcp_project_id,
+)
 
 DEFAULT_CLOUD_IDENTITY_DOMAIN = "fde-workspace.corp"
-DEFAULT_PROJECT_NAME = "fde-sec-edgar-sandbox-dev"
 CUSTOM_RUNTIME_SA_ACCOUNT_ID = "sec-analyst-sa"
 
 _CUSTOM_SA_EMAIL_RE = re.compile(
@@ -71,12 +75,6 @@ VIEWER_PERMISSIONS: frozenset[str] = frozenset(
         Permission.RBAC_INSPECT.value,
     }
 )
-
-
-def _split_csv(raw: str | None) -> tuple[str, ...]:
-    if not raw:
-        return ()
-    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
 def parse_cloud_identity_group(raw_group: str) -> tuple[str, str | None]:
@@ -275,16 +273,18 @@ class CloudIdentityRBACPolicy:
         if not roles:
             return (), (), ()
 
+        role_set = set(roles)
+        if "admin" in role_set:
+            # Admins inherit analyst operational capabilities alongside administrative controls.
+            role_set.add("analyst")
+
         ordered_roles: list[str] = ["authenticated"]
-        if "admin" in roles:
-            # Admins inherit analyst operational capabilities alongside administrative controls
-            if "analyst" not in roles:
-                ordered_roles.append("analyst")
-            ordered_roles.append("admin")
-        else:
-            for r in roles:
-                if r not in ordered_roles:
-                    ordered_roles.append(r)
+        for canonical_role in ("viewer", "analyst", "admin"):
+            if canonical_role in role_set:
+                ordered_roles.append(canonical_role)
+        for role_name in roles:
+            if role_name not in ordered_roles:
+                ordered_roles.append(role_name)
 
         return tuple(ordered_roles), tuple(sorted(permissions)), tuple(matched_groups)
 
@@ -381,12 +381,15 @@ class RuntimeServiceAccountConfig:
 
     @classmethod
     def from_env(cls) -> RuntimeServiceAccountConfig:
-        project_id = (
-            os.environ.get("GCP_PROJECT_ID", "").strip()
-            or os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
-            or DEFAULT_PROJECT_ID
+        project_id = resolve_gcp_project_id()
+        is_default_project = project_id.lower() in {
+            DEFAULT_PROJECT_ID.lower(),
+            DEFAULT_PROJECT_NAME.lower(),
+        }
+        explicit_project_name = os.environ.get("GCP_PROJECT_NAME", "").strip()
+        project_name = explicit_project_name or (
+            DEFAULT_PROJECT_NAME if is_default_project else project_id
         )
-        project_name = os.environ.get("GCP_PROJECT_NAME", "").strip() or DEFAULT_PROJECT_NAME
         account_id = (
             os.environ.get("RUNTIME_SERVICE_ACCOUNT_ID", "").strip() or CUSTOM_RUNTIME_SA_ACCOUNT_ID
         )
@@ -410,15 +413,30 @@ class RuntimeServiceAccountConfig:
         )
 
     def allowed_projects(self) -> tuple[str, ...]:
-        extra = _split_csv(os.environ.get("ALLOWED_SERVICE_ACCOUNT_PROJECTS"))
-        ordered: list[str] = []
-        for candidate in (
-            self.project_id,
-            self.project_name,
-            DEFAULT_PROJECT_ID,
-            DEFAULT_PROJECT_NAME,
-            *extra,
+        extra = split_csv_env(os.environ.get("ALLOWED_SERVICE_ACCOUNT_PROJECTS"))
+        proj_id_norm = self.project_id.strip().lower()
+        proj_name_norm = self.project_name.strip().lower()
+        is_default_project = proj_id_norm in {
+            DEFAULT_PROJECT_ID.lower(),
+            DEFAULT_PROJECT_NAME.lower(),
+        }
+
+        candidates: list[str] = [self.project_id]
+        email_match = _CUSTOM_SA_EMAIL_RE.match(self.email.strip().lower())
+        if email_match:
+            candidates.append(email_match.group("project"))
+        # Never silently trust the hardcoded sandbox project ID/name when deployed under
+        # an explicit external organization's GCP project.
+        if proj_name_norm and (
+            proj_name_norm != DEFAULT_PROJECT_NAME.lower() or is_default_project
         ):
+            candidates.append(self.project_name)
+        if is_default_project:
+            candidates.extend((DEFAULT_PROJECT_ID, DEFAULT_PROJECT_NAME))
+        candidates.extend(extra)
+
+        ordered: list[str] = []
+        for candidate in candidates:
             norm = candidate.strip().lower()
             if norm and norm not in ordered:
                 ordered.append(norm)

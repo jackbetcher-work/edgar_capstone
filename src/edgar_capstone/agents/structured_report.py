@@ -25,14 +25,22 @@ tags use `[TICKER FYxxxx | XBRL <concept> | acc:<accession_number>](sec_filing_u
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
+from edgar_capstone.agents.citations import format_inline_citation
 from edgar_capstone.agents.material_variances import material_flag_payload_figures
 from edgar_capstone.agents.schemas import AnalystFinding, AnalystMetricReference, AnalystReport
 from edgar_capstone.agents.tools import get_full_10k_section
+from edgar_capstone.common.domain import CORE_METRICS, METRIC_LABELS, lookup_year_key
+from edgar_capstone.common.formatting import (
+    fmt_pct,
+    fmt_usd,
+    normalize_quote_text,
+    parse_model_output,
+)
 
 MAX_FINDINGS = 6
 MAX_KEY_METRICS = 6
@@ -40,14 +48,9 @@ MAX_CHUNK_IDS_PER_FINDING = 3
 MAX_HEADLINE_CHARS = 300
 MIN_QUOTE_CHARS = 20
 
-_METRIC_LABELS = {
-    "revenue": "Revenue",
-    "operating_income": "Operating Income",
-    "net_income": "Net Income",
-    "research_and_development": "R&D Expense",
-}
-_SECTION_TITLES = {"item_1a": "Item 1A. Risk Factors", "item_7": "Item 7. MD&A"}
 _CHUNK_SECTION_RE = re.compile(r"^(?P<key>.+_\d{4}_(?:item_1a|item_7))_\d+$")
+_JOIN_DOLLAR_RE = re.compile(r"\$\s*\|\s*")
+_JOIN_PCT_RE = re.compile(r"\s*\|\s*%")
 
 # Figures worth verifying: currency amounts, magnitudes, percentages, and basis points.
 # Bare integers (years, counts, list numbers) are ignored.
@@ -140,19 +143,13 @@ def _extract_table_aware_quote_figures(
     if "|" not in cleaned_quote:
         return out
 
-    # Re-join pipe-split currency & percent cells: `$ | 254,098` -> `$254,098`, `21 | %` -> `21%`
-    joined = re.sub(r"\$\s*\|\s*", "$", cleaned_quote)
-    joined = re.sub(r"\s*\|\s*%", "%", joined)
+    joined = _JOIN_DOLLAR_RE.sub("$", cleaned_quote)
+    joined = _JOIN_PCT_RE.sub("%", joined)
     out.extend(extract_figures(joined))
 
-    # Determine explicit unit scales declared in the cited chunk(s) or quote itself
     context_blob = " ".join([cleaned_quote, *(chunk_excerpts or [])])
-    scales: list[float] = []
-    for pat, mult in _TABLE_SCALE_PATTERNS:
-        if pat.search(context_blob):
-            scales.append(mult)
+    scales = [mult for pat, mult in _TABLE_SCALE_PATTERNS if pat.search(context_blob)]
 
-    # Extract verbatim numeric cells (ignoring bare 4-digit fiscal years like 2024..2026)
     cell_parts = [c.strip() for c in cleaned_quote.split("|")]
     for idx, cell in enumerate(cell_parts):
         next_is_pct = idx + 1 < len(cell_parts) and cell_parts[idx + 1] == "%"
@@ -162,7 +159,6 @@ def _extract_table_aware_quote_figures(
             if next_is_pct:
                 out.append(Figure("pct", val, f"{raw_num}%"))
                 continue
-            # Skip uncomma'd 4-digit calendar years
             if "," not in raw_num and "." not in raw_num and 1990 <= val <= 2035:
                 continue
             out.append(Figure("amount", val, raw_num))
@@ -181,6 +177,14 @@ def _figures_match(a: Figure, b: Figure) -> bool:
     return abs(abs(a.value) - abs(b.value)) <= 0.5
 
 
+def _coerce_figure_kind(raw: str) -> FigureKind:
+    if raw == "pct":
+        return "pct"
+    if raw == "bps":
+        return "bps"
+    return "amount"
+
+
 def _payload_figures(
     variance_reports: list[dict[str, Any]],
     material_flags: list[dict[str, Any]] | None = None,
@@ -191,17 +195,12 @@ def _payload_figures(
     medians, sign-reversal amounts) so an analyst finding may quote them.
     """
     out: list[Figure] = [
-        Figure(kind, value, "material_flag")  # type: ignore[arg-type]
+        Figure(_coerce_figure_kind(kind), value, "material_flag")
         for kind, value in material_flag_payload_figures(material_flags)
     ]
     for rep in variance_reports:
-        for key in (
-            "revenue_variance",
-            "operating_income_variance",
-            "net_income_variance",
-            "research_and_development_variance",
-        ):
-            mv = rep.get(key) or {}
+        for metric in CORE_METRICS:
+            mv = rep.get(f"{metric}_variance") or {}
             for amount_key in ("start_value", "end_value", "absolute_delta"):
                 if mv.get(amount_key) is not None:
                     out.append(Figure("amount", abs(float(mv[amount_key])), amount_key))
@@ -216,7 +215,7 @@ def _payload_figures(
             if rep.get(bps_key) is not None:
                 out.append(Figure("bps", float(rep[bps_key]), bps_key))
         for step in rep.get("annual_series") or []:
-            for metric in ("revenue", "operating_income", "net_income", "research_and_development"):
+            for metric in CORE_METRICS:
                 if step.get(metric) is not None:
                     out.append(Figure("amount", abs(float(step[metric])), metric))
                 if step.get(f"{metric}_yoy_delta") is not None:
@@ -234,22 +233,8 @@ def _payload_pct_matches(fig: Figure, payload: list[Figure]) -> bool:
 
 
 def _normalize(text: str) -> str:
-    text = (text or "").replace("\\", "")
-    text = text.translate(
-        str.maketrans(
-            {
-                "\u2019": "'",
-                "\u2018": "'",
-                "\u201c": '"',
-                "\u201d": '"',
-                "\u2014": "-",
-                "\u2013": "-",
-                "*": "",
-                "_": " ",
-            }
-        )
-    )
-    return " ".join(text.lower().split())
+    cleaned = normalize_quote_text((text or "").replace("\\", ""))
+    return " ".join(cleaned.replace("*", "").replace("_", " ").split())
 
 
 # ---------------------------------------------------------------------------
@@ -281,21 +266,13 @@ class ReportVerification(BaseModel):
 class VerifiedAnalystReport:
     report: AnalystReport
     verification: ReportVerification
-    verified_findings: list[AnalystFinding] = field(default_factory=list)
 
 
 def parse_analyst_report(raw: Any) -> AnalystReport | None:
-    """Parse the ADK output_key value (dict or JSON string) into an `AnalystReport`."""
+    """Parse the ADK output_key value (instance, dict, or JSON string) into an `AnalystReport`."""
     if raw is None or raw == "":
         return None
-    try:
-        if isinstance(raw, AnalystReport):
-            return raw
-        if isinstance(raw, str):
-            return AnalystReport.model_validate_json(raw)
-        return AnalystReport.model_validate(raw)
-    except ValidationError:
-        return None
+    return parse_model_output(raw, AnalystReport)
 
 
 def _trim_words(text: str, max_chars: int) -> str:
@@ -317,10 +294,61 @@ def _locate_quote(
     for cid in chunk_ids:
         m = _CHUNK_SECTION_RE.match(cid)
         entry = get_full_10k_section(m["key"]) if m else None
-        if entry:
-            if quote_norm in _normalize(str(entry.get("full_text") or "")):
-                return "section"
+        if entry and quote_norm in _normalize(str(entry.get("full_text") or "")):
+            return "section"
     return None
+
+
+def _verify_single_finding(
+    idx: int,
+    finding: AnalystFinding,
+    *,
+    by_id: dict[str, dict[str, Any]],
+    payload: list[Figure],
+) -> tuple[FindingVerification, list[Figure]]:
+    """Verify chunk grounding, verbatim quote location, and numeric fidelity for one finding."""
+    reasons: list[str] = []
+    if not finding.chunk_ids:
+        reasons.append("no chunk_ids cited")
+    unresolved = [cid for cid in finding.chunk_ids if cid not in by_id]
+    if unresolved:
+        reasons.append(f"chunk_ids not retrieved this turn: {unresolved}")
+
+    quote_norm = _normalize(finding.evidence_quote)
+    located: Literal["chunk", "section"] | None = None
+    if len(quote_norm) < MIN_QUOTE_CHARS:
+        reasons.append("evidence_quote missing or too short")
+    elif not unresolved and finding.chunk_ids:
+        located = _locate_quote(quote_norm, finding.chunk_ids, by_id)
+        if located is None:
+            reasons.append("evidence_quote not found in the cited passages")
+
+    cited_excerpts = [
+        str(by_id[cid].get("excerpt") or "") for cid in finding.chunk_ids if cid in by_id
+    ]
+    if "|" in finding.evidence_quote:
+        for cid in finding.chunk_ids:
+            m = _CHUNK_SECTION_RE.match(cid)
+            entry = get_full_10k_section(m["key"]) if m else None
+            if entry and entry.get("full_text"):
+                cited_excerpts.append(str(entry["full_text"])[:4000])
+
+    quote_figs = _extract_table_aware_quote_figures(finding.evidence_quote, cited_excerpts)
+    unsupported = [
+        f.text
+        for f in extract_figures(finding.statement)
+        if not any(_figures_match(f, q) for q in quote_figs)
+        and not _payload_pct_matches(f, payload)
+    ]
+    if unsupported:
+        reasons.append(f"figures not in the quote or deterministic payload: {unsupported}")
+
+    return (
+        FindingVerification(
+            index=idx, verified=not reasons, reasons=reasons, quote_located_in=located
+        ),
+        quote_figs,
+    )
 
 
 def verify_analyst_report(
@@ -350,44 +378,9 @@ def verify_analyst_report(
     verified_quote_figures: list[Figure] = []
 
     for idx, finding in enumerate(trimmed.findings):
-        reasons: list[str] = []
-        if not finding.chunk_ids:
-            reasons.append("no chunk_ids cited")
-        unresolved = [cid for cid in finding.chunk_ids if cid not in by_id]
-        if unresolved:
-            reasons.append(f"chunk_ids not retrieved this turn: {unresolved}")
-        quote_norm = _normalize(finding.evidence_quote)
-        located: Literal["chunk", "section"] | None = None
-        if len(quote_norm) < MIN_QUOTE_CHARS:
-            reasons.append("evidence_quote missing or too short")
-        elif not unresolved and finding.chunk_ids:
-            located = _locate_quote(quote_norm, finding.chunk_ids, by_id)
-            if located is None:
-                reasons.append("evidence_quote not found in the cited passages")
-        cited_excerpts = [
-            str(by_id[cid].get("excerpt") or "") for cid in finding.chunk_ids if cid in by_id
-        ]
-        # Also include full cached section scale headers if present when a quote came from a table
-        if "|" in finding.evidence_quote:
-            for cid in finding.chunk_ids:
-                m = _CHUNK_SECTION_RE.match(cid)
-                entry = get_full_10k_section(m["key"]) if m else None
-                if entry and entry.get("full_text"):
-                    cited_excerpts.append(str(entry["full_text"])[:4000])
-        quote_figs = _extract_table_aware_quote_figures(finding.evidence_quote, cited_excerpts)
-        unsupported = [
-            f.text
-            for f in extract_figures(finding.statement)
-            if not any(_figures_match(f, q) for q in quote_figs)
-            and not _payload_pct_matches(f, payload)
-        ]
-        if unsupported:
-            reasons.append(f"figures not in the quote or deterministic payload: {unsupported}")
-        ok = not reasons
-        verification.findings.append(
-            FindingVerification(index=idx, verified=ok, reasons=reasons, quote_located_in=located)
-        )
-        if ok:
+        f_ver, quote_figs = _verify_single_finding(idx, finding, by_id=by_id, payload=payload)
+        verification.findings.append(f_ver)
+        if f_ver.verified:
             verified.append(finding)
             verified_quote_figures.extend(quote_figs)
 
@@ -406,17 +399,14 @@ def verify_analyst_report(
             [f"unsupported figures: {headline_bad}"] if headline_bad else ["empty headline"]
         )
 
-    kept_metrics = []
+    kept_metrics: list[AnalystMetricReference] = []
     for ref in trimmed.key_metrics:
         if ref.ticker.upper() in payload_tickers:
             kept_metrics.append(ref)
         else:
             verification.metrics_dropped.append(f"{ref.ticker}:{ref.metric}")
 
-    # Every rejected finding is dropped prior to release so the rendered report carries zero
-    # unsupported claims; we also record how many claims were rejected for auditing/evals.
     verification.unsupported_claims_count = 0
-
     if verification.findings_total > 0 and not verified:
         verification.usable = False
         verification.unusable_reason = (
@@ -424,49 +414,13 @@ def verify_analyst_report(
         )
         verification.unsupported_claims_count = verification.findings_rejected
 
-    final = trimmed.model_copy(
-        update={
-            "key_metrics": kept_metrics,
-            "findings": verified,
-        }
-    )
-    return VerifiedAnalystReport(
-        report=final, verification=verification, verified_findings=verified
-    )
+    final = trimmed.model_copy(update={"key_metrics": kept_metrics, "findings": verified})
+    return VerifiedAnalystReport(report=final, verification=verification)
 
 
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
-
-
-def _fmt_usd(value: float | None) -> str:
-    if value is None:
-        return "N/A"
-    sign = "-" if value < 0 else ""
-    v = abs(value)
-    if v >= 1e12:
-        return f"{sign}${v / 1e12:.2f}T"
-    if v >= 1e9:
-        return f"{sign}${v / 1e9:.2f}B"
-    if v >= 1e6:
-        return f"{sign}${v / 1e6:.2f}M"
-    return f"{sign}${v:,.0f}"
-
-
-def _fmt_pct(value: float | None) -> str:
-    return "N/A" if value is None else f"{value:+.2f}%"
-
-
-def _citation_tag(cit: dict[str, Any], fallback_ticker: str, fallback_fy: int) -> str:
-    ticker = cit.get("ticker") or fallback_ticker
-    fy = cit.get("fiscal_year") or fallback_fy
-    section = cit.get("section_title") or _SECTION_TITLES.get(
-        str(cit.get("section_id") or ""), "10-K"
-    )
-    return (
-        f"[{ticker} FY{fy} | {section} | {cit.get('chunk_id')}]({cit.get('sec_filing_url') or ''})"
-    )
 
 
 def _xbrl_citation_tag(
@@ -483,16 +437,102 @@ def _xbrl_citation_tag(
     return f"[{ticker} FY{fiscal_year} | XBRL {concept} | acc:{acc}]({url})"
 
 
-def _lookup_year_map(mapping: dict[Any, Any] | None, year: int) -> Any:
-    if not isinstance(mapping, dict):
-        return None
-    return mapping.get(year) if year in mapping else mapping.get(str(year))
-
-
 def _fiscal_label(fy: int, period_of_report: str | None) -> str:
-    if period_of_report:
-        return f"FY{fy} ({period_of_report})"
-    return f"FY{fy}"
+    return f"FY{fy} ({period_of_report})" if period_of_report else f"FY{fy}"
+
+
+def _render_coverage_notices(coverage_notices: list[dict[str, Any]] | None) -> list[str]:
+    if not coverage_notices:
+        return []
+    notice_lines: list[str] = []
+    for notice in coverage_notices:
+        msg = str(notice.get("message") or "").strip()
+        if msg:
+            prefix = "Warning" if notice.get("severity") == "warning" else "Note"
+            notice_lines.append(f"> **{prefix} (Coverage):** {msg}")
+    return [*notice_lines, ""] if notice_lines else []
+
+
+def _render_metric_line(ref: AnalystMetricReference, rep: dict[str, Any]) -> str | None:
+    ticker_upper = ref.ticker.upper()
+    mv = rep.get(f"{ref.metric}_variance") or {}
+    if mv.get("start_value") is None or mv.get("end_value") is None:
+        return None
+    start_fy = int(mv.get("start_year") or rep.get("start_year") or 0)
+    end_fy = int(mv.get("end_year") or rep.get("end_year") or 0)
+    period_dates = rep.get("period_end_dates") or {}
+    acc_map = rep.get("accession_numbers") or {}
+    url_map = rep.get("source_urls") or {}
+    prov_map = rep.get("metric_provenance") or {}
+
+    start_period = mv.get("start_period_of_report") or lookup_year_key(period_dates, start_fy)
+    end_period = mv.get("end_period_of_report") or lookup_year_key(period_dates, end_fy)
+    start_acc = mv.get("start_accession_number") or lookup_year_key(acc_map, start_fy)
+    end_acc = mv.get("end_accession_number") or lookup_year_key(acc_map, end_fy)
+    start_url = mv.get("start_sec_filing_url") or lookup_year_key(url_map, start_fy)
+    end_url = mv.get("end_sec_filing_url") or lookup_year_key(url_map, end_fy)
+    start_prov = lookup_year_key(prov_map, start_fy) or {}
+    end_prov = lookup_year_key(prov_map, end_fy) or {}
+    start_concept = mv.get("start_xbrl_concept") or (
+        start_prov.get(ref.metric) if isinstance(start_prov, dict) else None
+    )
+    end_concept = mv.get("end_xbrl_concept") or (
+        end_prov.get(ref.metric) if isinstance(end_prov, dict) else None
+    )
+
+    xbrl_tags: list[str] = []
+    if start_acc or start_concept:
+        xbrl_tags.append(
+            _xbrl_citation_tag(
+                ticker=ticker_upper,
+                fiscal_year=start_fy,
+                xbrl_concept=start_concept,
+                accession_number=start_acc,
+                sec_filing_url=start_url,
+            )
+        )
+    if end_fy != start_fy and (end_acc or end_concept):
+        xbrl_tags.append(
+            _xbrl_citation_tag(
+                ticker=ticker_upper,
+                fiscal_year=end_fy,
+                xbrl_concept=end_concept,
+                accession_number=end_acc,
+                sec_filing_url=end_url,
+            )
+        )
+    cite_suffix = f" {' '.join(xbrl_tags)}" if xbrl_tags else ""
+    return (
+        f"- **{rep.get('company_name', ref.ticker)} ({ticker_upper}) · "
+        f"{METRIC_LABELS[ref.metric]}:** {fmt_usd(mv.get('start_value'))} "
+        f"({_fiscal_label(start_fy, start_period)}) → {fmt_usd(mv.get('end_value'))} "
+        f"({_fiscal_label(end_fy, end_period)}), **{fmt_pct(mv.get('percentage_delta'))}** "
+        f"(CAGR {fmt_pct(mv.get('cagr_pct'))}){cite_suffix}"
+    )
+
+
+def _render_findings_lines(
+    findings: list[AnalystFinding],
+    by_id: dict[str, dict[str, Any]],
+) -> list[str]:
+    if not findings:
+        return []
+    lines = ["#### Findings"]
+    for f in findings:
+        tags = " ".join(
+            format_inline_citation(
+                by_id[cid],
+                fallback_ticker=f.ticker,
+                fallback_fy=f.fiscal_year,
+                default_url="",
+            )
+            for cid in f.chunk_ids
+            if cid in by_id
+        )
+        lines.append(f"- {' '.join(f.statement.split())} {tags}".rstrip())
+        lines.append(f'  - *Evidence:* "{" ".join(f.evidence_quote.split())}"')
+    lines.append("")
+    return lines
 
 
 def render_analyst_report_markdown(
@@ -516,96 +556,23 @@ def render_analyst_report_markdown(
             f"FY{scope.get('start_year', '')}–FY{scope.get('end_year', '')}"
         )
     lines = [f"### {headline}", ""]
-
-    if coverage_notices:
-        notice_lines: list[str] = []
-        for notice in coverage_notices:
-            msg = str(notice.get("message") or "").strip()
-            if msg:
-                prefix = "Warning" if notice.get("severity") == "warning" else "Note"
-                notice_lines.append(f"> **{prefix} (Coverage):** {msg}")
-        if notice_lines:
-            lines += [*notice_lines, ""]
+    lines.extend(_render_coverage_notices(coverage_notices))
 
     metric_refs = list(report.key_metrics)
     if not metric_refs:
-        # Default: the three core metrics for up to two companies in the payload.
         metric_refs = [
             AnalystMetricReference(ticker=t, metric=m)
             for t in list(reps)[:2]
             for m in ("revenue", "operating_income", "net_income")
         ]
-    metric_lines: list[str] = []
-    for ref in metric_refs:
-        ticker_upper = ref.ticker.upper()
-        rep = reps.get(ticker_upper)
-        mv = (rep or {}).get(f"{ref.metric}_variance") or {}
-        if not rep or mv.get("start_value") is None or mv.get("end_value") is None:
-            continue
-        start_fy = int(mv.get("start_year") or rep.get("start_year") or 0)
-        end_fy = int(mv.get("end_year") or rep.get("end_year") or 0)
-        period_dates = rep.get("period_end_dates") or {}
-        acc_map = rep.get("accession_numbers") or {}
-        url_map = rep.get("source_urls") or {}
-        prov_map = rep.get("metric_provenance") or {}
-
-        start_period = mv.get("start_period_of_report") or _lookup_year_map(period_dates, start_fy)
-        end_period = mv.get("end_period_of_report") or _lookup_year_map(period_dates, end_fy)
-        start_acc = mv.get("start_accession_number") or _lookup_year_map(acc_map, start_fy)
-        end_acc = mv.get("end_accession_number") or _lookup_year_map(acc_map, end_fy)
-        start_url = mv.get("start_sec_filing_url") or _lookup_year_map(url_map, start_fy)
-        end_url = mv.get("end_sec_filing_url") or _lookup_year_map(url_map, end_fy)
-        start_prov = _lookup_year_map(prov_map, start_fy) or {}
-        end_prov = _lookup_year_map(prov_map, end_fy) or {}
-        start_concept = mv.get("start_xbrl_concept") or (
-            start_prov.get(ref.metric) if isinstance(start_prov, dict) else None
-        )
-        end_concept = mv.get("end_xbrl_concept") or (
-            end_prov.get(ref.metric) if isinstance(end_prov, dict) else None
-        )
-
-        xbrl_tags: list[str] = []
-        if start_acc or start_concept:
-            xbrl_tags.append(
-                _xbrl_citation_tag(
-                    ticker=ticker_upper,
-                    fiscal_year=start_fy,
-                    xbrl_concept=start_concept,
-                    accession_number=start_acc,
-                    sec_filing_url=start_url,
-                )
-            )
-        if end_fy != start_fy and (end_acc or end_concept):
-            xbrl_tags.append(
-                _xbrl_citation_tag(
-                    ticker=ticker_upper,
-                    fiscal_year=end_fy,
-                    xbrl_concept=end_concept,
-                    accession_number=end_acc,
-                    sec_filing_url=end_url,
-                )
-            )
-        cite_suffix = f" {' '.join(xbrl_tags)}" if xbrl_tags else ""
-        metric_lines.append(
-            f"- **{rep.get('company_name', ref.ticker)} ({ticker_upper}) · "
-            f"{_METRIC_LABELS[ref.metric]}:** {_fmt_usd(mv.get('start_value'))} "
-            f"({_fiscal_label(start_fy, start_period)}) → {_fmt_usd(mv.get('end_value'))} "
-            f"({_fiscal_label(end_fy, end_period)}), **{_fmt_pct(mv.get('percentage_delta'))}** "
-            f"(CAGR {_fmt_pct(mv.get('cagr_pct'))}){cite_suffix}"
-        )
+    metric_lines = [
+        rendered
+        for ref in metric_refs
+        if (rep := reps.get(ref.ticker.upper())) is not None
+        and (rendered := _render_metric_line(ref, rep)) is not None
+    ]
     if metric_lines:
         lines += ["#### Key Metrics (deterministic engine)", *metric_lines, ""]
 
-    if report.findings:
-        lines.append("#### Findings")
-        for f in report.findings:
-            tags = " ".join(
-                _citation_tag(by_id[cid], f.ticker, f.fiscal_year)
-                for cid in f.chunk_ids
-                if cid in by_id
-            )
-            lines.append(f"- {' '.join(f.statement.split())} {tags}".rstrip())
-            lines.append(f'  - *Evidence:* "{" ".join(f.evidence_quote.split())}"')
-        lines.append("")
-
+    lines.extend(_render_findings_lines(report.findings, by_id))
     return "\n".join(lines).strip() + "\n"

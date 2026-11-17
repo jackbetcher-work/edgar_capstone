@@ -41,6 +41,7 @@ import type {
   ParsedInlineCitationToken,
   ParsedInlineXbrlToken,
 } from './utils/formatters'
+import { buildXbrlFactFromInlineToken } from './utils/xbrlFactSelection'
 
 const DEFAULT_FILTERS: SearchScopeFilters = {
   selectedTickers: [],
@@ -417,22 +418,7 @@ export function App() {
     const matchedRep = reports.find(
       (r) => r.ticker.toUpperCase() === token.ticker.toUpperCase()
     )
-    const fyKey = String(token.fiscalYear)
-    const period = matchedRep?.period_end_dates?.[fyKey] ?? null
-    const filingDate = matchedRep?.filing_dates?.[fyKey] ?? null
-    const fact: XbrlFactSelection = {
-      title: `${token.ticker} FY${token.fiscalYear} · ${token.xbrlConcept}`,
-      ticker: token.ticker,
-      companyName: matchedRep?.company_name,
-      fiscalYear: token.fiscalYear,
-      metricLabel: token.xbrlConcept,
-      periodOfReport: period,
-      filingDate,
-      accessionNumber: token.accessionNumber,
-      xbrlConcept: token.xbrlConcept,
-      secFilingUrl: token.url || matchedRep?.source_urls?.[fyKey] || null,
-    }
-    handleInspectXbrlFact(fact)
+    handleInspectXbrlFact(buildXbrlFactFromInlineToken(token, matchedRep))
   }
 
   const handleSelectInlineCitation = (

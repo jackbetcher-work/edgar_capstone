@@ -1,35 +1,46 @@
-"""BigQuery I/O for the golden eval set and eval results (plain REST + ADC, like the rest of
-the code base).
+"""BigQuery I/O for the golden eval set and eval results (plain REST + ADC).
 
-- `load_golden_dataset_to_bigquery`: multipart-upload load job (WRITE_TRUNCATE) into
+Provided on `EvalBigQueryClient` (inheriting thread-safe ADC refresh, pooled HTTP
+transport, and BigQuery REST v2 wire decoding from `BigQueryRestClient`):
+- `load_golden_dataset`: multipart-upload load job (`WRITE_TRUNCATE`) into
   `sec_edgar.golden_eval_set`, so no GCS staging object is needed.
-- `read_golden_dataset_from_bigquery`: `tabledata.list` (needs only `bigquery.tables.getData`).
-- `stream_eval_result`: `tabledata.insertAll` of one run summary row into `sec_edgar.eval_results`.
+- `read_golden_dataset`: `tabledata.list` (needs only `bigquery.tables.getData`).
+- `stream_eval_result`: `tabledata.insertAll` of one run summary row into
+  `sec_edgar.eval_results`.
 """
 
 from __future__ import annotations
 
 import json
-import time
 import uuid
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import google.auth
 import httpx
-from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.auth.exceptions import DefaultCredentialsError
 
-from edgar_capstone.dataset.gcs_storage import DEFAULT_LOCATION, DEFAULT_PROJECT_ID
+from edgar_capstone.common.formatting import utc_now_iso
 from edgar_capstone.evals.golden import (
     REPO_ROOT,
     GoldenEvalItem,
     dataset_fingerprint,
 )
+from edgar_capstone.gcp.bigquery import (
+    BIGQUERY_API_ROOT,
+    BIGQUERY_UPLOAD_ROOT,
+    BigQueryRestClient,
+    decode_bq_row,
+    load_bigquery_schema_fields,
+)
+from edgar_capstone.gcp.defaults import (
+    DEFAULT_BIGQUERY_DATASET_ID,
+    DEFAULT_LOCATION,
+    DEFAULT_PROJECT_ID,
+)
+from edgar_capstone.gcp.lro import OperationError, OperationTimeoutError, poll_operation
+from edgar_capstone.gcp.rest_client import GcpRestError
 
-BIGQUERY_API_ROOT = "https://bigquery.googleapis.com/bigquery/v2"
-BIGQUERY_UPLOAD_ROOT = "https://bigquery.googleapis.com/upload/bigquery/v2"
-DEFAULT_DATASET_ID = "sec_edgar"
+DEFAULT_DATASET_ID = DEFAULT_BIGQUERY_DATASET_ID
 GOLDEN_EVAL_SET_TABLE = "golden_eval_set"
 EVAL_RESULTS_TABLE = "eval_results"
 SCHEMA_DIR = REPO_ROOT / "terraform" / "schemas"
@@ -40,10 +51,13 @@ class EvalBigQueryError(RuntimeError):
 
 
 def load_schema_fields(table_id: str, schema_dir: Path = SCHEMA_DIR) -> list[dict[str, Any]]:
-    return json.loads((schema_dir / f"{table_id}.json").read_text(encoding="utf-8"))
+    """Load and validate a BigQuery table schema JSON file from `schema_dir`."""
+    return load_bigquery_schema_fields(table_id, schema_dir=schema_dir)
 
 
-class EvalBigQueryClient:
+class EvalBigQueryClient(BigQueryRestClient):
+    """BigQuery REST v2 client for `golden_eval_set` and `eval_results`."""
+
     def __init__(
         self,
         *,
@@ -53,23 +67,15 @@ class EvalBigQueryClient:
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
     ) -> None:
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.location = location
-        self._http = http_client
-        self._credentials = credentials
-
-    # -- transport ---------------------------------------------------------------------------
-    def _token(self) -> str:
-        if self._credentials is None:
-            self._credentials, _ = google.auth.default(
-                scopes=["https://www.googleapis.com/auth/cloud-platform"]
-            )
-        if not getattr(self._credentials, "valid", False) or not getattr(
-            self._credentials, "token", None
-        ):
-            self._credentials.refresh(GoogleAuthRequest())
-        return str(self._credentials.token)
+        super().__init__(
+            project_id=project_id,
+            dataset_id=dataset_id,
+            location=location,
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=60.0,
+            quota_project_id=project_id,
+        )
 
     def _request(
         self,
@@ -81,21 +87,18 @@ class EvalBigQueryClient:
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        hdrs = {"Authorization": f"Bearer {self._token()}", "x-goog-user-project": self.project_id}
-        hdrs.update(headers or {})
-        client = self._http or httpx.Client(timeout=60.0)
         try:
-            resp = client.request(
-                method, url, json=json_body, content=content, headers=hdrs, params=params
+            payload = self._request_json(
+                method,
+                url,
+                json_body=json_body,
+                content=content,
+                headers=headers,
+                params=params,
             )
-        finally:
-            if self._http is None:
-                client.close()
-        if resp.status_code >= 400:
-            raise EvalBigQueryError(
-                f"BigQuery {method} {url} failed (HTTP {resp.status_code}): {resp.text[:500]}"
-            )
-        return resp.json() if resp.content else {}
+        except (GcpRestError, DefaultCredentialsError) as exc:
+            raise EvalBigQueryError(f"BigQuery {method} {url} failed: {exc}") from exc
+        return payload if isinstance(payload, dict) else {}
 
     def _table_url(self, table_id: str) -> str:
         return (
@@ -113,7 +116,7 @@ class EvalBigQueryClient:
     ) -> dict[str, Any]:
         """Replace `golden_eval_set` with `items` via a multipart-upload load job."""
         version = dataset_fingerprint(items)
-        loaded_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        loaded_at = utc_now_iso()
         ndjson = "\n".join(
             json.dumps(i.to_bigquery_row(dataset_version=version, loaded_at=loaded_at))
             for i in items
@@ -164,21 +167,29 @@ class EvalBigQueryClient:
         }
 
     def _wait_for_job(self, job_id: str, timeout_seconds: float) -> dict[str, Any]:
-        deadline = time.monotonic() + timeout_seconds
         url = f"{BIGQUERY_API_ROOT}/projects/{self.project_id}/jobs/{job_id}"
-        while True:
-            job = self._request("GET", url, params={"location": self.location})
-            status = job.get("status") or {}
-            if status.get("state") == "DONE":
-                if status.get("errorResult"):
-                    raise EvalBigQueryError(
-                        f"BigQuery job {job_id} failed: {status['errorResult']} "
-                        f"{(status.get('errors') or [])[:3]}"
-                    )
-                return job
-            if time.monotonic() > deadline:
-                raise EvalBigQueryError(f"BigQuery job {job_id} still running after timeout")
-            time.sleep(1.5)
+        try:
+            job = poll_operation(
+                lambda: self._raw_request("GET", url, params={"location": self.location}),
+                lambda payload: (payload.get("status") or {}).get("state") == "DONE",
+                label=f"BigQuery job {job_id}",
+                timeout_seconds=timeout_seconds,
+                initial_interval_seconds=1.5,
+                max_interval_seconds=1.5,
+                backoff_multiplier=1.0,
+            )
+        except OperationTimeoutError as exc:
+            raise EvalBigQueryError(f"BigQuery job {job_id} still running after timeout") from exc
+        except (OperationError, DefaultCredentialsError) as exc:
+            raise EvalBigQueryError(str(exc)) from exc
+
+        status = job.get("status") or {}
+        if status.get("errorResult"):
+            raise EvalBigQueryError(
+                f"BigQuery job {job_id} failed: {status['errorResult']} "
+                f"{(status.get('errors') or [])[:3]}"
+            )
+        return job
 
     def read_golden_dataset(self, *, table_id: str = GOLDEN_EVAL_SET_TABLE) -> list[GoldenEvalItem]:
         table = self._request("GET", self._table_url(table_id))
@@ -190,7 +201,7 @@ class EvalBigQueryClient:
             if page_token:
                 params["pageToken"] = page_token
             data = self._request("GET", f"{self._table_url(table_id)}/data", params=params)
-            rows.extend(_decode_record(r, fields) for r in data.get("rows") or [])
+            rows.extend(decode_bq_row(r, fields) for r in data.get("rows") or [])
             page_token = data.get("pageToken")
             if not page_token:
                 break
@@ -201,46 +212,20 @@ class EvalBigQueryClient:
     def stream_eval_result(
         self, row: dict[str, Any], *, table_id: str = EVAL_RESULTS_TABLE
     ) -> dict[str, Any]:
-        payload = {
-            "kind": "bigquery#tableDataInsertAllRequest",
-            "skipInvalidRows": False,
-            "ignoreUnknownValues": False,
-            "rows": [{"insertId": row["run_id"], "json": row}],
-        }
-        resp = self._request("POST", f"{self._table_url(table_id)}/insertAll", json_body=payload)
+        try:
+            resp = self.insert_all(
+                table_id,
+                [{"insertId": row["run_id"], "json": row}],
+                skip_invalid_rows=False,
+                ignore_unknown_values=False,
+            )
+        except (GcpRestError, DefaultCredentialsError) as exc:
+            raise EvalBigQueryError(f"BigQuery insertAll failed: {exc}") from exc
         if resp.get("insertErrors"):
             raise EvalBigQueryError(
                 f"insertAll rejected eval_results row: {json.dumps(resp['insertErrors'])[:500]}"
             )
         return {"table": f"{self.project_id}.{self.dataset_id}.{table_id}", "run_id": row["run_id"]}
-
-
-def _decode_value(raw: Any, field: dict[str, Any]) -> Any:
-    mode = str(field.get("mode") or "NULLABLE").upper()
-    if mode == "REPEATED":
-        inner = {**field, "mode": "NULLABLE"}
-        return [_decode_value(v.get("v") if isinstance(v, dict) else v, inner) for v in raw or []]
-    if raw is None:
-        return None
-    ftype = str(field.get("type") or "STRING").upper()
-    if ftype in ("RECORD", "STRUCT"):
-        return _decode_record(raw, field.get("fields") or [])
-    if ftype in ("INTEGER", "INT64"):
-        return int(raw)
-    if ftype in ("FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC"):
-        return float(raw)
-    if ftype in ("BOOLEAN", "BOOL"):
-        return raw if isinstance(raw, bool) else str(raw).lower() == "true"
-    return raw
-
-
-def _decode_record(row: dict[str, Any], fields: list[dict[str, Any]]) -> dict[str, Any]:
-    cells = row.get("f") or []
-    out: dict[str, Any] = {}
-    for idx, field in enumerate(fields):
-        cell = cells[idx] if idx < len(cells) else {"v": None}
-        out[field["name"]] = _decode_value(cell.get("v") if isinstance(cell, dict) else cell, field)
-    return out
 
 
 def _drop_nulls(value: Any) -> Any:

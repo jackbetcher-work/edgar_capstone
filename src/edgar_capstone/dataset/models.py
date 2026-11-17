@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-
-def utc_now_iso() -> str:
-    """Return current UTC timestamp in ISO-8601 format."""
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+from edgar_capstone.common.formatting import utc_now_iso
+from edgar_capstone.common.models import FilingMetadataBase
 
 
 class CompanyConstituent(BaseModel):
@@ -52,7 +49,7 @@ class MetricProvenance(BaseModel):
     )
 
 
-class FinancialDataProfile(BaseModel):
+class FinancialDataProfile(FilingMetadataBase):
     """Structured financial profile for a single company-year 10-K filing.
 
     Serialized to `structured/{ticker}/{fy}_financials.json` and aggregated into
@@ -60,14 +57,10 @@ class FinancialDataProfile(BaseModel):
     deterministic variance calculations.
     """
 
-    profile_id: str = Field(..., description="Unique identifier: {TICKER}_{FY}")
-    ticker: str = Field(..., description="Canonical company ticker symbol")
     cik: str = Field(..., description="10-digit zero-padded SEC CIK")
-    company_name: str = Field(..., description="Official SEC registrant name")
     gics_sector: str = Field(default="Unknown", description="GICS Sector")
     gics_sub_industry: str = Field(default="Unknown", description="GICS Sub-Industry")
     form_type: str = Field(default="10-K", description="SEC form type")
-    fiscal_year: int = Field(..., description="Reporting fiscal year (e.g., 2026)")
     fiscal_period: str = Field(default="FY", description="Fiscal period focus")
     period_of_report: str = Field(..., description="Fiscal period end date (YYYY-MM-DD)")
     filing_date: str = Field(..., description="SEC EDGAR filing date (YYYY-MM-DD)")
@@ -106,13 +99,9 @@ class FinancialDataProfile(BaseModel):
     structured_blob_path: str = Field(
         ..., description="Relative GCS object path for structured financials JSON"
     )
-    unstructured_gcs_uri: str = Field(
-        ..., description="Full gs:// URI for unstructured 10-K Markdown"
-    )
     structured_gcs_uri: str = Field(
         ..., description="Full gs:// URI for structured financials JSON"
     )
-    sec_filing_url: str = Field(..., description="Public SEC EDGAR URL for the source filing")
     ingested_at: str = Field(
         default_factory=utc_now_iso, description="UTC ingestion timestamp (ISO-8601)"
     )

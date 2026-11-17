@@ -1,16 +1,19 @@
-"""Streaming BigQuery Telemetry & Audit Sinks, Firestore Feedback Persistence, and LookML Catalog.
+"""Streaming BigQuery Telemetry & Audit Sinks, Firestore Feedback/Session Stores, and LookML Re-exports.
 
 Implements:
 1. Streaming LLM token/cost/latency telemetry (`llm_telemetry_events`), conversational session &
-   tool-usage analytics (`session_telemetry_events`), and 10-K security/access audit trails
-   (`security_audit_logs`) to Google BigQuery sink tables via REST v2 `tabledata.insertAll`
-   plus structured Cloud Logging JSON emission for `google_logging_project_sink` durability.
-2. Persistent user feedback storage (`analyst_feedback`) backed by Google Cloud Firestore Native
-   REST v1 (`documents` & `:runQuery`) with ADC IAM authentication (`roles/datastore.user`).
+   tool-usage analytics (`session_telemetry_events`), async LLM-as-a-Judge evaluation updates,
+   and 10-K security/access audit trails (`security_audit_logs`) to Google BigQuery sink tables
+   via REST v2 `tabledata.insertAll` plus structured Cloud Logging JSON emission for
+   `google_logging_project_sink` durability.
+2. Persistent analyst feedback (`analyst_feedback`) and multi-instance conversational session
+   storage (`analyst_sessions`) backed by Google Cloud Firestore Native REST v1
+   (`documents` & `:runQuery`) built on the shared `FirestoreCollectionStore` transport.
 3. Sink selection (`auto` | `gcp` | `local`): Cloud Run streams to BigQuery & Firestore, while
    `local` keeps telemetry and feedback in memory so test and developer runs don't write to the
-   production telemetry tables. (These are write-only sinks; no answer data is read from them.)
-4. LookML semantic layer catalog introspection over `looker/` models, views, explores, and dashboards.
+   production telemetry tables.
+4. Backward-compatible re-exports of the LookML semantic layer catalog (`edgar_capstone.lookml`)
+   and Firestore wire codec (`edgar_capstone.gcp.firestore`).
 """
 
 from __future__ import annotations
@@ -20,24 +23,56 @@ import hashlib
 import json
 import logging
 import os
-import re
 import threading
 import time
-import urllib.parse
 import uuid
-from collections import Counter, defaultdict, deque
+from collections import Counter, OrderedDict, defaultdict, deque
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
-import google.auth
 import httpx
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
-from google.auth.transport.requests import Request as GoogleAuthRequest
 
-from edgar_capstone.dataset.gcs_storage import DEFAULT_LOCATION, DEFAULT_PROJECT_ID
+from edgar_capstone.common.env import TRUTHY_ENV_VALUES, env_bool
+from edgar_capstone.common.formatting import percentile, utc_now_iso
+from edgar_capstone.gcp.bigquery import (
+    BIGQUERY_API_ROOT,
+    bq_scalar_param,
+    decode_bq_rows,
+    validate_bq_identifier,
+)
+from edgar_capstone.gcp.defaults import (
+    DEFAULT_BIGQUERY_DATASET_ID,
+    DEFAULT_LOCATION,
+    DEFAULT_PROJECT_ID,
+    resolve_bq_dataset_id,
+    resolve_gcp_location,
+    resolve_gcp_project_id,
+)
+from edgar_capstone.gcp.firestore import (
+    DEFAULT_FIRESTORE_DATABASE_ID,
+    FirestoreCollectionStore,
+    decode_firestore_document,
+    decode_firestore_value,
+    encode_firestore_fields,
+    encode_firestore_value,
+)
+from edgar_capstone.gcp.rest_client import (
+    GcpNotFoundError,
+    GcpRateLimitError,
+    GcpRestClient,
+    GcpRestError,
+    GcpTimeoutError,
+    parse_retry_after,
+)
+from edgar_capstone.lookml import (
+    clear_lookml_catalog_cache,
+    load_lookml_project_catalog,
+    resolve_looker_project_dir,
+)
 from edgar_capstone.observability.tracing import add_span_event, current_trace_correlation
 
 if TYPE_CHECKING:
@@ -48,50 +83,92 @@ cloud_sink_logger = logging.getLogger("edgar_capstone.cloud_logging_sink")
 
 TelemetryBackendMode = Literal["auto", "gcp", "local"]
 
-DEFAULT_BIGQUERY_DATASET_ID = "sec_edgar"
 DEFAULT_BQ_LLM_TELEMETRY_TABLE = "llm_telemetry_events"
 DEFAULT_BQ_SESSION_TELEMETRY_TABLE = "session_telemetry_events"
 DEFAULT_BQ_AUDIT_LOGS_TABLE = "security_audit_logs"
 DEFAULT_BQ_TELEMETRY_COST_VIEW = "v_telemetry_cost_and_latency"
 
-DEFAULT_FIRESTORE_DATABASE_ID = "(default)"
 DEFAULT_FIRESTORE_FEEDBACK_COLLECTION = "analyst_feedback"
 DEFAULT_FIRESTORE_SESSION_COLLECTION = "analyst_sessions"
 
-_SAFE_BQ_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-_ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
-_TRUTHY_ENV_VALUES = frozenset({"1", "true", "yes", "on"})
+DEFAULT_MAX_LOCAL_RECORDS = 500
+DEFAULT_MAX_TRACKED_SESSIONS = 2000
+
+_TRUTHY_ENV_VALUES = TRUTHY_ENV_VALUES
+
+__all__ = [
+    "BigQueryTelemetrySink",
+    "DEFAULT_BIGQUERY_DATASET_ID",
+    "DEFAULT_BQ_AUDIT_LOGS_TABLE",
+    "DEFAULT_BQ_LLM_TELEMETRY_TABLE",
+    "DEFAULT_BQ_SESSION_TELEMETRY_TABLE",
+    "DEFAULT_BQ_TELEMETRY_COST_VIEW",
+    "DEFAULT_FIRESTORE_DATABASE_ID",
+    "DEFAULT_FIRESTORE_FEEDBACK_COLLECTION",
+    "DEFAULT_FIRESTORE_SESSION_COLLECTION",
+    "DEFAULT_LOCATION",
+    "DEFAULT_PROJECT_ID",
+    "FirestoreFeedbackStore",
+    "FirestoreSessionStore",
+    "TelemetryBackendMode",
+    "TelemetryConfig",
+    "TelemetryNotFoundError",
+    "TelemetryRateLimitError",
+    "TelemetrySinkError",
+    "TelemetryTimeoutError",
+    "clear_lookml_catalog_cache",
+    "cloud_sink_logger",
+    "configure_telemetry_stores",
+    "decode_firestore_document",
+    "decode_firestore_value",
+    "emit_cloud_logging_sink_record",
+    "encode_firestore_fields",
+    "encode_firestore_value",
+    "get_feedback_store",
+    "get_session_store",
+    "get_telemetry_sink",
+    "load_lookml_project_catalog",
+    "parse_retry_after",
+    "reset_telemetry_stores",
+    "resolve_looker_project_dir",
+    "session_firestore_doc_id",
+]
 
 
-class TelemetrySinkError(RuntimeError):
+class TelemetrySinkError(GcpRestError):
     """Raised when streaming or persisting telemetry/feedback to GCP fails."""
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
+
+class TelemetryNotFoundError(TelemetrySinkError, GcpNotFoundError):
+    """Raised when a BigQuery or Firestore resource returns HTTP 404 Not Found."""
 
 
-class TelemetryNotFoundError(TelemetrySinkError):
-    """Raised when a Firestore document returns HTTP 404 Not Found."""
-
-
-class TelemetryRateLimitError(TelemetrySinkError):
+class TelemetryRateLimitError(TelemetrySinkError, GcpRateLimitError):
     """Raised when BigQuery or Firestore returns HTTP 429 Too Many Requests."""
 
     def __init__(self, message: str, retry_after_seconds: float | None = None) -> None:
-        super().__init__(message)
+        GcpRestError.__init__(self, message, status_code=429)
         self.retry_after_seconds = retry_after_seconds
 
 
-class TelemetryTimeoutError(TelemetrySinkError, TimeoutError):
+class TelemetryTimeoutError(TelemetrySinkError, GcpTimeoutError):
     """Raised when a BigQuery or Firestore REST request times out."""
 
 
-def _validate_bq_id(value: str, label: str) -> str:
-    cleaned = value.strip()
-    if not cleaned or not _SAFE_BQ_IDENTIFIER_RE.match(cleaned):
-        raise ValueError(f"Unsafe BigQuery {label} identifier: {value!r}")
-    return cleaned
+def _translate_gcp_error(exc: GcpRestError) -> TelemetrySinkError:
+    """Translate `GcpRestError` subclasses into matching `Telemetry*Error` instances."""
+    if isinstance(exc, TelemetrySinkError):
+        return exc
+    if isinstance(exc, GcpTimeoutError):
+        return TelemetryTimeoutError(str(exc), status_code=exc.status_code)
+    if isinstance(exc, GcpRateLimitError):
+        return TelemetryRateLimitError(
+            str(exc),
+            retry_after_seconds=exc.retry_after_seconds,
+        )
+    if isinstance(exc, GcpNotFoundError):
+        return TelemetryNotFoundError(str(exc), status_code=exc.status_code or 404)
+    return TelemetrySinkError(str(exc), status_code=exc.status_code)
 
 
 def _resolve_backend_mode(raw_mode: str) -> TelemetryBackendMode:
@@ -130,33 +207,20 @@ class TelemetryConfig:
         feedback_backend = _resolve_backend_mode(raw_feedback)
 
         auto_signals = (
-            os.environ.get("EDGAR_USE_GCP_TELEMETRY", "").strip().lower() in _TRUTHY_ENV_VALUES
+            env_bool("EDGAR_USE_GCP_TELEMETRY", False)
             or bool(os.environ.get("K_SERVICE", "").strip())
             or bool(os.environ.get("BIGQUERY_DATASET_ID", "").strip())
             or bool(os.environ.get("FIRESTORE_DATABASE_ID", "").strip())
             or bool(os.environ.get("FIRESTORE_FEEDBACK_COLLECTION", "").strip())
-            or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in _TRUTHY_ENV_VALUES
+            or env_bool("GOOGLE_GENAI_USE_VERTEXAI", False)
         )
-
-        project_id = (
-            os.environ.get("GCP_PROJECT_ID")
-            or os.environ.get("GOOGLE_CLOUD_PROJECT")
-            or DEFAULT_PROJECT_ID
-        ).strip()
-        location = (
-            os.environ.get("GCP_REGION")
-            or os.environ.get("GOOGLE_CLOUD_LOCATION")
-            or DEFAULT_LOCATION
-        ).strip()
 
         return cls(
             telemetry_backend=telemetry_backend,
             feedback_backend=feedback_backend,
-            project_id=project_id,
-            location=location,
-            bq_dataset_id=(
-                os.environ.get("BIGQUERY_DATASET_ID") or DEFAULT_BIGQUERY_DATASET_ID
-            ).strip(),
+            project_id=resolve_gcp_project_id(),
+            location=resolve_gcp_location(allow_global=False),
+            bq_dataset_id=resolve_bq_dataset_id(),
             bq_llm_telemetry_table=(
                 os.environ.get("BIGQUERY_LLM_TELEMETRY_TABLE") or DEFAULT_BQ_LLM_TELEMETRY_TABLE
             ).strip(),
@@ -211,177 +275,20 @@ def emit_cloud_logging_sink_record(sink_table: str, payload: dict[str, Any]) -> 
     )
 
 
-class _AuthenticatedRestTransport:
-    """ADC OAuth2 bearer authentication and pooled HTTP helper for BigQuery & Firestore REST APIs."""
-
-    def __init__(
-        self,
-        *,
-        http_client: httpx.Client | None = None,
-        credentials: Any | None = None,
-        default_timeout: float = 15.0,
-    ) -> None:
-        self._http_client = http_client
-        self._pooled_http_client: httpx.Client | None = None
-        self._credentials = credentials
-        self._default_timeout = default_timeout
-        self._auth_lock = threading.Lock()
-        self._client_lock = threading.Lock()
-
-    def _get_http_client(self) -> httpx.Client:
-        if self._http_client is not None:
-            return self._http_client
-        with self._client_lock:
-            if self._pooled_http_client is None or self._pooled_http_client.is_closed:
-                self._pooled_http_client = httpx.Client(
-                    timeout=self._default_timeout,
-                    limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
-                )
-            return self._pooled_http_client
-
-    def _get_bearer_token(self) -> str:
-        with self._auth_lock:
-            if self._credentials is None:
-                self._credentials, _ = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
-                )
-            if not getattr(self._credentials, "valid", False) or not getattr(
-                self._credentials, "token", None
-            ):
-                self._credentials.refresh(GoogleAuthRequest())
-            token = getattr(self._credentials, "token", None)
-        if not token:
-            raise DefaultCredentialsError(
-                "Application Default Credentials did not return an OAuth2 bearer token."
-            )
-        return str(token)
-
-    def _request_json(
-        self,
-        method: str,
-        url: str,
-        *,
-        json_body: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> Any:
-        token = self._get_bearer_token()
-        headers: dict[str, str] = {"Authorization": f"Bearer {token}"}
-        if json_body is not None:
-            headers["Content-Type"] = "application/json"
-
-        client = self._get_http_client()
-        try:
-            resp = client.request(
-                method,
-                url,
-                json=json_body,
-                params=params,
-                headers=headers,
-            )
-        except httpx.TimeoutException as exc:
-            raise TelemetryTimeoutError(f"Timed out calling GCP endpoint {url}: {exc}") from exc
-
-        if resp.status_code == 429:
-            raise TelemetryRateLimitError(
-                f"GCP API HTTP 429 Too Many Requests for {url}: {resp.text[:300]}"
-            )
-        if resp.status_code == 404:
-            raise TelemetryNotFoundError(
-                f"GCP REST resource not found (HTTP 404) for {url}: {resp.text[:300]}",
-                status_code=404,
-            )
-        if resp.status_code >= 400:
-            raise TelemetrySinkError(
-                f"GCP REST request failed (HTTP {resp.status_code}) for {url}: {resp.text[:500]}",
-                status_code=resp.status_code,
-            )
-        if not resp.content:
-            return {}
-        return resp.json()
-
-
 def _should_fallback_to_local(exc: BaseException, *, strict_gcp: bool) -> bool:
     if strict_gcp:
         return False
-    if isinstance(
+    return isinstance(
         exc,
         (
             DefaultCredentialsError,
             RefreshError,
+            GcpRestError,
             TelemetrySinkError,
-            TelemetryRateLimitError,
-            TelemetryTimeoutError,
             httpx.HTTPError,
             OSError,
         ),
-    ):
-        return True
-    return False
-
-
-def _bq_scalar_param(name: str, bq_type: str, value: Any) -> dict[str, Any]:
-    return {
-        "name": name,
-        "parameterType": {"type": bq_type},
-        "parameterValue": {"value": None if value is None else str(value)},
-    }
-
-
-def _decode_bq_cell(raw_val: Any, field_schema: dict[str, Any]) -> Any:
-    mode = str(field_schema.get("mode") or "NULLABLE").upper()
-    field_type = str(field_schema.get("type") or "STRING").upper()
-    if mode == "REPEATED":
-        if raw_val is None:
-            return []
-        elem_schema = {**field_schema, "mode": "NULLABLE"}
-        items: list[Any] = []
-        if isinstance(raw_val, list):
-            for item in raw_val:
-                inner = item.get("v") if isinstance(item, dict) and "v" in item else item
-                items.append(_decode_bq_cell(inner, elem_schema))
-        return items
-    if raw_val is None:
-        return None
-    if field_type in ("INTEGER", "INT64"):
-        return int(raw_val)
-    if field_type in ("FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC"):
-        return float(raw_val)
-    if field_type in ("BOOLEAN", "BOOL"):
-        if isinstance(raw_val, bool):
-            return raw_val
-        return str(raw_val).strip().lower() == "true"
-    return str(raw_val)
-
-
-def _decode_bq_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
-    schema_fields = (data.get("schema") or {}).get("fields") or []
-    raw_rows = data.get("rows") or []
-    decoded_rows: list[dict[str, Any]] = []
-    for row_obj in raw_rows:
-        cells = row_obj.get("f")
-        if not isinstance(cells, list):
-            decoded_rows.append(dict(row_obj))
-            continue
-        row_dict: dict[str, Any] = {}
-        for idx, f_schema in enumerate(schema_fields):
-            col_name = str(f_schema.get("name") or f"col_{idx}")
-            cell = cells[idx] if idx < len(cells) else {"v": None}
-            raw_val = cell.get("v") if isinstance(cell, dict) and "v" in cell else cell
-            row_dict[col_name] = _decode_bq_cell(raw_val, f_schema)
-        decoded_rows.append(row_dict)
-    return decoded_rows
-
-
-def _percentile(sorted_vals: list[float], pct: float) -> float:
-    if not sorted_vals:
-        return 0.0
-    if len(sorted_vals) == 1:
-        return sorted_vals[0]
-    idx = (pct / 100.0) * (len(sorted_vals) - 1)
-    lo = int(idx)
-    hi = min(lo + 1, len(sorted_vals) - 1)
-    frac = idx - lo
-    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +304,7 @@ class _SessionCumulativeTracker:
     reports_generated: int = 0
 
 
-class BigQueryTelemetrySink(_AuthenticatedRestTransport):
+class BigQueryTelemetrySink(GcpRestClient):
     """Streams LLM token/cost/latency events, session analytics, and audit logs to BigQuery."""
 
     def __init__(
@@ -406,34 +313,70 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         *,
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
-        max_local_records: int = 500,
+        max_local_records: int = DEFAULT_MAX_LOCAL_RECORDS,
+        max_sessions: int = DEFAULT_MAX_TRACKED_SESSIONS,
     ) -> None:
-        super().__init__(http_client=http_client, credentials=credentials, default_timeout=15.0)
+        super().__init__(
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=15.0,
+            max_connections=32,
+            max_keepalive_connections=16,
+        )
         self.config = config or TelemetryConfig.from_env()
-        self.project_id = _validate_bq_id(self.config.project_id, "project_id")
-        self.dataset_id = _validate_bq_id(self.config.bq_dataset_id, "dataset_id")
-        self.llm_table = _validate_bq_id(self.config.bq_llm_telemetry_table, "llm_telemetry_table")
-        self.session_table = _validate_bq_id(
+        self.project_id = validate_bq_identifier(self.config.project_id, "project_id")
+        self.dataset_id = validate_bq_identifier(self.config.bq_dataset_id, "dataset_id")
+        self.llm_table = validate_bq_identifier(
+            self.config.bq_llm_telemetry_table, "llm_telemetry_table"
+        )
+        self.session_table = validate_bq_identifier(
             self.config.bq_session_telemetry_table, "session_telemetry_table"
         )
-        self.audit_table = _validate_bq_id(self.config.bq_audit_logs_table, "audit_logs_table")
-        self.telemetry_cost_view = _validate_bq_id(
+        self.audit_table = validate_bq_identifier(
+            self.config.bq_audit_logs_table, "audit_logs_table"
+        )
+        self.telemetry_cost_view = validate_bq_identifier(
             self.config.bq_telemetry_cost_view, "telemetry_cost_view"
         )
 
+        self._max_sessions = max(1, int(max_sessions))
         self._lock = threading.Lock()
         self._llm_events: deque[dict[str, Any]] = deque(maxlen=max_local_records)
         self._session_events: deque[dict[str, Any]] = deque(maxlen=max_local_records)
         self._audit_events: deque[dict[str, Any]] = deque(maxlen=max_local_records)
-        self._sessions: dict[str, _SessionCumulativeTracker] = {}
+        self._evaluation_events: deque[dict[str, Any]] = deque(maxlen=max_local_records)
+        self._sessions: OrderedDict[str, _SessionCumulativeTracker] = OrderedDict()
         self._streamed_counts: dict[str, int] = defaultdict(int)
         self._fallback_counts: dict[str, int] = defaultdict(int)
         self._last_streamed_at: str | None = None
         self._last_error: str | None = None
+        self._closed = False
         # Non-blocking background streaming pool for live BigQuery insertAll when no test client
         # is injected; Cloud Logging JSON sink emission remains synchronous for trace correlation.
         self._async_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="edgar-bq-sink")
         self._pending_writes: list[Future[Any]] = []
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        try:
+            resp = self._send_request(
+                method,
+                url,
+                json_body=json_body,
+                params=params,
+                not_found_as_dedicated_error=True,
+                **kwargs,
+            )
+        except GcpRestError as exc:
+            raise _translate_gcp_error(exc) from exc
+        return resp.json() if resp.content else {}
 
     def flush_async_writes(self, timeout: float = 10.0) -> int:
         """Wait for any in-flight background BigQuery streaming writes to complete."""
@@ -449,6 +392,18 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
                 logger.debug("Async BigQuery telemetry write raised during flush", exc_info=True)
         return done
 
+    def close(self, timeout_seconds: float = 5.0) -> None:
+        """Flush pending async writes, shut down the worker pool, and close pooled HTTP client."""
+        with self._lock:
+            already_closed = self._closed
+            self._closed = True
+        if not already_closed:
+            try:
+                self.flush_async_writes(timeout=timeout_seconds)
+            finally:
+                self._async_pool.shutdown(wait=False, cancel_futures=False)
+        super().close()
+
     def _should_attempt_gcp(self) -> tuple[bool, bool]:
         """Return `(attempt_gcp, strict_gcp)`."""
         mode = self.config.telemetry_backend
@@ -458,8 +413,18 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             return True, True
         return self.config.gcp_auto_triggered, False
 
+    def is_gcp_enabled(self) -> bool:
+        """Return True when live GCP BigQuery streaming and query paths are enabled."""
+        attempt_gcp, _ = self._should_attempt_gcp()
+        return attempt_gcp
+
+    def clear_local_audit_events(self) -> None:
+        """Thread-safely clear the in-memory security audit event buffer."""
+        with self._lock:
+            self._audit_events.clear()
+
     def _table_ref(self, table_or_view: str) -> str:
-        safe = _validate_bq_id(table_or_view, "table_or_view")
+        safe = validate_bq_identifier(table_or_view, "table_or_view")
         return f"`{self.project_id}.{self.dataset_id}.{safe}`"
 
     def stream_rows(
@@ -470,9 +435,9 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         """Stream rows to BigQuery REST v2 `tabledata.insertAll` with deterministic `insertId`s."""
         if not rows:
             return {"inserted": 0, "table_id": table_id}
-        safe_table = _validate_bq_id(table_id, "table_id")
+        safe_table = validate_bq_identifier(table_id, "table_id")
         url = (
-            f"https://bigquery.googleapis.com/bigquery/v2/projects/{self.project_id}"
+            f"{BIGQUERY_API_ROOT}/projects/{self.project_id}"
             f"/datasets/{self.dataset_id}/tables/{safe_table}/insertAll"
         )
         payload = {
@@ -488,7 +453,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
                 f"BigQuery insertAll rejected rows for {self.dataset_id}.{safe_table}: "
                 f"{json.dumps(insert_errors)[:400]}"
             )
-        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = utc_now_iso()
         with self._lock:
             self._streamed_counts[safe_table] += len(rows)
             self._last_streamed_at = now_iso
@@ -506,7 +471,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         query_parameters: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
         """Execute a parameterized Standard SQL query against BigQuery sink tables/views."""
-        url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{self.project_id}/queries"
+        url = f"{BIGQUERY_API_ROOT}/projects/{self.project_id}/queries"
         payload: dict[str, Any] = {
             "query": sql,
             "useLegacySql": False,
@@ -517,7 +482,131 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             payload["parameterMode"] = "NAMED"
             payload["queryParameters"] = query_parameters
         data = self._request_json("POST", url, json_body=payload)
-        return _decode_bq_rows(data if isinstance(data, dict) else {})
+        return decode_bq_rows(data if isinstance(data, dict) else {})
+
+    def _query_filtered_table(
+        self,
+        *,
+        operation_name: str,
+        table_id: str,
+        select_columns: str,
+        order_by: str,
+        local_deque: deque[dict[str, Any]],
+        limit: int,
+        filter_column: str | None = None,
+        filter_value: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query a BigQuery sink table with optional equality filter and local deque fallback."""
+        bounded = max(1, min(int(limit), 500))
+        cleaned_val = filter_value.strip() if filter_value and filter_value.strip() else None
+        params = [bq_scalar_param("limit", "INT64", bounded)]
+        where_sql = ""
+        if filter_column and cleaned_val:
+            where_sql = f"WHERE {filter_column} = @{filter_column} "
+            params.append(bq_scalar_param(filter_column, "STRING", cleaned_val))
+        sql = (
+            f"SELECT {select_columns} "
+            f"FROM {self._table_ref(table_id)} "
+            f"{where_sql}"
+            f"ORDER BY {order_by} "
+            "LIMIT @limit"
+        )
+
+        def _local_read() -> list[dict[str, Any]]:
+            with self._lock:
+                items = list(local_deque)
+            if filter_column and cleaned_val:
+                items = [r for r in items if r.get(filter_column) == cleaned_val]
+            return items[:bounded]
+
+        return self._query_with_local_fallback(
+            operation_name=operation_name,
+            sql=sql,
+            query_parameters=params,
+            local_fallback=_local_read,
+        )
+
+    @staticmethod
+    def _build_session_telemetry_row(
+        *,
+        turn_id: str,
+        recorded_at: str,
+        session_id: str,
+        turn_index: int,
+        user_id: str,
+        intent: str,
+        execution_mode: str,
+        status: str,
+        tickers_analyzed: list[str],
+        evaluation_grade: str | None,
+        evaluation_score: float | None,
+        trace_id: str | None,
+        **overrides: Any,
+    ) -> dict[str, Any]:
+        """Build a schema-complete `session_telemetry_events` row with safe defaults."""
+        row: dict[str, Any] = {
+            "turn_id": turn_id,
+            "recorded_at": recorded_at,
+            "session_id": session_id,
+            "turn_index": turn_index,
+            "user_id": user_id,
+            "intent": intent,
+            "execution_mode": execution_mode,
+            "status": status,
+            "tickers_analyzed": tickers_analyzed,
+            "companies_analyzed_count": len(tickers_analyzed),
+            "gics_sector": "ALL",
+            "start_year": None,
+            "end_year": None,
+            "report_generated": False,
+            "variance_reports_count": None,
+            "citations_count": None,
+            "tool_invocations": [],
+            "tool_invocation_count": 0,
+            "llm_call_count": 0,
+            "total_context_tokens": 0,
+            "cached_context_tokens": 0,
+            "output_tokens": 0,
+            "total_cost_usd": 0.0,
+            "cached_token_savings_usd": 0.0,
+            "ttft_ms": 0.0,
+            "total_latency_ms": 0.0,
+            "session_cumulative_turns": None,
+            "session_cumulative_companies_count": None,
+            "session_cumulative_reports_count": None,
+            "session_elapsed_seconds": None,
+            "fact_check_passed": None,
+            "evaluation_grade": evaluation_grade,
+            "evaluation_score": (
+                round(float(evaluation_score), 4) if evaluation_score is not None else None
+            ),
+            "trace_id": trace_id,
+        }
+        row.update(overrides)
+        return row
+
+    def _query_with_local_fallback(
+        self,
+        *,
+        operation_name: str,
+        sql: str,
+        query_parameters: list[dict[str, Any]],
+        local_fallback: Callable[[], list[dict[str, Any]]],
+    ) -> list[dict[str, Any]]:
+        """Execute a BigQuery query when GCP is enabled, falling back locally in auto mode."""
+        attempt_gcp, strict_gcp = self._should_attempt_gcp()
+        if attempt_gcp:
+            try:
+                return self.run_query(sql, query_parameters)
+            except Exception as exc:
+                if not _should_fallback_to_local(exc, strict_gcp=strict_gcp):
+                    raise
+                logger.warning(
+                    "BigQuery %s failed in auto mode (%s); reading local buffer.",
+                    operation_name,
+                    exc,
+                )
+        return local_fallback()
 
     @staticmethod
     def serialize_llm_record(record: ModelContextLatencyRecord) -> dict[str, Any]:
@@ -568,11 +657,13 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         insert_id: str,
         row: dict[str, Any],
         local_deque: deque[dict[str, Any]],
+        local_entry: dict[str, Any] | None = None,
+        log_payload: dict[str, Any] | None = None,
     ) -> str:
         with self._lock:
-            local_deque.appendleft(row)
+            local_deque.appendleft(local_entry if local_entry is not None else row)
 
-        emit_cloud_logging_sink_record(table_id, row)
+        emit_cloud_logging_sink_record(table_id, log_payload if log_payload is not None else row)
 
         attempt_gcp, strict_gcp = self._should_attempt_gcp()
         if not attempt_gcp:
@@ -581,6 +672,10 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         # When running live (no injected test http_client or credentials), stream BigQuery insertAll
         # off the request thread so interactive /api/v1/chat latency is never blocked by telemetry I/O.
         if self._http_client is None and self._credentials is None:
+            with self._lock:
+                if self._closed:
+                    self._fallback_counts[table_id] += 1
+                    return "local_buffer_fallback"
 
             def _bg_stream() -> None:
                 try:
@@ -596,7 +691,16 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
                     )
 
             ctx = contextvars.copy_context()
-            fut = self._async_pool.submit(ctx.run, _bg_stream)
+            try:
+                fut = self._async_pool.submit(ctx.run, _bg_stream)
+            except RuntimeError as exc:
+                with self._lock:
+                    self._fallback_counts[table_id] += 1
+                    self._last_error = str(exc)
+                logger.debug(
+                    "Skipping background BigQuery telemetry submit after pool shutdown: %s", exc
+                )
+                return "local_buffer_fallback"
             with self._lock:
                 self._pending_writes[:] = [f for f in self._pending_writes if not f.done()]
                 self._pending_writes.append(fut)
@@ -672,7 +776,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
     ) -> dict[str, Any]:
         """Record conversational session, company scope, report generation, tool usage & cost telemetry."""
         now_epoch = time.time()
-        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = utc_now_iso()
         eff_session_id = (session_id or "").strip() or f"ephemeral-{uuid.uuid4().hex[:10]}"
         norm_tickers = sorted({str(t).strip().upper() for t in tickers_analyzed if str(t).strip()})
 
@@ -680,7 +784,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         for step in agent_trace:
             raw_tool = str(step.get("tool") or "").strip()
             if raw_tool:
-                # Normalize e.g. 'query_looker_financial_explore(chunk_health)' -> canonical base or keep descriptive
+                # Normalize e.g. 'query_looker_financial_explore(chunk_health)' -> canonical base
                 base_tool = raw_tool.split("(", 1)[0].strip()
                 if base_tool:
                     tools_used.append(base_tool)
@@ -690,6 +794,10 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             if tracker is None:
                 tracker = _SessionCumulativeTracker(started_at_epoch=now_epoch)
                 self._sessions[eff_session_id] = tracker
+                while len(self._sessions) > self._max_sessions:
+                    self._sessions.popitem(last=False)
+            else:
+                self._sessions.move_to_end(eff_session_id)
             tracker.turn_count += 1
             tracker.distinct_tickers.update(norm_tickers)
             if report_generated:
@@ -714,44 +822,41 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         )
 
         turn_id = f"sess-turn-{uuid.uuid4().hex[:12]}"
-        row: dict[str, Any] = {
-            "turn_id": turn_id,
-            "recorded_at": now_iso,
-            "session_id": eff_session_id,
-            "turn_index": turn_index,
-            "user_id": user_id,
-            "intent": intent,
-            "execution_mode": execution_mode,
-            "status": status_outcome,
-            "tickers_analyzed": norm_tickers,
-            "companies_analyzed_count": len(norm_tickers),
-            "gics_sector": gics_sector or "ALL",
-            "start_year": int(start_year),
-            "end_year": int(end_year),
-            "report_generated": bool(report_generated),
-            "variance_reports_count": int(variance_reports_count),
-            "citations_count": int(citations_count),
-            "tool_invocations": tools_used,
-            "tool_invocation_count": len(tools_used),
-            "llm_call_count": len(turn_latency_records),
-            "total_context_tokens": tot_ctx_tokens,
-            "cached_context_tokens": cached_ctx_tokens,
-            "output_tokens": out_tokens,
-            "total_cost_usd": tot_cost_usd,
-            "cached_token_savings_usd": saved_cost_usd,
-            "ttft_ms": ttft_ms,
-            "total_latency_ms": round(float(total_latency_ms), 3),
-            "session_cumulative_turns": cum_turns,
-            "session_cumulative_companies_count": cum_companies,
-            "session_cumulative_reports_count": cum_reports,
-            "session_elapsed_seconds": elapsed_sec,
-            "fact_check_passed": bool(fact_check_passed),
-            "evaluation_grade": evaluation_grade,
-            "evaluation_score": (
-                round(float(evaluation_score), 4) if evaluation_score is not None else None
-            ),
-            "trace_id": _current_trace_id(),
-        }
+        row = self._build_session_telemetry_row(
+            turn_id=turn_id,
+            recorded_at=now_iso,
+            session_id=eff_session_id,
+            turn_index=turn_index,
+            user_id=user_id,
+            intent=intent,
+            execution_mode=execution_mode,
+            status=status_outcome,
+            tickers_analyzed=norm_tickers,
+            evaluation_grade=evaluation_grade,
+            evaluation_score=evaluation_score,
+            trace_id=_current_trace_id(),
+            gics_sector=gics_sector or "ALL",
+            start_year=int(start_year),
+            end_year=int(end_year),
+            report_generated=bool(report_generated),
+            variance_reports_count=int(variance_reports_count),
+            citations_count=int(citations_count),
+            tool_invocations=tools_used,
+            tool_invocation_count=len(tools_used),
+            llm_call_count=len(turn_latency_records),
+            total_context_tokens=tot_ctx_tokens,
+            cached_context_tokens=cached_ctx_tokens,
+            output_tokens=out_tokens,
+            total_cost_usd=tot_cost_usd,
+            cached_token_savings_usd=saved_cost_usd,
+            ttft_ms=ttft_ms,
+            total_latency_ms=round(float(total_latency_ms), 3),
+            session_cumulative_turns=cum_turns,
+            session_cumulative_companies_count=cum_companies,
+            session_cumulative_reports_count=cum_reports,
+            session_elapsed_seconds=elapsed_sec,
+            fact_check_passed=bool(fact_check_passed),
+        )
         delivery = self._deliver_row(
             table_id=self.session_table,
             insert_id=turn_id,
@@ -760,11 +865,126 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         )
         return {"row": row, "delivery": delivery}
 
+    def record_async_evaluation_result(
+        self,
+        *,
+        session_id: str,
+        user_email: str,
+        intent: str,
+        evaluation_grade: str,
+        evaluation_score: float,
+        evaluator_model: str,
+        query_text: str = "",
+        tickers_analyzed: list[str] | None = None,
+        rationale: str = "",
+        turn_id: str | None = None,
+        trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Log completed background Flash LLM-as-a-Judge grade & score asynchronously.
+
+        In BigQuery, interactive turns store ``evaluation_grade="pending"`` and
+        ``evaluation_score=NULL`` (ignored by Looker ``AVG(evaluation_score)``); once the
+        background judge finishes, this method updates the matching local turn in place
+        (without inflating local turn counts or latency averages), emits a structured Cloud
+        Logging sink entry with the full judge rationale, and streams a schema-valid row to
+        ``session_telemetry_events`` via ``insertAll``.
+        """
+        now_iso = utc_now_iso()
+        eff_session_id = (session_id or "").strip() or f"ephemeral-{uuid.uuid4().hex[:10]}"
+        norm_tickers = sorted(
+            {str(t).strip().upper() for t in (tickers_analyzed or []) if str(t).strip()}
+        )
+        grade_val = str(evaluation_grade).strip() or "unknown"
+        score_val = round(float(evaluation_score), 4)
+        eff_trace_id = trace_id or _current_trace_id()
+        eval_id = f"eval-{uuid.uuid4().hex[:12]}"
+
+        matched_turn_index = 0
+        matched_turn_id = turn_id
+        updated_local_turn = False
+        with self._lock:
+            target_idx: int | None = None
+            for idx, existing in enumerate(self._session_events):
+                if turn_id and existing.get("turn_id") == turn_id:
+                    target_idx = idx
+                    break
+                if (
+                    existing.get("session_id") == eff_session_id
+                    and existing.get("evaluation_grade") in (None, "pending")
+                    and target_idx is None
+                ):
+                    target_idx = idx
+                    if not turn_id:
+                        break
+            if target_idx is not None:
+                prev = self._session_events[target_idx]
+                self._session_events[target_idx] = {
+                    **prev,
+                    "evaluation_grade": grade_val,
+                    "evaluation_score": score_val,
+                }
+                matched_turn_index = int(prev.get("turn_index") or 0)
+                matched_turn_id = str(prev.get("turn_id") or turn_id or "") or None
+                updated_local_turn = True
+
+        row = self._build_session_telemetry_row(
+            turn_id=eval_id,
+            recorded_at=now_iso,
+            session_id=eff_session_id,
+            turn_index=matched_turn_index,
+            user_id=user_email,
+            intent=intent,
+            execution_mode="async_evaluation",
+            status="evaluated",
+            tickers_analyzed=norm_tickers,
+            evaluation_grade=grade_val,
+            evaluation_score=score_val,
+            trace_id=eff_trace_id,
+        )
+        eval_record: dict[str, Any] = {
+            **row,
+            "evaluator_model": evaluator_model,
+            "query_text": query_text,
+            "rationale": rationale,
+            "source_turn_id": matched_turn_id,
+        }
+        delivery = self._deliver_row(
+            table_id=self.session_table,
+            insert_id=eval_id,
+            row=row,
+            local_deque=self._evaluation_events,
+            local_entry=eval_record,
+            log_payload=eval_record,
+        )
+        return {
+            "row": row,
+            "evaluation": eval_record,
+            "delivery": delivery,
+            "updated_local_turn": updated_local_turn,
+        }
+
+    def recent_async_evaluations(
+        self,
+        *,
+        limit: int = 50,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recently buffered async LLM-as-a-Judge evaluation records."""
+        bounded = max(1, min(int(limit), 500))
+        with self._lock:
+            items = list(self._evaluation_events)
+        if session_id and session_id.strip():
+            target = session_id.strip()
+            items = [r for r in items if r.get("session_id") == target]
+        return items[:bounded]
+
     def record_security_audit_log(self, entry: dict[str, Any]) -> dict[str, Any]:
         """Stream a structured authentication or 10-K access audit log to `security_audit_logs`."""
         epoch = float(entry.get("recorded_at_epoch") or time.time())
-        recorded_at = entry.get("recorded_at") or datetime.fromtimestamp(epoch, tz=UTC).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
+        recorded_at = (
+            entry.get("recorded_at")
+            or entry.get("timestamp")
+            or datetime.fromtimestamp(epoch, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         )
         event_id = str(entry.get("event_id") or f"aud-{uuid.uuid4().hex[:12]}")
         row: dict[str, Any] = {
@@ -772,7 +992,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             "recorded_at": recorded_at,
             "recorded_at_epoch": round(epoch, 3),
             "event_type": str(entry.get("event_type") or "unknown"),
-            "status": str(entry.get("status") or "allowed"),
+            "status": str(entry.get("status") or entry.get("status_outcome") or "allowed"),
             "resource": str(entry.get("resource") or ""),
             "tickers": [str(t) for t in (entry.get("tickers") or [])],
             "user_email": str(entry.get("user_email") or "unauthenticated"),
@@ -802,46 +1022,28 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Query recent session & tool-usage telemetry from BigQuery or local buffer."""
-        bounded = max(1, min(int(limit), 500))
-        attempt_gcp, strict_gcp = self._should_attempt_gcp()
-        if attempt_gcp:
-            try:
-                clauses: list[str] = []
-                params = [_bq_scalar_param("limit", "INT64", bounded)]
-                if session_id and session_id.strip():
-                    clauses.append("session_id = @session_id")
-                    params.append(_bq_scalar_param("session_id", "STRING", session_id.strip()))
-                where_sql = f"WHERE {' AND '.join(clauses)} " if clauses else ""
-                sql = (
-                    "SELECT turn_id, CAST(recorded_at AS STRING) AS recorded_at, session_id, "
-                    "turn_index, user_id, intent, execution_mode, status, tickers_analyzed, "
-                    "companies_analyzed_count, gics_sector, start_year, end_year, "
-                    "report_generated, variance_reports_count, citations_count, "
-                    "tool_invocations, tool_invocation_count, llm_call_count, "
-                    "total_context_tokens, cached_context_tokens, output_tokens, "
-                    "total_cost_usd, cached_token_savings_usd, ttft_ms, total_latency_ms, "
-                    "session_cumulative_turns, session_cumulative_companies_count, "
-                    "session_cumulative_reports_count, session_elapsed_seconds, "
-                    "fact_check_passed, evaluation_grade, evaluation_score "
-                    f"FROM {self._table_ref(self.session_table)} "
-                    f"{where_sql}"
-                    "ORDER BY recorded_at DESC "
-                    "LIMIT @limit"
-                )
-                return self.run_query(sql, params)
-            except Exception as exc:
-                if not _should_fallback_to_local(exc, strict_gcp=strict_gcp):
-                    raise
-                logger.warning(
-                    "BigQuery query_session_telemetry failed in auto mode (%s); reading local buffer.",
-                    exc,
-                )
-
-        with self._lock:
-            items = list(self._session_events)
-        if session_id and session_id.strip():
-            items = [r for r in items if r.get("session_id") == session_id.strip()]
-        return items[:bounded]
+        cols = (
+            "turn_id, CAST(recorded_at AS STRING) AS recorded_at, session_id, "
+            "turn_index, user_id, intent, execution_mode, status, tickers_analyzed, "
+            "companies_analyzed_count, gics_sector, start_year, end_year, "
+            "report_generated, variance_reports_count, citations_count, "
+            "tool_invocations, tool_invocation_count, llm_call_count, "
+            "total_context_tokens, cached_context_tokens, output_tokens, "
+            "total_cost_usd, cached_token_savings_usd, ttft_ms, total_latency_ms, "
+            "session_cumulative_turns, session_cumulative_companies_count, "
+            "session_cumulative_reports_count, session_elapsed_seconds, "
+            "fact_check_passed, evaluation_grade, evaluation_score, trace_id"
+        )
+        return self._query_filtered_table(
+            operation_name="query_session_telemetry",
+            table_id=self.session_table,
+            select_columns=cols,
+            order_by="recorded_at DESC",
+            local_deque=self._session_events,
+            limit=limit,
+            filter_column="session_id",
+            filter_value=session_id,
+        )
 
     def summarize_session_telemetry(self) -> dict[str, Any]:
         """Compute aggregate session length, companies analyzed, report counts, and tool usage."""
@@ -875,7 +1077,6 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             total_cost += float(ev.get("total_cost_usd") or 0.0)
             total_savings += float(ev.get("cached_token_savings_usd") or 0.0)
 
-        latencies.sort()
         avg_turns_per_session = (
             round(sum(v[0] for v in sessions_snap.values()) / len(sessions_snap), 2)
             if sessions_snap
@@ -892,7 +1093,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             "mean_turn_latency_ms": (
                 round(sum(latencies) / len(latencies), 3) if latencies else 0.0
             ),
-            "p95_turn_latency_ms": round(_percentile(latencies, 95.0), 3),
+            "p95_turn_latency_ms": round(percentile(latencies, 95.0), 3),
             "total_turn_cost_usd": round(total_cost, 8),
             "total_cached_token_savings_usd": round(total_savings, 8),
             "tool_usage_counts": dict(tool_counter.most_common()),
@@ -905,128 +1106,111 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
         event_type: str | None = None,
     ) -> list[dict[str, Any]]:
         """Query security & 10-K access audit events from BigQuery or local buffer."""
-        bounded = max(1, min(int(limit), 500))
-        attempt_gcp, strict_gcp = self._should_attempt_gcp()
-        if attempt_gcp:
-            try:
-                clauses: list[str] = []
-                params = [_bq_scalar_param("limit", "INT64", bounded)]
-                if event_type and event_type.strip():
-                    clauses.append("event_type = @event_type")
-                    params.append(_bq_scalar_param("event_type", "STRING", event_type.strip()))
-                where_sql = f"WHERE {' AND '.join(clauses)} " if clauses else ""
-                sql = (
-                    "SELECT event_id, CAST(recorded_at AS STRING) AS recorded_at, "
-                    "recorded_at_epoch, event_type, status, resource, tickers, "
-                    "user_email, user_sub, hosted_domain, identity_provider, "
-                    "roles, cloud_identity_groups, agent_identity, spiffe_id, "
-                    "iap_assertion_verified, detail "
-                    f"FROM {self._table_ref(self.audit_table)} "
-                    f"{where_sql}"
-                    "ORDER BY recorded_at_epoch DESC "
-                    "LIMIT @limit"
-                )
-                return self.run_query(sql, params)
-            except Exception as exc:
-                if not _should_fallback_to_local(exc, strict_gcp=strict_gcp):
-                    raise
-                logger.warning(
-                    "BigQuery query_security_audit_logs failed in auto mode (%s); reading local buffer.",
-                    exc,
-                )
-
-        with self._lock:
-            items = list(self._audit_events)
-        if event_type and event_type.strip():
-            items = [r for r in items if r.get("event_type") == event_type.strip()]
-        return items[:bounded]
+        cols = (
+            "event_id, CAST(recorded_at AS STRING) AS recorded_at, "
+            "recorded_at_epoch, event_type, status, resource, tickers, "
+            "user_email, user_sub, hosted_domain, identity_provider, "
+            "roles, cloud_identity_groups, agent_identity, spiffe_id, "
+            "iap_assertion_verified, detail, trace_id"
+        )
+        return self._query_filtered_table(
+            operation_name="query_security_audit_logs",
+            table_id=self.audit_table,
+            select_columns=cols,
+            order_by="recorded_at_epoch DESC",
+            local_deque=self._audit_events,
+            limit=limit,
+            filter_column="event_type",
+            filter_value=event_type,
+        )
 
     def query_llm_telemetry_explore(self, *, limit: int = 50) -> list[dict[str, Any]]:
         """Query aggregated model/agent cost, cached-token savings, and latency rows for Looker."""
         bounded = max(1, min(int(limit), 200))
-        attempt_gcp, strict_gcp = self._should_attempt_gcp()
-        if attempt_gcp:
-            try:
-                sql = (
-                    "SELECT CAST(telemetry_date AS STRING) AS telemetry_date, "
-                    "model_name, agent_name, task_category, call_count, "
-                    "total_context_tokens, cached_context_tokens, uncached_context_tokens, "
-                    "output_tokens, cache_hit_rate, avg_total_latency_ms, "
-                    "p95_total_latency_ms, avg_ttft_ms, p95_ttft_ms, "
-                    "ttft_slo_compliance_rate, total_cost_usd, "
-                    "uncached_baseline_cost_usd, cached_token_savings_usd "
-                    f"FROM {self._table_ref(self.telemetry_cost_view)} "
-                    "ORDER BY telemetry_date DESC, total_cost_usd DESC "
-                    "LIMIT @limit"
+        sql = (
+            "SELECT CAST(telemetry_date AS STRING) AS telemetry_date, "
+            "model_name, agent_name, task_category, call_count, "
+            "total_context_tokens, cached_context_tokens, uncached_context_tokens, "
+            "output_tokens, cache_hit_rate, avg_total_latency_ms, "
+            "p95_total_latency_ms, avg_ttft_ms, p95_ttft_ms, "
+            "ttft_slo_compliance_rate, total_cost_usd, "
+            "uncached_baseline_cost_usd, cached_token_savings_usd "
+            f"FROM {self._table_ref(self.telemetry_cost_view)} "
+            "ORDER BY telemetry_date DESC, total_cost_usd DESC "
+            "LIMIT @limit"
+        )
+
+        def _local_aggregate() -> list[dict[str, Any]]:
+            with self._lock:
+                events = list(self._llm_events)
+
+            grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+            for ev in events:
+                day = str(ev.get("recorded_at") or "")[:10] or datetime.now(UTC).strftime(
+                    "%Y-%m-%d"
                 )
-                return self.run_query(sql, [_bq_scalar_param("limit", "INT64", bounded)])
-            except Exception as exc:
-                if not _should_fallback_to_local(exc, strict_gcp=strict_gcp):
-                    raise
-                logger.warning(
-                    "BigQuery query_llm_telemetry_explore failed in auto mode (%s); aggregating locally.",
-                    exc,
+                key = (
+                    day,
+                    str(ev.get("model_name") or "unknown"),
+                    str(ev.get("agent_name") or "unknown"),
+                    str(ev.get("task_category") or "financial_reasoning"),
                 )
+                grouped[key].append(ev)
 
-        with self._lock:
-            events = list(self._llm_events)
+            rows: list[dict[str, Any]] = []
+            for (day, model_name, agent_name, task_cat), recs in sorted(
+                grouped.items(), reverse=True
+            ):
+                tot_lats = [float(r.get("total_model_latency_ms") or 0.0) for r in recs]
+                ttfts = [float(r.get("ttft_ms") or 0.0) for r in recs]
+                hits = sum(1 for r in recs if r.get("cache_hit"))
+                slo_ok = sum(1 for r in recs if r.get("within_ttft_slo", True))
+                rows.append(
+                    {
+                        "telemetry_date": day,
+                        "model_name": model_name,
+                        "agent_name": agent_name,
+                        "task_category": task_cat,
+                        "call_count": len(recs),
+                        "total_context_tokens": sum(
+                            int(r.get("total_context_tokens") or 0) for r in recs
+                        ),
+                        "cached_context_tokens": sum(
+                            int(r.get("cached_context_tokens") or 0) for r in recs
+                        ),
+                        "uncached_context_tokens": sum(
+                            int(r.get("uncached_context_tokens") or 0) for r in recs
+                        ),
+                        "output_tokens": sum(
+                            int(r.get("output_tokens") or 0) + int(r.get("thoughts_tokens") or 0)
+                            for r in recs
+                        ),
+                        "cache_hit_rate": round(hits / len(recs), 4),
+                        "avg_total_latency_ms": round(sum(tot_lats) / len(tot_lats), 3),
+                        "p95_total_latency_ms": round(percentile(tot_lats, 95.0), 3),
+                        "avg_ttft_ms": round(sum(ttfts) / len(ttfts), 3),
+                        "p95_ttft_ms": round(percentile(ttfts, 95.0), 3),
+                        "ttft_slo_compliance_rate": round(slo_ok / len(recs), 4),
+                        "total_cost_usd": round(
+                            sum(float(r.get("total_cost_usd") or 0.0) for r in recs), 8
+                        ),
+                        "uncached_baseline_cost_usd": round(
+                            sum(float(r.get("uncached_baseline_cost_usd") or 0.0) for r in recs),
+                            8,
+                        ),
+                        "cached_token_savings_usd": round(
+                            sum(float(r.get("cached_token_savings_usd") or 0.0) for r in recs), 8
+                        ),
+                    }
+                )
+            return rows[:bounded]
 
-        grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
-        for ev in events:
-            day = str(ev.get("recorded_at") or "")[:10] or datetime.now(UTC).strftime("%Y-%m-%d")
-            key = (
-                day,
-                str(ev.get("model_name") or "unknown"),
-                str(ev.get("agent_name") or "unknown"),
-                str(ev.get("task_category") or "financial_reasoning"),
-            )
-            grouped[key].append(ev)
-
-        rows: list[dict[str, Any]] = []
-        for (day, model_name, agent_name, task_cat), recs in sorted(grouped.items(), reverse=True):
-            tot_lats = sorted(float(r.get("total_model_latency_ms") or 0.0) for r in recs)
-            ttfts = sorted(float(r.get("ttft_ms") or 0.0) for r in recs)
-            hits = sum(1 for r in recs if r.get("cache_hit"))
-            slo_ok = sum(1 for r in recs if r.get("within_ttft_slo", True))
-            rows.append(
-                {
-                    "telemetry_date": day,
-                    "model_name": model_name,
-                    "agent_name": agent_name,
-                    "task_category": task_cat,
-                    "call_count": len(recs),
-                    "total_context_tokens": sum(
-                        int(r.get("total_context_tokens") or 0) for r in recs
-                    ),
-                    "cached_context_tokens": sum(
-                        int(r.get("cached_context_tokens") or 0) for r in recs
-                    ),
-                    "uncached_context_tokens": sum(
-                        int(r.get("uncached_context_tokens") or 0) for r in recs
-                    ),
-                    "output_tokens": sum(
-                        int(r.get("output_tokens") or 0) + int(r.get("thoughts_tokens") or 0)
-                        for r in recs
-                    ),
-                    "cache_hit_rate": round(hits / len(recs), 4),
-                    "avg_total_latency_ms": round(sum(tot_lats) / len(tot_lats), 3),
-                    "p95_total_latency_ms": round(_percentile(tot_lats, 95.0), 3),
-                    "avg_ttft_ms": round(sum(ttfts) / len(ttfts), 3),
-                    "p95_ttft_ms": round(_percentile(ttfts, 95.0), 3),
-                    "ttft_slo_compliance_rate": round(slo_ok / len(recs), 4),
-                    "total_cost_usd": round(
-                        sum(float(r.get("total_cost_usd") or 0.0) for r in recs), 8
-                    ),
-                    "uncached_baseline_cost_usd": round(
-                        sum(float(r.get("uncached_baseline_cost_usd") or 0.0) for r in recs),
-                        8,
-                    ),
-                    "cached_token_savings_usd": round(
-                        sum(float(r.get("cached_token_savings_usd") or 0.0) for r in recs), 8
-                    ),
-                }
-            )
-        return rows[:bounded]
+        return self._query_with_local_fallback(
+            operation_name="query_llm_telemetry_explore",
+            sql=sql,
+            query_parameters=[bq_scalar_param("limit", "INT64", bounded)],
+            local_fallback=_local_aggregate,
+        )
 
     def status_metadata(self) -> dict[str, Any]:
         """Return secret-free diagnostic status of the BigQuery telemetry & audit sinks."""
@@ -1066,6 +1250,7 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
             self._llm_events.clear()
             self._session_events.clear()
             self._audit_events.clear()
+            self._evaluation_events.clear()
             self._sessions.clear()
             self._streamed_counts.clear()
             self._fallback_counts.clear()
@@ -1074,74 +1259,33 @@ class BigQueryTelemetrySink(_AuthenticatedRestTransport):
 
 
 # ---------------------------------------------------------------------------
-# 2. Google Cloud Firestore Persistent User Feedback Store
+# 2. Google Cloud Firestore Stores (Feedback & Persistent Session Memory)
 # ---------------------------------------------------------------------------
 
 
-def encode_firestore_value(value: Any, *, field_name: str = "") -> dict[str, Any]:
-    """Encode a Python value into Firestore REST v1 `Value` JSON wire representation."""
-    if value is None:
-        return {"nullValue": None}
-    if isinstance(value, bool):
-        return {"booleanValue": value}
-    if isinstance(value, int):
-        return {"integerValue": str(value)}
-    if isinstance(value, float):
-        return {"doubleValue": value}
-    if isinstance(value, str):
-        if field_name.endswith("_at") and _ISO_UTC_RE.match(value):
-            return {"timestampValue": value}
-        return {"stringValue": value}
-    if isinstance(value, (list, tuple)):
-        return {"arrayValue": {"values": [encode_firestore_value(v) for v in value]}}
-    if isinstance(value, dict):
-        return {
-            "mapValue": {
-                "fields": {
-                    str(k): encode_firestore_value(v, field_name=str(k)) for k, v in value.items()
-                }
-            }
-        }
-    return {"stringValue": str(value)}
+class _TelemetryFirestoreStore(FirestoreCollectionStore):
+    """`FirestoreCollectionStore` subclass translating `GcpRestError` into `Telemetry*Error`."""
+
+    def _firestore_request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        json_body: dict[str, Any] | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        try:
+            return super()._firestore_request_json(
+                method,
+                url,
+                json_body=json_body,
+                params=params,
+            )
+        except GcpRestError as exc:
+            raise _translate_gcp_error(exc) from exc
 
 
-def encode_firestore_fields(record: dict[str, Any]) -> dict[str, Any]:
-    return {str(k): encode_firestore_value(v, field_name=str(k)) for k, v in record.items()}
-
-
-def decode_firestore_value(val_obj: dict[str, Any]) -> Any:
-    """Decode a Firestore REST v1 `Value` JSON object back into native Python types."""
-    if "nullValue" in val_obj:
-        return None
-    if "booleanValue" in val_obj:
-        return bool(val_obj["booleanValue"])
-    if "integerValue" in val_obj:
-        return int(val_obj["integerValue"])
-    if "doubleValue" in val_obj:
-        return float(val_obj["doubleValue"])
-    if "timestampValue" in val_obj:
-        return str(val_obj["timestampValue"])
-    if "stringValue" in val_obj:
-        return str(val_obj["stringValue"])
-    if "arrayValue" in val_obj:
-        arr = val_obj["arrayValue"] or {}
-        return [decode_firestore_value(item) for item in (arr.get("values") or [])]
-    if "mapValue" in val_obj:
-        mp = val_obj["mapValue"] or {}
-        return {str(k): decode_firestore_value(v) for k, v in (mp.get("fields") or {}).items()}
-    return None
-
-
-def decode_firestore_document(doc: dict[str, Any]) -> dict[str, Any]:
-    """Decode a Firestore REST v1 `Document` payload into a flat Python dictionary."""
-    fields = doc.get("fields") or {}
-    decoded = {str(k): decode_firestore_value(v) for k, v in fields.items()}
-    if doc.get("name") and "document_name" not in decoded:
-        decoded["document_name"] = str(doc["name"])
-    return decoded
-
-
-class FirestoreFeedbackStore(_AuthenticatedRestTransport):
+class FirestoreFeedbackStore(_TelemetryFirestoreStore):
     """Persists analyst thumbs-up/down ratings and audit comments to Google Cloud Firestore."""
 
     def __init__(
@@ -1150,16 +1294,19 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
         *,
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
+        max_local_records: int = DEFAULT_MAX_LOCAL_RECORDS,
     ) -> None:
-        super().__init__(http_client=http_client, credentials=credentials, default_timeout=15.0)
         self.config = config or TelemetryConfig.from_env()
-        self.project_id = self.config.project_id
-        self.database_id = self.config.firestore_database_id
-        self.collection_id = self.config.firestore_feedback_collection
-        self._lock = threading.Lock()
-        self._local_feedback: list[dict[str, Any]] = []
+        super().__init__(
+            project_id=self.config.project_id,
+            database_id=self.config.firestore_database_id,
+            collection_id=self.config.firestore_feedback_collection,
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=15.0,
+        )
+        self._local_feedback: deque[dict[str, Any]] = deque(maxlen=max_local_records)
         self._persisted_firestore_count = 0
-        self._last_error: str | None = None
 
     def _should_attempt_gcp(self) -> tuple[bool, bool]:
         mode = self.config.feedback_backend
@@ -1168,13 +1315,6 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
         if mode == "gcp":
             return True, True
         return self.config.gcp_auto_triggered, False
-
-    def _documents_base_url(self) -> str:
-        encoded_db = urllib.parse.quote(self.database_id, safe="()")
-        return (
-            f"https://firestore.googleapis.com/v1/projects/{urllib.parse.quote(self.project_id, safe='')}"
-            f"/databases/{encoded_db}/documents"
-        )
 
     def record_feedback(
         self,
@@ -1189,9 +1329,9 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
         tickers: list[str] | None = None,
         intent: str = "",
     ) -> dict[str, Any]:
-        """Persist an analyst feedback entry to Firestore (with local fallback in offline/auto mode)."""
+        """Persist an analyst feedback entry to Firestore (or local memory in local mode)."""
         now_epoch = round(time.time(), 3)
-        now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        now_iso = utc_now_iso()
         feedback_id = f"fbk-{uuid.uuid4().hex[:12]}"
         norm_tickers = [str(t).strip().upper() for t in (tickers or []) if str(t).strip()]
 
@@ -1220,12 +1360,11 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
         attempt_gcp, strict_gcp = self._should_attempt_gcp()
 
         if attempt_gcp:
-            url = f"{self._documents_base_url()}/{urllib.parse.quote(self.collection_id, safe='')}"
             doc_body = {"fields": encode_firestore_fields(entry)}
             try:
-                created_doc = self._request_json(
+                created_doc = self._firestore_request_json(
                     "POST",
-                    url,
+                    self.collection_url(),
                     json_body=doc_body,
                     params={"documentId": feedback_id},
                 )
@@ -1241,7 +1380,7 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
                 if not _should_fallback_to_local(exc, strict_gcp=strict_gcp):
                     raise
                 logger.warning(
-                    "Firestore feedback write failed in auto mode (%s); persisting in local fallback store.",
+                    "Firestore feedback write failed in auto mode (%s); persisting in local buffer.",
                     exc,
                 )
                 backend_used = "local_memory_fallback"
@@ -1265,7 +1404,7 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
         limit: int = 50,
         rating: Literal["up", "down"] | None = None,
     ) -> dict[str, Any]:
-        """List persisted analyst feedback entries from Firestore `:runQuery` or local fallback."""
+        """List persisted analyst feedback entries from Firestore `:runQuery` or local buffer."""
         bounded = max(1, min(int(limit), 500))
         attempt_gcp, strict_gcp = self._should_attempt_gcp()
         items: list[dict[str, Any]] | None = None
@@ -1290,17 +1429,8 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
                         "value": {"stringValue": rating},
                     }
                 }
-            url = f"{self._documents_base_url()}:runQuery"
             try:
-                raw_results = self._request_json(
-                    "POST", url, json_body={"structuredQuery": structured_query}
-                )
-                parsed: list[dict[str, Any]] = []
-                if isinstance(raw_results, list):
-                    for row in raw_results:
-                        if isinstance(row, dict) and isinstance(row.get("document"), dict):
-                            parsed.append(decode_firestore_document(row["document"]))
-                items = parsed
+                items = self.run_structured_query(structured_query)
                 source = "firestore"
             except Exception as exc:
                 with self._lock:
@@ -1308,7 +1438,7 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
                 if not _should_fallback_to_local(exc, strict_gcp=strict_gcp):
                     raise
                 logger.warning(
-                    "Firestore feedback query failed in auto mode (%s); reading local fallback store.",
+                    "Firestore feedback query failed in auto mode (%s); reading local buffer.",
                     exc,
                 )
                 source = "local_memory_fallback"
@@ -1359,18 +1489,13 @@ class FirestoreFeedbackStore(_AuthenticatedRestTransport):
             self._last_error = None
 
 
-# ---------------------------------------------------------------------------
-# 2b. Firestore Persistent Session Memory Store (multi-instance Cloud Run)
-# ---------------------------------------------------------------------------
-
-
 def session_firestore_doc_id(user_id: str, session_id: str) -> str:
     """Compute a deterministic, tenant-isolated Firestore document ID for `(user_id, session_id)`."""
     raw = f"{user_id.strip().lower()}::{session_id.strip()}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
 
-class FirestoreSessionStore(_AuthenticatedRestTransport):
+class FirestoreSessionStore(_TelemetryFirestoreStore):
     """Durable, user-isolated conversational session store backed by Cloud Firestore Native REST v1.
 
     Uses the existing `(default)` Firestore database provisioned in `terraform/telemetry.tf`
@@ -1387,26 +1512,22 @@ class FirestoreSessionStore(_AuthenticatedRestTransport):
         credentials: Any | None = None,
         collection_id: str | None = None,
     ) -> None:
-        super().__init__(http_client=http_client, credentials=credentials, default_timeout=15.0)
         self.config = config or TelemetryConfig.from_env()
-        self.project_id = _validate_bq_id(self.config.project_id, "project_id")
-        self.database_id = self.config.firestore_database_id or DEFAULT_FIRESTORE_DATABASE_ID
-        self.collection_id = (
+        effective_collection = (
             collection_id
             or self.config.firestore_session_collection
             or DEFAULT_FIRESTORE_SESSION_COLLECTION
         )
-        self._lock = threading.Lock()
+        super().__init__(
+            project_id=self.config.project_id,
+            database_id=self.config.firestore_database_id or DEFAULT_FIRESTORE_DATABASE_ID,
+            collection_id=effective_collection,
+            http_client=http_client,
+            credentials=credentials,
+            default_timeout=15.0,
+        )
         self._reads = 0
         self._writes = 0
-        self._last_error: str | None = None
-
-    @property
-    def documents_base_url(self) -> str:
-        return (
-            f"https://firestore.googleapis.com/v1/projects/{self.project_id}"
-            f"/databases/{self.database_id}/documents"
-        )
 
     def is_live_enabled(self) -> bool:
         """Return True when session persistence targets live Cloud Firestore."""
@@ -1421,20 +1542,19 @@ class FirestoreSessionStore(_AuthenticatedRestTransport):
         return self.config.gcp_auto_triggered
 
     def _doc_url(self, user_id: str, session_id: str) -> str:
-        doc_id = session_firestore_doc_id(user_id, session_id)
-        return f"{self.documents_base_url}/{self.collection_id}/{doc_id}"
+        return self.document_url(session_firestore_doc_id(user_id, session_id))
 
     def load_session(self, user_id: str, session_id: str) -> dict[str, Any] | None:
         """Load a persisted session document for `(user_id, session_id)` (None if 404)."""
         if not self.is_live_enabled():
             return None
+        doc_id = session_firestore_doc_id(user_id, session_id)
         try:
-            raw = self._request_json("GET", self._doc_url(user_id, session_id))
-            with self._lock:
-                self._reads += 1
-            return decode_firestore_document(raw)
-        except TelemetryNotFoundError:
-            return None
+            doc = self.get_document(doc_id)
+            if doc is not None:
+                with self._lock:
+                    self._reads += 1
+            return doc
         except Exception as exc:
             with self._lock:
                 self._last_error = str(exc)
@@ -1446,7 +1566,7 @@ class FirestoreSessionStore(_AuthenticatedRestTransport):
             return
         fields = encode_firestore_fields(payload)
         try:
-            self._request_json(
+            self._firestore_request_json(
                 "PATCH",
                 self._doc_url(user_id, session_id),
                 json_body={"fields": fields},
@@ -1463,7 +1583,7 @@ class FirestoreSessionStore(_AuthenticatedRestTransport):
         if not self.is_live_enabled():
             return False
         try:
-            self._request_json("DELETE", self._doc_url(user_id, session_id))
+            self._firestore_request_json("DELETE", self._doc_url(user_id, session_id))
             return True
         except TelemetryNotFoundError:
             return False
@@ -1476,27 +1596,23 @@ class FirestoreSessionStore(_AuthenticatedRestTransport):
         """List recent sessions belonging to `user_id`."""
         if not self.is_live_enabled():
             return []
-        url = f"{self.documents_base_url}:runQuery"
-        query_body: dict[str, Any] = {
-            "structuredQuery": {
-                "from": [{"collectionId": self.collection_id}],
-                "where": {
-                    "fieldFilter": {
-                        "field": {"fieldPath": "user_id"},
-                        "op": "EQUAL",
-                        "value": {"stringValue": user_id.strip().lower()},
-                    }
-                },
-                "limit": max(1, min(int(limit), 100)),
-            }
+        structured_query: dict[str, Any] = {
+            "from": [{"collectionId": self.collection_id}],
+            "where": {
+                "fieldFilter": {
+                    "field": {"fieldPath": "user_id"},
+                    "op": "EQUAL",
+                    "value": {"stringValue": user_id.strip().lower()},
+                }
+            },
+            "limit": max(1, min(int(limit), 100)),
         }
-        raw_results = self._request_json("POST", url, json_body=query_body)
-        items: list[dict[str, Any]] = []
-        if isinstance(raw_results, list):
-            for entry in raw_results:
-                doc = entry.get("document") if isinstance(entry, dict) else None
-                if doc:
-                    items.append(decode_firestore_document(doc))
+        try:
+            items = self.run_structured_query(structured_query)
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+            raise
         items.sort(key=lambda d: str(d.get("updated_at") or ""), reverse=True)
         return items[:limit]
 
@@ -1513,185 +1629,146 @@ class FirestoreSessionStore(_AuthenticatedRestTransport):
             "last_error": last_err,
         }
 
+    def reset_local_buffers(self) -> None:
+        with self._lock:
+            self._reads = 0
+            self._writes = 0
+            self._last_error = None
+
 
 # ---------------------------------------------------------------------------
 # 3. Singleton Registry & Dependency Injection Helpers
 # ---------------------------------------------------------------------------
 
-_CUSTOM_TELEMETRY_SINK: BigQueryTelemetrySink | None = None
-_CUSTOM_FEEDBACK_STORE: FirestoreFeedbackStore | None = None
-_ENV_TELEMETRY_CACHE: tuple[TelemetryConfig, BigQueryTelemetrySink] | None = None
-_ENV_FEEDBACK_CACHE: tuple[TelemetryConfig, FirestoreFeedbackStore] | None = None
+_TELEMETRY_ENV_KEYS: tuple[str, ...] = (
+    "EDGAR_TELEMETRY_BACKEND",
+    "EDGAR_FEEDBACK_BACKEND",
+    "EDGAR_SESSION_BACKEND",
+    "EDGAR_USE_GCP_TELEMETRY",
+    "K_SERVICE",
+    "GCP_PROJECT_ID",
+    "GOOGLE_CLOUD_PROJECT",
+    "GCLOUD_PROJECT",
+    "EDGAR_GCP_PROJECT_ID",
+    "GCP_REGION",
+    "GOOGLE_CLOUD_LOCATION",
+    "BIGQUERY_LOCATION",
+    "EDGAR_GCP_REGION",
+    "BIGQUERY_DATASET_ID",
+    "EDGAR_BQ_DATASET",
+    "BIGQUERY_LLM_TELEMETRY_TABLE",
+    "BIGQUERY_SESSION_TELEMETRY_TABLE",
+    "BIGQUERY_AUDIT_LOGS_TABLE",
+    "BIGQUERY_TELEMETRY_COST_VIEW",
+    "FIRESTORE_DATABASE_ID",
+    "FIRESTORE_FEEDBACK_COLLECTION",
+    "FIRESTORE_SESSION_COLLECTION",
+    "GOOGLE_GENAI_USE_VERTEXAI",
+)
+
+
+def _telemetry_env_snapshot() -> tuple[str | None, ...]:
+    """Capture raw env values affecting `TelemetryConfig` for fast hot-path cache checks."""
+    env = os.environ
+    return tuple(env.get(key) for key in _TELEMETRY_ENV_KEYS)
+
+
+_StoreT = TypeVar("_StoreT", BigQueryTelemetrySink, FirestoreFeedbackStore, FirestoreSessionStore)
 _REGISTRY_LOCK = threading.Lock()
+
+
+class _EnvCachedStore(Generic[_StoreT]):
+    """Thread-safe env-snapshot-cached singleton slot with test injection & `.close()` on eviction."""
+
+    def __init__(self, factory: Callable[[TelemetryConfig], _StoreT]) -> None:
+        self._factory = factory
+        self._custom: _StoreT | None = None
+        self._cached: tuple[tuple[str | None, ...], TelemetryConfig, _StoreT] | None = None
+
+    def set_custom(self, instance: _StoreT | None) -> None:
+        self._custom = instance
+
+    def get(self) -> _StoreT:
+        old: _StoreT | None = None
+        with _REGISTRY_LOCK:
+            if self._custom is not None:
+                return self._custom
+            snap = _telemetry_env_snapshot()
+            if self._cached is not None and self._cached[0] == snap:
+                return self._cached[2]
+            cfg = TelemetryConfig.from_env()
+            if self._cached is not None and self._cached[1] == cfg:
+                self._cached = (snap, cfg, self._cached[2])
+                return self._cached[2]
+            if self._cached is not None:
+                old = self._cached[2]
+            instance = self._factory(cfg)
+            self._cached = (snap, cfg, instance)
+        if old is not None:
+            old.close()
+        return instance
+
+    def drain_for_reset(self) -> list[_StoreT]:
+        """Reset buffers on custom/cached stores and return them for closing (caller holds lock)."""
+        items: list[_StoreT] = []
+        for obj in (self._custom, self._cached[2] if self._cached is not None else None):
+            if obj is not None:
+                obj.reset_local_buffers()
+                items.append(obj)
+        self._custom = None
+        self._cached = None
+        return items
+
+
+_TELEMETRY_STORE_SLOT: _EnvCachedStore[BigQueryTelemetrySink] = _EnvCachedStore(
+    BigQueryTelemetrySink
+)
+_FEEDBACK_STORE_SLOT: _EnvCachedStore[FirestoreFeedbackStore] = _EnvCachedStore(
+    FirestoreFeedbackStore
+)
+_SESSION_STORE_SLOT: _EnvCachedStore[FirestoreSessionStore] = _EnvCachedStore(FirestoreSessionStore)
 
 
 def configure_telemetry_stores(
     *,
     telemetry_sink: BigQueryTelemetrySink | None = None,
     feedback_store: FirestoreFeedbackStore | None = None,
+    session_store: FirestoreSessionStore | None = None,
 ) -> None:
-    """Explicitly inject `BigQueryTelemetrySink` and/or `FirestoreFeedbackStore` (for testing)."""
-    global _CUSTOM_TELEMETRY_SINK, _CUSTOM_FEEDBACK_STORE
+    """Explicitly inject `BigQueryTelemetrySink`, `FirestoreFeedbackStore`, and/or `FirestoreSessionStore`."""
     with _REGISTRY_LOCK:
-        _CUSTOM_TELEMETRY_SINK = telemetry_sink
-        _CUSTOM_FEEDBACK_STORE = feedback_store
+        _TELEMETRY_STORE_SLOT.set_custom(telemetry_sink)
+        _FEEDBACK_STORE_SLOT.set_custom(feedback_store)
+        _SESSION_STORE_SLOT.set_custom(session_store)
 
 
 def reset_telemetry_stores() -> None:
-    """Reset injected and environment-cached telemetry sink & feedback store singletons."""
-    global _CUSTOM_TELEMETRY_SINK, _CUSTOM_FEEDBACK_STORE, _ENV_TELEMETRY_CACHE, _ENV_FEEDBACK_CACHE
+    """Reset and cleanly close injected and environment-cached telemetry/feedback/session singletons."""
+    to_close: list[Any] = []
+    seen_ids: set[int] = set()
     with _REGISTRY_LOCK:
-        if _CUSTOM_TELEMETRY_SINK is not None:
-            _CUSTOM_TELEMETRY_SINK.reset_local_buffers()
-        if _CUSTOM_FEEDBACK_STORE is not None:
-            _CUSTOM_FEEDBACK_STORE.reset_local_buffers()
-        if _ENV_TELEMETRY_CACHE is not None:
-            _ENV_TELEMETRY_CACHE[1].reset_local_buffers()
-        if _ENV_FEEDBACK_CACHE is not None:
-            _ENV_FEEDBACK_CACHE[1].reset_local_buffers()
-        _CUSTOM_TELEMETRY_SINK = None
-        _CUSTOM_FEEDBACK_STORE = None
-        _ENV_TELEMETRY_CACHE = None
-        _ENV_FEEDBACK_CACHE = None
+        for slot in (_TELEMETRY_STORE_SLOT, _FEEDBACK_STORE_SLOT, _SESSION_STORE_SLOT):
+            for obj in slot.drain_for_reset():
+                if id(obj) not in seen_ids:
+                    seen_ids.add(id(obj))
+                    to_close.append(obj)
+    for obj in to_close:
+        try:
+            obj.close()
+        except Exception:
+            logger.debug("Ignoring close error during telemetry store reset", exc_info=True)
 
 
 def get_telemetry_sink() -> BigQueryTelemetrySink:
     """Return the active `BigQueryTelemetrySink` instance."""
-    global _ENV_TELEMETRY_CACHE
-    with _REGISTRY_LOCK:
-        if _CUSTOM_TELEMETRY_SINK is not None:
-            return _CUSTOM_TELEMETRY_SINK
-        cfg = TelemetryConfig.from_env()
-        if _ENV_TELEMETRY_CACHE is None or _ENV_TELEMETRY_CACHE[0] != cfg:
-            _ENV_TELEMETRY_CACHE = (cfg, BigQueryTelemetrySink(cfg))
-        return _ENV_TELEMETRY_CACHE[1]
+    return _TELEMETRY_STORE_SLOT.get()
 
 
 def get_feedback_store() -> FirestoreFeedbackStore:
     """Return the active `FirestoreFeedbackStore` instance."""
-    global _ENV_FEEDBACK_CACHE
-    with _REGISTRY_LOCK:
-        if _CUSTOM_FEEDBACK_STORE is not None:
-            return _CUSTOM_FEEDBACK_STORE
-        cfg = TelemetryConfig.from_env()
-        if _ENV_FEEDBACK_CACHE is None or _ENV_FEEDBACK_CACHE[0] != cfg:
-            _ENV_FEEDBACK_CACHE = (cfg, FirestoreFeedbackStore(cfg))
-        return _ENV_FEEDBACK_CACHE[1]
+    return _FEEDBACK_STORE_SLOT.get()
 
 
-# ---------------------------------------------------------------------------
-# 4. LookML Project Catalog Introspection (`looker/`)
-# ---------------------------------------------------------------------------
-
-_LOOKML_EXPLORE_RE = re.compile(r"^\s*explore:\s*([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
-_LOOKML_VIEW_RE = re.compile(r"^\s*view:\s*([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
-_LOOKML_DIMENSION_RE = re.compile(
-    r"^\s*(?:dimension|dimension_group):\s*([A-Za-z0-9_]+)\s*\{", re.MULTILINE
-)
-_LOOKML_MEASURE_RE = re.compile(r"^\s*measure:\s*([A-Za-z0-9_]+)\s*\{", re.MULTILINE)
-_LOOKML_SQL_TABLE_RE = re.compile(r"sql_table_name:\s*([^;]+);;", re.MULTILINE)
-_LOOKML_CONNECTION_RE = re.compile(r'connection:\s*"([^"]+)"')
-_LOOKML_DASHBOARD_RE = re.compile(r"^\s*-\s*dashboard:\s*([A-Za-z0-9_]+)", re.MULTILINE)
-_LOOKML_TITLE_RE = re.compile(r"^\s*title:\s*(.+)$", re.MULTILINE)
-_LOOKML_ELEMENT_NAME_RE = re.compile(r"^\s*-\s*name:\s*([A-Za-z0-9_]+)", re.MULTILINE)
-
-
-def resolve_looker_project_dir() -> Path:
-    """Locate the repository `looker/` semantic layer directory."""
-    env_dir = os.environ.get("EDGAR_LOOKML_DIR", "").strip()
-    if env_dir:
-        return Path(env_dir).resolve()
-    candidates = [
-        Path.cwd() / "looker",
-        Path(__file__).resolve().parents[2] / "looker",
-    ]
-    for cand in candidates:
-        if cand.is_dir():
-            return cand.resolve()
-    return candidates[-1].resolve()
-
-
-def load_lookml_project_catalog(looker_dir: Path | None = None) -> dict[str, Any]:
-    """Parse LookML models, views, explores, and dashboards in `looker/` into a catalog."""
-    root = (looker_dir or resolve_looker_project_dir()).resolve()
-    if not root.is_dir():
-        return {
-            "status": "missing",
-            "looker_dir": str(root),
-            "models": [],
-            "views": [],
-            "dashboards": [],
-        }
-
-    manifest_path = root / "manifest.lkml"
-    models: list[dict[str, Any]] = []
-    for model_file in (
-        sorted((root / "models").glob("*.model.lkml")) if (root / "models").is_dir() else []
-    ):
-        content = model_file.read_text(encoding="utf-8")
-        conn_match = _LOOKML_CONNECTION_RE.search(content)
-        explores = _LOOKML_EXPLORE_RE.findall(content)
-        models.append(
-            {
-                "model_name": model_file.name.replace(".model.lkml", ""),
-                "file": f"looker/models/{model_file.name}",
-                "connection": conn_match.group(1) if conn_match else None,
-                "explores": explores,
-                "explore_count": len(explores),
-            }
-        )
-
-    views: list[dict[str, Any]] = []
-    for view_file in (
-        sorted((root / "views").glob("*.view.lkml")) if (root / "views").is_dir() else []
-    ):
-        content = view_file.read_text(encoding="utf-8")
-        view_names = _LOOKML_VIEW_RE.findall(content)
-        sql_table_match = _LOOKML_SQL_TABLE_RE.search(content)
-        dims = _LOOKML_DIMENSION_RE.findall(content)
-        measures = _LOOKML_MEASURE_RE.findall(content)
-        views.append(
-            {
-                "view_name": view_names[0] if view_names else view_file.stem.replace(".view", ""),
-                "file": f"looker/views/{view_file.name}",
-                "sql_table_name": (sql_table_match.group(1).strip() if sql_table_match else None),
-                "dimensions": dims,
-                "measures": measures,
-                "dimension_count": len(dims),
-                "measure_count": len(measures),
-            }
-        )
-
-    dashboards: list[dict[str, Any]] = []
-    for dash_file in (
-        sorted((root / "dashboards").glob("*.dashboard.lookml"))
-        if (root / "dashboards").is_dir()
-        else []
-    ):
-        content = dash_file.read_text(encoding="utf-8")
-        dash_ids = _LOOKML_DASHBOARD_RE.findall(content)
-        titles = _LOOKML_TITLE_RE.findall(content)
-        tiles = _LOOKML_ELEMENT_NAME_RE.findall(content)
-        dashboards.append(
-            {
-                "dashboard_id": (
-                    dash_ids[0] if dash_ids else dash_file.name.replace(".dashboard.lookml", "")
-                ),
-                "title": titles[0].strip().strip("\"'") if titles else "",
-                "file": f"looker/dashboards/{dash_file.name}",
-                "elements": tiles,
-                "element_count": len(tiles),
-            }
-        )
-
-    return {
-        "status": "ok",
-        "looker_dir": str(root),
-        "manifest_present": manifest_path.is_file(),
-        "model_count": len(models),
-        "view_count": len(views),
-        "dashboard_count": len(dashboards),
-        "models": models,
-        "views": views,
-        "dashboards": dashboards,
-    }
+def get_session_store() -> FirestoreSessionStore:
+    """Return the active `FirestoreSessionStore` instance."""
+    return _SESSION_STORE_SLOT.get()

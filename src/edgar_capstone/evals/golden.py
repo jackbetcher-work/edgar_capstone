@@ -20,7 +20,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+from edgar_capstone.common.domain import normalize_edgar_ticker
+from edgar_capstone.gcp.paths import resolve_repo_root
+
+REPO_ROOT = resolve_repo_root()
 DEFAULT_GOLDEN_DATASET_PATH = REPO_ROOT / "evals" / "golden_dataset.jsonl"
 
 GoldenCategory = Literal[
@@ -83,7 +86,7 @@ class ExpectedVariance(BaseModel):
     @field_validator("ticker")
     @classmethod
     def _upper_ticker(cls, v: str) -> str:
-        return v.strip().upper().replace(".", "-")
+        return normalize_edgar_ticker(v)
 
     @property
     def key(self) -> str:
@@ -102,10 +105,10 @@ class ExpectedSection(BaseModel):
     @field_validator("ticker")
     @classmethod
     def _upper_ticker(cls, v: str | None) -> str | None:
-        return v.strip().upper().replace(".", "-") if v else None
+        return normalize_edgar_ticker(v) if v else None
 
     def matches(self, ticker: str, fiscal_year: int, section_id: str) -> bool:
-        if self.ticker is not None and self.ticker != ticker.upper().replace(".", "-"):
+        if self.ticker is not None and self.ticker != normalize_edgar_ticker(ticker):
             return False
         if self.fiscal_year is not None and self.fiscal_year != int(fiscal_year):
             return False
@@ -133,7 +136,7 @@ class ExpectedDelta(BaseModel):
     @field_validator("ticker")
     @classmethod
     def _upper_ticker(cls, v: str) -> str:
-        return v.strip().upper().replace(".", "-")
+        return normalize_edgar_ticker(v)
 
     @property
     def label(self) -> str:
@@ -158,7 +161,7 @@ class ExpectedFlag(BaseModel):
     @field_validator("ticker")
     @classmethod
     def _upper_ticker(cls, v: str) -> str:
-        return v.strip().upper().replace(".", "-")
+        return normalize_edgar_ticker(v)
 
     @property
     def label(self) -> str:
@@ -179,7 +182,7 @@ class RequestFilters(BaseModel):
 
 
 class GoldenEvalItem(BaseModel):
-    """One golden query–variance–explanation mapping (or a red-team safety probe)."""
+    """One golden query-variance-explanation mapping (or a red-team safety probe)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -196,8 +199,7 @@ class GoldenEvalItem(BaseModel):
     expected_flags: list[ExpectedFlag] = Field(default_factory=list)
     expected_status: ExpectedStatusType | None = None
     expected_coverage_notice_codes: list[str] = Field(default_factory=list)
-    # Exact chunk IDs are corpus-specific; they are only scored against the hydrated / GCP
-    # corpus (CI synthesizes chunks from the financials manifest, which renumbers them).
+    # Exact chunk IDs from the live BigQuery `sec_edgar.filing_chunks` corpus.
     expected_chunk_ids: list[str] = Field(default_factory=list)
     reference_explanation: str = ""
     expect_blocked: bool = False
@@ -209,7 +211,7 @@ class GoldenEvalItem(BaseModel):
     @field_validator("tickers")
     @classmethod
     def _normalize_tickers(cls, v: list[str]) -> list[str]:
-        return [t.strip().upper().replace(".", "-") for t in v if t.strip()]
+        return [normalize_edgar_ticker(t) for t in v if t.strip()]
 
     @field_validator("fiscal_years")
     @classmethod
@@ -267,10 +269,6 @@ class GoldenEvalItem(BaseModel):
             "clarification",
             "out_of_corpus",
         )
-
-    @property
-    def is_scored_rag(self) -> bool:
-        return not self.is_safety and not self.is_scope_early_exit
 
     @property
     def start_year(self) -> int | None:

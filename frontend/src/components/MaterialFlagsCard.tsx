@@ -5,6 +5,7 @@ import type {
 } from '../types/edgar'
 import type { ParsedInlineCitationToken } from '../utils/formatters'
 import { citationToken } from '../utils/citationTokens'
+import { buildXbrlFactFromFlag } from '../utils/xbrlFactSelection'
 
 interface MaterialFlagsCardProps {
   turnId: string
@@ -149,30 +150,14 @@ export function MaterialFlagsCard({
                             id={`btn-flag-xbrl-${turnId}-${flag.flag_id}`}
                             type="button"
                             onClick={() =>
-                              onInspectXbrlFact({
-                                title: `${flag.ticker} ${METRIC_LABELS[flag.metric]} (${RULE_LABELS[flag.rule]})`,
-                                ticker: flag.ticker,
-                                companyName: flag.company_name,
-                                fiscalYear: flag.fiscal_year,
-                                priorFiscalYear: flag.prior_fiscal_year,
-                                metricLabel: METRIC_LABELS[flag.metric],
-                                deltaFormatted: formatFlagValue(flag),
-                                periodOfReport: flag.source.period_of_report,
-                                priorPeriodOfReport:
-                                  flag.source.prior_period_of_report,
-                                accessionNumber: flag.source.accession_number,
-                                priorAccessionNumber:
-                                  flag.source.prior_accession_number,
-                                xbrlConcept: flag.source.xbrl_concept,
-                                priorXbrlConcept:
-                                  flag.source.prior_xbrl_concept ?? null,
-                                denominatorXbrlConcept:
-                                  flag.source.denominator_xbrl_concept ?? null,
-                                priorDenominatorXbrlConcept:
-                                  flag.source.prior_denominator_xbrl_concept ?? null,
-                                secFilingUrl: flag.source.sec_filing_url,
-                                priorSecFilingUrl: flag.source.prior_sec_filing_url,
-                              })
+                              onInspectXbrlFact(
+                                buildXbrlFactFromFlag(
+                                  flag,
+                                  METRIC_LABELS[flag.metric],
+                                  RULE_LABELS[flag.rule],
+                                  formatFlagValue(flag)
+                                )
+                              )
                             }
                             className="text-bb-amber hover:underline text-[10px] font-semibold uppercase cursor-pointer"
                             title={`Inspect XBRL provenance (${flag.source.accession_number})`}

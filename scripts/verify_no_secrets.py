@@ -7,14 +7,12 @@ import argparse
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = PROJECT_ROOT / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+try:
+    from scripts._cli import PROJECT_ROOT
+except ImportError:  # pragma: no cover - direct script execution without editable install
+    from _cli import PROJECT_ROOT  # type: ignore[import-not-found,no-redef]
 
-from edgar_capstone.security.secrets import (  # noqa: E402
-    scan_repository_for_exposed_secrets,
-)
+from edgar_capstone.security.secrets import scan_repository_for_exposed_secrets
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -24,7 +22,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--repo-root",
         type=Path,
-        default=Path(__file__).resolve().parents[1],
+        default=PROJECT_ROOT,
         help="Path to the repository root directory.",
     )
     return parser.parse_args(argv)

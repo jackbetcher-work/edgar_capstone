@@ -9,8 +9,12 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
+from edgar_capstone.common.domain import normalize_edgar_ticker
+from edgar_capstone.common.formatting import percentile as _common_percentile
 from edgar_capstone.evals.golden import (
     METRIC_TO_REPORT_KEY,
     ExpectedSection,
@@ -25,12 +29,81 @@ _CHUNK_ID_RE = re.compile(
 _CITATION_TAG_RE = re.compile(r"\[([A-Z][A-Z0-9.\-]{0,6})\s+FY(\d{4})\s*\|\s*([^|\]]+)")
 _PERCENT_RE = re.compile(r"([+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[+-]?\d+(?:\.\d+)?)\s*%")
 
+# Inline XBRL numeric citation tag: `[NVDA FY2026 | XBRL us-gaap:Revenues | acc:0001045810-26-000021](url)`.
+_XBRL_TAG_RE = re.compile(
+    r"\[([A-Z][A-Z0-9.\-]{0,6})\s+FY(\d{4})\s*\|\s*XBRL\s+([^|\]]+?)\s*\|\s*acc:([^\]]+?)\]"
+)
+_NOTES_SECTION_MARKER = "#### Notes (not source-verified)"
+
 PCT_ENGINE_TOLERANCE = 0.01
 VALUE_REL_TOLERANCE = 1e-6
 
 
 def _norm_ticker(t: str) -> str:
-    return str(t).upper().replace(".", "-")
+    return normalize_edgar_ticker(str(t))
+
+
+@dataclass(slots=True)
+class _ScopeConstraints:
+    """Normalized scope filters extracted from a `GoldenEvalItem` for citation checks."""
+
+    allowed_tickers: set[str]
+    lo_yr: int | None
+    hi_yr: int | None
+    req_sector: str | None
+    req_section: str | None
+
+
+def _extract_scope_constraints(
+    item: GoldenEvalItem, *, infer_single_expected_section: bool = False
+) -> _ScopeConstraints:
+    allowed_tickers = {_norm_ticker(t) for t in item.tickers} if item.tickers else set()
+    req_sector = (
+        item.gics_sector.strip().lower()
+        if item.gics_sector and item.gics_sector.upper() != "ALL"
+        else None
+    )
+    explicit_sec = (
+        item.filters.section_id.strip().lower()
+        if item.filters.section_id and item.filters.section_id.upper() != "ALL"
+        else None
+    )
+    req_section = explicit_sec
+    if req_section is None and infer_single_expected_section and item.expected_sections:
+        req_sections = {s.section_id for s in item.expected_sections if s.section_id}
+        if len(req_sections) == 1 and all(s.section_id is not None for s in item.expected_sections):
+            req_section = next(iter(req_sections))
+    return _ScopeConstraints(
+        allowed_tickers=allowed_tickers,
+        lo_yr=item.start_year,
+        hi_yr=item.end_year,
+        req_sector=req_sector,
+        req_section=req_section,
+    )
+
+
+def _citation_scope_violations(c: dict[str, Any], scope: _ScopeConstraints) -> list[str]:
+    """Return a list of scope constraint violations for one retrieved citation."""
+    tk = _norm_ticker(c.get("ticker", ""))
+    fy = int(c.get("fiscal_year") or 0)
+    sec = str(c.get("section_id") or "").strip().lower()
+    gics = str(c.get("gics_sector") or "").strip().lower()
+
+    viol: list[str] = []
+    if scope.allowed_tickers and tk and tk not in scope.allowed_tickers:
+        viol.append(f"ticker={tk} not in {sorted(scope.allowed_tickers)}")
+    if (
+        scope.lo_yr is not None
+        and scope.hi_yr is not None
+        and fy
+        and not (scope.lo_yr <= fy <= scope.hi_yr)
+    ):
+        viol.append(f"fy={fy} outside {scope.lo_yr}-{scope.hi_yr}")
+    if scope.req_sector and gics and gics != scope.req_sector:
+        viol.append(f"sector={gics!r} != {scope.req_sector!r}")
+    if scope.req_section and sec and sec != scope.req_section:
+        viol.append(f"section={sec!r} != {scope.req_section!r}")
+    return viol
 
 
 def cited_chunk_ids(answer_markdown: str) -> set[str]:
@@ -143,8 +216,8 @@ def score_grounding(
     *,
     score_chunk_ids: bool,
 ) -> tuple[int, int, list[str]]:
-    """Return `(matched, expected, missing_labels)` over expected sections (+ chunk IDs when the
-    corpus is the hydrated/GCP one). A source counts only if it was retrieved *and* cited."""
+    """Return `(matched, expected, missing_labels)` over expected sections (+ chunk IDs when
+    enabled against live BigQuery `filing_chunks`). A source counts only if retrieved *and* cited."""
     citations = response.get("citations") or []
     answer = response.get("answer_markdown") or ""
     cited_ids = cited_chunk_ids(answer)
@@ -152,7 +225,11 @@ def score_grounding(
 
     retrieved_and_cited: list[tuple[str, int, str]] = []
     for c in citations:
-        src = (_norm_ticker(c.get("ticker", "")), int(c.get("fiscal_year", 0)), c.get("section_id"))
+        src = (
+            _norm_ticker(c.get("ticker", "")),
+            int(c.get("fiscal_year") or 0),
+            str(c.get("section_id") or ""),
+        )
         if str(c.get("chunk_id")) in cited_ids or src in cited_srcs:
             retrieved_and_cited.append(src)
 
@@ -201,61 +278,6 @@ def score_routing(item: GoldenEvalItem, response: dict[str, Any]) -> tuple[bool,
             f"expected FY{item.start_year}-FY{item.end_year}"
         )
     return not reasons, reasons
-
-
-# Inline XBRL numeric citation tag: `[NVDA FY2026 | XBRL us-gaap:Revenues | acc:0001045810-26-000021](url)`.
-_XBRL_TAG_RE = re.compile(
-    r"\[([A-Z][A-Z0-9.\-]{0,6})\s+FY(\d{4})\s*\|\s*XBRL\s+([^|\]]+?)\s*\|\s*acc:([^\]]+?)\]"
-)
-_NOTES_SECTION_MARKER = "#### Notes (not source-verified)"
-_STOP_WORDS = frozenset(
-    {
-        "the",
-        "and",
-        "for",
-        "from",
-        "with",
-        "how",
-        "did",
-        "what",
-        "why",
-        "are",
-        "was",
-        "were",
-        "has",
-        "have",
-        "been",
-        "into",
-        "over",
-        "their",
-        "this",
-        "that",
-        "between",
-        "across",
-        "compare",
-        "explain",
-        "track",
-        "walk",
-        "through",
-        "change",
-        "changed",
-        "shifted",
-        "evolved",
-        "growth",
-        "revenue",
-        "income",
-        "operating",
-        "net",
-        "fiscal",
-        "year",
-        "years",
-        "company",
-        "companies",
-        "filing",
-        "filings",
-        "10-k",
-    }
-)
 
 
 def cited_xbrl_tags(answer_markdown: str) -> list[tuple[str, int, str, str]]:
@@ -309,38 +331,12 @@ def score_metadata_filter_correctness(
     if not citations:
         return False, 0.0, ["no citations retrieved to check metadata filters"]
 
-    allowed_tickers = {_norm_ticker(t) for t in item.tickers} if item.tickers else set()
-    lo_yr = item.start_year
-    hi_yr = item.end_year
-    req_sector = (
-        item.gics_sector.strip().lower()
-        if item.gics_sector and item.gics_sector.upper() != "ALL"
-        else None
-    )
-    req_section = (
-        item.filters.section_id.strip().lower()
-        if item.filters.section_id and item.filters.section_id.upper() != "ALL"
-        else None
-    )
-
+    scope = _extract_scope_constraints(item, infer_single_expected_section=False)
     good = 0
     reasons: list[str] = []
     for c in citations:
         cid = str(c.get("chunk_id") or "?")
-        tk = _norm_ticker(c.get("ticker", ""))
-        fy = int(c.get("fiscal_year") or 0)
-        sec = str(c.get("section_id") or "").strip().lower()
-        gics = str(c.get("gics_sector") or "").strip().lower()
-
-        viol: list[str] = []
-        if allowed_tickers and tk and tk not in allowed_tickers:
-            viol.append(f"ticker={tk} not in {sorted(allowed_tickers)}")
-        if lo_yr is not None and hi_yr is not None and fy and not (lo_yr <= fy <= hi_yr):
-            viol.append(f"fy={fy} outside {lo_yr}-{hi_yr}")
-        if req_sector and gics and gics != req_sector:
-            viol.append(f"sector={gics!r} != {req_sector!r}")
-        if req_section and sec and sec != req_section:
-            viol.append(f"section={sec!r} != {req_section!r}")
+        viol = _citation_scope_violations(c, scope)
         if viol:
             reasons.append(f"{cid}: {', '.join(viol)}")
         else:
@@ -356,44 +352,12 @@ def score_retrieval_precision_at_10(item: GoldenEvalItem, response: dict[str, An
     if not citations:
         return 0.0
 
-    allowed_tickers = {_norm_ticker(t) for t in item.tickers} if item.tickers else set()
-    lo_yr = item.start_year
-    hi_yr = item.end_year
-    req_sector = (
-        item.gics_sector.strip().lower()
-        if item.gics_sector and item.gics_sector.upper() != "ALL"
-        else None
-    )
-    req_sections = {s.section_id for s in item.expected_sections if s.section_id}
-    explicit_sec = (
-        item.filters.section_id.strip().lower()
-        if item.filters.section_id and item.filters.section_id.upper() != "ALL"
-        else None
-    )
-    single_expected_sec = explicit_sec or (
-        next(iter(req_sections))
-        if len(req_sections) == 1
-        and all(s.section_id is not None for s in item.expected_sections)
-        and item.expected_sections
-        else None
-    )
-
+    scope = _extract_scope_constraints(item, infer_single_expected_section=True)
     relevant = 0
     for c in citations:
-        tk = _norm_ticker(c.get("ticker", ""))
-        fy = int(c.get("fiscal_year") or 0)
-        sec = str(c.get("section_id") or "").strip().lower()
-        gics = str(c.get("gics_sector") or "").strip().lower()
+        if _citation_scope_violations(c, scope):
+            continue
         excerpt = str(c.get("excerpt") or c.get("chunk_text") or "").strip()
-
-        if allowed_tickers and tk and tk not in allowed_tickers:
-            continue
-        if lo_yr is not None and hi_yr is not None and fy and not (lo_yr <= fy <= hi_yr):
-            continue
-        if req_sector and gics and gics != req_sector:
-            continue
-        if single_expected_sec and sec and sec != single_expected_sec:
-            continue
         if len(excerpt) < 20 and float(c.get("score") or 0.0) <= 0.0 and not c.get("chunk_id"):
             continue
         relevant += 1
@@ -557,14 +521,8 @@ def score_safety(item: GoldenEvalItem, response: dict[str, Any]) -> tuple[bool, 
     return not reasons, reasons
 
 
-def percentile(values: list[float], pct: float) -> float | None:
-    """Linear-interpolated percentile (same convention as the telemetry summaries)."""
+def percentile(values: Sequence[float], pct: float) -> float | None:
+    """Linear-interpolated percentile (returns `None` for empty sequences)."""
     if not values:
         return None
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-    idx = (pct / 100.0) * (len(ordered) - 1)
-    lo = int(idx)
-    hi = min(lo + 1, len(ordered) - 1)
-    return ordered[lo] + (ordered[hi] - ordered[lo]) * (idx - lo)
+    return _common_percentile(values, pct)

@@ -26,7 +26,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /build
 
-COPY pyproject.toml requirements.txt ./
+COPY pyproject.toml ./
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 
