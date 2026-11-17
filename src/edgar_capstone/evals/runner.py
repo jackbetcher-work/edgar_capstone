@@ -306,7 +306,7 @@ def _default_turn_fn() -> TurnFn:
 
 
 def _default_judge_fn() -> JudgeFn:
-    from edgar_capstone.agents.evaluation_and_coding import evaluate_variance_explanation
+    from edgar_capstone.agents.evaluation import evaluate_variance_explanation
 
     return evaluate_variance_explanation
 

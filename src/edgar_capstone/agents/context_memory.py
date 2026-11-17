@@ -2,15 +2,18 @@
 
 Implements:
 1. Dual-Model Specialization Strategy:
-   - `gemini-3.8-flash` (`EDGAR_ANALYST_MODEL`): Complex financial reasoning, multi-period variance synthesis,
-     and ReAct orchestration.
-   - `gemini-3.5-flash`: Coding assistance, LLM-as-a-Judge evaluation tasks, and context compaction summarization.
+   - `gemini-3.8-flash` (`EDGAR_ANALYST_MODEL`): Complex financial reasoning, multi-period variance
+     synthesis, and ReAct orchestration.
+   - `gemini-3.5-flash` (`EDGAR_FLASH_MODEL`): LLM-as-a-Judge evaluation tasks and ADK app event
+     compaction summarization.
 2. Context-Induced Latency Tracking:
-   - Decomposes every model call into context preparation latency, context prefill latency (cached vs. uncached),
-     and output token generation latency, tracking TTFT SLO compliance (<= 3.0s p95) and KV-cache savings.
+   - Decomposes every model call into context preparation latency, context prefill latency (cached
+     vs. uncached), and output token generation latency, tracking TTFT SLO compliance (<= 3.0s p95)
+     and KV-cache savings.
 3. Session State, Context Caching, Compaction & Long-Term Memory:
-   - Configures ADK `ContextCacheConfig`, token-triggered `EventsCompactionConfig` (`gemini-3.5-flash`),
-     `InMemorySessionService` / `InMemoryMemoryService`, and multi-turn conversational entity/variance recall.
+   - Configures ADK `ContextCacheConfig`, token-triggered `EventsCompactionConfig`, bounded
+     `InMemorySessionService` / `BoundedInMemoryMemoryService`, and tenant-isolated multi-turn
+     conversational memory backed by `SessionStoreProtocol` (Firestore REST v1 in production).
 """
 
 from __future__ import annotations
@@ -21,9 +24,9 @@ import os
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from google.adk.agents import BaseAgent
 from google.adk.agents.callback_context import CallbackContext
@@ -46,6 +49,10 @@ from edgar_capstone.agents.schemas import (
     ModelContextLatencyRecord,
     ModelTaskCategory,
 )
+from edgar_capstone.common.domain import RETRIEVAL_TOOL_NAMES
+from edgar_capstone.common.env import env_positive_float
+from edgar_capstone.common.formatting import percentile, utc_now_iso
+from edgar_capstone.security.model_armor import ModelArmorSafetyPlugin
 from edgar_capstone.telemetry import FirestoreSessionStore, get_telemetry_sink
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
@@ -58,12 +65,53 @@ logger = logging.getLogger(__name__)
 FINANCIAL_REASONING_MODEL: str = os.environ.get("EDGAR_ANALYST_MODEL", "gemini-3.8-flash")
 FLASH_CODING_AND_EVAL_MODEL: str = os.environ.get("EDGAR_FLASH_MODEL", "gemini-3.5-flash")
 
-TTFT_SLO_TARGET_MS: float = float(os.environ.get("EDGAR_TTFT_SLO_MS", "3000.0"))
+DEFAULT_TTFT_SLO_MS: float = 3000.0
+TTFT_SLO_TARGET_MS: float = env_positive_float(
+    "EDGAR_TTFT_SLO_MS", DEFAULT_TTFT_SLO_MS, minimum=1.0
+)
 DEFAULT_CONTEXT_CACHE_MIN_TOKENS: int = 2048
 DEFAULT_CONTEXT_CACHE_TTL_SECONDS: int = 1800
 DEFAULT_CONTEXT_CACHE_INTERVALS: int = 10
 DEFAULT_COMPACTION_TOKEN_THRESHOLD: int = 32000
 DEFAULT_COMPACTION_RETENTION_SIZE: int = 5
+DEFAULT_MAX_LOCAL_SESSIONS: int = 500
+DEFAULT_MAX_ADK_MEMORY_SESSIONS: int = 200
+
+EPHEMERAL_AGENT_NAMES: frozenset[str] = frozenset(
+    {
+        "NarrativeEvaluatorAgent",
+        "SectorBatchMapper",
+    }
+)
+EPHEMERAL_SESSION_PREFIXES: tuple[str, ...] = (
+    "eval-",
+    "sector-map-",
+    "adk-sess-",
+)
+
+_VARIANCE_PAYLOAD_TOOLS: frozenset[str] = frozenset(
+    {
+        "calculate_period_variances",
+        "fetch_financial_metrics",
+        "query_looker_financial_explore",
+        "flag_material_variances",
+    }
+)
+
+
+def get_ttft_slo_ms() -> float:
+    """Resolve the active TTFT SLO target in milliseconds dynamically from environment."""
+    return env_positive_float("EDGAR_TTFT_SLO_MS", DEFAULT_TTFT_SLO_MS, minimum=1.0)
+
+
+def is_ephemeral_session_id(session_id: str | None) -> bool:
+    """Return True when `session_id` belongs to a short-lived utility/retry/eval invocation."""
+    if not session_id:
+        return True
+    cleaned = session_id.strip()
+    if not cleaned:
+        return True
+    return cleaned.startswith(EPHEMERAL_SESSION_PREFIXES) or cleaned.endswith("-retry")
 
 
 @dataclass(frozen=True)
@@ -154,15 +202,14 @@ TASK_TO_MODEL_TIER: dict[ModelTaskCategory, str] = {
 AGENT_DEFAULT_TASK_CATEGORY: dict[str, ModelTaskCategory] = {
     "RootOrchestrator": "orchestration",
     "FinancialAnalystAgent": "financial_reasoning",
-    "ContextCacheAgent": "context_cache_warmup",
     "ContextCacheManager": "context_cache_warmup",
     "NarrativeEvaluatorAgent": "evaluation",
-    "CodingAssistantAgent": "coding_assistance",
+    "SectorBatchMapper": "context_compaction",
 }
 
 
 def low_thinking_config_for_model(model: str | BaseLlm) -> genai_types.ThinkingConfig | None:
-    """Low-effort thinking for structured Gemini tasks (analyst, judge, map-reduce, cache warmup).
+    """Low-effort thinking for structured Gemini tasks (judge, map-reduce, utility calls).
 
     Empirically A/B tested on the 43-item live golden suite: Gemini 3.x native
     `ThinkingLevel.LOW` outperformed legacy `thinking_budget=512` on both speed and quality
@@ -218,10 +265,7 @@ def get_model_strategy_metadata() -> dict[str, Any]:
     return {
         "financial_reasoning_model": fin_model,
         "coding_and_evaluation_model": flash_model,
-        "task_routing": {
-            task: resolve_model_for_task(task)  # type: ignore[arg-type]
-            for task in TASK_TO_MODEL_TIER
-        },
+        "task_routing": {task: resolve_model_for_task(task) for task in TASK_TO_MODEL_TIER},
         "context_cache_config": {
             "min_tokens": DEFAULT_CONTEXT_CACHE_MIN_TOKENS,
             "ttl_seconds": DEFAULT_CONTEXT_CACHE_TTL_SECONDS,
@@ -230,7 +274,8 @@ def get_model_strategy_metadata() -> dict[str, Any]:
         "events_compaction_config": {
             "token_threshold": DEFAULT_COMPACTION_TOKEN_THRESHOLD,
             "event_retention_size": DEFAULT_COMPACTION_RETENTION_SIZE,
-            "summarizer_model": flash_model,
+            "compaction_method": "deterministic_digest",
+            "adk_app_summarizer_model": flash_model,
         },
         "pricing_per_1m_tokens_usd": {
             name: {
@@ -240,7 +285,7 @@ def get_model_strategy_metadata() -> dict[str, Any]:
             }
             for name, prof in MODEL_PROFILES.items()
         },
-        "ttft_slo_target_ms": TTFT_SLO_TARGET_MS,
+        "ttft_slo_target_ms": get_ttft_slo_ms(),
     }
 
 
@@ -249,37 +294,54 @@ def get_model_strategy_metadata() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def _count_system_instruction_tokens(llm_request: LlmRequest) -> int:
+    cfg = getattr(llm_request, "config", None)
+    sys_inst = getattr(cfg, "system_instruction", None) if cfg is not None else None
+    if isinstance(sys_inst, str) and sys_inst.strip():
+        return estimate_token_count(sys_inst)
+    if sys_inst is not None and hasattr(sys_inst, "parts"):
+        sys_text = "\n".join(
+            p.text for p in (getattr(sys_inst, "parts", None) or []) if getattr(p, "text", None)
+        )
+        return estimate_token_count(sys_text)
+    return 0
+
+
+def _find_last_user_text_index(contents: list[Any]) -> int:
+    for idx in range(len(contents) - 1, -1, -1):
+        if getattr(contents[idx], "role", None) == "user":
+            if any(
+                bool(getattr(p, "text", None))
+                for p in (getattr(contents[idx], "parts", None) or [])
+            ):
+                return idx
+    return -1
+
+
+def _classify_function_response_tokens(resp_name: str, resp_payload: Any) -> tuple[str, int]:
+    serialized = json.dumps(resp_payload, default=str)
+    resp_tokens = estimate_token_count(serialized)
+    if resp_name in _VARIANCE_PAYLOAD_TOOLS:
+        return "variance", resp_tokens
+    if (
+        resp_name in RETRIEVAL_TOOL_NAMES
+        and isinstance(resp_payload, dict)
+        and resp_payload.get("cache_hit")
+    ):
+        return "cached_10k", resp_tokens
+    return "uncached_10k", resp_tokens
+
+
 def extract_llm_request_context_breakdown(
     llm_request: LlmRequest,
     state: Any | None = None,
 ) -> ContextBreakdown:
     """Inspect an ADK `LlmRequest` and session state to quantify input context components."""
     state_dict = state if isinstance(state, dict) or hasattr(state, "get") else {}
+    sys_tokens = _count_system_instruction_tokens(llm_request)
 
-    # 1. System instruction tokens
-    sys_tokens = 0
-    cfg = getattr(llm_request, "config", None)
-    sys_inst = getattr(cfg, "system_instruction", None) if cfg is not None else None
-    if isinstance(sys_inst, str) and sys_inst.strip():
-        sys_tokens = estimate_token_count(sys_inst)
-    elif sys_inst is not None and hasattr(sys_inst, "parts"):
-        sys_text = "\n".join(
-            p.text for p in (getattr(sys_inst, "parts", None) or []) if getattr(p, "text", None)
-        )
-        sys_tokens = estimate_token_count(sys_text)
-
-    # 2. Classify conversation contents into active user prompt, history/memory, variance JSON, and 10-K context
     contents = list(getattr(llm_request, "contents", None) or [])
-    last_user_idx = -1
-    for idx in range(len(contents) - 1, -1, -1):
-        if getattr(contents[idx], "role", None) == "user":
-            has_text = any(
-                bool(getattr(p, "text", None))
-                for p in (getattr(contents[idx], "parts", None) or [])
-            )
-            if has_text:
-                last_user_idx = idx
-                break
+    last_user_idx = _find_last_user_text_index(contents)
 
     user_prompt_tokens = 0
     memory_and_history_tokens = 0
@@ -291,9 +353,6 @@ def extract_llm_request_context_breakdown(
         role = getattr(content, "role", "") or ""
         for part in getattr(content, "parts", None) or []:
             part_text = getattr(part, "text", None)
-            fn_resp = getattr(part, "function_response", None)
-            fn_call = getattr(part, "function_call", None)
-
             if part_text:
                 t_count = estimate_token_count(part_text)
                 if idx == last_user_idx and role == "user":
@@ -301,26 +360,23 @@ def extract_llm_request_context_breakdown(
                 else:
                     memory_and_history_tokens += t_count
 
+            fn_call = getattr(part, "function_call", None)
             if fn_call is not None:
-                fc_str = f"{getattr(fn_call, 'name', '')}({json.dumps(getattr(fn_call, 'args', {}) or {}, default=str)})"
+                fc_str = (
+                    f"{getattr(fn_call, 'name', '')}"
+                    f"({json.dumps(getattr(fn_call, 'args', {}) or {}, default=str)})"
+                )
                 memory_and_history_tokens += estimate_token_count(fc_str)
 
+            fn_resp = getattr(part, "function_response", None)
             if fn_resp is not None:
                 resp_name = str(getattr(fn_resp, "name", "") or "")
                 resp_payload = getattr(fn_resp, "response", None) or {}
-                serialized = json.dumps(resp_payload, default=str)
-                resp_tokens = estimate_token_count(serialized)
-                if resp_name in (
-                    "calculate_period_variances",
-                    "fetch_financial_metrics",
-                    "query_looker_financial_explore",
-                ):
+                bucket, resp_tokens = _classify_function_response_tokens(resp_name, resp_payload)
+                if bucket == "variance":
                     variance_payload_tokens += resp_tokens
-                elif resp_name in ("load_cached_10k_section", "query_cached_10k_context"):
-                    if isinstance(resp_payload, dict) and resp_payload.get("cache_hit"):
-                        cached_10k_tokens += resp_tokens
-                    else:
-                        uncached_10k_and_tool_tokens += resp_tokens
+                elif bucket == "cached_10k":
+                    cached_10k_tokens += resp_tokens
                 else:
                     uncached_10k_and_tool_tokens += resp_tokens
 
@@ -347,12 +403,7 @@ def extract_llm_request_context_breakdown(
     if has_cache_metadata and adk_cacheable_tokens > cached_total:
         cached_total = min(total_tokens, adk_cacheable_tokens)
 
-    cache_stats = state_dict.get("context_cache_stats") if state_dict else None
-    cache_hit = cached_total > 0 or (
-        isinstance(cache_stats, dict)
-        and int(cache_stats.get("hits", 0) or 0) > 0
-        and cached_10k_tokens > 0
-    )
+    cache_hit = cached_total > 0
     uncached_total = max(0, total_tokens - cached_total)
 
     return ContextBreakdown(
@@ -369,62 +420,66 @@ def extract_llm_request_context_breakdown(
     )
 
 
+def _estimate_response_output_tokens(llm_response: LlmResponse) -> tuple[int, int]:
+    if not llm_response.content or not llm_response.content.parts:
+        return 0, 0
+    out_text_parts: list[str] = []
+    thought_text_parts: list[str] = []
+    for part in llm_response.content.parts:
+        txt = getattr(part, "text", None)
+        if txt:
+            if getattr(part, "thought", False):
+                thought_text_parts.append(txt)
+            else:
+                out_text_parts.append(txt)
+        fc = getattr(part, "function_call", None)
+        if fc is not None:
+            out_text_parts.append(
+                f"{getattr(fc, 'name', '')}({json.dumps(getattr(fc, 'args', {}) or {}, default=str)})"
+            )
+    return estimate_token_count("\n".join(out_text_parts)), estimate_token_count(
+        "\n".join(thought_text_parts)
+    )
+
+
 def reconcile_breakdown_with_usage_metadata(
     breakdown: ContextBreakdown,
     llm_response: LlmResponse | None,
 ) -> tuple[ContextBreakdown, int, int]:
     """Reconcile estimated context breakdown with authoritative Gemini `usage_metadata` when available."""
-    output_tokens = 0
-    thoughts_tokens = 0
+    if llm_response is None:
+        return breakdown, 0, 0
 
-    if llm_response is not None:
-        if llm_response.content and llm_response.content.parts:
-            out_text_parts: list[str] = []
-            thought_text_parts: list[str] = []
-            for part in llm_response.content.parts:
-                txt = getattr(part, "text", None)
-                if txt:
-                    if getattr(part, "thought", False):
-                        thought_text_parts.append(txt)
-                    else:
-                        out_text_parts.append(txt)
-                fc = getattr(part, "function_call", None)
-                if fc is not None:
-                    out_text_parts.append(
-                        f"{getattr(fc, 'name', '')}({json.dumps(getattr(fc, 'args', {}) or {}, default=str)})"
-                    )
-            output_tokens = estimate_token_count("\n".join(out_text_parts))
-            thoughts_tokens = estimate_token_count("\n".join(thought_text_parts))
+    output_tokens, thoughts_tokens = _estimate_response_output_tokens(llm_response)
+    usage = getattr(llm_response, "usage_metadata", None)
+    if usage is None:
+        return breakdown, output_tokens, thoughts_tokens
 
-        usage = getattr(llm_response, "usage_metadata", None)
-        if usage is not None:
-            prompt_cnt = getattr(usage, "prompt_token_count", None)
-            cached_cnt = getattr(usage, "cached_content_token_count", None)
-            cand_cnt = getattr(usage, "candidates_token_count", None)
-            th_cnt = getattr(usage, "thoughts_token_count", None)
+    prompt_cnt = getattr(usage, "prompt_token_count", None)
+    cached_cnt = getattr(usage, "cached_content_token_count", None)
+    cand_cnt = getattr(usage, "candidates_token_count", None)
+    th_cnt = getattr(usage, "thoughts_token_count", None)
 
-            if cand_cnt is not None and int(cand_cnt) >= 0:
-                output_tokens = int(cand_cnt)
-            if th_cnt is not None and int(th_cnt) >= 0:
-                thoughts_tokens = int(th_cnt)
+    if cand_cnt is not None and int(cand_cnt) >= 0:
+        output_tokens = int(cand_cnt)
+    if th_cnt is not None and int(th_cnt) >= 0:
+        thoughts_tokens = int(th_cnt)
 
-            if prompt_cnt is not None and int(prompt_cnt) > 0:
-                authoritative_total = int(prompt_cnt)
-                authoritative_cached = (
-                    min(authoritative_total, int(cached_cnt))
-                    if cached_cnt is not None and int(cached_cnt) >= 0
-                    else min(authoritative_total, breakdown.cached_context_tokens)
-                )
-                breakdown = breakdown.model_copy(
-                    update={
-                        "total_context_tokens": authoritative_total,
-                        "cached_context_tokens": authoritative_cached,
-                        "uncached_context_tokens": max(
-                            0, authoritative_total - authoritative_cached
-                        ),
-                        "cache_hit": authoritative_cached > 0 or breakdown.cache_hit,
-                    }
-                )
+    if prompt_cnt is not None and int(prompt_cnt) > 0:
+        authoritative_total = int(prompt_cnt)
+        authoritative_cached = (
+            min(authoritative_total, int(cached_cnt))
+            if cached_cnt is not None and int(cached_cnt) >= 0
+            else min(authoritative_total, breakdown.cached_context_tokens)
+        )
+        breakdown = breakdown.model_copy(
+            update={
+                "total_context_tokens": authoritative_total,
+                "cached_context_tokens": authoritative_cached,
+                "uncached_context_tokens": max(0, authoritative_total - authoritative_cached),
+                "cache_hit": authoritative_cached > 0 or breakdown.cache_hit,
+            }
+        )
 
     return breakdown, output_tokens, thoughts_tokens
 
@@ -509,10 +564,11 @@ def attribute_context_latency(
     total_cost_usd = input_cost_usd + output_cost_usd
     uncached_baseline_cost_usd = uncached_input_baseline_usd + output_cost_usd
     cached_token_savings_usd = max(0.0, uncached_input_baseline_usd - input_cost_usd)
+    slo_ms = get_ttft_slo_ms()
 
     return ModelContextLatencyRecord(
         call_id=f"llm-ctx-{uuid.uuid4().hex[:12]}",
-        timestamp=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        timestamp=utc_now_iso(),
         agent_name=agent_name,
         model_name=model_name,
         task_category=task_category,
@@ -529,7 +585,7 @@ def attribute_context_latency(
         context_latency_ratio=round(ctx_ratio, 4),
         latency_per_1k_context_tokens_ms=round(per_1k_ms, 3),
         estimated_cache_latency_saved_ms=round(cache_saved_ms, 3),
-        within_ttft_slo=ttft_ms <= TTFT_SLO_TARGET_MS,
+        within_ttft_slo=ttft_ms <= slo_ms,
         input_cost_usd=round(input_cost_usd, 8),
         output_cost_usd=round(output_cost_usd, 8),
         total_cost_usd=round(total_cost_usd, 8),
@@ -538,18 +594,6 @@ def attribute_context_latency(
         session_id=session_id,
         user_id=user_id,
     )
-
-
-def _percentile(sorted_vals: list[float], pct: float) -> float:
-    if not sorted_vals:
-        return 0.0
-    if len(sorted_vals) == 1:
-        return sorted_vals[0]
-    idx = (pct / 100.0) * (len(sorted_vals) - 1)
-    lo = int(idx)
-    hi = min(lo + 1, len(sorted_vals) - 1)
-    frac = idx - lo
-    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
 
 
 class ContextLatencyTracker:
@@ -595,6 +639,8 @@ class ContextLatencyTracker:
             self._records.append(rec)
             if len(self._records) > self._max_records:
                 self._records = self._records[-self._max_records :]
+        # Called outside `self._lock`; in live production mode `BigQueryTelemetrySink` dispatches
+        # `tabledata.insertAll` asynchronously on its background pool so `_ADK_LOOP` is never blocked.
         get_telemetry_sink().record_llm_telemetry(rec)
         return rec
 
@@ -625,7 +671,8 @@ class ContextLatencyTracker:
         self,
         records: list[ModelContextLatencyRecord] | None = None,
     ) -> ContextLatencySummary:
-        """Aggregate p50/p95 context latency, TTFT SLO compliance, and Pro vs Flash breakdowns."""
+        """Aggregate p50/p95 context latency, TTFT SLO compliance, and model-tier breakdowns."""
+        slo_ms = get_ttft_slo_ms()
         if records is None:
             with self._lock:
                 items = list(self._records)
@@ -633,7 +680,7 @@ class ContextLatencyTracker:
             items = list(records)
 
         if not items:
-            return ContextLatencySummary(ttft_slo_target_ms=TTFT_SLO_TARGET_MS)
+            return ContextLatencySummary(ttft_slo_target_ms=slo_ms)
 
         ctx_latencies = sorted(r.context_latency_ms for r in items)
         total_latencies = [r.total_model_latency_ms for r in items]
@@ -665,7 +712,7 @@ class ContextLatencyTracker:
                 ),
                 "output_tokens": sum(x.output_tokens for x in m_recs),
                 "mean_context_latency_ms": round(sum(m_ctx) / len(m_ctx), 3),
-                "p95_context_latency_ms": round(_percentile(m_ctx, 95.0), 3),
+                "p95_context_latency_ms": round(percentile(m_ctx, 95.0), 3),
                 "mean_total_model_latency_ms": round(sum(m_tot) / len(m_tot), 3),
                 "estimated_cache_latency_saved_ms": round(
                     sum(x.estimated_cache_latency_saved_ms for x in m_recs), 3
@@ -697,11 +744,11 @@ class ContextLatencyTracker:
             total_output_tokens=sum(r.output_tokens for r in items),
             total_thoughts_tokens=sum(r.thoughts_tokens for r in items),
             mean_context_latency_ms=round(sum(ctx_latencies) / len(ctx_latencies), 3),
-            p50_context_latency_ms=round(_percentile(ctx_latencies, 50.0), 3),
-            p95_context_latency_ms=round(_percentile(ctx_latencies, 95.0), 3),
+            p50_context_latency_ms=round(percentile(ctx_latencies, 50.0), 3),
+            p95_context_latency_ms=round(percentile(ctx_latencies, 95.0), 3),
             mean_total_model_latency_ms=round(sum(total_latencies) / len(total_latencies), 3),
-            p95_ttft_ms=round(_percentile(ttfts, 95.0), 3),
-            ttft_slo_target_ms=TTFT_SLO_TARGET_MS,
+            p95_ttft_ms=round(percentile(ttfts, 95.0), 3),
+            ttft_slo_target_ms=slo_ms,
             ttft_slo_compliance_ratio=round(within_slo / len(items), 4),
             mean_context_latency_ratio=round(sum(ratios) / len(ratios), 4),
             mean_latency_per_1k_context_tokens_ms=round(
@@ -735,6 +782,64 @@ def get_context_latency_tracker() -> ContextLatencyTracker:
 # ---------------------------------------------------------------------------
 
 
+@runtime_checkable
+class SessionStoreProtocol(Protocol):
+    """Minimal persistence contract for durable conversational session stores."""
+
+    def is_live_enabled(self) -> bool: ...
+    def load_session(self, user_id: str, session_id: str) -> dict[str, Any] | None: ...
+    def save_session(self, user_id: str, session_id: str, payload: dict[str, Any]) -> None: ...
+    def delete_session(self, user_id: str, session_id: str) -> bool: ...
+    def list_sessions(self, user_id: str, *, limit: int = 25) -> list[dict[str, Any]]: ...
+    def status_metadata(self) -> dict[str, Any]: ...
+
+
+class BoundedInMemoryMemoryService(InMemoryMemoryService):
+    """LRU-bounded ADK `InMemoryMemoryService` that ignores ephemeral utility sessions."""
+
+    def __init__(self, *, max_sessions: int = DEFAULT_MAX_ADK_MEMORY_SESSIONS) -> None:
+        super().__init__()
+        self._max_sessions = max(1, int(max_sessions))
+        self._insertion_order: OrderedDict[tuple[tuple[str, str], str | None], None] = OrderedDict()
+
+    async def add_session_to_memory(self, session: Any) -> None:
+        session_id = getattr(session, "id", None)
+        if is_ephemeral_session_id(session_id):
+            return
+        await super().add_session_to_memory(session)
+        user_key = (str(getattr(session, "app_name", "")), str(getattr(session, "user_id", "")))
+        with self._lock:
+            entry_key = (user_key, session_id)
+            self._insertion_order.pop(entry_key, None)
+            self._insertion_order[entry_key] = None
+            while len(self._insertion_order) > self._max_sessions:
+                (old_user_key, old_sid), _ = self._insertion_order.popitem(last=False)
+                user_map = self._session_events.get(old_user_key)
+                if user_map is not None:
+                    user_map.pop(old_sid, None)
+                    if not user_map:
+                        self._session_events.pop(old_user_key, None)
+
+    def drop_session(self, session_id: str, candidate_users: set[str]) -> bool:
+        """Drop all cached memory events for `session_id` owned by any user in `candidate_users`."""
+        removed = False
+        with self._lock:
+            for user_key in list(self._session_events.keys()):
+                if user_key[1] in candidate_users:
+                    user_map = self._session_events.get(user_key)
+                    if user_map is not None and session_id in user_map:
+                        user_map.pop(session_id, None)
+                        self._insertion_order.pop((user_key, session_id), None)
+                        removed = True
+                        if not user_map:
+                            self._session_events.pop(user_key, None)
+        return removed
+
+    def tracked_session_count(self) -> int:
+        with self._lock:
+            return len(self._insertion_order)
+
+
 @dataclass
 class TurnMemoryEntry:
     """Structured memory entry stored per conversational turn."""
@@ -766,9 +871,7 @@ class SessionMemoryState:
     last_start_year: int = 2024
     last_end_year: int = 2026
     last_gics_sector: str = "ALL"
-    updated_at: str = field(
-        default_factory=lambda: datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    )
+    updated_at: str = field(default_factory=utc_now_iso)
 
     def to_firestore_dict(self) -> dict[str, Any]:
         return {
@@ -790,7 +893,12 @@ class SessionMemoryState:
         raw_turns = doc.get("turns_json") or "[]"
         try:
             parsed_turns = json.loads(raw_turns) if isinstance(raw_turns, str) else list(raw_turns)
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            logger.warning(
+                "Failed to deserialize turns_json for session '%s': %s",
+                doc.get("session_id", ""),
+                exc,
+            )
             parsed_turns = []
         turns: list[TurnMemoryEntry] = []
         for t in parsed_turns:
@@ -822,9 +930,7 @@ class SessionMemoryState:
             last_start_year=int(doc.get("last_start_year") or 2024),
             last_end_year=int(doc.get("last_end_year") or 2026),
             last_gics_sector=str(doc.get("last_gics_sector") or "ALL"),
-            updated_at=str(
-                doc.get("updated_at") or datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-            ),
+            updated_at=str(doc.get("updated_at") or utc_now_iso()),
         )
 
 
@@ -832,9 +938,9 @@ class ConversationMemoryManager:
     """Manages durable, tenant-isolated conversational session state and follow-up entity recall.
 
     Sessions are keyed strictly by `(user_id, session_id)` so two authenticated users supplying
-    the same `session_id` never collide. When Firestore is active (Cloud Run / `gcp` mode),
-    every turn is persisted to the `analyst_sessions` collection and reloaded across instances
-    so follow-ups survive restarts and horizontal autoscaling (`min-instances > 1`).
+    the same `session_id` never collide. Per-session locking serializes concurrent `record_turn`
+    load-mutate-save cycles to prevent lost updates across threads while allowing distinct
+    sessions to proceed concurrently.
     """
 
     def __init__(
@@ -842,37 +948,77 @@ class ConversationMemoryManager:
         *,
         token_threshold: int = DEFAULT_COMPACTION_TOKEN_THRESHOLD,
         retention_turns: int = DEFAULT_COMPACTION_RETENTION_SIZE,
-        session_store: FirestoreSessionStore | None = None,
+        session_store: SessionStoreProtocol | None = None,
         refresh_ttl_seconds: float = 5.0,
+        max_local_sessions: int = DEFAULT_MAX_LOCAL_SESSIONS,
+        max_adk_memory_sessions: int = DEFAULT_MAX_ADK_MEMORY_SESSIONS,
     ) -> None:
         self.token_threshold = token_threshold
         self.retention_turns = retention_turns
         self.refresh_ttl_seconds = float(refresh_ttl_seconds)
+        self._max_local_sessions = max(1, int(max_local_sessions))
+        self._max_adk_memory_sessions = max(1, int(max_adk_memory_sessions))
         self._explicit_store = session_store
-        self._default_store: FirestoreSessionStore | None = None
+        self._default_store: SessionStoreProtocol | None = None
         self.adk_session_service = InMemorySessionService()
-        self.adk_memory_service = InMemoryMemoryService()
+        self.adk_memory_service = BoundedInMemoryMemoryService(
+            max_sessions=self._max_adk_memory_sessions
+        )
         self._lock = threading.Lock()
-        # Keyed by (norm_user_id, norm_session_id) -> (loaded_monotonic, SessionMemoryState)
-        self._sessions: dict[tuple[str, str], tuple[float, SessionMemoryState]] = {}
+        self._session_locks: dict[tuple[str, str], threading.Lock] = {}
+        # LRU-bounded map keyed by (norm_user_id, norm_session_id) -> (loaded_monotonic, SessionMemoryState)
+        self._sessions: OrderedDict[tuple[str, str], tuple[float, SessionMemoryState]] = (
+            OrderedDict()
+        )
 
-    def _get_store(self) -> FirestoreSessionStore:
+    def _get_store(self) -> SessionStoreProtocol:
         if self._explicit_store is not None:
             return self._explicit_store
         if self._default_store is None:
             self._default_store = FirestoreSessionStore()
         return self._default_store
 
-    def configure_session_store(self, store: FirestoreSessionStore | None) -> None:
-        """Inject or clear a custom `FirestoreSessionStore` (used in tests and wiring)."""
-        with self._lock:
-            self._explicit_store = store
-            self._default_store = None
-
     @staticmethod
     def _session_key(session_id: str, user_id: str = "analyst") -> tuple[str, str]:
         norm_user = (user_id or "analyst").strip().lower() or "analyst"
         return (norm_user, session_id.strip())
+
+    def _get_session_lock(self, key: tuple[str, str]) -> threading.Lock:
+        with self._lock:
+            lock = self._session_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._session_locks[key] = lock
+            return lock
+
+    def _store_local_session_locked(
+        self,
+        key: tuple[str, str],
+        state: SessionMemoryState,
+    ) -> None:
+        self._sessions[key] = (time.monotonic(), state)
+        self._sessions.move_to_end(key)
+        while len(self._sessions) > self._max_local_sessions:
+            old_key, _ = self._sessions.popitem(last=False)
+            self._session_locks.pop(old_key, None)
+
+    def _evict_adk_session_state(self, session_id: str, user_id: str) -> bool:
+        """Delete matching `(user_id, session_id)` entries from in-memory ADK session & memory services."""
+        norm_user = (user_id or "analyst").strip().lower() or "analyst"
+        candidate_users = {user_id.strip(), norm_user}
+        removed_session = False
+        sessions_by_app = getattr(self.adk_session_service, "sessions", None)
+        if isinstance(sessions_by_app, dict):
+            for app_sessions in list(sessions_by_app.values()):
+                if not isinstance(app_sessions, dict):
+                    continue
+                for uid in candidate_users:
+                    user_sessions = app_sessions.get(uid)
+                    if isinstance(user_sessions, dict) and session_id in user_sessions:
+                        del user_sessions[session_id]
+                        removed_session = True
+        removed_memory = self.adk_memory_service.drop_session(session_id, candidate_users)
+        return removed_session or removed_memory
 
     def _load_or_refresh_session(
         self,
@@ -898,25 +1044,8 @@ class ConversationMemoryManager:
             return cached[1] if cached is not None else None
         hydrated = SessionMemoryState.from_firestore_dict(doc)
         with self._lock:
-            self._sessions[key] = (time.monotonic(), hydrated)
+            self._store_local_session_locked(key, hydrated)
         return hydrated
-
-    def get_or_create_session(
-        self,
-        session_id: str,
-        user_id: str = "analyst",
-    ) -> SessionMemoryState:
-        key = self._session_key(session_id, user_id)
-        existing = self._load_or_refresh_session(session_id, user_id)
-        if existing is not None:
-            return existing
-        with self._lock:
-            cached = self._sessions.get(key)
-            if cached is not None:
-                return cached[1]
-            created = SessionMemoryState(session_id=key[1], user_id=key[0])
-            self._sessions[key] = (time.monotonic(), created)
-            return created
 
     def recall_session_context(
         self,
@@ -925,10 +1054,12 @@ class ConversationMemoryManager:
     ) -> dict[str, Any]:
         """Retrieve active tenant-isolated session memory and measure context recall latency."""
         t0 = time.perf_counter()
+        backend_label = "firestore" if self._get_store().is_live_enabled() else "in_memory"
+        norm_user = (user_id or "analyst").strip().lower()
         if not session_id or not session_id.strip():
             return {
                 "session_id": None,
-                "user_id": (user_id or "analyst").strip().lower(),
+                "user_id": norm_user,
                 "has_prior_memory": False,
                 "turn_count": 0,
                 "remembered_tickers": [],
@@ -938,18 +1069,15 @@ class ConversationMemoryManager:
                 "compaction_count": 0,
                 "memory_summary_text": "",
                 "memory_tokens": 0,
-                "persistence_backend": "firestore"
-                if self._get_store().is_live_enabled()
-                else "in_memory",
+                "persistence_backend": backend_label,
                 "memory_lookup_latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
             }
 
         sess = self._load_or_refresh_session(session_id, user_id)
-        backend_label = "firestore" if self._get_store().is_live_enabled() else "in_memory"
         if sess is None or (not sess.turns and not sess.compacted_summary):
             return {
                 "session_id": session_id.strip(),
-                "user_id": (user_id or "analyst").strip().lower(),
+                "user_id": norm_user,
                 "has_prior_memory": False,
                 "turn_count": 0,
                 "remembered_tickers": [],
@@ -1011,75 +1139,81 @@ class ConversationMemoryManager:
             return {"persisted": False, "compaction_triggered": False, "turn_count": 0}
 
         key = self._session_key(session_id, user_id)
-        existing = self._load_or_refresh_session(session_id, user_id)
+        session_lock = self._get_session_lock(key)
         compaction_triggered = False
 
-        with self._lock:
-            sess = existing
-            if sess is None:
-                cached = self._sessions.get(key)
-                sess = cached[1] if cached is not None else None
-            if sess is None:
-                sess = SessionMemoryState(session_id=key[1], user_id=key[0])
+        # Serialize load -> mutate -> remote save per `(user_id, session_id)` to prevent lost updates.
+        with session_lock:
+            existing = self._load_or_refresh_session(session_id, user_id)
+            with self._lock:
+                sess = existing
+                if sess is None:
+                    cached = self._sessions.get(key)
+                    sess = cached[1] if cached is not None else None
+                if sess is None:
+                    sess = SessionMemoryState(session_id=key[1], user_id=key[0])
 
-            now_iso = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-            turn_text = f"{query}\n{answer_markdown}"
-            entry = TurnMemoryEntry(
-                turn_index=len(sess.turns) + 1,
-                timestamp=now_iso,
-                query=query,
-                intent=intent,
-                tickers=list(tickers),
-                gics_sector=gics_sector,
-                start_year=start_year,
-                end_year=end_year,
-                variance_highlights=list(variance_highlights or []),
-                cited_chunk_ids=list(cited_chunk_ids or []),
-                cached_10k_keys=list(cached_10k_keys or []),
-                token_estimate=estimate_token_count(turn_text),
-            )
-            sess.turns.append(entry)
-            if tickers:
-                sess.remembered_tickers = list(tickers)
-            sess.last_start_year = start_year
-            sess.last_end_year = end_year
-            if gics_sector and gics_sector != "ALL":
-                sess.last_gics_sector = gics_sector
-            sess.updated_at = now_iso
+                now_iso = utc_now_iso()
+                turn_text = f"{query}\n{answer_markdown}"
+                entry = TurnMemoryEntry(
+                    turn_index=len(sess.turns) + 1,
+                    timestamp=now_iso,
+                    query=query,
+                    intent=intent,
+                    tickers=list(tickers),
+                    gics_sector=gics_sector,
+                    start_year=start_year,
+                    end_year=end_year,
+                    variance_highlights=list(variance_highlights or []),
+                    cited_chunk_ids=list(cited_chunk_ids or []),
+                    cached_10k_keys=list(cached_10k_keys or []),
+                    token_estimate=estimate_token_count(turn_text),
+                )
+                sess.turns.append(entry)
+                if tickers:
+                    sess.remembered_tickers = list(tickers)
+                sess.last_start_year = start_year
+                sess.last_end_year = end_year
+                if gics_sector and gics_sector != "ALL":
+                    sess.last_gics_sector = gics_sector
+                sess.updated_at = now_iso
 
-            total_mem_tokens = sum(t.token_estimate for t in sess.turns) + estimate_token_count(
-                sess.compacted_summary
-            )
-            if total_mem_tokens >= self.token_threshold and len(sess.turns) > self.retention_turns:
-                compaction_triggered = True
-                older_turns = sess.turns[: -self.retention_turns]
-                sess.turns = sess.turns[-self.retention_turns :]
-                digest_parts: list[str] = []
-                if sess.compacted_summary:
-                    digest_parts.append(sess.compacted_summary)
-                for old in older_turns:
-                    tk_str = ",".join(old.tickers) if old.tickers else old.gics_sector
-                    hl_str = (
-                        "; ".join(old.variance_highlights[:1])
-                        if old.variance_highlights
-                        else old.intent
-                    )
-                    digest_parts.append(
-                        f"T{old.turn_index}({tk_str} FY{old.start_year}-{old.end_year}): {hl_str}"
-                    )
-                sess.compacted_summary = " | ".join(digest_parts)[-2000:]
-                sess.compaction_count += 1
+                total_mem_tokens = sum(t.token_estimate for t in sess.turns) + estimate_token_count(
+                    sess.compacted_summary
+                )
+                if (
+                    total_mem_tokens >= self.token_threshold
+                    and len(sess.turns) > self.retention_turns
+                ):
+                    compaction_triggered = True
+                    older_turns = sess.turns[: -self.retention_turns]
+                    sess.turns = sess.turns[-self.retention_turns :]
+                    digest_parts: list[str] = []
+                    if sess.compacted_summary:
+                        digest_parts.append(sess.compacted_summary)
+                    for old in older_turns:
+                        tk_str = ",".join(old.tickers) if old.tickers else old.gics_sector
+                        hl_str = (
+                            "; ".join(old.variance_highlights[:1])
+                            if old.variance_highlights
+                            else old.intent
+                        )
+                        digest_parts.append(
+                            f"T{old.turn_index}({tk_str} FY{old.start_year}-{old.end_year}): {hl_str}"
+                        )
+                    sess.compacted_summary = " | ".join(digest_parts)[-2000:]
+                    sess.compaction_count += 1
 
-            self._sessions[key] = (time.monotonic(), sess)
-            turn_count = len(sess.turns)
-            compaction_count = sess.compaction_count
-            firestore_payload = sess.to_firestore_dict()
+                self._store_local_session_locked(key, sess)
+                turn_count = len(sess.turns)
+                compaction_count = sess.compaction_count
+                firestore_payload = sess.to_firestore_dict()
 
-        store = self._get_store()
-        backend_label = "in_memory"
-        if store.is_live_enabled():
-            store.save_session(key[0], key[1], firestore_payload)
-            backend_label = "firestore"
+            store = self._get_store()
+            backend_label = "in_memory"
+            if store.is_live_enabled():
+                store.save_session(key[0], key[1], firestore_payload)
+                backend_label = "firestore"
 
         return {
             "persisted": True,
@@ -1130,13 +1264,19 @@ class ConversationMemoryManager:
         return items[:limit]
 
     def delete_session(self, session_id: str, user_id: str = "analyst") -> bool:
-        """Delete a session belonging to `(user_id, session_id)` from L1 cache and Firestore."""
+        """Delete a session belonging to `(user_id, session_id)` from L1 cache, ADK services, and Firestore."""
         key = self._session_key(session_id, user_id)
-        with self._lock:
-            removed_local = self._sessions.pop(key, None) is not None
-        store = self._get_store()
-        removed_remote = store.delete_session(key[0], key[1]) if store.is_live_enabled() else False
-        return removed_local or removed_remote
+        session_lock = self._get_session_lock(key)
+        with session_lock:
+            with self._lock:
+                removed_local = self._sessions.pop(key, None) is not None
+                self._session_locks.pop(key, None)
+            removed_adk = self._evict_adk_session_state(key[1], user_id)
+            store = self._get_store()
+            removed_remote = (
+                store.delete_session(key[0], key[1]) if store.is_live_enabled() else False
+            )
+        return removed_local or removed_adk or removed_remote
 
     def persistence_status(self) -> dict[str, Any]:
         """Return health metadata for session memory storage."""
@@ -1145,8 +1285,11 @@ class ConversationMemoryManager:
     def reset(self) -> None:
         with self._lock:
             self._sessions.clear()
+            self._session_locks.clear()
             self.adk_session_service = InMemorySessionService()
-            self.adk_memory_service = InMemoryMemoryService()
+            self.adk_memory_service = BoundedInMemoryMemoryService(
+                max_sessions=self._max_adk_memory_sessions
+            )
 
 
 _GLOBAL_MEMORY_MANAGER = ConversationMemoryManager()
@@ -1160,19 +1303,26 @@ def get_conversation_memory_manager() -> ConversationMemoryManager:
 async def after_agent_memory_callback(
     callback_context: CallbackContext,
 ) -> genai_types.Content | None:
-    """ADK `after_agent_callback` persisting session events to Memory Bank & tracking agent duration."""
+    """ADK `after_agent_callback` persisting non-ephemeral sessions to Memory Bank & tracking duration."""
     state = callback_context.state
     start_ts = state.get("_agent_start_monotonic")
     if start_ts is not None:
         state["last_agent_total_duration_ms"] = round(
             (time.perf_counter() - float(start_ts)) * 1000.0, 3
         )
+    agent_name = str(getattr(callback_context, "agent_name", "") or "")
+    adk_session = getattr(callback_context, "session", None)
+    sess_id = getattr(adk_session, "id", None) or state.get("session_id")
+    if agent_name in EPHEMERAL_AGENT_NAMES or (
+        sess_id is not None and is_ephemeral_session_id(str(sess_id))
+    ):
+        return None
     add_mem = getattr(callback_context, "add_session_to_memory", None)
     if callable(add_mem):
         try:
             await add_mem()
         except Exception as exc:
-            logger.debug("Optional Memory Bank sync skipped in local mode: %s", exc)
+            logger.debug("Optional ADK Memory Bank sync skipped: %s", exc)
     return None
 
 
@@ -1199,12 +1349,9 @@ def create_edgar_adk_app(
         if enable_context_cache
         else None
     )
-    if plugins is not None:
-        resolved_plugins: list[BasePlugin] = list(plugins)
-    else:
-        from edgar_capstone.security.model_armor import ModelArmorSafetyPlugin
-
-        resolved_plugins = [ModelArmorSafetyPlugin()]
+    resolved_plugins: list[BasePlugin] = (
+        list(plugins) if plugins is not None else [ModelArmorSafetyPlugin()]
+    )
     return App(
         name=app_name,
         root_agent=root_agent,

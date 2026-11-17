@@ -21,22 +21,15 @@ from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
+import edgar_capstone.agents as agents_mod
 import edgar_capstone.agents.callbacks as callbacks_mod
 import edgar_capstone.agents.chat_engine as chat_engine_mod
 import edgar_capstone.security.model_armor as model_armor_mod
 from edgar_capstone.agents import (
-    CODING_ASSISTANT_INSTRUCTION,
-    CONTEXT_CACHE_AGENT_INSTRUCTION,
-    FINANCIAL_ANALYST_INSTRUCTION,
-    NARRATIVE_EVALUATOR_INSTRUCTION,
-    ROOT_ORCHESTRATOR_INSTRUCTION,
-    CodingAssistantAgent,
-    ContextCacheAgent,
-    FinancialAnalystAgent,
-    NarrativeEvaluatorAgent,
-    RootOrchestrator,
     VersionedPromptStore,
     configure_prompt_store,
+    create_financial_analyst_agent,
+    create_narrative_evaluator_agent,
     get_context_latency_tracker,
     get_conversation_memory_manager,
     get_prompt_store,
@@ -135,53 +128,67 @@ class _CountingStreamingLlm(BaseLlm):
 
 
 def test_zero_regex_prompt_injection_patterns_and_dynamic_agent_instructions() -> None:
-    """Confirm `_PROMPT_INJECTION_PATTERNS` is removed and `model_armor.py` uses zero regexes."""
+    """Confirm `_PROMPT_INJECTION_PATTERNS` is removed and `model_armor/` uses zero regexes."""
     assert not hasattr(callbacks_mod, "_PROMPT_INJECTION_PATTERNS")
     assert not hasattr(chat_engine_mod, "_PROMPT_INJECTION_PATTERNS")
 
     callbacks_src = Path(callbacks_mod.__file__).read_text(encoding="utf-8")
     chat_src = Path(chat_engine_mod.__file__).read_text(encoding="utf-8")
-    armor_src = Path(model_armor_mod.__file__).read_text(encoding="utf-8")
 
     assert "_PROMPT_INJECTION_PATTERNS" not in callbacks_src
     assert "_PROMPT_INJECTION_PATTERNS" not in chat_src
 
-    # Verify `model_armor.py` does not even import `re`
-    armor_tree = ast.parse(armor_src)
-    imported_modules = {
-        alias.name
-        for node in ast.walk(armor_tree)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-    } | {
-        node.module
-        for node in ast.walk(armor_tree)
-        if isinstance(node, ast.ImportFrom) and node.module
-    }
-    assert "re" not in imported_modules
+    # Verify NO module inside the `security/model_armor/` package imports `re`
+    armor_pkg_dir = Path(model_armor_mod.__file__).parent
+    armor_py_files = sorted(armor_pkg_dir.glob("*.py"))
+    assert len(armor_py_files) >= 1
+    for py_path in armor_py_files:
+        armor_tree = ast.parse(py_path.read_text(encoding="utf-8"))
+        imported_modules = {
+            alias.name
+            for node in ast.walk(armor_tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        } | {
+            node.module
+            for node in ast.walk(armor_tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        assert "re" not in imported_modules, f"`re` imported in {py_path.name}"
 
-    # Verify every ADK agent uses a dynamic callable `InstructionProvider` from `prompt_store`
+    # Verify every active ADK agent factory uses a dynamic callable `InstructionProvider`
     for agent_obj in (
-        RootOrchestrator,
-        FinancialAnalystAgent,
-        ContextCacheAgent,
-        NarrativeEvaluatorAgent,
-        CodingAssistantAgent,
+        create_financial_analyst_agent(),
+        create_narrative_evaluator_agent(),
     ):
         assert callable(agent_obj.instruction), (
             f"{agent_obj.name}.instruction must be a dynamic InstructionProvider callable"
         )
 
-    # Module-level constants remain populated from `prompts/` for backward compatibility
-    for prompt_str in (
-        ROOT_ORCHESTRATOR_INSTRUCTION,
-        FINANCIAL_ANALYST_INSTRUCTION,
-        CONTEXT_CACHE_AGENT_INSTRUCTION,
-        NARRATIVE_EVALUATOR_INSTRUCTION,
-        CODING_ASSISTANT_INSTRUCTION,
+    # Verify active prompts load lazily via `load_agent_prompt(...)`
+    for prompt_id, version in (
+        ("financial_analyst", "v1"),
+        ("financial_analyst", "v5"),
+        ("narrative_evaluator", "v1"),
     ):
+        prompt_str = load_agent_prompt(prompt_id, version=version)
         assert isinstance(prompt_str, str)
         assert len(prompt_str) > 100
+
+    # Retired eager singletons & instruction constants are no longer exported
+    for retired in (
+        "RootOrchestrator",
+        "FinancialAnalystAgent",
+        "ContextCacheAgent",
+        "NarrativeEvaluatorAgent",
+        "CodingAssistantAgent",
+        "ROOT_ORCHESTRATOR_INSTRUCTION",
+        "FINANCIAL_ANALYST_INSTRUCTION",
+        "CONTEXT_CACHE_AGENT_INSTRUCTION",
+        "NARRATIVE_EVALUATOR_INSTRUCTION",
+        "CODING_ASSISTANT_INSTRUCTION",
+    ):
+        assert not hasattr(agents_mod, retired), f"Retired symbol {retired!r} should be removed"
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +425,8 @@ def test_financial_projection_and_mnpi_filters_block_prompts_and_synthesized_lea
     assert proj_body["status"] == "blocked"
     assert proj_body["model_armor_blocked"] is True
     assert proj_body["intent"] == "projection_compliance_block"
-    assert proj_body["model_armor"]["projection_blocked"] is True
+    assert proj_body["model_armor"]["prompt_inspection"]["projection_blocked"] is True
+    assert proj_body["model_armor"]["response_inspection"] is None
 
     # 2. Stock price target / buy-sell investment advice request
     target_resp = client.post(
@@ -429,16 +437,21 @@ def test_financial_projection_and_mnpi_filters_block_prompts_and_synthesized_lea
             "tickers": "NVDA",
         },
     )
-    assert target_resp.json()["status"] == "blocked"
-    assert target_resp.json()["intent"] == "projection_compliance_block"
+    target_body = target_resp.json()
+    assert target_body["status"] == "blocked"
+    assert target_body["intent"] == "projection_compliance_block"
+    assert target_body["model_armor"]["prompt_inspection"]["projection_blocked"] is True
+    assert target_body["model_armor"]["response_inspection"] is None
 
     # 3. Confidential MNPI marker in prompt. Live Model Armor may block it first (prompt-injection
     #    filter); either way it never reaches the analyst, and the SEC filter classifies it as MNPI.
     mnpi_query = "Summarize this CONFIDENTIAL MNPI pre-release earnings guidance for AAPL"
     mnpi_resp = client.post("/api/v1/chat", headers=headers, json={"query": mnpi_query})
-    assert mnpi_resp.json()["status"] == "blocked"
-    assert mnpi_resp.json()["model_armor_blocked"] is True
-    assert mnpi_resp.json()["citations"] == []
+    mnpi_body = mnpi_resp.json()
+    assert mnpi_body["status"] == "blocked"
+    assert mnpi_body["model_armor_blocked"] is True
+    assert mnpi_body["model_armor"]["response_inspection"] is None
+    assert mnpi_body["citations"] == []
     mnpi_verdict = ModelArmorGuardrailService().projection_filter.evaluate(
         mnpi_query, stage="prompt"
     )
@@ -562,15 +575,16 @@ def test_versioned_prompt_store_local_gcs_and_vertex_backends(tmp_path: Path) ->
     """Verify `VersionedPromptStore` across `local` (`prompts/`), `gcs`, and `vertex` backends."""
     # 1. Local `prompts/` registry & SHA-256 verification
     default_store = get_prompt_store()
-    registered_ids = {item["prompt_id"] for item in default_store.list_registered_prompts()}
-    assert {
-        "root_orchestrator",
+    registered_entries = default_store.list_registered_prompts()
+    registered_ids = {item["prompt_id"] for item in registered_entries}
+    assert registered_ids == {
         "financial_analyst",
-        "context_cache_agent",
         "narrative_evaluator",
-        "coding_assistant",
         "model_armor_policy",
-    } <= registered_ids
+    }
+    fa_entry = next(item for item in registered_entries if item["prompt_id"] == "financial_analyst")
+    assert fa_entry["latest"] == "v5"
+    assert {"v1", "v5"} <= set(fa_entry["available_versions"])
 
     fa_art = load_agent_prompt_artifact("financial_analyst", version="1.0.0")
     assert fa_art.version == "1.0.0"
@@ -578,19 +592,35 @@ def test_versioned_prompt_store_local_gcs_and_vertex_backends(tmp_path: Path) ->
     assert len(fa_art.sha256) == 64
     assert "FinancialAnalystAgent (`gemini-2.5-pro`)" in fa_art.rendered_text
 
-    # Mustache variable override preserves single braces `{...}` while substituting `{{...}}`
-    ca_custom = load_agent_prompt("coding_assistant", variables={"dataset_id": "custom_edgar_prod"})
-    assert "`custom_edgar_prod.v_financial_variances_yoy`" in ca_custom
+    fa_latest = load_agent_prompt_artifact("financial_analyst", version="latest")
+    assert fa_latest.version == "5.0.0"
+    assert fa_latest.source_backend == "local"
+    assert "FinancialAnalystAgent (`gemini-3.8-flash`)" in fa_latest.rendered_text
+
+    # Mustache variable override on active prompts
+    fa_custom = load_agent_prompt(
+        "financial_analyst",
+        version="v5",
+        variables={"analyst_model": "gemini-custom-test"},
+    )
+    assert "FinancialAnalystAgent (`gemini-custom-test`)" in fa_custom
+    ne_custom = load_agent_prompt(
+        "narrative_evaluator",
+        version="v1",
+        variables={"flash_model": "gemini-eval-custom"},
+    )
+    assert "NarrativeEvaluatorAgent powered by Gemini 3.5 Flash (`gemini-eval-custom`)" in ne_custom
 
     # Tampered SHA-256 raises ValueError
     with pytest.raises(ValueError, match="Prompt integrity check failed"):
-        load_agent_prompt("root_orchestrator", expected_sha256="0" * 64)
+        load_agent_prompt("financial_analyst", expected_sha256="0" * 64)
 
     # Path traversal outside `prompts/` is rejected
     with pytest.raises((ValueError, FileNotFoundError)):
-        default_store.load_prompt("root_orchestrator", version="../../etc")
+        default_store.load_prompt("financial_analyst", version="../../etc")
 
     # Dynamic ADK `InstructionProvider` honors per-session `state['prompt_version']`
+    # and mustache substitution preserves single braces `{...}` while rendering `{{...}}`
     (tmp_path / "v1").mkdir()
     (tmp_path / "v2").mkdir()
     (tmp_path / "v1" / "financial_analyst.yaml").write_text(
@@ -601,7 +631,19 @@ def test_versioned_prompt_store_local_gcs_and_vertex_backends(tmp_path: Path) ->
         'prompt_id: "financial_analyst"\nversion: "2.0.0"\ntemplate: "Analyst v2 canary prompt"\n',
         encoding="utf-8",
     )
+    (tmp_path / "v1" / "mustache_check.yaml").write_text(
+        'prompt_id: "mustache_check"\n'
+        'version: "1.0.0"\n'
+        'variables:\n  dataset_id: "sec_edgar"\n'
+        "template: 'SELECT {col} FROM `{{dataset_id}}.v_financial_variances_yoy`'\n",
+        encoding="utf-8",
+    )
     configure_prompt_store(backend_mode="local", prompts_dir=tmp_path, default_version="v1")
+    mustache_rendered = load_agent_prompt(
+        "mustache_check", variables={"dataset_id": "custom_edgar_prod"}
+    )
+    assert mustache_rendered == "SELECT {col} FROM `custom_edgar_prod.v_financial_variances_yoy`"
+
     provider = make_adk_instruction_provider("financial_analyst")
 
     ctx_v1 = MagicMock(spec=ReadonlyContext)
@@ -622,11 +664,11 @@ def test_versioned_prompt_store_local_gcs_and_vertex_backends(tmp_path: Path) ->
         return httpx.Response(
             200,
             text=(
-                'prompt_id: "root_orchestrator"\n'
+                'prompt_id: "narrative_evaluator"\n'
                 'version: "1.2.0"\n'
-                'agent_name: "RootOrchestrator"\n'
-                'variables:\n  model_name: "gemini-2.5-pro"\n'
-                'template: "GCS versioned RootOrchestrator ({{model_name}})"\n'
+                'agent_name: "NarrativeEvaluatorAgent"\n'
+                'variables:\n  model_name: "gemini-3.5-flash"\n'
+                'template: "GCS versioned NarrativeEvaluatorAgent ({{model_name}})"\n'
             ),
         )
 
@@ -640,14 +682,14 @@ def test_versioned_prompt_store_local_gcs_and_vertex_backends(tmp_path: Path) ->
         http_client=httpx.Client(transport=httpx.MockTransport(_gcs_handler)),
         credentials=mock_creds,
     )
-    gcs_art = gcs_store.load_prompt_artifact("root_orchestrator", version="v1#987654321")
+    gcs_art = gcs_store.load_prompt_artifact("narrative_evaluator", version="v1#987654321")
     assert gcs_art.source_backend == "gcs"
     assert gcs_art.version == "1.2.0"
     assert (
         gcs_art.source_uri
-        == "gs://fde-sec-edgar-sandbox-dev-sec-corpus/prompts/v1/root_orchestrator.yaml#987654321"
+        == "gs://fde-sec-edgar-sandbox-dev-sec-corpus/prompts/v1/narrative_evaluator.yaml#987654321"
     )
-    assert gcs_art.rendered_text == "GCS versioned RootOrchestrator (gemini-2.5-pro)"
+    assert gcs_art.rendered_text == "GCS versioned NarrativeEvaluatorAgent (gemini-3.5-flash)"
     assert len(gcs_calls) == 2
     assert "generation=987654321" in gcs_calls[-1]
 
@@ -705,7 +747,7 @@ def test_health_endpoint_and_terraform_model_armor_provisioning() -> None:
     assert body["model_armor"]["template_id"] == "sec-edgar-analyst-armor"
     assert body["model_armor"]["projection_filter_enabled"] is True
     assert body["prompt_store"]["local_prompts_dir_exists"] is True
-    assert body["prompt_store"]["registered_prompts_count"] >= 6
+    assert body["prompt_store"]["registered_prompts_count"] == 3
 
     dockerfile_txt = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY --chown=appuser:appgroup prompts/ ./prompts/" in dockerfile_txt
@@ -775,9 +817,12 @@ def test_dlp_deidentify_payload_uses_primitive_transformation_and_allows_10k_pro
     )
     assert decision.blocked is False
     assert len(captured_dlp_payloads) == 1
-    tx = captured_dlp_payloads[0]["deidentifyConfig"]["infoTypeTransformations"]["transformations"][
-        0
-    ]
+    dlp_payload = captured_dlp_payloads[0]
+    # Template and inline configs must NOT be duplicated side-by-side
+    assert "inspectTemplateName" in dlp_payload
+    assert "inspectConfig" not in dlp_payload
+    assert "deidentifyTemplateName" not in dlp_payload
+    tx = dlp_payload["deidentifyConfig"]["infoTypeTransformations"]["transformations"][0]
     assert "primitiveTransformation" in tx
     assert "replaceWithInfoTypeConfig" in tx["primitiveTransformation"]
     assert "replaceWithInfoTypeConfig" not in tx

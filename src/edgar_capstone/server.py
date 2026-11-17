@@ -3,96 +3,42 @@
 from __future__ import annotations
 
 import asyncio
-import contextvars
-import json
 import logging
-import os
-import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any, Literal
+from importlib import metadata
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
 
-from edgar_capstone.agents.chat_engine import (
-    list_curated_companies,
-    run_conversational_rag_turn,
-)
-from edgar_capstone.agents.context_memory import (
-    get_context_latency_tracker,
-    get_conversation_memory_manager,
-    get_model_strategy_metadata,
-)
-from edgar_capstone.agents.evaluation_and_coding import (
-    evaluate_variance_explanation,
-    generate_financial_coding_assistance,
-)
-from edgar_capstone.agents.live_runtime import get_live_runtime_status_metadata
-from edgar_capstone.agents.prompt_store import get_prompt_store_status_metadata
+from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.agents.react_loop import flush_pending_evaluations
-from edgar_capstone.agents.root_orchestrator import (
-    RootOrchestrator,
-    classify_query_intent,
+from edgar_capstone.api.dependencies import (
+    LiveRuntimeUnavailableError,
+    register_exception_handlers,
 )
-from edgar_capstone.agents.tools import (
-    calculate_period_variances,
-    fetch_financial_metrics,
-    get_active_gcp_tool_adapters,
-    get_context_cache_runtime_stats,
-    get_gcp_adapters_status_metadata,
-    load_cached_10k_section,
-    query_looker_financial_explore,
-    search_10k_chunks_rag,
+from edgar_capstone.api.routers import ALL_ROUTERS
+from edgar_capstone.api.routers.spa import _resolve_frontend_dist_dir
+from edgar_capstone.api.schemas import (
+    ChatQueryRequest,
+    DevWorkspaceSsoLoginRequest,
+    FeedbackRequest,
+    FilingScopeMixin,
+    SsoTokenExchangeRequest,
 )
 from edgar_capstone.observability import (
+    REQUEST_ID_HEADER,
     TRACE_ID_HEADER,
     RequestTelemetryMiddleware,
     configure_logging,
     configure_tracing,
-    current_trace_metadata,
     flush_tracing,
     instrument_fastapi_app,
     logging_status_metadata,
-    set_span_attributes,
     tracing_status_metadata,
 )
-from edgar_capstone.security.agent_identity import (
-    PER_AGENT_IDENTITIES,
-    S2S_AGENT_ASSERTION_HEADER,
-)
-from edgar_capstone.security.auth import (
-    GOOGLE_IAP_ISSUER,
-    AuthenticatedUser,
-    AuthenticationError,
-    AuthorizationError,
-    IAPJwtVerifier,
-    get_auth_verifier,
-    get_security_audit_events,
-    issue_local_dev_workspace_sso_token,
-    record_security_audit_event,
-    require_authenticated_user,
-    require_permissions,
-    revoke_bearer_token,
-)
-from edgar_capstone.security.model_armor import get_model_armor_status_metadata
-from edgar_capstone.security.rbac import (
-    Permission,
-    RuntimeServiceAccountConfig,
-)
-from edgar_capstone.security.secrets import (
-    DEFAULT_PROJECT_ID,
-    MANAGED_SECRETS,
-    SecretManagerClient,
-)
-from edgar_capstone.telemetry import (
-    get_feedback_store,
-    get_telemetry_sink,
-    load_lookml_project_catalog,
-)
+from edgar_capstone.security.agent_identity import S2S_AGENT_ASSERTION_HEADER
+from edgar_capstone.telemetry import get_telemetry_sink, reset_telemetry_stores
 
 # Structured JSON logs (Cloud Logging) + OpenTelemetry tracing (Cloud Trace) must be configured
 # before the app object is built so the FastAPI instrumentation and every module logger see them.
@@ -101,10 +47,25 @@ configure_tracing()
 
 logger = logging.getLogger(__name__)
 
+_CORS_ALLOW_ORIGINS: list[str] = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+]
+
+
+def _resolve_package_version() -> str:
+    """Resolve the installed `edgar-capstone` distribution version dynamically."""
+    try:
+        return metadata.version("edgar-capstone")
+    except metadata.PackageNotFoundError:
+        return "0.1.0"
+
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
-    """Log startup metadata and flush background judges, telemetry writes, and trace spans on shutdown."""
+    """Log startup metadata and flush/close background workers, telemetry stores, and trace spans."""
     logger.info(
         "SEC EDGAR analyst API ready",
         extra={
@@ -118,1203 +79,80 @@ async def _app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Drain async background LLM-as-a-Judge evaluations, non-blocking BQ inserts, and trace spans.
-        await asyncio.to_thread(flush_pending_evaluations, 10.0)
-        await asyncio.to_thread(get_telemetry_sink().flush_async_writes, 10.0)
-        await asyncio.to_thread(flush_tracing)
-
-
-app = FastAPI(
-    lifespan=_app_lifespan,
-    title="SEC EDGAR Natural Language Analyst API",
-    version="0.2.0",
-    description=(
-        "Cloud Run FastAPI backend for deterministic SEC 10-K financial variance "
-        "calculations, metadata-filtered Hybrid RAG search, and ADK RootOrchestrator routing. "
-        "Internal APIs are protected via Identity-Aware Proxy (IAP) and Google Workspace "
-        "Okta/SSO JWT Bearer authentication."
-    ),
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=[
-        "Authorization",
-        "Content-Type",
-        "X-Goog-IAP-JWT-Assertion",
-        S2S_AGENT_ASSERTION_HEADER,
-        "traceparent",
-        "tracestate",
-        "X-Cloud-Trace-Context",
-        "X-Request-Id",
-    ],
-    expose_headers=["WWW-Authenticate", TRACE_ID_HEADER, "X-Request-Id", "Server-Timing"],
-)
-# Added after CORS so it wraps it: preflight responses also carry trace/latency headers.
-app.add_middleware(RequestTelemetryMiddleware)
-# Outermost: OpenTelemetry server span, continuing upstream `traceparent` / X-Cloud-Trace-Context.
-instrument_fastapi_app(app)
-
-
-class VarianceRequest(BaseModel):
-    tickers: str = Field(..., description="Comma-separated tickers, e.g. 'NVDA,AAPL'")
-    start_year: int = Field(2024, ge=2015, le=2035)
-    end_year: int = Field(2026, ge=2015, le=2035)
-
-
-class RagSearchRequest(BaseModel):
-    query: str = Field(..., min_length=2)
-    tickers: str = Field("ALL")
-    gics_sector: str = Field("ALL")
-    section_id: str = Field("ALL")
-    start_year: int = Field(2024, ge=2015, le=2035)
-    end_year: int = Field(2026, ge=2015, le=2035)
-    top_k: int = Field(5, ge=1, le=25)
-
-
-class IntentClassifyRequest(BaseModel):
-    query: str = Field(..., min_length=2)
-    tickers: list[str] | None = None
-
-
-class SsoTokenExchangeRequest(BaseModel):
-    id_token: str = Field(..., min_length=16, description="OIDC / IAP signed JWT bearer token")
-
-
-class DevWorkspaceSsoLoginRequest(BaseModel):
-    email: str = Field(
-        default="analyst@fde-workspace.corp",
-        min_length=5,
-        max_length=254,
-        description="Google Workspace corporate email federated via Okta SSO",
-    )
-    name: str = Field(
-        default="Senior Financial Analyst",
-        min_length=1,
-        max_length=120,
-    )
-    groups: list[str] = Field(
-        default_factory=lambda: ["sec-edgar-analysts"],
-        description="Cloud Identity / Okta SSO group memberships",
-    )
-
-
-@app.get("/health")
-@app.get("/healthz", include_in_schema=False)
-def health() -> dict[str, Any]:
-    """Cloud Run external health check and internal probe endpoint."""
-    runtime_sa = RuntimeServiceAccountConfig.from_env()
-    model_meta = get_model_strategy_metadata()
-    lookml_cat = load_lookml_project_catalog()
-    return {
-        "status": "ok",
-        "service": os.environ.get("K_SERVICE", "sec-edgar-analyst"),
-        "project_id": os.environ.get("GCP_PROJECT_ID", DEFAULT_PROJECT_ID),
-        "runtime_service_account": runtime_sa.email,
-        "runtime_service_account_project_name": runtime_sa.project_name_alias_email,
-        "root_agent": RootOrchestrator.name,
-        "sub_agents": [sa.name for sa in RootOrchestrator.sub_agents],
-        "reasoning_strategy": "structured_react_loop",
-        "models": {
-            "financial_reasoning": model_meta["financial_reasoning_model"],
-            "coding_and_evaluation": model_meta["coding_and_evaluation_model"],
-        },
-        "adk_runtime": get_live_runtime_status_metadata(),
-        "model_armor": get_model_armor_status_metadata(),
-        "prompt_store": get_prompt_store_status_metadata(),
-        "telemetry_sink": get_telemetry_sink().status_metadata(),
-        "feedback_store": get_feedback_store().status_metadata(),
-        "session_memory": get_conversation_memory_manager().persistence_status(),
-        "lookml_semantic_layer": {
-            "status": lookml_cat["status"],
-            "model_count": lookml_cat.get("model_count", 0),
-            "view_count": lookml_cat.get("view_count", 0),
-            "dashboard_count": lookml_cat.get("dashboard_count", 0),
-        },
-        "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
-        "iap_jwt_auth_enabled": True,
-        "data_backend": get_gcp_adapters_status_metadata(),
-        "observability": {
-            "tracing": tracing_status_metadata(),
-            "logging": logging_status_metadata(),
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# Identity-Aware Proxy (IAP) & Google Workspace Okta/SSO Authentication APIs
-# ---------------------------------------------------------------------------
-
-
-@app.get("/api/v1/auth/config")
-def auth_discovery_config(
-    verifier: IAPJwtVerifier = Depends(get_auth_verifier),
-) -> dict[str, Any]:
-    """Return public SSO, IAP, Cloud Identity RBAC, and Agent Identity metadata (no secrets)."""
-    settings = verifier.settings
-    runtime_sa = RuntimeServiceAccountConfig.from_env()
-    return {
-        "status": "ok",
-        "auth_required": True,
-        "access_pattern": "iap_jwt_bearer",
-        "identity_provider": {
-            "name": "Google Workspace (Okta SSO)",
-            "protocol": "OIDC / SAML-Federated Workspace + IAP",
-            "google_issuer": "https://accounts.google.com",
-            "iap_issuer": GOOGLE_IAP_ISSUER,
-            "okta_issuer": settings.okta_issuer_uri,
-            "okta_client_id": settings.okta_client_id,
-            "google_client_id": settings.google_oauth_client_id,
-            "authorization_endpoint": settings.authorization_endpoint(),
-            "allowed_workspace_domains": list(settings.allowed_workspace_domains),
-            "required_analyst_groups": list(settings.required_analyst_groups),
-            "local_sso_dev_broker_enabled": not settings.strict_production_mode,
-        },
-        "iap": {
-            "enabled": True,
-            "strict_production_mode": settings.strict_production_mode,
-            "bearer_header": "Authorization",
-            "assertion_header": "X-Goog-IAP-JWT-Assertion",
-            "agent_s2s_assertion_header": S2S_AGENT_ASSERTION_HEADER,
-            "audience_configured": bool(settings.audiences),
-            # In Cloud Run the browser can sign in through the IAP session alone; the
-            # frontend probes /api/v1/auth/me without a Bearer token when this is true.
-            "session_auth_enabled": settings.strict_production_mode,
-            "default_role": settings.iap_default_role,
-        },
-        "rbac": settings.rbac_policy().to_public_dict(),
-        "service_account": runtime_sa.to_public_dict(),
-        "agent_identities": [
-            spec.to_public_dict(runtime_sa.project_id) for spec in PER_AGENT_IDENTITIES.values()
-        ],
-    }
-
-
-@app.post("/api/v1/auth/sso/exchange")
-def exchange_sso_id_token(
-    req: SsoTokenExchangeRequest,
-    verifier: IAPJwtVerifier = Depends(get_auth_verifier),
-) -> dict[str, Any]:
-    """Validate a Google Workspace / Okta SSO / IAP OIDC ID token for API Bearer access."""
-    cleaned_jwt = req.id_token.strip()
-    if cleaned_jwt.lower().startswith("bearer "):
-        cleaned_jwt = cleaned_jwt[7:].strip()
-
-    try:
-        user = verifier.verify_jwt(cleaned_jwt)
-    except AuthenticationError as exc:
-        record_security_audit_event(
-            event_type="sso_token_exchange_failed",
-            user=None,
-            resource="/api/v1/auth/sso/exchange",
-            status_outcome="denied_401",
-            detail=exc.message,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={
-                "status": "unauthorized",
-                "error": exc.error_code,
-                "message": exc.message,
-            },
-            headers={"WWW-Authenticate": 'Bearer realm="sec-edgar-iap", error="invalid_token"'},
-        ) from exc
-    except AuthorizationError as exc:
-        record_security_audit_event(
-            event_type="sso_token_exchange_forbidden",
-            user=None,
-            resource="/api/v1/auth/sso/exchange",
-            status_outcome="denied_403",
-            detail=exc.message,
-        )
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "status": "forbidden",
-                "error": "insufficient_permissions",
-                "message": exc.message,
-            },
-        ) from exc
-
-    record_security_audit_event(
-        event_type="sso_token_exchange",
-        user=user,
-        resource="/api/v1/auth/sso/exchange",
-        status_outcome="allowed",
-    )
-    return {
-        "status": "authenticated",
-        "token_type": "Bearer",
-        "access_token": cleaned_jwt,
-        "expires_at": user.expires_at,
-        "user": user.to_public_dict(),
-    }
-
-
-@app.post("/api/v1/auth/sso/dev-token")
-def mint_local_dev_sso_token(
-    req: DevWorkspaceSsoLoginRequest,
-    verifier: IAPJwtVerifier = Depends(get_auth_verifier),
-) -> dict[str, Any]:
-    """Issue a signed ES256 Workspace/Okta JWT for local development (disabled in Cloud Run)."""
-    try:
-        signed_jwt, user = issue_local_dev_workspace_sso_token(
-            email=req.email,
-            name=req.name,
-            groups=req.groups,
-            verifier=verifier,
-        )
-    except AuthenticationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"status": "unauthorized", "error": exc.error_code, "message": exc.message},
-            headers={"WWW-Authenticate": 'Bearer realm="sec-edgar-iap"'},
-        ) from exc
-    except AuthorizationError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "status": "forbidden",
-                "error": "local_sso_broker_forbidden",
-                "message": exc.message,
-            },
-        ) from exc
-
-    record_security_audit_event(
-        event_type="sso_workspace_okta_login",
-        user=user,
-        resource="/api/v1/auth/sso/dev-token",
-        status_outcome="allowed",
-    )
-    return {
-        "status": "authenticated",
-        "token_type": "Bearer",
-        "access_token": signed_jwt,
-        "expires_at": user.expires_at,
-        "user": user.to_public_dict(),
-    }
-
-
-@app.get("/api/v1/auth/me")
-def get_authenticated_session(
-    user: AuthenticatedUser = Depends(require_authenticated_user),
-) -> dict[str, Any]:
-    """Return the verified Google Workspace / Okta SSO & IAP principal for the active Bearer JWT."""
-    return {
-        "status": "authenticated",
-        "user": user.to_public_dict(),
-    }
-
-
-@app.post("/api/v1/auth/logout")
-def logout_authenticated_session(
-    request: Request,
-    user: AuthenticatedUser = Depends(require_authenticated_user),
-) -> dict[str, Any]:
-    """Revoke the active Bearer JWT and record a session logout audit event."""
-    raw_token = getattr(request.state, "raw_bearer_token", "")
-    if raw_token:
-        revoke_bearer_token(raw_token, expires_at=user.expires_at)
-    record_security_audit_event(
-        event_type="sso_logout",
-        user=user,
-        resource="/api/v1/auth/logout",
-        status_outcome="revoked",
-    )
-    return {
-        "status": "logged_out",
-        "revoked_sub": user.sub,
-        "user_email": user.email,
-    }
-
-
-@app.get("/api/v1/auth/audit")
-def list_security_audit_trail(
-    limit: int = Query(50, ge=1, le=500),
-    user: AuthenticatedUser = Depends(require_permissions(Permission.AUDIT_READ.value)),
-) -> dict[str, Any]:
-    """Retrieve structured authentication and 10-K report access audit logs."""
-    events = get_security_audit_events(limit=limit)
-    return {
-        "status": "ok",
-        "requested_by": user.email,
-        "event_count": len(events),
-        "events": events,
-    }
-
-
-@app.get("/api/v1/auth/rbac")
-def inspect_rbac_and_agent_identities(
-    user: AuthenticatedUser = Depends(require_permissions(Permission.RBAC_INSPECT.value)),
-    verifier: IAPJwtVerifier = Depends(get_auth_verifier),
-) -> dict[str, Any]:
-    """Inspect active Cloud Identity Group RBAC role definitions, custom runtime SA, and per-agent S2S identities."""
-    record_security_audit_event(
-        event_type="rbac_policy_inspected",
-        user=user,
-        resource="/api/v1/auth/rbac",
-    )
-    runtime_sa = RuntimeServiceAccountConfig.from_env()
-    return {
-        "status": "ok",
-        "principal": {
-            "email": user.email,
-            "roles": list(user.roles),
-            "permissions": list(user.permissions),
-            "cloud_identity_groups": list(user.cloud_identity_groups),
-            "agent_identity": user.agent_identity,
-            "spiffe_id": user.spiffe_id,
-        },
-        "rbac_policy": verifier.settings.rbac_policy().to_public_dict(),
-        "runtime_service_account": runtime_sa.to_public_dict(),
-        "agent_identities": [
-            spec.to_public_dict(runtime_sa.project_id) for spec in PER_AGENT_IDENTITIES.values()
-        ],
-    }
-
-
-@app.get("/api/v1/admin/rbac/policies")
-def admin_rbac_governance_policies(
-    user: AuthenticatedUser = Depends(require_permissions(Permission.RBAC_ADMIN.value)),
-    verifier: IAPJwtVerifier = Depends(get_auth_verifier),
-) -> dict[str, Any]:
-    """Administrative endpoint restricted strictly to Cloud Identity `admin` group principals."""
-    record_security_audit_event(
-        event_type="admin_rbac_governance_inspected",
-        user=user,
-        resource="/api/v1/admin/rbac/policies",
-    )
-    runtime_sa = RuntimeServiceAccountConfig.from_env()
-    return {
-        "status": "ok",
-        "administered_by": user.email,
-        "cloud_identity_groups": list(user.cloud_identity_groups),
-        "rbac_policy": verifier.settings.rbac_policy().to_public_dict(),
-        "runtime_service_account": runtime_sa.to_public_dict(),
-        "agent_identities": {
-            name: spec.to_public_dict(runtime_sa.project_id)
-            for name, spec in PER_AGENT_IDENTITIES.items()
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# IAP JWT Bearer & Cloud Identity RBAC Protected Internal SEC EDGAR APIs
-# ---------------------------------------------------------------------------
-
-
-@app.get("/api/v1/secrets/status")
-def secrets_status(
-    user: AuthenticatedUser = Depends(require_permissions(Permission.SECRETS_INSPECT.value)),
-) -> dict[str, Any]:
-    """Report Secret Manager binding metadata without ever exposing secret values."""
-    record_security_audit_event(
-        event_type="secrets_metadata_inspected",
-        user=user,
-        resource="/api/v1/secrets/status",
-    )
-    client = SecretManagerClient()
-    bindings = []
-    for spec in MANAGED_SECRETS:
-        is_mounted_in_env = bool(os.environ.get(spec.env_var))
-        bindings.append(
-            {
-                "env_var": spec.env_var,
-                "secret_id": spec.secret_id,
-                "resource_name": spec.resource_name(client.project_id),
-                "cloud_run_mount": spec.cloud_run_mount_spec(),
-                "required": spec.required,
-                "mounted_in_env": is_mounted_in_env,
-                "value": "***REDACTED***",
-            }
-        )
-    return {
-        "status": "ok",
-        "project_id": client.project_id,
-        "secret_manager_enabled": True,
-        "secrets": bindings,
-    }
-
-
-@app.post("/api/v1/variances")
-def compute_variances(
-    req: VarianceRequest,
-    user: AuthenticatedUser = Depends(
-        require_permissions(
-            Permission.VARIANCES_CALCULATE.value,
-            agent_tool="calculate_period_variances",
-        )
-    ),
-) -> dict[str, Any]:
-    """Compute deterministic period-over-period financial variances."""
-    record_security_audit_event(
-        event_type="variance_calculation",
-        user=user,
-        resource="/api/v1/variances",
-        tickers=req.tickers,
-        detail=f"FY{req.start_year}-FY{req.end_year}",
-    )
-    res = calculate_period_variances(
-        tickers=req.tickers,
-        start_year=req.start_year,
-        end_year=req.end_year,
-    )
-    if res.get("status") == "error":
-        raise HTTPException(status_code=400, detail=res.get("message", "Invalid request"))
-    return res
-
-
-@app.post("/api/v1/search")
-def rag_search(
-    req: RagSearchRequest,
-    user: AuthenticatedUser = Depends(
-        require_permissions(
-            Permission.FILINGS_READ.value,
-            agent_tool="search_10k_chunks_rag",
-        )
-    ),
-) -> dict[str, Any]:
-    """Run metadata-filtered Hybrid RAG search over SEC 10-K filing chunks."""
-    record_security_audit_event(
-        event_type="rag_chunk_search",
-        user=user,
-        resource="/api/v1/search",
-        tickers=req.tickers,
-        detail=f"section={req.section_id} FY{req.start_year}-FY{req.end_year}",
-    )
-    return search_10k_chunks_rag(
-        query=req.query,
-        tickers=req.tickers,
-        gics_sector=req.gics_sector,
-        section_id=req.section_id,
-        start_year=req.start_year,
-        end_year=req.end_year,
-        top_k=req.top_k,
-    )
-
-
-@app.post("/api/v1/intent")
-def classify_intent(
-    req: IntentClassifyRequest,
-    user: AuthenticatedUser = Depends(
-        require_permissions(
-            Permission.CHAT_QUERY.value,
-            agent_tool="classify_query_intent",
-        )
-    ),
-) -> dict[str, Any]:
-    """Deterministically classify an analyst query into a RootOrchestrator routing intent."""
-    record_security_audit_event(
-        event_type="intent_classification",
-        user=user,
-        resource="/api/v1/intent",
-        tickers=req.tickers,
-    )
-    intent = classify_query_intent(req.query, tickers=req.tickers)
-    return {
-        "status": "success",
-        "query": req.query,
-        "intent": intent,
-        "orchestrator": RootOrchestrator.name,
-    }
-
-
-@app.get("/api/v1/metrics")
-def get_metrics(
-    tickers: str = "NVDA,AAPL",
-    start_year: int = 2024,
-    end_year: int = 2026,
-    gics_sector: str = "ALL",
-    user: AuthenticatedUser = Depends(
-        require_permissions(
-            Permission.FILINGS_READ.value,
-            agent_tool="fetch_financial_metrics",
-        )
-    ),
-) -> dict[str, Any]:
-    """Retrieve structured SEC 10-K financial metrics."""
-    record_security_audit_event(
-        event_type="financial_metrics_read",
-        user=user,
-        resource="/api/v1/metrics",
-        tickers=tickers,
-        detail=f"FY{start_year}-FY{end_year}",
-    )
-    return fetch_financial_metrics(
-        tickers=tickers,
-        start_year=start_year,
-        end_year=end_year,
-        gics_sector=gics_sector,
-    )
-
-
-@app.get("/api/v1/explore/{explore_name}")
-def get_looker_explore(
-    explore_name: str,
-    tickers: str = "ALL",
-    gics_sector: str = "ALL",
-    start_year: int = 2024,
-    end_year: int = 2026,
-    user: AuthenticatedUser = Depends(
-        require_permissions(
-            Permission.FILINGS_READ.value,
-            agent_tool="query_looker_financial_explore",
-        )
-    ),
-) -> dict[str, Any]:
-    """Query Looker BI semantic explores (yoy_variances, sector_benchmarks, peer_comparison, chunk_health)."""
-    record_security_audit_event(
-        event_type="looker_explore_query",
-        user=user,
-        resource=f"/api/v1/explore/{explore_name}",
-        tickers=tickers,
-    )
-    return query_looker_financial_explore(
-        explore_name=explore_name,
-        tickers=tickers,
-        gics_sector=gics_sector,
-        start_year=start_year,
-        end_year=end_year,
-    )
-
-
-@app.get("/api/v1/looker/catalog")
-def get_lookml_semantic_catalog(
-    user: AuthenticatedUser = Depends(require_permissions(Permission.FILINGS_READ.value)),
-) -> dict[str, Any]:
-    """Inspect repository LookML semantic models, views, explores, and dashboards."""
-    record_security_audit_event(
-        event_type="lookml_catalog_inspected",
-        user=user,
-        resource="/api/v1/looker/catalog",
-    )
-    return load_lookml_project_catalog()
-
-
-class ChatQueryRequest(BaseModel):
-    query: str = Field(..., min_length=2)
-    tickers: str = Field("ALL")
-    gics_sector: str = Field("ALL")
-    section_id: str = Field("ALL")
-    start_year: int = Field(2024, ge=2015, le=2035)
-    end_year: int = Field(2026, ge=2015, le=2035)
-    top_k: int = Field(8, ge=1, le=25)
-    session_id: str | None = Field(default=None, max_length=128)
-
-
-class EvaluationRequest(BaseModel):
-    query: str = Field(..., min_length=2)
-    response_markdown: str = Field(..., min_length=2)
-    variance_reports: list[dict[str, Any]] = Field(default_factory=list)
-    citations: list[dict[str, Any]] = Field(default_factory=list)
-    cached_explanations_count: int = Field(default=0, ge=0)
-
-
-class CodingAssistRequest(BaseModel):
-    prompt: str = Field(..., min_length=2, max_length=2000)
-    language: Literal["sql", "python", "lookml"] = Field("sql")
-    tickers: str = Field("NVDA,AAPL")
-    start_year: int = Field(2024, ge=2015, le=2035)
-    end_year: int = Field(2026, ge=2015, le=2035)
-    dataset_id: str = Field("sec_edgar", min_length=1, max_length=128)
-
-
-class SectionLoadRequest(BaseModel):
-    ticker: str = Field(..., min_length=1)
-    fiscal_year: int = Field(..., ge=2015, le=2035)
-    section_id: Literal["item_1a", "item_7"] = Field("item_7")
-    max_chars: int = Field(32000, ge=500, le=50000)
-
-
-class FeedbackRequest(BaseModel):
-    message_id: str = Field(..., min_length=1)
-    rating: Literal["up", "down"]
-    comment: str = Field(default="", max_length=1000)
-    query: str = Field(default="", max_length=1000)
-    session_id: str | None = Field(default=None, max_length=128)
-    tickers: list[str] = Field(default_factory=list)
-    intent: str = Field(default="", max_length=128)
-
-
-@app.get("/api/v1/companies")
-def get_companies(
-    user: AuthenticatedUser = Depends(require_permissions(Permission.FILINGS_READ.value)),
-) -> dict[str, Any]:
-    """List all curated S&P 500 issuers, GICS sectors, and available fiscal years."""
-    record_security_audit_event(
-        event_type="companies_catalog_read",
-        user=user,
-        resource="/api/v1/companies",
-    )
-    return list_curated_companies()
-
-
-@app.post("/api/v1/chat")
-def conversational_rag_chat(
-    req: ChatQueryRequest,
-    user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
-) -> dict[str, Any]:
-    """Execute a source-grounded conversational Hybrid RAG query with ADK Runner / ReAct trace & fact-check."""
-    try:
-        turn_result = run_conversational_rag_turn(
-            query=req.query,
-            tickers=req.tickers,
-            gics_sector=req.gics_sector,
-            section_id=req.section_id,
-            start_year=req.start_year,
-            end_year=req.end_year,
-            top_k=req.top_k,
-            session_id=req.session_id,
-            user_id=user.email,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "status": "error",
-                "error": "live_adk_unavailable",
-                "message": str(exc),
-            },
-        ) from exc
-    resolved_tickers = turn_result.get("resolved_scope", {}).get("tickers") or req.tickers
-    record_security_audit_event(
-        event_type="conversational_rag_chat",
-        user=user,
-        resource="/api/v1/chat",
-        tickers=resolved_tickers,
-        status_outcome=str(turn_result.get("status", "success")),
-        detail=f"intent={turn_result.get('intent', 'unknown')} verified={turn_result.get('answer_verified')}",
-    )
-    turn_result["authenticated_principal"] = {
-        "email": user.email,
-        "identity_provider": user.identity_provider,
-        "iap_assertion_verified": user.iap_assertion_verified,
-        "roles": list(user.roles),
-        "cloud_identity_groups": list(user.cloud_identity_groups),
-        "agent_identity": user.agent_identity,
-    }
-    set_span_attributes(
-        **{
-            "edgar.chat.intent": turn_result.get("intent"),
-            "edgar.chat.status": turn_result.get("status"),
-            "edgar.chat.execution_mode": turn_result.get("execution_mode"),
-            "edgar.chat.citations_count": len(turn_result.get("citations") or []),
-            "edgar.chat.total_latency_ms": turn_result.get("total_latency_ms"),
-            "edgar.chat.session_id": req.session_id,
-        }
-    )
-    turn_result["observability"] = current_trace_metadata()
-    return turn_result
-
-
-def _format_sse_event(event: str, payload: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(payload, default=str)}\n\n"
-
-
-@app.post("/api/v1/chat/stream")
-async def conversational_rag_chat_stream(
-    req: ChatQueryRequest,
-    user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
-) -> StreamingResponse:
-    """Stream live Server-Sent Events (SSE) progress updates followed by the final grounded chat response."""
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[tuple[str, dict[str, Any]] | None] = asyncio.Queue()
-    t_start = time.perf_counter()
-    trace_meta_snapshot = current_trace_metadata()
-    worker_ctx = contextvars.copy_context()
-
-    def _on_progress(stage: str, message: str, meta: dict[str, Any] | None = None) -> None:
-        elapsed_ms = round((time.perf_counter() - t_start) * 1000.0, 1)
-        payload = {
-            "stage": stage,
-            "message": message,
-            "meta": meta,
-            "elapsed_ms": elapsed_ms,
-        }
-        loop.call_soon_threadsafe(queue.put_nowait, ("progress", payload))
-
-    def _worker() -> None:
+        # Drain async background LLM-as-a-Judge evaluations, flush/close BigQuery telemetry writes,
+        # and flush OpenTelemetry trace spans even if an earlier cleanup step raises.
         try:
-            turn_result = run_conversational_rag_turn(
-                query=req.query,
-                tickers=req.tickers,
-                gics_sector=req.gics_sector,
-                section_id=req.section_id,
-                start_year=req.start_year,
-                end_year=req.end_year,
-                top_k=req.top_k,
-                session_id=req.session_id,
-                user_id=user.email,
-                on_progress=_on_progress,
-            )
-            resolved_tickers = turn_result.get("resolved_scope", {}).get("tickers") or req.tickers
-            record_security_audit_event(
-                event_type="conversational_rag_chat",
-                user=user,
-                resource="/api/v1/chat/stream",
-                tickers=resolved_tickers,
-                status_outcome=str(turn_result.get("status", "success")),
-                detail=(
-                    f"intent={turn_result.get('intent', 'unknown')} "
-                    f"verified={turn_result.get('answer_verified')}"
-                ),
-            )
-            turn_result["authenticated_principal"] = {
-                "email": user.email,
-                "identity_provider": user.identity_provider,
-                "iap_assertion_verified": user.iap_assertion_verified,
-                "roles": list(user.roles),
-                "cloud_identity_groups": list(user.cloud_identity_groups),
-                "agent_identity": user.agent_identity,
-            }
-            set_span_attributes(
-                **{
-                    "edgar.chat.intent": turn_result.get("intent"),
-                    "edgar.chat.status": turn_result.get("status"),
-                    "edgar.chat.execution_mode": turn_result.get("execution_mode"),
-                    "edgar.chat.citations_count": len(turn_result.get("citations") or []),
-                    "edgar.chat.total_latency_ms": turn_result.get("total_latency_ms"),
-                    "edgar.chat.session_id": req.session_id,
-                    "edgar.chat.streaming": True,
-                }
-            )
-            turn_result["observability"] = current_trace_metadata() or trace_meta_snapshot
-            loop.call_soon_threadsafe(queue.put_nowait, ("result", turn_result))
-        except RuntimeError as exc:
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                (
-                    "error",
-                    {
-                        "status": "error",
-                        "error": "live_adk_unavailable",
-                        "message": str(exc),
-                        "observability": trace_meta_snapshot,
-                    },
-                ),
-            )
-        except Exception as exc:
-            logger.exception("Unhandled error during /api/v1/chat/stream")
-            loop.call_soon_threadsafe(
-                queue.put_nowait,
-                (
-                    "error",
-                    {
-                        "status": "error",
-                        "error": "internal_server_error",
-                        "message": str(exc),
-                        "observability": trace_meta_snapshot,
-                    },
-                ),
-            )
+            await asyncio.to_thread(flush_pending_evaluations, 10.0)
         finally:
-            loop.call_soon_threadsafe(queue.put_nowait, None)
-
-    async def _event_generator() -> AsyncIterator[str]:
-        yield _format_sse_event(
-            "progress",
-            {
-                "stage": "connected",
-                "message": "Connected to SEC EDGAR analyst stream...",
-                "meta": {"trace_id": trace_meta_snapshot.get("trace_id")},
-                "elapsed_ms": round((time.perf_counter() - t_start) * 1000.0, 1),
-            },
-        )
-        worker_task = asyncio.ensure_future(loop.run_in_executor(None, worker_ctx.run, _worker))
-        try:
-            while True:
+            try:
+                await asyncio.to_thread(get_telemetry_sink().flush_async_writes, 10.0)
+            finally:
                 try:
-                    item = await asyncio.wait_for(queue.get(), timeout=15.0)
-                except TimeoutError:
-                    yield ": keepalive\n\n"
-                    continue
-                if item is None:
-                    break
-                event_name, payload = item
-                yield _format_sse_event(event_name, payload)
-        finally:
-            if not worker_task.done():
-                await asyncio.shield(worker_task)
+                    await asyncio.to_thread(reset_telemetry_stores)
+                finally:
+                    await asyncio.to_thread(flush_tracing)
 
-    return StreamingResponse(
-        _event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+
+def create_app() -> FastAPI:
+    """Construct and configure the FastAPI application with middleware, handlers, and routers."""
+    application = FastAPI(
+        lifespan=_app_lifespan,
+        title="SEC EDGAR Natural Language Analyst API",
+        version=_resolve_package_version(),
+        description=(
+            "Cloud Run FastAPI backend for deterministic SEC 10-K financial variance "
+            "calculations, metadata-filtered Hybrid RAG search, and ADK agent orchestration. "
+            "Internal APIs are protected via Identity-Aware Proxy (IAP) and Google Workspace "
+            "Okta/SSO JWT Bearer authentication."
+        ),
     )
 
+    register_exception_handlers(application)
 
-@app.get("/api/v1/sessions")
-def list_user_chat_sessions(
-    limit: int = Query(25, ge=1, le=100),
-    user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
-) -> dict[str, Any]:
-    """List persistent analyst chat sessions belonging solely to the authenticated user."""
-    memory_mgr = get_conversation_memory_manager()
-    sessions = memory_mgr.list_user_sessions(user.email, limit=limit)
-    record_security_audit_event(
-        event_type="chat_sessions_listed",
-        user=user,
-        resource="/api/v1/sessions",
-        detail=f"count={len(sessions)}",
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=_CORS_ALLOW_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "X-Goog-IAP-JWT-Assertion",
+            S2S_AGENT_ASSERTION_HEADER,
+            "traceparent",
+            "tracestate",
+            "X-Cloud-Trace-Context",
+            REQUEST_ID_HEADER,
+        ],
+        expose_headers=[
+            "WWW-Authenticate",
+            TRACE_ID_HEADER,
+            REQUEST_ID_HEADER,
+            "Server-Timing",
+        ],
     )
-    return {
-        "status": "ok",
-        "user_email": user.email,
-        "persistence": memory_mgr.persistence_status(),
-        "session_count": len(sessions),
-        "sessions": sessions,
-    }
+    # Added after CORS so it wraps it: preflight responses also carry trace/latency headers.
+    application.add_middleware(RequestTelemetryMiddleware)
+    # Outermost: OpenTelemetry server span, continuing upstream `traceparent` / X-Cloud-Trace-Context.
+    instrument_fastapi_app(application)
+
+    for router in ALL_ROUTERS:
+        application.include_router(router)
+
+    return application
 
 
-@app.delete("/api/v1/sessions/{session_id}")
-def delete_user_chat_session(
-    session_id: str,
-    user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
-) -> dict[str, Any]:
-    """Delete a persistent analyst chat session scoped strictly to the authenticated user."""
-    memory_mgr = get_conversation_memory_manager()
-    deleted = memory_mgr.delete_session(session_id, user_id=user.email)
-    record_security_audit_event(
-        event_type="chat_session_deleted",
-        user=user,
-        resource=f"/api/v1/sessions/{session_id}",
-        status_outcome="deleted" if deleted else "not_found",
-    )
-    if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={
-                "status": "not_found",
-                "message": f"Session '{session_id}' was not found for {user.email}.",
-            },
-        )
-    return {
-        "status": "deleted",
-        "session_id": session_id,
-        "user_email": user.email,
-    }
+app = create_app()
 
-
-@app.get("/api/v1/telemetry/context-latency")
-def get_context_latency_telemetry(
-    limit: int = Query(25, ge=1, le=250),
-    model: str | None = Query(default=None),
-    user: AuthenticatedUser = Depends(require_permissions(Permission.FILINGS_READ.value)),
-) -> dict[str, Any]:
-    """Return model-call context latency telemetry, KV-cache prefill savings, and Pro/Flash routing strategy."""
-    record_security_audit_event(
-        event_type="context_latency_telemetry_read",
-        user=user,
-        resource="/api/v1/telemetry/context-latency",
-        detail=f"limit={limit} model={model or 'ALL'}",
-    )
-    tracker = get_context_latency_tracker()
-    records = tracker.recent_records(limit=limit, model_name=model)
-    sink = get_telemetry_sink()
-    return {
-        "status": "ok",
-        "adk_runtime": get_live_runtime_status_metadata(),
-        "models": get_model_strategy_metadata(),
-        "context_cache_runtime": get_context_cache_runtime_stats(),
-        "telemetry_sink": sink.status_metadata(),
-        "session_summary": sink.summarize_session_telemetry(),
-        "summary": tracker.summarize().model_dump(mode="json"),
-        "record_count": len(records),
-        "recent_records": [r.model_dump(mode="json") for r in records],
-    }
-
-
-@app.get("/api/v1/telemetry/sessions")
-def get_session_and_tool_telemetry(
-    limit: int = Query(50, ge=1, le=500),
-    session_id: str | None = Query(default=None),
-    user: AuthenticatedUser = Depends(require_permissions(Permission.AUDIT_READ.value)),
-) -> dict[str, Any]:
-    """Retrieve conversational session length, companies analyzed, report counts, tool usage, and BigQuery sink metrics."""
-    record_security_audit_event(
-        event_type="session_telemetry_read",
-        user=user,
-        resource="/api/v1/telemetry/sessions",
-        detail=f"limit={limit} session_id={session_id or 'ALL'}",
-    )
-    sink = get_telemetry_sink()
-    events = sink.query_session_telemetry(limit=limit, session_id=session_id)
-    return {
-        "status": "ok",
-        "requested_by": user.email,
-        "telemetry_sink": sink.status_metadata(),
-        "summary": sink.summarize_session_telemetry(),
-        "event_count": len(events),
-        "events": events,
-    }
-
-
-@app.post("/api/v1/evaluate")
-def evaluate_grounded_narrative(
-    req: EvaluationRequest,
-    user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
-) -> dict[str, Any]:
-    """Run Gemini 3.5 Flash LLM-as-a-Judge evaluation on a financial variance explanation."""
-    try:
-        report = evaluate_variance_explanation(
-            query=req.query,
-            response_markdown=req.response_markdown,
-            variance_reports=req.variance_reports,
-            citations=req.citations,
-            cached_explanations_count=req.cached_explanations_count,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "status": "error",
-                "error": "live_adk_unavailable",
-                "message": str(exc),
-            },
-        ) from exc
-    record_security_audit_event(
-        event_type="flash_narrative_evaluation",
-        user=user,
-        resource="/api/v1/evaluate",
-        detail=f"model={report.evaluator_model} grade={report.grade} score={report.overall_score}",
-    )
-    return {
-        "status": "success",
-        "evaluation": report.model_dump(mode="json"),
-    }
-
-
-@app.post("/api/v1/coding-assist")
-def coding_assistance_endpoint(
-    req: CodingAssistRequest,
-    user: AuthenticatedUser = Depends(require_permissions(Permission.CHAT_QUERY.value)),
-) -> dict[str, Any]:
-    """Run Gemini 3.5 Flash analytical coding assistance (SQL, Python variance audit, or LookML)."""
-    try:
-        report = generate_financial_coding_assistance(
-            prompt=req.prompt,
-            language=req.language,
-            tickers=req.tickers,
-            start_year=req.start_year,
-            end_year=req.end_year,
-            dataset_id=req.dataset_id,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "status": "error",
-                "error": "live_adk_unavailable",
-                "message": str(exc),
-            },
-        ) from exc
-    record_security_audit_event(
-        event_type="flash_coding_assistance",
-        user=user,
-        resource="/api/v1/coding-assist",
-        tickers=report.tickers_referenced,
-        detail=f"model={report.assistant_model} language={report.language}",
-    )
-    return {
-        "status": "success",
-        "coding_assistance": report.model_dump(mode="json"),
-    }
-
-
-def _enrich_section_response(
-    ticker: str,
-    fiscal_year: int,
-    section_id: str,
-    max_chars: int,
-) -> dict[str, Any]:
-    res = load_cached_10k_section(
-        ticker=ticker,
-        fiscal_year=fiscal_year,
-        section_id=section_id,
-        max_chars=max_chars,
-    )
-    if res.get("status") == "error":
-        raise HTTPException(status_code=404, detail=res.get("message", "Section not found"))
-
-    norm_t = ticker.strip().upper().replace(".", "-")
-    profiles = get_active_gcp_tool_adapters().bigquery.fetch_profiles(
-        tickers={norm_t}, start_year=fiscal_year, end_year=fiscal_year
-    )
-    matched_prof = profiles[0] if profiles else None
-    if matched_prof is not None:
-        res["cik"] = matched_prof.cik
-        res["accession_number"] = matched_prof.accession_number
-        res["filing_date"] = matched_prof.filing_date
-        res["period_of_report"] = matched_prof.period_of_report
-        res["gics_sector"] = matched_prof.gics_sector
-        res["gics_sub_industry"] = matched_prof.gics_sub_industry
-    return res
-
-
-@app.get("/api/v1/section")
-def get_cached_section(
-    ticker: str = "NVDA",
-    fiscal_year: int = 2026,
-    section_id: Literal["item_1a", "item_7"] = "item_7",
-    max_chars: int = 32000,
-    user: AuthenticatedUser = Depends(
-        require_permissions(
-            Permission.FILINGS_READ.value,
-            agent_tool="load_cached_10k_section",
-        )
-    ),
-) -> dict[str, Any]:
-    """Load a cached 10-K filing section (Item 1A Risk Factors or Item 7 MD&A) for the split-pane source viewer."""
-    record_security_audit_event(
-        event_type="filing_10k_section_read",
-        user=user,
-        resource="/api/v1/section",
-        tickers=[ticker],
-        detail=f"FY{fiscal_year} {section_id}",
-    )
-    return _enrich_section_response(
-        ticker=ticker,
-        fiscal_year=fiscal_year,
-        section_id=section_id,
-        max_chars=max_chars,
-    )
-
-
-@app.post("/api/v1/section")
-def post_cached_section(
-    req: SectionLoadRequest,
-    user: AuthenticatedUser = Depends(
-        require_permissions(
-            Permission.FILINGS_READ.value,
-            agent_tool="load_cached_10k_section",
-        )
-    ),
-) -> dict[str, Any]:
-    """Load a cached 10-K filing section via POST payload."""
-    record_security_audit_event(
-        event_type="filing_10k_section_read",
-        user=user,
-        resource="/api/v1/section",
-        tickers=[req.ticker],
-        detail=f"FY{req.fiscal_year} {req.section_id}",
-    )
-    return _enrich_section_response(
-        ticker=req.ticker,
-        fiscal_year=req.fiscal_year,
-        section_id=req.section_id,
-        max_chars=req.max_chars,
-    )
-
-
-@app.post("/api/v1/feedback")
-def submit_analyst_feedback(
-    req: FeedbackRequest,
-    user: AuthenticatedUser = Depends(require_permissions(Permission.FEEDBACK_SUBMIT.value)),
-) -> dict[str, Any]:
-    """Persist analyst thumbs-up/down audit feedback and optional comment to Firestore."""
-    persisted = get_feedback_store().record_feedback(
-        message_id=req.message_id,
-        rating=req.rating,
-        comment=req.comment,
-        query=req.query,
-        user_email=user.email,
-        identity_provider=user.identity_provider,
-        session_id=req.session_id,
-        tickers=req.tickers,
-        intent=req.intent,
-    )
-    entry = persisted["entry"]
-    record_security_audit_event(
-        event_type="analyst_feedback_submitted",
-        user=user,
-        resource="/api/v1/feedback",
-        tickers=req.tickers,
-        detail=f"message_id={req.message_id} rating={req.rating} backend={persisted['backend_used']}",
-    )
-    logger.info(
-        "Recorded analyst feedback message_id=%s rating=%s user=%s backend=%s",
-        req.message_id,
-        req.rating,
-        user.email,
-        persisted["backend_used"],
-    )
-    return {
-        "status": "success",
-        "recorded": entry,
-        "persistence": {
-            "backend": persisted["backend_used"],
-            "database_id": persisted["database_id"],
-            "collection": persisted["collection"],
-            "document_name": persisted["document_name"],
-        },
-        "total_feedback_count": persisted["total_feedback_count"],
-    }
-
-
-@app.get("/api/v1/feedback")
-def list_analyst_feedback(
-    limit: int = Query(50, ge=1, le=500),
-    rating: Literal["up", "down"] | None = Query(default=None),
-    user: AuthenticatedUser = Depends(require_permissions(Permission.AUDIT_READ.value)),
-) -> dict[str, Any]:
-    """List persisted analyst feedback ratings and audit comments from Firestore."""
-    record_security_audit_event(
-        event_type="analyst_feedback_listed",
-        user=user,
-        resource="/api/v1/feedback",
-        detail=f"limit={limit} rating={rating or 'ALL'}",
-    )
-    result = get_feedback_store().list_feedback(limit=limit, rating=rating)
-    return {
-        "status": "ok",
-        "requested_by": user.email,
-        **result,
-    }
-
-
-def _resolve_frontend_dist_dir() -> Path | None:
-    candidates: list[Path] = []
-    env_override = os.environ.get("FRONTEND_DIST_DIR", "").strip()
-    if env_override:
-        candidates.append(Path(env_override))
-    candidates.append(Path.cwd() / "frontend" / "dist")
-    candidates.append(Path(__file__).resolve().parents[2] / "frontend" / "dist")
-    for directory in candidates:
-        if (directory / "index.html").is_file():
-            return directory.resolve()
-    return None
-
-
-@app.get("/", include_in_schema=False)
-@app.get("/{full_path:path}", include_in_schema=False)
-def serve_terminal_ui(full_path: str = "") -> FileResponse:
-    """Serve the compiled SEC EDGAR Terminal UI identically in local preview and Cloud Run."""
-    normalized = full_path.strip("/")
-    if normalized == "api" or normalized.startswith("api/"):
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
-
-    dist_dir = _resolve_frontend_dist_dir()
-    if dist_dir is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Frontend bundle not found. Run 'make build' to compile frontend/dist.",
-        )
-
-    if normalized:
-        asset_path = (dist_dir / normalized).resolve()
-        if asset_path.is_relative_to(dist_dir) and asset_path.is_file():
-            return FileResponse(asset_path)
-
-    return FileResponse(dist_dir / "index.html")
+__all__ = [
+    "ChatQueryRequest",
+    "DevWorkspaceSsoLoginRequest",
+    "FeedbackRequest",
+    "FilingScopeMixin",
+    "LiveRuntimeUnavailableError",
+    "SsoTokenExchangeRequest",
+    "_resolve_frontend_dist_dir",
+    "app",
+    "create_app",
+    "run_conversational_rag_turn",
+]

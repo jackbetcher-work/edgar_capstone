@@ -1,4 +1,4 @@
-"""Unit tests for ADK RootOrchestrator, FinancialAnalystAgent, and specialized tools."""
+"""Unit tests for ADK FinancialAnalystAgent, NarrativeEvaluatorAgent, callbacks, intent routing, and tools."""
 
 from __future__ import annotations
 
@@ -11,29 +11,33 @@ from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
+import edgar_capstone.agents as agents_mod
 from edgar_capstone.agents import (
+    AnomalyFlagTool,
     ContextCacheTool,
-    FinancialAnalystAgent,
+    DisclosureDeltaTool,
     HybridSearchTool,
     LookerQueryTool,
     MetricFetchTool,
+    QueryCached10KTool,
     RateLimitExceededError,
-    RootOrchestrator,
     VarianceCalculationTool,
     after_model_fact_check_callback,
+    after_model_telemetry_callback,
     before_agent_telemetry_callback,
     before_model_safety_and_latency_callback,
+    before_model_telemetry_callback,
     calculate_period_variances,
     classify_query_intent,
     create_financial_analyst_agent,
-    create_root_orchestrator,
+    create_narrative_evaluator_agent,
     fetch_financial_metrics,
     load_cached_10k_section,
     query_looker_financial_explore,
-    root_agent,
     search_10k_chunks_rag,
     with_tool_resilience,
 )
+from edgar_capstone.agents.intent import classify_query_intent as intent_classify_query_intent
 from edgar_capstone.agents.tools import get_active_gcp_tool_adapters
 
 
@@ -41,17 +45,34 @@ def _dummy_tool_context() -> SimpleNamespace:
     return SimpleNamespace(state={}, actions=SimpleNamespace(escalate=False))
 
 
-def test_adk_agent_hierarchy_and_tool_registration() -> None:
-    assert isinstance(RootOrchestrator, Agent)
-    assert RootOrchestrator is root_agent
-    assert RootOrchestrator.name == "RootOrchestrator"
+def test_adk_agent_factories_and_tool_registration() -> None:
+    analyst = create_financial_analyst_agent()
+    assert isinstance(analyst, Agent)
+    assert analyst.name == "FinancialAnalystAgent"
+    assert callable(analyst.instruction)
+    assert analyst.before_model_callback is before_model_safety_and_latency_callback
+    assert analyst.after_model_callback is after_model_fact_check_callback
 
-    assert isinstance(FinancialAnalystAgent, Agent)
-    assert FinancialAnalystAgent.name == "FinancialAnalystAgent"
+    evaluator = create_narrative_evaluator_agent()
+    assert isinstance(evaluator, Agent)
+    assert evaluator.name == "NarrativeEvaluatorAgent"
+    assert callable(evaluator.instruction)
+    # Judge uses telemetry-only callbacks (never Model Armor HTTP or AnalystReport parsing)
+    assert evaluator.before_model_callback is before_model_telemetry_callback
+    assert evaluator.after_model_callback is after_model_telemetry_callback
 
-    # RootOrchestrator supervises FinancialAnalystAgent
-    sub_names = [sa.name for sa in RootOrchestrator.sub_agents]
-    assert "FinancialAnalystAgent" in sub_names
+    # Retired eager singletons & unused supervisor hierarchy are no longer exported
+    for retired in (
+        "RootOrchestrator",
+        "root_agent",
+        "create_root_orchestrator",
+        "FinancialAnalystAgent",
+        "NarrativeEvaluatorAgent",
+        "ContextCacheAgent",
+        "CodingAssistantAgent",
+        "edgar_adk_app",
+    ):
+        assert not hasattr(agents_mod, retired), f"Retired symbol {retired!r} should be removed"
 
     # Verify explicit ADK FunctionTool wrappers
     for tool_obj in (
@@ -60,21 +81,26 @@ def test_adk_agent_hierarchy_and_tool_registration() -> None:
         VarianceCalculationTool,
         HybridSearchTool,
         ContextCacheTool,
+        QueryCached10KTool,
+        AnomalyFlagTool,
+        DisclosureDeltaTool,
     ):
         assert isinstance(tool_obj, FunctionTool)
 
-    analyst = create_financial_analyst_agent()
     tool_names = [t.name for t in analyst.tools]
     assert "calculate_period_variances" in tool_names
+    assert "flag_material_variances" in tool_names
     assert "fetch_financial_metrics" in tool_names
     assert "query_looker_financial_explore" in tool_names
     assert "search_10k_chunks_rag" in tool_names
     assert "query_cached_10k_context" in tool_names
+    assert "compare_disclosures_across_years" in tool_names
     # Targeted retrieval only: the synthesis agent cannot pull whole 10-K sections
     assert "load_cached_10k_section" not in tool_names
 
 
 def test_intent_routing_classification() -> None:
+    assert classify_query_intent is intent_classify_query_intent
     assert (
         classify_query_intent("Compare NVIDIA and Apple's R&D spend from 2024-2026")
         == "multi_company_peer_comparison"
@@ -254,7 +280,7 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
 
     # Test Model Armor prompt-injection blocking callback
     cb_ctx = MagicMock()
-    cb_ctx.agent_name = "RootOrchestrator"
+    cb_ctx.agent_name = "FinancialAnalystAgent"
     cb_ctx.state = {}
     before_agent_telemetry_callback(cb_ctx)
 
@@ -300,4 +326,30 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
     after_model_fact_check_callback(cb_ctx, valid_llm_resp)
     assert cb_ctx.state["fact_check_report"]["passed"] is True
     assert cb_ctx.state["fact_check_report"]["matched_citations_count"] >= 1
-    assert isinstance(create_root_orchestrator(), Agent)
+
+    # Test telemetry-only callbacks used by NarrativeEvaluatorAgent (no Model Armor or fact-check)
+    eval_ctx = MagicMock()
+    eval_ctx.agent_name = "NarrativeEvaluatorAgent"
+    eval_ctx.state = {}
+    before_agent_telemetry_callback(eval_ctx)
+    assert before_model_telemetry_callback(eval_ctx, inj_req) is None
+    assert "model_armor_blocked" not in eval_ctx.state
+    assert "model_armor_last_decision" not in eval_ctx.state
+
+    judge_resp = LlmResponse(
+        model_version="gemini-3.5-flash",
+        content=genai_types.Content(
+            role="model",
+            parts=[genai_types.Part(text='{"grade": "pass", "overall_score": 0.94}')],
+        ),
+        usage_metadata=genai_types.GenerateContentResponseUsageMetadata(
+            prompt_token_count=320,
+            candidates_token_count=24,
+        ),
+    )
+    assert after_model_telemetry_callback(eval_ctx, judge_resp) is None
+    assert len(eval_ctx.state["latency_metrics"]) == 1
+    assert eval_ctx.state["latency_metrics"][0]["model_name"] == "gemini-3.5-flash"
+    assert "fact_check_report" not in eval_ctx.state
+    assert isinstance(create_financial_analyst_agent(), Agent)
+    assert isinstance(create_narrative_evaluator_agent(), Agent)

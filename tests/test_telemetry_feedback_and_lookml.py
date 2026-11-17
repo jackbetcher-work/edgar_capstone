@@ -22,8 +22,8 @@ from edgar_capstone.agents.context_memory import (
     get_context_latency_tracker,
     get_model_strategy_metadata,
 )
-from edgar_capstone.agents.evaluation_and_coding import generate_financial_coding_assistance
 from edgar_capstone.agents.schemas import ContextBreakdown
+from edgar_capstone.agents.tools import query_looker_financial_explore
 from edgar_capstone.security import (
     GOOGLE_IAP_ISSUER,
     GOOGLE_IAP_JWKS_URI,
@@ -409,7 +409,14 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     assert sess_row_1["session_id"] == "sess-bq-stream-1"
     assert sess_row_1["session_cumulative_turns"] == 1
     assert sess_row_1["tickers_analyzed"] == ["NVDA"]
-    # A report counts as generated only when the live answer passed verification
+    # Deferred judge stores grade="pending" and score=None (BigQuery NULL) when answer is verified;
+    # withheld answers store grade="fail" and score=0.0.
+    if turn_1["answer_verified"]:
+        assert sess_row_1["evaluation_grade"] == "pending"
+        assert sess_row_1["evaluation_score"] is None
+    else:
+        assert sess_row_1["evaluation_grade"] == "fail"
+        assert sess_row_1["evaluation_score"] == 0.0
     assert sess_row_1["report_generated"] is bool(turn_1["answer_verified"])
     assert sess_row_1["execution_mode"] == "live_adk"
     assert len(sess_row_1["tool_invocations"]) >= 2
@@ -785,7 +792,8 @@ def test_lookml_catalog_views_models_and_dashboards_validity(
             assert elem["model"] == "sec_edgar_analytics"
             assert elem["explore"] in expected_explores
 
-    # Verify `/health`, `/api/v1/looker/catalog`, new `/api/v1/explore/*`, and `/api/v1/telemetry/sessions`
+    # Verify `/health`, pruned Looker/telemetry routes return 404, direct Looker explore calls,
+    # and retained `/api/v1/chat`, `/api/v1/section`, and `/api/v1/telemetry/sessions`
     client: TestClient = auth_client_env["client"]
     analyst_jwt = auth_client_env["mint_token"](
         "analyst@fde-workspace.corp",
@@ -796,11 +804,20 @@ def test_lookml_catalog_views_models_and_dashboards_validity(
     health = client.get("/health")
     assert health.status_code == 200
     health_json = health.json()
+    assert health_json["root_agent"] == "FinancialAnalystAgent"
     assert health_json["lookml_semantic_layer"]["model_count"] == 1
     assert health_json["lookml_semantic_layer"]["view_count"] == 6
     assert health_json["lookml_semantic_layer"]["dashboard_count"] == 2
     assert "telemetry_sink" in health_json
     assert "feedback_store" in health_json
+
+    # Verify retained section viewer endpoint logs a real audit event
+    sec_resp = client.get(
+        "/api/v1/section",
+        headers=headers,
+        params={"ticker": "NVDA", "fiscal_year": 2026, "section_id": "item_7", "max_chars": 2000},
+    )
+    assert sec_resp.status_code == 200
 
     # One live chat turn so the LLM, session, and audit buffers have real records to explore
     chat_resp = client.post(
@@ -815,19 +832,34 @@ def test_lookml_catalog_views_models_and_dashboards_validity(
         },
     )
     assert chat_resp.status_code == 200
-    assert chat_resp.json()["status"] == "success"
+    chat_json = chat_resp.json()
+    assert chat_json["status"] == "success"
+    if chat_json["answer_verified"]:
+        assert chat_json["evaluation"]["grade"] == "pending"
+        assert chat_json["evaluation"]["overall_score"] is None
 
-    cat_resp = client.get("/api/v1/looker/catalog", headers=headers)
-    assert cat_resp.status_code == 200
-    assert cat_resp.json()["model_count"] == 1
+    # Pruned HTTP routes return 404; underlying Python helpers stay directly callable
+    assert client.get("/api/v1/looker/catalog", headers=headers).status_code == 404
+    assert client.get("/api/v1/telemetry/context-latency", headers=headers).status_code == 404
+
+    direct_catalog = load_lookml_project_catalog()
+    assert direct_catalog["status"] == "ok"
+    assert direct_catalog["model_count"] == 1
+    assert direct_catalog["view_count"] == 6
+    assert direct_catalog["dashboard_count"] == 2
 
     for explore_slug in ("llm_telemetry", "session_analytics", "audit_trail"):
-        exp_resp = client.get(f"/api/v1/explore/{explore_slug}", headers=headers)
-        assert exp_resp.status_code == 200
-        exp_json = exp_resp.json()
-        assert exp_json["status"] == "success"
-        assert exp_json["lookml_model"] == "sec_edgar_analytics"
-        assert exp_json["row_count"] >= 1
+        assert client.get(f"/api/v1/explore/{explore_slug}", headers=headers).status_code == 404
+        exp_res = query_looker_financial_explore(
+            explore_name=explore_slug,
+            tickers="ALL",
+            gics_sector="ALL",
+            start_year=2024,
+            end_year=2026,
+        )
+        assert exp_res["status"] == "success"
+        assert exp_res["lookml_model"] == "sec_edgar_analytics"
+        assert exp_res["row_count"] >= 1
 
     sess_resp = client.get(
         "/api/v1/telemetry/sessions?session_id=sess-explore-check",
@@ -837,20 +869,6 @@ def test_lookml_catalog_views_models_and_dashboards_validity(
     sess_json = sess_resp.json()
     assert sess_json["event_count"] == 1
     assert sess_json["summary"]["distinct_companies_analyzed"] == ["MSFT", "NVDA"]
-
-    # Live CodingAssistantAgent LookML generation targets the BigQuery dataset
-    coding_report = generate_financial_coding_assistance(
-        prompt="Create a LookML view and explore for YoY revenue variance and telemetry cost.",
-        language="lookml",
-        tickers="NVDA,MSFT",
-    )
-    assert coding_report.language == "lookml"
-    assert coding_report.task_category == "coding_assistance"
-    assert coding_report.code.strip() and coding_report.explanation.strip()
-    lookml = coding_report.code.lower()
-    assert "view" in lookml and ("dimension" in lookml or "measure" in lookml)
-    assert "sec_edgar" in lookml
-    assert coding_report.total_latency_ms > 0
 
 
 # ---------------------------------------------------------------------------

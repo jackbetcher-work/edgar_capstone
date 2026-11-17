@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from edgar_capstone.agents import FinancialAnalystAgent
+from edgar_capstone.agents import create_financial_analyst_agent
 from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.agents.disclosure_deltas import (
     SectionMaterial,
@@ -427,7 +427,8 @@ def test_compare_disclosures_tool_on_live_corpus() -> None:
 
 
 def test_analyst_agent_registers_new_tools_with_least_privilege() -> None:
-    names = {getattr(t, "name", "") for t in FinancialAnalystAgent.tools}
+    analyst = create_financial_analyst_agent()
+    names = {getattr(t, "name", "") for t in analyst.tools}
     assert {"flag_material_variances", "compare_disclosures_across_years"} <= names
     for tool in ("flag_material_variances", "compare_disclosures_across_years"):
         claims = authorize_agent_tool_invocation(

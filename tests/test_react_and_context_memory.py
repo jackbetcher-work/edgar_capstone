@@ -19,7 +19,7 @@ from google.adk.memory import InMemoryMemoryService
 from google.adk.models.base_llm import BaseLlm, LlmCapabilities
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
-from google.adk.planners import BuiltInPlanner, PlanReActPlanner
+from google.adk.planners import BuiltInPlanner
 from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
@@ -27,24 +27,24 @@ from google.genai import types as genai_types
 from edgar_capstone.agents import (
     FINANCIAL_REASONING_MODEL,
     FLASH_CODING_AND_EVAL_MODEL,
-    CodingAssistantAgent,
     ContextBreakdown,
-    ContextCacheAgent,
     ContextLatencyTracker,
     ConversationMemoryManager,
-    FinancialAnalystAgent,
-    NarrativeEvaluatorAgent,
     QueryCached10KTool,
-    RootOrchestrator,
     StructuredReActExecutor,
+    after_model_fact_check_callback,
+    after_model_telemetry_callback,
     attribute_context_latency,
+    before_model_safety_and_latency_callback,
+    before_model_telemetry_callback,
     calculate_period_variances,
     create_edgar_adk_app,
     create_financial_analyst_agent,
-    edgar_adk_app,
+    create_narrative_evaluator_agent,
     evaluate_calculated_variances,
+    evaluate_variance_explanation,
     extract_llm_request_context_breakdown,
-    generate_financial_coding_assistance,
+    flush_pending_evaluations,
     get_context_latency_tracker,
     get_conversation_memory_manager,
     get_model_strategy_metadata,
@@ -247,32 +247,28 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     ):
         assert resolve_model_for_task(flash_task) == "gemini-3.5-flash"  # type: ignore[arg-type]
 
-    # ADK Agent model assignments & PlanReActPlanner registration
-    assert RootOrchestrator.model == "gemini-3.8-flash"
-    assert FinancialAnalystAgent.model == "gemini-3.8-flash"
-    assert isinstance(RootOrchestrator.planner, PlanReActPlanner)
+    # ADK Agent model assignments, planners & callbacks via lazy factories
+    analyst = create_financial_analyst_agent()
+    evaluator = create_narrative_evaluator_agent()
+    assert analyst.model == "gemini-3.8-flash"
     # Native thinking for the analyst: PlanReActPlanner's text "/*ACTION*/" tool snippets made
     # Gemini 3.x write tool calls as prose instead of issuing function calls.
-    assert isinstance(FinancialAnalystAgent.planner, BuiltInPlanner)
-    assert FinancialAnalystAgent.planner.thinking_config.include_thoughts is True
+    assert isinstance(analyst.planner, BuiltInPlanner)
+    assert analyst.planner.thinking_config.include_thoughts is True
+    assert analyst.before_model_callback is before_model_safety_and_latency_callback
+    assert analyst.after_model_callback is after_model_fact_check_callback
 
-    assert NarrativeEvaluatorAgent.model == "gemini-3.5-flash"
-    assert CodingAssistantAgent.model == "gemini-3.5-flash"
-    assert ContextCacheAgent.model == "gemini-3.5-flash"
+    assert evaluator.model == "gemini-3.5-flash"
+    assert evaluator.before_model_callback is before_model_telemetry_callback
+    assert evaluator.after_model_callback is after_model_telemetry_callback
 
-    sub_agent_models = {sa.name: sa.model for sa in RootOrchestrator.sub_agents}
-    assert sub_agent_models["FinancialAnalystAgent"] == "gemini-3.8-flash"
-    assert sub_agent_models["ContextCacheAgent"] == "gemini-3.5-flash"
-    assert sub_agent_models["NarrativeEvaluatorAgent"] == "gemini-3.5-flash"
-    assert sub_agent_models["CodingAssistantAgent"] == "gemini-3.5-flash"
-
-    analyst_tool_names = {t.name for t in FinancialAnalystAgent.tools}
+    analyst_tool_names = {t.name for t in analyst.tools}
     assert QueryCached10KTool.name == "query_cached_10k_context"
     assert "query_cached_10k_context" in analyst_tool_names
 
     # ADK App ContextCacheConfig + EventsCompactionConfig (summarized via Gemini 3.5 Flash)
-    assert isinstance(edgar_adk_app, App)
-    custom_app = create_edgar_adk_app(RootOrchestrator, app_name="edgar_test_app")
+    custom_app = create_edgar_adk_app(analyst, app_name="edgar_test_app")
+    assert isinstance(custom_app, App)
     assert custom_app.context_cache_config is not None
     assert custom_app.context_cache_config.min_tokens == 2048
     assert custom_app.context_cache_config.ttl_seconds == 1800
@@ -284,6 +280,7 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     meta = get_model_strategy_metadata()
     assert meta["financial_reasoning_model"] == "gemini-3.8-flash"
     assert meta["coding_and_evaluation_model"] == "gemini-3.5-flash"
+    assert meta["events_compaction_config"]["compaction_method"] == "deterministic_digest"
 
 
 def test_adk_runner_executes_structured_react_loop_with_context_latency_tracking() -> None:
@@ -589,23 +586,6 @@ def test_structured_react_executor_live_peer_comparison() -> None:
         assert out["adk_runtime"]["answer_withheld_reason"]
 
 
-def test_flash_coding_assistance_python_and_lookml() -> None:
-    """Live `gemini-3.5-flash` CodingAssistantAgent across non-SQL languages."""
-    for lang in ("python", "lookml"):
-        code_rep = generate_financial_coding_assistance(
-            prompt="Audit NVDA and MSFT YoY revenue and operating margin variances",
-            language=lang,  # type: ignore[arg-type]
-            tickers="NVDA,MSFT",
-            start_year=2024,
-            end_year=2026,
-        )
-        assert _is_model(code_rep.assistant_model, "gemini-3.5-flash")
-        assert code_rep.task_category == "coding_assistance"
-        assert code_rep.language == lang
-        assert code_rep.code.strip()
-        assert code_rep.context_tokens > 0
-
-
 def test_conversation_memory_token_threshold_compaction() -> None:
     """Older turns are compacted into a digest once session memory crosses the token threshold."""
     compact_mgr = ConversationMemoryManager(token_threshold=80, retention_turns=1)
@@ -647,7 +627,9 @@ def test_conversation_memory_token_threshold_compaction() -> None:
 
 
 def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
-    """Two live /api/v1/chat turns (follow-up inherits scope), then telemetry, evaluate, coding."""
+    """Two live /api/v1/chat turns (follow-up inherits scope), session telemetry, tracker, and judge."""
+    tracker = get_context_latency_tracker()
+    tracker.reset()
     get_conversation_memory_manager().reset()
     client = TestClient(app)
     headers = _bearer_headers()
@@ -655,6 +637,8 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
     health_resp = client.get("/health")
     assert health_resp.status_code == 200
     h_body = health_resp.json()
+    assert h_body["root_agent"] == "FinancialAnalystAgent"
+    assert h_body["active_agents"] == ["FinancialAnalystAgent", "NarrativeEvaluatorAgent"]
     assert h_body["reasoning_strategy"] == "structured_react_loop"
     assert h_body["models"] == {
         "financial_reasoning": "gemini-3.8-flash",
@@ -681,11 +665,18 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
     assert turn1["react_execution"]["iterations"] >= 4
     assert len(turn1["react_execution"]["cached_10k_explanations"]) >= 1
     assert _is_model(turn1["evaluation"]["evaluator_model"], "gemini-3.5-flash")
-    assert turn1["react_execution"]["judge_mode"] == "async_background"
     assert turn1["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
     # Interactive HTTP turn keeps live LLM-as-a-Judge off the critical path (>= 1 analyst call)
     assert turn1["context_and_memory"]["turn_context_latency"]["total_calls"] >= 1
     assert isinstance(turn1["answer_verified"], bool)
+    if turn1["answer_verified"]:
+        assert turn1["react_execution"]["judge_mode"] == "async_background"
+        assert turn1["evaluation"]["grade"] == "pending"
+        assert turn1["evaluation"]["overall_score"] is None
+    else:
+        assert turn1["react_execution"]["judge_mode"] == "skipped"
+        assert turn1["evaluation"]["grade"] == "fail"
+        assert turn1["evaluation"]["overall_score"] == 0.0
 
     # Turn 2 omits the company ("those margins") and inherits NVDA from session memory
     resp2 = client.post(
@@ -705,55 +696,41 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
     assert turn2["context_and_memory"]["session_memory"]["has_prior_memory"] is True
     assert turn2["context_and_memory"]["session_memory"]["turn_count"] == 1
 
-    # Context-induced latency telemetry endpoint reflects the live model calls
-    tel_resp = client.get(
-        "/api/v1/telemetry/context-latency",
+    # Flush async background judge tasks so telemetry records reflect both analyst & judge calls
+    flush_pending_evaluations(timeout=30.0)
+
+    # Retained session telemetry HTTP endpoint reflects both turns
+    sess_tel_resp = client.get(
+        "/api/v1/telemetry/sessions",
         headers=headers,
-        params={"limit": 10},
+        params={"session_id": "http-multi-turn-session", "limit": 20},
     )
-    assert tel_resp.status_code == 200
-    t_body = tel_resp.json()
-    assert t_body["status"] == "ok"
-    assert t_body["summary"]["total_calls"] >= 4
-    assert len(t_body["recent_records"]) >= 1
-    by_model = list(t_body["summary"]["by_model"])
+    assert sess_tel_resp.status_code == 200, sess_tel_resp.text
+    st_body = sess_tel_resp.json()
+    assert st_body["status"] == "ok"
+    assert st_body["event_count"] >= 2
+
+    # Direct Python ContextLatencyTracker check (replaces retired `/api/v1/telemetry/context-latency`)
+    tracker_summary = tracker.summarize()
+    assert tracker_summary.total_calls >= 2
+    assert len(tracker.recent_records(limit=10)) >= 1
+    by_model = list(tracker_summary.by_model)
     assert any(_is_model(m, "gemini-3.8-flash") for m in by_model), by_model
-    assert any(_is_model(m, "gemini-3.5-flash") for m in by_model), by_model
+    if turn1["answer_verified"] or turn2["answer_verified"]:
+        assert any(_is_model(m, "gemini-3.5-flash") for m in by_model), by_model
 
-    # Gemini 3.5 Flash Evaluation endpoint (live judge)
-    eval_resp = client.post(
-        "/api/v1/evaluate",
-        headers=headers,
-        json={
-            "query": "NVDA FY2024-2026 revenue and operating margin",
-            "response_markdown": turn1["answer_markdown"],
-            "variance_reports": turn1["variance_reports"],
-            "citations": turn1["citations"],
-            "cached_explanations_count": len(turn1["react_execution"]["cached_10k_explanations"]),
-        },
+    # Direct Python Gemini 3.5 Flash judge check (replaces retired `/api/v1/evaluate`)
+    evaluation = evaluate_variance_explanation(
+        query="NVDA FY2024-2026 revenue and operating margin",
+        response_markdown=turn1["answer_markdown"],
+        variance_reports=turn1["variance_reports"],
+        citations=turn1["citations"],
+        cached_explanations_count=len(turn1["react_execution"]["cached_10k_explanations"]),
     )
-    assert eval_resp.status_code == 200, eval_resp.text
-    evaluation = eval_resp.json()["evaluation"]
-    assert _is_model(evaluation["evaluator_model"], "gemini-3.5-flash")
-    assert evaluation["grade"] in {"pass", "needs_revision", "fail"}
-
-    # Gemini 3.5 Flash Coding Assistance endpoint (live)
-    code_resp = client.post(
-        "/api/v1/coding-assist",
-        headers=headers,
-        json={
-            "prompt": "Generate a BigQuery SQL query for YoY revenue and operating margin variances",
-            "language": "sql",
-            "tickers": "NVDA,MSFT",
-            "start_year": 2024,
-            "end_year": 2026,
-        },
-    )
-    assert code_resp.status_code == 200, code_resp.text
-    code_body = code_resp.json()["coding_assistance"]
-    assert _is_model(code_body["assistant_model"], "gemini-3.5-flash")
-    assert "SELECT" in code_body["code"].upper()
-    assert "sec_edgar." in code_body["code"]
+    assert _is_model(evaluation.evaluator_model, "gemini-3.5-flash")
+    assert evaluation.grade in {"pass", "needs_revision", "fail"}
+    assert evaluation.overall_score is not None
+    assert 0.0 <= evaluation.overall_score <= 1.0
 
 
 def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
@@ -782,11 +759,19 @@ def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
     ctx = SimpleNamespace(state={})
     analyst_text = make_adk_instruction_provider("financial_analyst")(ctx)
     assert "FinancialAnalystAgent (`gemini-3.8-flash`)" in analyst_text
-    root_text = make_adk_instruction_provider("root_orchestrator")(ctx)
-    assert "RootOrchestrator (`gemini-3.8-flash`)" in root_text
-    assert "gemini-2.5-pro" not in root_text
+    assert "gemini-2.5-pro" not in analyst_text
+
+    analyst_v5_text = make_adk_instruction_provider("financial_analyst", version="latest")(ctx)
+    assert "FinancialAnalystAgent (`gemini-3.8-flash`)" in analyst_v5_text
+    assert "gemini-2.5-pro" not in analyst_v5_text
+
+    eval_text = make_adk_instruction_provider("narrative_evaluator")(ctx)
+    assert "NarrativeEvaluatorAgent" in eval_text
+    assert "(`gemini-3.5-flash`)" in eval_text
 
     monkeypatch.setenv("EDGAR_ANALYST_MODEL", "gemini-next-pro")
     assert "FinancialAnalystAgent (`gemini-next-pro`)" in make_adk_instruction_provider(
         "financial_analyst"
     )(ctx)
+    monkeypatch.setenv("EDGAR_FLASH_MODEL", "gemini-next-flash")
+    assert "(`gemini-next-flash`)" in make_adk_instruction_provider("narrative_evaluator")(ctx)

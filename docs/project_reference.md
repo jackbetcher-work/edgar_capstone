@@ -34,7 +34,7 @@ Supported query types (routing intents): `longitudinal_single_company`, `multi_c
 ### Objective Traceability
 | Objective | Delivered By | Measured By (§5) |
 |---|---|---|
-| B1 | Chat UI, RootOrchestrator intent routing, session memory (§7) | Intent routing accuracy, latency |
+| B1 | Chat UI, deterministic intent routing (`agents/intent.py`, `agents/chat_engine.py`), Firestore session memory (§7) | Intent routing accuracy, latency |
 | B2 | Deterministic Variance Calculation Engine (§7) | Numerical accuracy |
 | B3 | Deterministic anomaly flagging + grounded MD&A/Risk Factor explanations (§7) | Grounding recall, LLM-as-a-Judge explanation quality |
 | T1 | BigQuery metrics + Vertex AI Search / vector search with metadata filters (§8) | Retrieval precision@k |
@@ -46,7 +46,7 @@ Supported query types (routing intents): `longitudinal_single_company`, `multi_c
 ## 3. Scope
 
 ### In Scope
-- **Conversational Agentic Architecture:** Root Orchestrator with intent routing for longitudinal analysis, peer comparison, and thematic trend tracking; multi-turn sessions with follow-up refinement.
+- **Conversational Agentic Architecture:** Direct `FinancialAnalystAgent` orchestration with deterministic intent routing (`agents/intent.py`, `agents/chat_engine.py`) for longitudinal analysis, peer comparison, and thematic trend tracking; multi-turn sessions with follow-up refinement. *(The legacy unused supervisor hierarchy — `RootOrchestrator` / `agent.py`, `ContextCacheAgent`, and `CodingAssistantAgent` — has been retired, while granular SPIFFE S2S per-agent workload identities remain enforced in `security/agent_identity.py`.)*
 - **Deterministic Calculation Engine:** Period-over-period and YoY variances for the core metrics (Revenue, Operating Income, Net Income) and the supported extended metric R&D expense.
 - **Hybrid Search & Data Foundation:** Ingestion of SEC 10-K filings (Item 1A, Item 7) into Vertex AI Search and vector search, with structured metrics in BigQuery for metadata-filtered RAG.
 - **Longitudinal Thematic Tracking:** Year-over-year disclosure comparison for a theme across FY2024–FY2026 for a single company, a peer set, or a GICS sector.
@@ -93,12 +93,12 @@ Supported query types (routing intents): `longitudinal_single_company`, `multi_c
 ---
 
 ## 6. Technology Stack
-- **Runtime:** Python 3.11+ / FastAPI
-- **Frontend:** React 18+ / TypeScript / Tailwind CSS (Vite)
-- **Orchestration:** Google ADK / AGY SDK
-- **Models:** `gemini-3.8-flash` for financial reasoning and orchestration (`RootOrchestrator`, `FinancialAnalystAgent`), served from the Vertex AI `global` endpoint; `gemini-3.5-flash` for evaluation (LLM-as-a-Judge), coding assistance, and context compaction. Both are configurable (`EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`).
-- **Infrastructure:** Google Cloud Run, Cloud Storage, Vertex AI Search, BigQuery (`financial_metrics` + `VECTOR_SEARCH` over `filing_chunks` embeddings), Cloud Firestore (`analyst_sessions` + `analyst_feedback`), Vertex AI Context Caching, Secret Manager, Model Armor + Cloud SDP/DLP, OpenTelemetry, Cloud Trace, Cloud Monitoring (optional VPC Service Controls perimeter and opt-in Vertex AI Vector Search index deployment)
-- **IaC / Packaging:** Terraform, Docker
+- **Runtime:** Python 3.11+ / modular FastAPI (`server.py` + `api/routers/{health,auth,filings,chat,sessions,telemetry,feedback,spa}.py`). Shared zero-SDK foundations live in `common/`, `gcp/`, and `lookml.py` with PEP 562 lazy package loading. Runtime installs (`pip install .` / `requirements.txt`) exclude heavy ingestion packages (`edgartools`, `pandas`, `google-cloud-storage`), which live under `[project.optional-dependencies].ingest` (`pyproject.toml`); `uv.lock` has been removed.
+- **Frontend:** React 19 / TypeScript / Tailwind CSS v4 (Vite), with shared `services/httpClient.ts` and modular `components/inspector/{CitationsTab,FilingReaderTab,XbrlFactTab}.tsx`
+- **Orchestration:** Google ADK (`google.adk.runners.Runner` + `ToolThreadPoolConfig`)
+- **Models:** `gemini-3.8-flash` for `FinancialAnalystAgent` (primary orchestrator & financial reasoning), served from the Vertex AI `global` endpoint; `gemini-3.5-flash` for `NarrativeEvaluatorAgent` (LLM-as-a-Judge) and sector map-reduce batch extraction. Both are configurable (`EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`). *(Unused legacy agents `RootOrchestrator`, `ContextCacheAgent`, and `CodingAssistantAgent` are retired.)*
+- **Infrastructure:** Google Cloud Run, Cloud Storage, Vertex AI Search, BigQuery (`financial_metrics` + `VECTOR_SEARCH` over `filing_chunks` embeddings), Cloud Firestore (`analyst_sessions` + `analyst_feedback`), Vertex AI Context Caching, Secret Manager, Model Armor + Cloud SDP/DLP (`security/model_armor/`), OpenTelemetry, Cloud Trace, Cloud Monitoring (optional VPC Service Controls perimeter and opt-in Vertex AI Vector Search index deployment)
+- **IaC / Packaging:** Terraform, Docker (lean multi-stage runtime image with no offline ingestion extras or baked-in corpus)
 - **CI/CD:** Cloud Build (`cloudbuild.yaml`) & GitHub Actions (`.github/workflows/deploy.yml`, keyless WIF)
 
 ---
@@ -108,37 +108,38 @@ Supported query types (routing intents): `longitudinal_single_company`, `multi_c
 ### High-Level Diagram
 ```mermaid
 graph TD
-    User([Financial Analyst]) -->|1. Chat Request| FE[React Frontend - Chat Pane + Source Viewer]
-    FE -->|2. SSE Stream POST /api/v1/chat/stream| BE[FastAPI Backend - Cloud Run]
-    subgraph Backend [FastAPI Backend - Secure Sandbox]
-        BE --> MA[Model Armor + Cloud SDP - Input Screening]
-        MA --> SV[Scope Validation & 501-Issuer EntityCatalog]
-        SV -->|Ambiguous / Out-of-Corpus| FE
-        SV --> OR[ADK RootOrchestrator - Intent Routing]
-        OR -->|3. Session Recall| MEM[Firestore Session Memory - analyst_sessions]
-        OR -->|4. Delegate| FA[FinancialAnalystAgent]
-        FA -->|5a. Metrics| MT[Metric Fetch Tool]
-        FA -->|5b. Variances and Anomalies| CE[Deterministic Variance Calculation Engine]
-        FA -->|5c. Text Retrieval| RAG[Hybrid RAG Search Tool]
-        FA -->|5d. Thematic Deltas / Map-Reduce| DD[Disclosure Delta & Sector Map-Reduce]
-        FA -->|6. Ranked Passages / Full Section| CM[Context Cache Manager]
-        CM -->|Fetch Full Section| GCS[Cloud Storage - SEC Corpus]
-        FA -->|7. Grounded Synthesis| GEM[gemini-3.8-flash - bounded thinking]
-        GEM --> CV[Table-Aware Citation & Fact Verifier]
-        CV -.->|Async Off-Path| JUDGE[gemini-3.5-flash Judge]
+    User(["Financial Analyst"]) -->|"1. Chat Request"| FE["React Frontend - Chat Pane + Source Viewer"]
+    FE -->|"2. SSE Stream POST /api/v1/chat/stream"| BE["FastAPI Backend - Modular api/routers on Cloud Run"]
+    subgraph Backend ["FastAPI Backend - Secure Sandbox"]
+        BE --> MA["Model Armor + Cloud SDP - Input Screening"]
+        MA --> SV["Scope Validation & 501-Issuer EntityCatalog"]
+        SV -->|"Ambiguous / Out-of-Corpus"| FE
+        SV --> OR["Chat Engine & Intent Router (agents/intent.py)"]
+        OR -->|"3. Session Recall"| MEM["Firestore Session Memory - analyst_sessions"]
+        OR -->|"4. Execute ReAct"| FA["FinancialAnalystAgent (Primary Orchestrator)"]
+        FA -->|"5a. Metrics"| MT["Metric Fetch Tool"]
+        FA -->|"5b. Variances and Anomalies"| CE["Deterministic Variance Calculation Engine"]
+        FA -->|"5c. Text Retrieval"| RAG["Hybrid RAG Search Tool"]
+        FA -->|"5d. Thematic Deltas / Map-Reduce"| DD["Disclosure Delta & Sector Map-Reduce"]
+        FA -->|"6. Ranked Passages / Full Section"| CM["Context Cache & Ranked Passages (agents/adapters/)"]
+        CM -->|"Fetch Full Section"| GCS["Cloud Storage - SEC Corpus"]
+        FA -->|"7. Grounded Synthesis"| GEM["gemini-3.8-flash - native default thinking"]
+        GEM --> CV["Table-Aware Citation & Fact Verifier"]
+        CV -.->|"Async Off-Path (pending to grade/score)"| JUDGE["NarrativeEvaluatorAgent (gemini-3.5-flash Judge)"]
     end
-    CV -->|8. Narrative + XBRL/Text Citations + Coverage Notices| FE
-    subgraph RAG_Data_Foundation [Hybrid Search Layer]
-        MT --> BQ_FIN[BigQuery - financial_metrics]
+    CV -->|"8. Narrative + XBRL/Text Citations + Coverage Notices"| FE
+    subgraph RAG_Data_Foundation ["Hybrid Search Layer"]
+        MT --> BQ_FIN["BigQuery - financial_metrics"]
         CE --> BQ_FIN
-        RAG --> VAIS[Vertex AI Search - 10-K Corpus]
-        RAG --> BQ_VEC[BigQuery VECTOR_SEARCH - filing_chunks Embeddings]
+        RAG --> VAIS["Vertex AI Search - 10-K Corpus"]
+        RAG --> BQ_VEC["BigQuery VECTOR_SEARCH - filing_chunks Embeddings"]
         DD --> BQ_VEC
         CM --> BQ_VEC
     end
-    BE -->|Spans/Traces| OTEL[OpenTelemetry / Cloud Trace]
-    BE -->|Logs/Metrics| BQ[BigQuery Telemetry Sink]
-    BE -->|Feedback / Sessions| FS[Cloud Firestore]
+    BE -->|"Spans/Traces"| OTEL["OpenTelemetry / Cloud Trace"]
+    BE -->|"Logs/Metrics"| BQ["BigQuery Telemetry Sink"]
+    JUDGE -.->|"record_async_evaluation_result"| BQ
+    BE -->|"Feedback / Sessions"| FS["Cloud Firestore"]
 ```
 
 ### Request Flow
@@ -151,18 +152,19 @@ graph TD
 
 ### Architecture Principles
 - **Calculation / Synthesis Separation:** The LLM receives pre-computed numbers and disclosure deltas as facts; it never performs arithmetic or invents comparisons.
-- **Modularity:** The calculation engine, retrieval tools, context cache manager, and ADK orchestrator are independent, allowing models and calculation logic to be updated without modifying other components.
+- **Modularity:** Shared zero-SDK foundations live in `common/` (`env`, `domain`, `formatting`, `jsonl`, `concurrency`, `cache`, `models`), `gcp/` (`defaults`, `rest_client`, `bigquery`, `firestore`, `lro`, `discovery_engine`, `paths`), and `lookml.py` (mtime-cached catalog). FastAPI routes are decomposed into `api/routers/{health,auth,filings,chat,sessions,telemetry,feedback,spa}.py` with shared `api/schemas.py` (`FilingScopeMixin`) and `api/dependencies.py`. Model Armor + Cloud SDP + Projection Filters live in `security/model_armor/`, GCP tool adapters live in `agents/adapters/{bigquery,vertex_search,gcs,registry}.py`, ADK helpers are split into `agents/{intent,factories,prompt_builders,evaluation}.py`, dataset extraction separates `dataset/{fiscal_years,section_parser,financial_extractor}.py`, CLI scripts share `scripts/_cli.py`, and PEP 562 lazy package loading avoids pulling heavy SDKs at cold-start.
 - **Scalability:** Hosted on Google Cloud Run with automated scaling bounds to handle multiple concurrent analyst sessions. Sector-wide thematic queries use a full-sector batched fan-out / map-reduce pattern (`agents/sector_map_reduce.py`: single BigQuery `ML.DISTANCE` + `QUALIFY ROW_NUMBER()` query over all matching issuers in the GICS sector, deterministic `build_company_evolution`, parallel `gemini-3.5-flash` map batches of ~14 issuers with quote verification, and `gemini-3.8-flash` reduce synthesis) rather than loading every filing into one context. Progress streams over SSE (`POST /api/v1/chat/stream`) within the 3.0 s TTFT target, while `POST /api/v1/chat` remains backward-compatible.
-- **Latency & Async Evaluation:** A persistent background `asyncio` event loop (`agents/live_runtime.py`) reuses cached ADK `Gemini` clients (`@PerLoopCachedProperty` HTTP/2 keepalive pool + OAuth2 credential cache), compacting redundant nested XBRL provenance metadata out of the LLM prompt copy (~10× smaller variance payload while preserving full provenance in API/UI/rendered output). `FinancialAnalystAgent` keeps default native thinking effort (`include_thoughts=True`, no forced low thinking level) to preserve full analytical reasoning quality; lightweight structured Flash helpers (`evaluation_and_coding`, `context_cache_agent`, `sector_map_reduce`) use `ThinkingLevel.LOW` to prevent truncated JSON within `max_output_tokens`. Live Flash LLM-as-a-Judge runs asynchronously off the interactive request path (flushed on shutdown); `evals/runner.py` invokes the judge directly with `reference_explanation`.
+- **Latency & Async Evaluation:** A persistent background `asyncio` event loop (`agents/live_runtime.py`) reuses cached ADK `Gemini` clients (`@PerLoopCachedProperty` HTTP/2 keepalive pool + OAuth2 credential cache) and configures `RunConfig(tool_thread_pool_config=ToolThreadPoolConfig(...))` so synchronous tool calls never block the shared event loop. Prompt builders (`agents/prompt_builders.py`) compact redundant nested XBRL provenance metadata out of the LLM prompt copy (~10× smaller variance payload while preserving full provenance in API/UI/rendered output). `FinancialAnalystAgent` keeps default native thinking effort (`include_thoughts=True`, no forced low thinking level) to preserve full analytical reasoning quality; lightweight structured Flash helpers (`agents/evaluation.py`, `agents/sector_map_reduce.py`) use `ThinkingLevel.LOW` to prevent truncated JSON within `max_output_tokens`. Live Flash LLM-as-a-Judge runs asynchronously off the interactive request path: interactive turns emit `evaluation_grade="pending"` and `evaluation_score=NULL` (so BigQuery/Looker `AVG(evaluation_score)` ignores pending turns rather than using placeholder scores), and once the background judge completes it streams the real grade and score via `BigQueryTelemetrySink.record_async_evaluation_result(...)` (drained cleanly on shutdown via `flush_pending_evaluations`). `evals/runner.py` invokes the judge directly with `reference_explanation`.
 - **Resilience:** Retry policies with exponential backoff for Vertex AI and BigQuery calls, plus bounded thread-safe query-embedding caching (`vector_db/embedder.py`). There is no offline or local-data fallback: retrieval always uses live BigQuery, Vertex AI Search, Vertex AI embeddings, and the GCS corpus, and every answer is written by live Gemini. If all findings in a live Gemini report fail verification on the first pass, a single verification-guided regeneration attempt runs with exact verifier rejection reasons; if still unverifiable, the answer is withheld (`answer_verified: false`) rather than replaced with template text; partial data coverage is reported deterministically via `coverage_notices`, not filled in.
 - **Hybrid Data Foundation:** Vertex AI Search, BigQuery `VECTOR_SEARCH` over `filing_chunks`, and BigQuery `financial_metrics` share common metadata keys (`ticker`, `cik`, `fiscal_year`, `gics_sector`, `section_id`, `accession_number`) so structured and unstructured results join cleanly.
 
 ### Agents & Tools (ADK)
-- **RootOrchestrator:** Central supervisor; scope resolution, session memory recall, and intent routing.
-- **FinancialAnalystAgent:** Executes the ReAct loop: calls tools, evaluates variances and deltas, retrieves explanations, and formats the grounded report.
-- **ContextCacheManager:** Loads and caches full 10-K sections (Item 1A, Item 7) for deep reading.
-- **ContextCompactionSummarizer:** Compacts long multi-turn sessions to control context size and latency.
-- **NarrativeEvaluatorAgent:** LLM-as-a-Judge for evaluation runs (faithfulness, explanation quality, thematic consistency).
+Active ADK agents (constructed via `agents/factories.py`):
+- **FinancialAnalystAgent** *(primary orchestrator)*: Executes the ReAct loop: evaluates variances and deltas, retrieves grounded explanations via bounded tool adapters (`agents/adapters/`), and outputs constrained `AnalystReport` JSON (`prompts/v5/financial_analyst.yaml`).
+- **NarrativeEvaluatorAgent:** Gemini 3.5 Flash LLM-as-a-Judge (`agents/evaluation.py`, `prompts/v1/narrative_evaluator.yaml`) evaluating faithfulness, explanation quality, citation precision, and thematic consistency — run synchronously in `evals/runner.py` and asynchronously off-path on interactive turns (`grade="pending"` / `overall_score=None` until completed via `record_async_evaluation_result`).
+
+*(Retired legacy supervisor hierarchy: the unused `RootOrchestrator` / `agent.py`, `ContextCacheAgent`, and `CodingAssistantAgent` ADK classes and legacy prompts `prompts/v2`–`v4` and `prompts/v1/{root_orchestrator,context_cache_agent,coding_assistant}.yaml` have been removed. Intent routing runs deterministically in `agents/intent.py`, session compaction runs deterministically in `agents/context_memory.py`, and 10-K section cache tools live directly in `agents/tools.py` + `agents/adapters/`. Note that granular SPIFFE S2S per-agent workload identities — including `RootOrchestrator`, `FinancialAnalystAgent`, `ContextCacheManager`, and `ModelArmorGuardrail` — are intentionally retained in `security/agent_identity.py` for least-privilege S2S hop attestation and IAM policy compatibility.)*
+
 - **Tools:**
   - `fetch_financial_metrics`: Retrieves structured metrics from BigQuery with ticker / year / sector filters.
   - `calculate_period_variances`: Deterministic multi-period and YoY variances for Revenue, Operating Income, Net Income, and R&D (absolute, %, and bps margin/intensity deltas).
@@ -186,14 +188,18 @@ graph TD
 - **Tool Registration:** Tool definitions are registered natively inside the ADK framework using explicit Pydantic type schemas.
 - **Function Calling Logic:** Standardized exception wrappers handle API rate limits (HTTP 429) and timeouts.
 
+### API Surface (Modular Routers)
+`server.py` registers 8 modular `APIRouter`s (`api/routers/{health,auth,filings,chat,sessions,telemetry,feedback,spa}.py`) exposing 18 documented endpoints (`GET /health`, `POST /api/v1/chat/stream`, `POST /api/v1/chat`, `GET /api/v1/companies`, `GET /api/v1/section`, `GET /api/v1/sessions`, `DELETE /api/v1/sessions/{session_id}`, `POST|GET /api/v1/feedback`, `GET /api/v1/telemetry/sessions`, `GET /api/v1/auth/config`, `POST /api/v1/auth/sso/exchange`, `POST /api/v1/auth/sso/dev-token`, `GET /api/v1/auth/me`, `POST /api/v1/auth/logout`, `GET /api/v1/auth/audit`, `GET /api/v1/admin/rbac/policies`, `GET /api/v1/secrets/status`) plus the SPA catch-all. Redundant/test-only legacy routes (`GET /healthz`, `POST /api/v1/section`, `GET /api/v1/auth/rbac`, `GET /api/v1/explore/yoy_variances`, `GET /api/v1/explore/audit_trail`, `GET /api/v1/looker/catalog`, `GET /api/v1/telemetry/context-latency`, `POST /api/v1/intent`, `POST /api/v1/evaluate`, `POST /api/v1/coding-assist`, `POST /api/v1/variances`, `POST /api/v1/search`, `GET /api/v1/metrics`) have been pruned and return `404`/`405`.
+
 ### Conversational Behavior
 - **Persistent Session Memory:** Scope (tickers, sector, years, metrics, theme) persists across turns and Cloud Run instances in Cloud Firestore (`analyst_sessions` collection), strictly isolated by authenticated `(user_id, session_id)` via deterministic SHA-256 document keys. Analysts can list (`GET /api/v1/sessions`) and delete (`DELETE /api/v1/sessions/{session_id}`) their own sessions. Follow-ups support additive (`"now add Microsoft"`) and subtractive (`"drop Apple"`) refinements. Deterministic context compaction tracks token digests without emitting synthetic LLM billing records.
 - **Clarification:** Ambiguous requests (e.g., no company, sector, or inherited scope) trigger a plain-English clarifying question (`status: "clarification_needed"`) with clickable suggested follow-up queries rather than guessing. Dynamic 501-issuer `EntityCatalog` resolves company names across all 11 GICS sectors and deduplicates dual-class share structures by CIK (e.g., `"Alphabet"` → `GOOGL`, while explicit `GOOG` still resolves).
 - **Out-of-Corpus Handling:** Requests for unsupported metrics (e.g., EBITDA, FCF, EPS), filing types (10-Q, 8-K, DEF 14A), non-S&P 500 issuers (e.g., Rivian, Stripe), or out-of-range years (`< FY2020`) return an explicit coverage statement (`status: "out_of_corpus"`) with clickable alternatives. Missing fiscal years (e.g., FY2026 for calendar-year filers filing in Q1 2027) and misaligned fiscal calendars emit deterministic `coverage_notices`.
 
 ### Frontend (Split-Pane Report)
+- **HTTP Client:** Shared `frontend/src/services/httpClient.ts` centralizes authenticated fetch, Bearer header injection, and error parsing across `authService.ts` and `edgarApi.ts`.
 - **Chat Pane:** Query composer, starter prompts, scope bar showing active filters (tickers / sector / years / sections), real-time SSE progress streaming (`POST /api/v1/chat/stream`), coverage notice banners, sector coverage pill, clickable suggested follow-up chips, variance table cards showing `period_of_report` dates and `DIFFERING FY-END DATES` badges, anomaly flag cards, and narrative with clickable inline text + XBRL citation chips.
-- **Source Viewer Pane:** Clicking a text citation opens the cited 10-K section (company, fiscal year, item) and highlights the exact passage with an SEC EDGAR link. Clicking an inline XBRL citation or `[XBRL]` provenance trigger opens the **XBRL Fact** tab displaying accession numbers, XBRL concepts, denominator concepts, derived calculation inputs, SEC EDGAR filing link, and MD&A jump button.
+- **Source Viewer Pane (`components/inspector/`):** Modular tabs (`CitationsTab.tsx`, `FilingReaderTab.tsx`, `XbrlFactTab.tsx`). Clicking a text citation opens the cited 10-K section (company, fiscal year, item) and highlights the exact passage with an SEC EDGAR link. Clicking an inline XBRL citation or `[XBRL]` provenance trigger opens the **XBRL Fact** tab displaying accession numbers, XBRL concepts, denominator concepts, derived calculation inputs, SEC EDGAR filing link, and MD&A jump button.
 - **Feedback:** Thumbs-up/down and comments per response persisted in Firestore (`analyst_feedback`).
 
 ---
@@ -249,7 +255,7 @@ Every citation resolves to a stable, traceable location in the source 10-K:
 - **API Access:** Internal APIs are protected using Identity-Aware Proxy (IAP), requiring JWT-based bearer authentication.
 - **RBAC:** Group-based access definitions managed via Cloud Identity Groups.
 - **Service Account:** `sec-analyst-sa@<project name>.iam.gserviceaccount.com` (e.g. `fde-sec-edgar-sandbox-dev` for dev)
-- **Agent Identities:** Granular, per-agent identities enforce Least Privilege for service-to-service communication.
+- **Agent Identities:** Granular, per-agent SPIFFE workload identities (`security/agent_identity.py`: `RootOrchestrator`, `FinancialAnalystAgent`, `ContextCacheManager`, `ModelArmorGuardrail`) enforce Least Privilege for service-to-service communication and remain enforced even after retiring the unused legacy ADK supervisor classes. Dual IAP + Bearer requests keep the Bearer JWT strictly authoritative (no privilege escalation from IAP default roles).
 
 ### Data Protection
 - **Encryption:** 100% of data is encrypted in transit using **TLS 1.2+** (`RESTRICTED` SSL policy in `load_balancer.tf`, and Google Front End automatic TLS 1.3 negotiation for modern clients in `iap_direct` mode). *(Amended from strict "TLS 1.3 only" because GCP Compute Engine SSL Policy rejects `TLS_1_3` as `min_tls_version` in `hashicorp/google` 6.50.0.)* Google-managed encryption keys (GMEK) protect Data-at-Rest.
@@ -270,7 +276,7 @@ Every citation resolves to a stable, traceable location in the source 10-K:
 ---
 
 ## 10. Testing & Evaluation
-- **Automated Verification:** pytest suite that runs against live GCP data (BigQuery, Vertex AI Search, Vertex AI embeddings, GCS) and live Gemini, so tests measure the real retrieval stack rather than fixtures that can drift. Achieves >80% code coverage, including math verification, metadata-filter correctness, citation-resolution, and regression checks. Mocked HTTP transports are used only to unit-test GCP adapter request/response mapping; a scripted model double is used only where a test must force a specific model behavior (e.g., a finding that fails verification).
+- **Automated Verification:** pytest suite that runs against live GCP data (BigQuery, Vertex AI Search, Vertex AI embeddings, GCS) and live Gemini, so tests measure the real retrieval stack rather than fixtures that can drift. Achieves >80% code coverage, including math verification, metadata-filter correctness, citation-resolution, and regression checks. A dedicated fast offline unit & regression suite (`tests/test_refactor_regressions.py`) uses mocked HTTP transports, ephemeral EC/JWT fixtures, and subprocess lazy-import isolation to verify `common/`, `gcp/`, `lookml.py`, `api/`, `security/model_armor/`, `agents/`, and every P0/P1 fix in `< 3 s` without live Gemini/BigQuery calls. A scripted model double is used only where a test must force a specific model behavior (e.g., a finding that fails verification).
 - **LLM-as-a-Judge:** Gemini 3.5 Flash evaluates narrative faithfulness, explanation quality, citation precision, and thematic consistency against the golden dataset.
 - **Ground Truth:** A golden dataset stored in BigQuery and used for regression checks (e.g. `make eval-all`) before deployment, with minimum coverage per category:
   - Single-company longitudinal (core metrics): >= 8 cases
@@ -282,13 +288,13 @@ Every citation resolves to a stable, traceable location in the source 10-K:
 ---
 
 ## 11. Analytics, Observability & Audit
-- **User Feedback:** Frontends log thumbs-up/down feedback and custom comments directly into a collections table (e.g. CloudSQL, FireStore).
-- **Session Metrics:** Session length, companies analyzed, intents routed, and report generation counts.
-- **Usage & Cost:** Logs token consumption (including cached token discount savings) to BigQuery.
+- **User Feedback:** Frontends log thumbs-up/down feedback and custom comments directly into Cloud Firestore (`analyst_feedback`, with bounded local deque buffering in `FirestoreFeedbackStore`).
+- **Session Metrics & Async Evaluation:** Session length (tracked with LRU-bounded `_sessions` cache), companies analyzed, intents routed, and report generation counts stream to BigQuery `session_telemetry_events` (with `trace_id` selected in query reads). Interactive turns log `evaluation_grade="pending"` and `evaluation_score=NULL` (so Looker `AVG(evaluation_score)` is never inflated by placeholder scores); when the background Gemini 3.5 Flash judge finishes, `record_async_evaluation_result(...)` updates the local turn in place and streams the completed grade and numeric score to BigQuery + Cloud Logging.
+- **Usage & Cost:** Logs token consumption (including cached token discount savings) to BigQuery `llm_telemetry_events`.
 - **Performance:** Captures TTFT (Time to First Token) and total latency per intent.
-- **BI Dashboards:** Exported to Looker to visualize tool usage, average latency, and estimated cost savings from caching.
-- **Logging:** FastAPI backend produces structured JSON logs containing trace IDs, exported directly to Cloud Logging.
-- **Audit Trails:** Logs track who accessed which company's 10-K report and when.
+- **BI Dashboards:** Exported to Looker (catalog cached by file mtimes in `lookml.py`) to visualize tool usage, average latency, and estimated cost savings from caching.
+- **Logging:** FastAPI backend produces structured JSON logs containing trace IDs (`_RESERVED_PAYLOAD_KEYS` protected) exported directly to Cloud Logging, and non-mutating `TraceAwareTextFormatter` locally.
+- **Audit Trails:** Logs track who accessed which company's 10-K report and when (including 401/403 audit events on SSO exchange and dev-token endpoints, and `trace_id` joinability in `security_audit_logs`).
 
 ---
 

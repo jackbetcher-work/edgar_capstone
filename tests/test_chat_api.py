@@ -66,8 +66,10 @@ def test_conversational_rag_peer_comparison_and_fact_check() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "success"
+    assert body["orchestrator"] == "FinancialAnalystAgent"
     assert body["execution_mode"] == "live_adk"
     assert body["model_armor_blocked"] is False
+    assert isinstance(body["model_armor"]["prompt_inspection"], dict)
     assert body["intent"] == "multi_company_peer_comparison"
     assert set(body["resolved_scope"]["tickers"]) == {"NVDA", "AAPL"}
     assert body["adk_runtime"]["executed_via_adk_runner"] is True
@@ -96,11 +98,15 @@ def test_conversational_rag_peer_comparison_and_fact_check() -> None:
     if body["answer_verified"]:
         assert body["adk_runtime"]["answer_withheld_reason"] is None
         assert body["fact_check"]["passed"] is True, body["fact_check"]
+        assert body["evaluation"]["grade"] == "pending"
+        assert body["evaluation"]["overall_score"] is None
         assert answer_chunk_ids
     else:
         # A live answer that fails verification is withheld rather than replaced by a template.
         assert body["answer_markdown"].startswith("### Answer withheld")
         assert body["adk_runtime"]["answer_withheld_reason"]
+        assert body["evaluation"]["grade"] == "fail"
+        assert body["evaluation"]["overall_score"] == 0.0
 
     assert len(body["agent_trace"]) >= 4
     assert body["authenticated_principal"]["email"] == "analyst@fde-workspace.corp"
@@ -119,7 +125,10 @@ def test_conversational_rag_model_armor_blocks_injection() -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "blocked"
+    assert body["orchestrator"] == "FinancialAnalystAgent"
     assert body["model_armor_blocked"] is True
+    assert body["model_armor"]["prompt_inspection"]["blocked"] is True
+    assert body["model_armor"]["response_inspection"] is None
     assert body["citations"] == []
 
 
@@ -178,3 +187,6 @@ def test_single_origin_terminal_ui_bundle_serving(tmp_path, monkeypatch) -> None
 
     unknown_api_resp = client.get("/api/v1/nonexistent")
     assert unknown_api_resp.status_code == 404
+
+    # Pruned legacy `/healthz` must return 404 even when frontend/dist exists (never SPA-shadowed)
+    assert client.get("/healthz").status_code == 404

@@ -228,26 +228,6 @@ class CompanyVarianceReport(BaseModel):
     )
 
 
-# TODO(Wave 3b): Delete dead `LookerExploreQuery` atomically with `agents/__init__.py` lines 131 & 214.
-class LookerExploreQuery(BaseModel):
-    """DEPRECATED: Retained temporarily until `agents/__init__.py` removes its re-export in Wave 3b."""
-
-    explore_name: Literal[
-        "yoy_variances",
-        "sector_benchmarks",
-        "peer_comparison",
-        "chunk_health",
-        "llm_telemetry",
-        "session_analytics",
-        "audit_trail",
-    ] = Field(..., description="Target Looker semantic explore view to query")
-    tickers: list[str] = Field(default_factory=list, description="Optional ticker symbols filter")
-    gics_sector: str | None = Field(default=None, description="Optional GICS Sector filter")
-    start_year: int = Field(default=2020, description="Start fiscal year (inclusive)")
-    end_year: int = Field(default=2026, description="End fiscal year (inclusive)")
-    limit: int = Field(default=25, ge=1, le=200, description="Max rows to return")
-
-
 class GroundedCitation(FilingMetadataBase):
     """Grounded citation linking a narrative claim to an exact 10-K section chunk."""
 
@@ -721,19 +701,6 @@ class NarrativeEvaluationReport(AgentReportTelemetryMixin):
     thematic_consistency_score: float | None = Field(default=None, ge=0.0, le=1.0)
     unsupported_claims_count: int = Field(default=0, ge=0)
     rationale: str = ""
-
-
-# TODO(Wave 3b): Delete `CodingAssistanceReport` atomically with `evaluation_and_coding.py` & `agents/__init__.py`.
-class CodingAssistanceReport(AgentReportTelemetryMixin):
-    """Analytical code / query generation output powered by Gemini 3.5 Flash."""
-
-    assistant_model: str = "gemini-3.5-flash"
-    task_category: Literal["coding_assistance"] = "coding_assistance"
-    language: Literal["sql", "python", "lookml"] = "sql"
-    artifact_title: str
-    code: str
-    explanation: str
-    tickers_referenced: list[str] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

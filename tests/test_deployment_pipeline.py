@@ -528,13 +528,22 @@ def test_frontend_lockfile_uses_public_npm_registry() -> None:
 
 
 def test_fastapi_cloud_run_service_endpoints() -> None:
+    from edgar_capstone.agents.intent import classify_query_intent
+    from edgar_capstone.agents.tools import calculate_period_variances
+
     client = TestClient(app)
 
     health_resp = client.get("/health")
     assert health_resp.status_code == 200
-    assert health_resp.json()["status"] == "ok"
-    assert health_resp.json()["root_agent"] == "RootOrchestrator"
-    assert health_resp.json()["iap_jwt_auth_enabled"] is True
+    health_body = health_resp.json()
+    assert health_body["status"] == "ok"
+    assert health_body["root_agent"] == "FinancialAnalystAgent"
+    assert health_body["active_agents"] == ["FinancialAnalystAgent", "NarrativeEvaluatorAgent"]
+    assert health_body["sub_agents"] == ["FinancialAnalystAgent", "NarrativeEvaluatorAgent"]
+    assert health_body["iap_jwt_auth_enabled"] is True
+
+    # Pruned legacy healthz probe returns 404
+    assert client.get("/healthz").status_code == 404
 
     # Internal APIs require IAP / Workspace Okta JWT Bearer authentication
     unauth_resp = client.get("/api/v1/secrets/status")
@@ -550,21 +559,52 @@ def test_fastapi_cloud_run_service_endpoints() -> None:
     assert secrets_body["secret_manager_enabled"] is True
     assert all(s["value"] == "***REDACTED***" for s in secrets_body["secrets"])
 
+    # Retained filing catalog and section viewer endpoints
+    companies_resp = client.get("/api/v1/companies", headers=auth_headers)
+    assert companies_resp.status_code == 200
+    companies_body = companies_resp.json()
+    assert companies_body["status"] == "success"
+    assert companies_body["company_count"] >= 15
+
+    section_resp = client.get(
+        "/api/v1/section",
+        headers=auth_headers,
+        params={"ticker": "NVDA", "fiscal_year": 2026, "section_id": "item_7", "max_chars": 2000},
+    )
+    assert section_resp.status_code == 200
+    section_body = section_resp.json()
+    assert section_body["status"] == "success"
+    assert section_body["ticker"] == "NVDA"
+    assert section_body["fiscal_year"] == 2026
+
+    # Pruned compute routes are removed from the API (GET -> 404; POST -> 404/405 via SPA catch-all)
+    assert client.get("/api/v1/variances", headers=auth_headers).status_code == 404
+    assert client.get("/api/v1/intent", headers=auth_headers).status_code == 404
     var_resp = client.post(
         "/api/v1/variances",
         headers=auth_headers,
         json={"tickers": "NVDA,AAPL", "start_year": 2024, "end_year": 2026},
     )
-    assert var_resp.status_code == 200
-    assert var_resp.json()["company_count"] == 2
+    assert var_resp.status_code in {404, 405}
 
     intent_resp = client.post(
         "/api/v1/intent",
         headers=auth_headers,
         json={"query": "Compare NVIDIA and Apple's R&D spend from 2024-2026"},
     )
-    assert intent_resp.status_code == 200
-    assert intent_resp.json()["intent"] == "multi_company_peer_comparison"
+    assert intent_resp.status_code in {404, 405}
+
+    schema_paths = app.openapi()["paths"]
+    assert "/api/v1/variances" not in schema_paths
+    assert "/api/v1/intent" not in schema_paths
+
+    # Underlying Python tools remain directly callable and verified
+    direct_var = calculate_period_variances(tickers="NVDA,AAPL", start_year=2024, end_year=2026)
+    assert direct_var["status"] == "success"
+    assert direct_var["company_count"] == 2
+
+    direct_intent = classify_query_intent("Compare NVIDIA and Apple's R&D spend from 2024-2026")
+    assert direct_intent == "multi_company_peer_comparison"
 
 
 def test_adk_tools_read_live_gcp_data_in_a_clean_checkout() -> None:

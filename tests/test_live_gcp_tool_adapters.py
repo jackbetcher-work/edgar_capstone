@@ -32,7 +32,6 @@ from edgar_capstone.agents import (
     GcpToolConfig,
     calculate_period_variances,
     configure_gcp_tool_adapters,
-    create_context_cache_agent,
     create_financial_analyst_agent,
     fetch_financial_metrics,
     get_context_latency_tracker,
@@ -45,7 +44,7 @@ from edgar_capstone.agents import (
     run_adk_agent_stream,
     search_10k_chunks_rag,
 )
-from edgar_capstone.agents.tools import _SESSION_10K_CONTEXT_CACHE
+from edgar_capstone.agents.tools import _SECTION_CHUNKS_CACHE, _SESSION_10K_CONTEXT_CACHE
 from edgar_capstone.dataset.extractor import format_combined_10k_markdown
 from tests.structured_report_helpers import finding_from_citation, report_json
 
@@ -855,8 +854,9 @@ def test_hybrid_rag_fuses_bigquery_vector_search_and_vertex_ai_search() -> None:
 
 
 def test_context_cache_miss_loads_from_bigquery_and_gcs_and_queries_cached_section() -> None:
-    """Verify `load_cached_10k_section` & `query_cached_10k_context` read from BigQuery + GCS on miss and link BigQuery chunks."""
+    """Verify `load_cached_10k_section` & `query_cached_10k_context` read from BigQuery + GCS on miss and hit L1 chunk cache on repeat."""
     _SESSION_10K_CONTEXT_CACHE.pop("NVDA_2026_item_7", None)
+    _SECTION_CHUNKS_CACHE.pop("NVDA_2026_item_7", None)
     hit_log: list[str] = []
     md_doc = _sample_nvda_2026_markdown()
 
@@ -974,6 +974,7 @@ def test_context_cache_miss_loads_from_bigquery_and_gcs_and_queries_cached_secti
     assert miss_res["cache_hit"] is False
     assert "Blackwell GB200 NVL72" in miss_res["content"]
 
+    # Cold `_SECTION_CHUNKS_CACHE` miss fetches chunks from BigQuery and reports `cache_hit=False`
     query_res = query_cached_10k_context(
         ticker="NVDA",
         fiscal_year=2026,
@@ -983,12 +984,27 @@ def test_context_cache_miss_loads_from_bigquery_and_gcs_and_queries_cached_secti
         tool_context=ctx,
     )
     assert query_res["status"] == "success"
-    assert query_res["cache_hit"] is True
+    assert query_res["cache_hit"] is False
     assert query_res["matched_chunk_ids"] == ["NVDA_2026_item_7_0000"]
     assert "bq_fetch_profile" in hit_log
     assert "gcs_download_10k_md" in hit_log
     assert "bq_fetch_section_chunks" in hit_log
     assert "vertex_embeddings" in hit_log
+
+    # Second call for the same section hits `_SECTION_CHUNKS_CACHE` with no extra BigQuery query
+    bq_chunk_fetches = hit_log.count("bq_fetch_section_chunks")
+    query_res_2 = query_cached_10k_context(
+        ticker="NVDA",
+        fiscal_year=2026,
+        section_id="item_7",
+        variance_query="Blackwell GB200 Data Center revenue growth",
+        max_passages=2,
+        tool_context=ctx,
+    )
+    assert query_res_2["status"] == "success"
+    assert query_res_2["cache_hit"] is True
+    assert query_res_2["matched_chunk_ids"] == ["NVDA_2026_item_7_0000"]
+    assert hit_log.count("bq_fetch_section_chunks") == bq_chunk_fetches
 
 
 class _LiveToolCallingAnalystLlm(BaseLlm):
@@ -1064,7 +1080,7 @@ class _LiveToolCallingAnalystLlm(BaseLlm):
 
 
 def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_search() -> None:
-    """Verify `FinancialAnalystAgent` and `ContextCacheAgent` hit BigQuery, Vertex AI Search, Vector Search, and GCS through the ADK Runner."""
+    """Verify `FinancialAnalystAgent` and `load_cached_10k_section` hit BigQuery, Vertex AI Search, Vector Search, and GCS through the ADK Runner."""
     get_context_latency_tracker().reset()
     get_conversation_memory_manager().reset()
     _SESSION_10K_CONTEXT_CACHE.pop("NVDA_2026_item_1a", None)
@@ -1257,13 +1273,12 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
     }
     assert stream_res.session_state["fact_check_report"]["passed"] is True
 
-    # Also verify ContextCacheAgent hits BigQuery + GCS via its allowed tool
+    # Also verify `load_cached_10k_section` hits BigQuery + GCS on a cache miss
     cache_res = load_cached_10k_section(
         ticker="NVDA", fiscal_year=2026, section_id="item_1a", max_chars=4000
     )
     assert cache_res["status"] == "success"
     assert "gcs" in gcp_services_contacted
-    assert create_context_cache_agent().name == "ContextCacheAgent"
 
 
 def test_http_429_rate_limit_retries_and_missing_credentials_error() -> None:

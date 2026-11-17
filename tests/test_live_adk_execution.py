@@ -1,9 +1,8 @@
 """Live Google ADK `Runner` SSE execution & Gemini runtime wiring.
 
-Chat turns, the narrative judge, and the coding assistant call live Gemini on Vertex AI and read
-live GCP data. Scripted ADK `BaseLlm`s are injected only for mechanics the live model can't be
-made to exercise on demand: exact SSE timing (TTFT attribution), a hallucinated finding that
-verification must reject, and a fixed RootOrchestrator tool-call / PlanReAct tag sequence.
+Chat turns and the narrative judge call live Gemini on Vertex AI and read live GCP data. Scripted
+ADK `BaseLlm`s are injected only for mechanics the live model can't be made to exercise on demand:
+exact SSE timing (TTFT attribution) and a hallucinated finding that verification must reject.
 """
 
 from __future__ import annotations
@@ -26,16 +25,15 @@ from edgar_capstone.agents import (
     create_financial_analyst_agent,
     evaluate_variance_explanation,
     flush_pending_evaluations,
-    generate_financial_coding_assistance,
     get_context_latency_tracker,
     get_conversation_memory_manager,
     get_live_runtime_status_metadata,
     resolve_live_adk_runtime,
     run_adk_agent_stream,
-    run_live_root_orchestrator_turn,
 )
 from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.agents.tools import search_10k_chunks_rag
+from edgar_capstone.telemetry import get_telemetry_sink
 from tests.structured_report_helpers import evidence_leads, finding_from_citation, report_json
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -132,80 +130,6 @@ class StreamingProAnalystLlm(BaseLlm):
                 cached_content_token_count=2100,
                 candidates_token_count=165,
                 thoughts_token_count=38,
-            ),
-        )
-
-
-class RootOrchestratorToolCallingLlm(BaseLlm):
-    """Scripted `RootOrchestrator` turn: one tool call, then PlanReAct-tagged final text."""
-
-    model: str = "gemini-2.5-pro"
-
-    async def generate_content_async(
-        self,
-        llm_request: LlmRequest,
-        stream: bool = False,
-    ) -> AsyncGenerator[LlmResponse, None]:
-        assert stream is True
-        has_tool_response = any(
-            getattr(p, "function_response", None) is not None
-            for c in (llm_request.contents or [])
-            for p in (c.parts or [])
-        )
-        await asyncio.sleep(0.008)
-        if not has_tool_response:
-            yield LlmResponse(
-                model_version=self.model,
-                partial=False,
-                content=genai_types.Content(
-                    role="model",
-                    parts=[
-                        genai_types.Part(
-                            text="/*PLANNING*/ 1. Call calculate_period_variances for NVDA.",
-                            thought=True,
-                        ),
-                        genai_types.Part.from_function_call(
-                            name="calculate_period_variances",
-                            args={"tickers": "NVDA", "start_year": 2024, "end_year": 2026},
-                        ),
-                    ],
-                ),
-                usage_metadata=genai_types.GenerateContentResponseUsageMetadata(
-                    prompt_token_count=650,
-                    candidates_token_count=35,
-                    thoughts_token_count=18,
-                ),
-            )
-            return
-
-        yield LlmResponse(
-            model_version=self.model,
-            partial=True,
-            content=genai_types.Content(
-                role="model",
-                parts=[genai_types.Part(text="/*FINAL_ANSWER*/ ### NVDA FY2024–FY2026 ")],
-            ),
-        )
-        await asyncio.sleep(0.008)
-        yield LlmResponse(
-            model_version=self.model,
-            partial=False,
-            content=genai_types.Content(
-                role="model",
-                parts=[
-                    genai_types.Part(
-                        text=(
-                            "/*REASONING*/ Deterministic variance calculation succeeded. "
-                            "/*FINAL_ANSWER*/ ### NVDA FY2024–FY2026 Supervisor Summary\n"
-                            "Verified deterministic variance metrics via `RootOrchestrator`."
-                        )
-                    )
-                ],
-            ),
-            usage_metadata=genai_types.GenerateContentResponseUsageMetadata(
-                prompt_token_count=1450,
-                candidates_token_count=54,
-                thoughts_token_count=14,
             ),
         )
 
@@ -366,8 +290,11 @@ def test_conversational_rag_turn_executes_live_gemini_end_to_end() -> None:
 
     evaluation = turn["evaluation"]
     assert _is_model(evaluation["evaluator_model"], "gemini-3.5-flash")
-    assert evaluation["grade"] in {"pass", "needs_revision", "fail"}
-    assert 0.0 <= evaluation["overall_score"] <= 1.0
+    # Interactive turns do NOT fabricate a synthetic 1.0 placeholder score while the async judge runs
+    assert evaluation["grade"] == "pending"
+    assert evaluation["overall_score"] is None
+    assert evaluation["numeric_fidelity_score"] is None
+    assert evaluation["citation_grounding_score"] is None
 
     # The interactive turn runs only the analyst (gemini-3.8-flash) on the request path;
     # the live Flash judge (gemini-3.5-flash) executes asynchronously off the critical path.
@@ -377,6 +304,16 @@ def test_conversational_rag_turn_executes_live_gemini_end_to_end() -> None:
     flush_pending_evaluations(timeout=30.0)
     all_models_called = [r.model_name for r in tracker.recent_records(limit=20)]
     assert any(_is_model(m, "gemini-3.5-flash") for m in all_models_called), all_models_called
+
+    async_evals = get_telemetry_sink().recent_async_evaluations(session_id="live-chat-sess-01")
+    assert len(async_evals) >= 1
+    assert any(
+        _is_model(ev.get("evaluator_model", ""), "gemini-3.5-flash")
+        and ev.get("evaluation_grade") in {"pass", "needs_revision", "fail"}
+        and ev.get("evaluation_score") is not None
+        and 0.0 <= float(ev["evaluation_score"]) <= 1.0
+        for ev in async_evals
+    ), async_evals
 
     # All S2S cryptographic agent attestations remain strictly enforced
     assert len(turn["agent_trace"]) >= 4
@@ -424,8 +361,8 @@ def test_unverifiable_live_answer_is_withheld_not_replaced() -> None:
     assert turn["variance_reports"] and turn["citations"]
 
 
-def test_live_narrative_evaluator_and_coding_assistant() -> None:
-    """Live `gemini-3.5-flash` judge (capped by the deterministic fact-check) and coding agent."""
+def test_live_narrative_evaluator() -> None:
+    """Live `gemini-3.5-flash` judge (capped by the deterministic fact-check)."""
     get_context_latency_tracker().reset()
 
     nvda_rep = calculate_period_variances(tickers="NVDA", start_year=2024, end_year=2026)[
@@ -465,39 +402,14 @@ def test_live_narrative_evaluator_and_coding_assistant() -> None:
         grounded.numeric_fidelity_score,
         grounded.citation_grounding_score,
     ):
+        assert score is not None
         assert 0.0 <= score <= 1.0
 
     # A figure that contradicts the deterministic engine caps numeric fidelity, whatever the judge says
     wrong = _evaluate(rev_pct + 37.0)
+    assert wrong.numeric_fidelity_score is not None
     assert wrong.numeric_fidelity_score <= 0.45
     assert wrong.grade != "pass"
-
-    code_report = generate_financial_coding_assistance(
-        prompt="Generate BigQuery YoY revenue variance SQL for NVDA and AAPL",
-        language="sql",
-        tickers="NVDA,AAPL",
-        start_year=2024,
-        end_year=2026,
-    )
-    assert _is_model(code_report.assistant_model, "gemini-3.5-flash")
-    assert code_report.language == "sql"
-    assert "SELECT" in code_report.code.upper()
-    assert "NVDA" in code_report.code
-    assert code_report.context_tokens > 0
-    assert code_report.context_latency_ms > 0.0
-
-
-def test_root_orchestrator_app_tool_call_and_planner_tag_splitting() -> None:
-    """Scripted RootOrchestrator turn calls the live variance tool and strips PlanReAct tags."""
-    get_context_latency_tracker().reset()
-    root_stream = run_live_root_orchestrator_turn(
-        query="Compute NVIDIA period variances from 2024 to 2026",
-        orchestrator_llm=RootOrchestratorToolCallingLlm(),
-    )
-    assert any(fc["name"] == "calculate_period_variances" for fc in root_stream.function_calls)
-    assert "NVDA FY2024–FY2026 Supervisor Summary" in root_stream.final_text
-    assert "/*FINAL_ANSWER*/" not in root_stream.final_text
-    assert root_stream.observed_ttft_ms is not None
 
 
 def test_deploy_configs_wire_vertex_ai_env() -> None:
