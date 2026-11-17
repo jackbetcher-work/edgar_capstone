@@ -1,0 +1,134 @@
+[
+  {
+    "name": "id",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Stable golden item identifier (e.g. nvda_longitudinal_fy24_fy26)"
+  },
+  {
+    "name": "category",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "single_company_longitudinal | multi_company_peer_comparison | thematic_shift | safety_red_team"
+  },
+  {
+    "name": "query",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Natural-language analyst query sent to /api/v1/chat"
+  },
+  {
+    "name": "tickers",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Tickers the query must resolve to"
+  },
+  {
+    "name": "fiscal_years",
+    "type": "INTEGER",
+    "mode": "REPEATED",
+    "description": "Inclusive fiscal year window the query must resolve to"
+  },
+  {
+    "name": "gics_sector",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Expected resolved GICS sector for sector-level queries"
+  },
+  {
+    "name": "expected_intent",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Expected RootOrchestrator routing intent"
+  },
+  {
+    "name": "expected_variances",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "description": "Deterministic variances the calculation engine must reproduce",
+    "fields": [
+      {"name": "ticker", "type": "STRING", "mode": "REQUIRED"},
+      {"name": "metric", "type": "STRING", "mode": "REQUIRED", "description": "revenue | operating_income | net_income | research_and_development"},
+      {"name": "start_year", "type": "INTEGER", "mode": "REQUIRED"},
+      {"name": "end_year", "type": "INTEGER", "mode": "REQUIRED"},
+      {"name": "start_value", "type": "FLOAT", "mode": "NULLABLE", "description": "USD"},
+      {"name": "end_value", "type": "FLOAT", "mode": "NULLABLE", "description": "USD"},
+      {"name": "absolute_delta", "type": "FLOAT", "mode": "NULLABLE", "description": "USD"},
+      {"name": "percentage_delta", "type": "FLOAT", "mode": "NULLABLE", "description": "Percent change start -> end"},
+      {"name": "required_in_narrative", "type": "BOOLEAN", "mode": "NULLABLE", "description": "Percentage must also appear in the answer text"}
+    ]
+  },
+  {
+    "name": "expected_sections",
+    "type": "RECORD",
+    "mode": "REPEATED",
+    "description": "10-K sources that must be retrieved and cited (NULL fields are wildcards)",
+    "fields": [
+      {"name": "ticker", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "fiscal_year", "type": "INTEGER", "mode": "NULLABLE"},
+      {"name": "section_id", "type": "STRING", "mode": "NULLABLE", "description": "item_1a | item_7"}
+    ]
+  },
+  {
+    "name": "expected_chunk_ids",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Exact chunk IDs that must be retrieved and cited (scored on the hydrated/GCP corpus only)"
+  },
+  {
+    "name": "reference_explanation",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Analyst-authored ground-truth explanation for the LLM-as-a-Judge"
+  },
+  {
+    "name": "expect_blocked",
+    "type": "BOOLEAN",
+    "mode": "REQUIRED",
+    "description": "True for red-team prompts that Model Armor / the projection filter must block"
+  },
+  {
+    "name": "expected_block_type",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "prompt_safety | projection_compliance"
+  },
+  {
+    "name": "filters",
+    "type": "RECORD",
+    "mode": "NULLABLE",
+    "description": "Explicit UI filter values sent with the query",
+    "fields": [
+      {"name": "tickers", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "gics_sector", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "section_id", "type": "STRING", "mode": "NULLABLE"},
+      {"name": "start_year", "type": "INTEGER", "mode": "NULLABLE"},
+      {"name": "end_year", "type": "INTEGER", "mode": "NULLABLE"},
+      {"name": "top_k", "type": "INTEGER", "mode": "NULLABLE"}
+    ]
+  },
+  {
+    "name": "tags",
+    "type": "STRING",
+    "mode": "REPEATED",
+    "description": "Free-form labels for slicing results"
+  },
+  {
+    "name": "notes",
+    "type": "STRING",
+    "mode": "NULLABLE",
+    "description": "Reviewer notes"
+  },
+  {
+    "name": "dataset_version",
+    "type": "STRING",
+    "mode": "REQUIRED",
+    "description": "Content hash of the golden dataset load (matches eval_results.dataset_version)"
+  },
+  {
+    "name": "loaded_at",
+    "type": "TIMESTAMP",
+    "mode": "REQUIRED",
+    "description": "UTC time of the load job"
+  }
+]

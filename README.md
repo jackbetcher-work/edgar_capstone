@@ -24,7 +24,7 @@ make dev
 # 3. Or build the frontend bundle and serve the single-origin app from FastAPI (:8000)
 make start
 
-# 4. Run secret scan, backend pytest suite (170 tests), ESLint, and frontend Vitest suite (7 tests)
+# 4. Run secret scan, backend pytest suite (189 tests), ESLint, and frontend Vitest suite (7 tests)
 make test
 
 # 5. Run the CI lint/format gates (ruff check + format --check, terraform fmt/validate, ESLint),
@@ -113,6 +113,17 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 
 `GET /health` includes an `observability` block showing the active exporter, sampling ratio, instrumentation state, and log format.
 
+### Golden Evals (`make eval-all`)
+`make eval-all` runs the golden query–variance–explanation set in [`evals/golden_dataset.jsonl`](evals/golden_dataset.jsonl) through the chat pipeline and exits non-zero when any gate in [`evals/thresholds.yaml`](evals/thresholds.yaml) regresses. See [`evals/README.md`](evals/README.md) for the record schema and how to add items.
+
+```bash
+make eval-all                                # Deterministic and offline (no credentials); report in build/evals/
+EVAL_MODE=live make eval-all                 # Live Gemini answers + Gemini 3.5 Flash judge with reference explanations + p95 TTFT gate
+EVAL_WRITE_BQ=true make eval-all             # Also stream the run to BigQuery sec_edgar.eval_results
+make load-golden-dataset                     # Replace BigQuery sec_edgar.golden_eval_set with the committed file
+make refresh-golden-expectations             # Recompute golden variance numbers from the engine (review the diff!)
+```
+
 ---
 
 ## Repository Structure
@@ -121,6 +132,7 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 ├── docs/project_reference.md        # Target architecture and product specification
 ├── docs/observability.md            # Tracing, structured logging, correlation surfaces & GCP lookup guide
 ├── prompts/                         # Versioned agent prompts: registry.yaml + v1/ (all agents), v2/ & v3/ (FinancialAnalystAgent)
+├── evals/                           # Golden eval dataset (golden_dataset.jsonl), regression gates (thresholds.yaml), schema guide
 ├── src/edgar_capstone/
 │   ├── server.py                    # FastAPI gateway, auth/RBAC routes, RAG & telemetry APIs
 │   ├── telemetry.py                 # Streaming BigQuery telemetry/audit sinks, Firestore feedback & LookML catalog
@@ -143,12 +155,13 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 │   │   ├── paths.py                 # Install-layout-aware data root resolution (source tree, /app/data, cwd)
 │   │   └── corpus_hydration.py      # GCS -> local corpus hydration (startup + CLI) and /health corpus status
 │   ├── vector_db/                   # Section-aware 10-K chunker, batched Vertex AI / deterministic 768-d embedder, chunk-health monitor
+│   ├── evals/                       # Golden eval models, scorers, gate runner, BigQuery golden_eval_set / eval_results I/O
 │   └── security/                    # IAP/OIDC JWT verification, Cloud Identity RBAC, SPIFFE S2S auth
 ├── looker/                          # LookML semantic layer (manifest, model, 6 views, 2 LookML dashboards)
 ├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI (see frontend/README.md)
-├── scripts/                         # CLI entrypoints: dataset build, vector DB build (+ --upload-only), R&D backfill, BigQuery / Vertex AI Search publishing, corpus hydration, container smoke test, secret scanner
+├── scripts/                         # CLI entrypoints: dataset build, vector DB build (+ --upload-only), R&D backfill, BigQuery / Vertex AI Search publishing, corpus hydration, container smoke test, secret scanner, golden evals (run_evals, load_golden_dataset, refresh_golden_expectations)
 ├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP (direct or via HTTPS LB), VPC + Vector Search PSC, VPC-SC (off by default), Cloud Build triggers, log-based latency metric
-├── tests/                           # Automated pytest suite (170 tests across agents, live ADK, GCP adapters, telemetry, observability, APIs, IaC, container packaging)
+├── tests/                           # Automated pytest suite (189 tests across agents, live ADK, GCP adapters, telemetry, observability, APIs, IaC, container packaging)
 ├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + Python 3.11 runtime) with baked manifests + build-time corpus check
 ├── .dockerignore                    # Keeps secrets and gitignored heavy corpus artifacts out of the build context
 ├── cloudbuild.yaml                  # Cloud Build: parallel lint/test gates -> build (+ offline smoke test) -> push + deploy (main) / verify-only (PRs)
@@ -340,7 +353,7 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 | :-- | :--- | :--- | :--- |
 | 1 | **VPC Service Controls and private networking** *(Sec. 8)* | Done | IAP-only access, Private Service Connect for Vector Search, and the perimeter definition are implemented. See [Current State § 4](#4-security-model-armor-guardrails-infrastructure--cicd-security-terraform-cloudbuildyaml). Applying the perimeter needs an org-delegated Access Context Manager policy. |
 | 2 | **OpenTelemetry, Cloud Trace, and trace-correlated JSON logs** *(Secs. 2, 4, 6, 10)* | Implemented; live check pending | Code, Terraform, and tests are done (see [`docs/observability.md`](docs/observability.md)). Next: deploy, then check one live `/api/v1/chat` trace in Cloud Trace. |
-| 3 | **Golden eval dataset, `make eval-all`, and coverage gate** *(Secs. 4, 9)* | Not started | No golden set, eval runner, coverage measurement, or CI gate. |
+| 3 | **Golden eval dataset, `make eval-all`, and coverage gate** *(Secs. 4, 9)* | Partially done | Golden set, BigQuery tables, loader, and `make eval-all` gates are in place (see [`evals/README.md`](evals/README.md)). Still to do: analyst review of the seed items, the `pytest-cov` gate, and running `make eval-all` in CI before deploy. |
 
 ---
 
@@ -362,25 +375,30 @@ These pieces are wired up end-to-end across the backend, Terraform, and Cloud Ru
 **Reference requirement:** A golden dataset of 20+ query–variance–explanation mappings in BigQuery; Gemini 3.5 Flash LLM-as-a-Judge regression checks through `make eval-all` before deployment; >80% pytest coverage; ≥92% grounding recall; 100% numeric agreement and citation coverage; p95 TTFT ≤ 3.0 s; 100% safety compliance.
 
 **Current state:**
-- 170 pytest tests with mocked LLM and Search APIs.
-- `NarrativeEvaluatorAgent` (4-axis rubric) and `/api/v1/evaluate`.
-- `verify_narrative_against_calculations` enforces numeric and citation locks for each response.
-- No golden dataset or BigQuery eval tables, no `make eval-all` target, and `pytest-cov` is not installed, so coverage is unmeasured.
-- Grounding recall, p95 TTFT, and safety compliance aren't benchmarked in CI. p95 TTFT appears only in the Looker dashboard.
+- **Golden dataset** ([`evals/golden_dataset.jsonl`](evals/golden_dataset.jsonl)) has 31 items:
+  - 9 single-company longitudinal, 7 multi-company peer comparison, and 7 thematic-shift queries (including NVIDIA export-control wording from FY2024 to FY2026 and generative-AI risk across IT issuers).
+  - 8 Model Armor / projection-filter red-team prompts.
+  - Each scored item records expected variances (numbers frozen from the calculation engine), expected grounding sections, and a reference explanation.
+  - The seed queries and explanations are drafts that still need analyst review.
+- **BigQuery:** `sec_edgar.golden_eval_set` and `sec_edgar.eval_results` are defined in `terraform/evals.tf`. Both CI service accounts can append to `eval_results` and read `golden_eval_set`. `make load-golden-dataset` replaces `golden_eval_set` using a multipart load job.
+- **`make eval-all`** (`scripts/run_evals.py`, `src/edgar_capstone/evals/`) runs every item through `run_conversational_rag_turn` and checks the gates in [`evals/thresholds.yaml`](evals/thresholds.yaml):
+  - numeric agreement (100%) and citation coverage (100%)
+  - grounding recall (≥ 92%) and routing accuracy (100%)
+  - judge faithfulness, explanation quality, and thematic consistency (in live mode, the Flash judge also gets the reference explanation)
+  - safety compliance (100%)
+  - p95 TTFT (≤ 3000 ms, `EVAL_MODE=live` only)
+  
+  The run exits non-zero on any regression. `EVAL_WRITE_BQ=true` streams one row per run, keyed by commit SHA, to `eval_results`.
+- **Deterministic baseline:**
+  - Synthetic (CI) corpus: 31/31 items, every gate passes.
+  - Hydrated corpus: every gate passes, with grounding recall at 0.927. In four longitudinal items (MSFT, UNH, XOM, CRM), the start-year filing is either not retrieved or not cited.
+- **Tests:** `tests/test_golden_evals.py` covers dataset coverage, golden numbers vs. the engine, schema drift, scorers, gates, mocked BigQuery I/O, and an end-to-end subset.
+- `pytest-cov` is not installed yet, so coverage is still unmeasured, and `make eval-all` is not wired into Cloud Build or GitHub Actions.
 
-**Work to close:**
-1. Write `evals/golden_dataset.jsonl` with at least 20 items covering single-company longitudinal, multi-company peer comparison, and thematic-shift queries (for example, AI-risk wording from 2024 to 2026). Fields: `query`, `tickers`, `fiscal_years`, `expected_variances`, `expected_chunk_ids` / sections, `reference_explanation`, and `category`.
-2. Provision `sec_edgar.golden_eval_set` and `sec_edgar.eval_results` in Terraform, and add a loader script.
-3. Write `scripts/run_evals.py` to compute these metrics against the thresholds:
-   - numeric agreement (100%)
-   - citation coverage (100%)
-   - grounding recall: expected chunks retrieved and cited (≥ 92%)
-   - Flash judge scores for faithfulness, explanation quality, and thematic consistency
-   - Model Armor red-team prompts blocked (100%)
-   - p95 TTFT in live mode (≤ 3000 ms)
-
-   Write the results to `eval_results` and exit non-zero on any regression.
-4. Add `make eval-all`, deterministic by default and `EVAL_MODE=live` for Gemini/Vertex.
-5. Add `pytest-cov` to the `dev` extras and run `pytest --cov=edgar_capstone --cov-fail-under=80` in `make test`, `cloudbuild.yaml`, and GitHub Actions. Run `make eval-all` as a gate before the deploy stage.
+**Remaining:**
+1. Have an analyst review the seed items in `evals/golden_dataset.jsonl` (queries, `expected_sections`, reference explanations). Then run `make load-golden-dataset`.
+2. Run `terraform apply`. It only adds the two tables and their IAM bindings.
+3. Run `EVAL_MODE=live make eval-all` once to calibrate the judge thresholds and get a TTFT baseline.
+4. Add `pytest-cov` to the `dev` extras and run `pytest --cov=edgar_capstone --cov-fail-under=80` in `make test`, `cloudbuild.yaml`, and GitHub Actions. Add a `python scripts/run_evals.py --write-bigquery` step that gates the deploy stage.
 
 **Done when:** CI fails if coverage drops below 80% or any eval threshold regresses, and each deploy has a matching `eval_results` row in BigQuery.

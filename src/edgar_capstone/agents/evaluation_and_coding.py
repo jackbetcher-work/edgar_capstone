@@ -131,8 +131,13 @@ def evaluate_variance_explanation(
     llm_judge_fn: Callable[[str, str], dict[str, Any]] | None = None,
     execution_mode: str | None = None,
     llm: BaseLlm | None = None,
+    reference_explanation: str | None = None,
 ) -> NarrativeEvaluationReport:
-    """Evaluate a synthesized financial variance report using `gemini-3.5-flash` and track context latency."""
+    """Evaluate a synthesized financial variance report using `gemini-3.5-flash` and track context latency.
+
+    `reference_explanation` (golden eval runs only) is forwarded to the live judge as a
+    ground-truth explanation; the deterministic rubric ignores it.
+    """
     prep_start = time.perf_counter()
     eval_model = llm.model if llm is not None else resolve_model_for_task("evaluation")
 
@@ -161,6 +166,7 @@ def evaluate_variance_explanation(
                     cached_explanations_count=cached_explanations_count,
                     resolution=runtime_res,
                     custom_llm=llm,
+                    reference_explanation=reference_explanation,
                 )
                 num_score = max(
                     0.0,

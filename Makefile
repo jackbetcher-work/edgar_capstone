@@ -22,7 +22,14 @@ OFFLINE_ENV := -e EDGAR_EXECUTION_MODE=deterministic -e EDGAR_DATA_BACKEND=local
 	-e EDGAR_TELEMETRY_BACKEND=local -e EDGAR_FEEDBACK_BACKEND=local \
 	-e EDGAR_PROMPT_STORE_BACKEND=local -e EDGAR_MODEL_ARMOR_MODE=disabled
 
-.PHONY: help install dev start backend frontend build lint format test check clean hydrate-corpus smoke docker-build docker-smoke docker-smoke-hydrated publish-financials index-vertex-search backfill-rd
+# Golden eval suite (scripts/run_evals.py). EVAL_MODE=live uses Gemini + the Flash judge on
+# Vertex AI; EVAL_WRITE_BQ=true streams the run to BigQuery sec_edgar.eval_results.
+EVAL_MODE ?= deterministic
+EVAL_DATASET ?= evals/golden_dataset.jsonl
+EVAL_WRITE_BQ ?= false
+EVAL_ARGS ?=
+
+.PHONY: help install dev start backend frontend build lint format test check clean hydrate-corpus smoke docker-build docker-smoke docker-smoke-hydrated publish-financials index-vertex-search backfill-rd eval-all load-golden-dataset refresh-golden-expectations
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage: make <target>\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 } END {printf "\n"}' $(MAKEFILE_LIST)
@@ -76,6 +83,16 @@ test: ## Run backend (pytest + secret scan) and frontend (lint + vitest) checks
 	$(PYTHON) scripts/verify_no_secrets.py --repo-root .
 	$(PYTHON) -m pytest -q
 	cd frontend && npm run lint && npm test
+
+eval-all: ## Run the golden eval regression gates (EVAL_MODE=deterministic|live, EVAL_WRITE_BQ=true)
+	$(PYTHON) scripts/run_evals.py --mode $(EVAL_MODE) --dataset $(EVAL_DATASET) \
+		$(if $(filter true 1 yes,$(EVAL_WRITE_BQ)),--write-bigquery --project-id $(CORPUS_PROJECT_ID),) $(EVAL_ARGS)
+
+load-golden-dataset: ## Validate evals/golden_dataset.jsonl and load it into BigQuery sec_edgar.golden_eval_set
+	$(PYTHON) scripts/load_golden_dataset.py --project-id $(CORPUS_PROJECT_ID) --dataset $(EVAL_DATASET)
+
+refresh-golden-expectations: ## Recompute golden expected_variances numbers from the local engine (review the diff!)
+	$(PYTHON) scripts/refresh_golden_expectations.py --dataset $(EVAL_DATASET)
 
 hydrate-corpus: ## Download gitignored chunks manifest + 10-K Markdown from GCS into data/curated_dataset
 	$(PYTHON) scripts/hydrate_corpus.py --bucket $(SEC_CORPUS_BUCKET) --project-id $(CORPUS_PROJECT_ID) --scopes $(HYDRATION_SCOPES) $(if $(HYDRATION_TICKERS),--tickers $(HYDRATION_TICKERS),)

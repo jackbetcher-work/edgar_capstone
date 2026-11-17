@@ -46,6 +46,8 @@ hydrate-sec-corpus = "scripts.hydrate_corpus:main"
 container-smoke-test = "scripts.container_smoke_test:main"
 publish-sec-corpus = "scripts.publish_corpus:main"
 backfill-rd-metric = "scripts.backfill_rd_metric:main"
+run-golden-evals = "scripts.run_evals:main"
+load-golden-dataset = "scripts.load_golden_dataset:main"
 
 [tool.setuptools.packages.find]
 where = ["src", "."]

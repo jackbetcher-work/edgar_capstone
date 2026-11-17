@@ -803,8 +803,14 @@ async def run_live_adk_narrative_evaluation_async(
     cached_explanations_count: int = 0,
     resolution: LiveRuntimeResolution | None = None,
     custom_llm: BaseLlm | None = None,
+    reference_explanation: str | None = None,
 ) -> tuple[dict[str, Any], AdkStreamResult]:
-    """Execute `NarrativeEvaluatorAgent` (`gemini-3.5-flash`) via ADK `Runner` with SSE streaming."""
+    """Execute `NarrativeEvaluatorAgent` (`gemini-3.5-flash`) via ADK `Runner` with SSE streaming.
+
+    When `reference_explanation` is supplied (golden eval runs), it is appended as an
+    analyst-authored reference so the judge can score thematic consistency and explanation
+    quality against the expected drivers rather than in isolation.
+    """
     from edgar_capstone.agents.evaluation_and_coding import create_narrative_evaluator_agent
 
     resolved = resolution or resolve_live_adk_runtime(custom_llm=custom_llm)
@@ -833,6 +839,15 @@ async def run_live_adk_narrative_evaluation_async(
         f"```json\n{json.dumps(judge_citations, default=str)}\n```\n\n"
         f"### Synthesized Narrative Report Under Evaluation\n{response_markdown}\n"
     )
+    if reference_explanation and reference_explanation.strip():
+        eval_prompt += (
+            "\n### Golden Reference Explanation (analyst-authored ground truth)\n"
+            f"{reference_explanation.strip()}\n\n"
+            "Score `explanation_quality_score` and `thematic_consistency_score` by how well the "
+            "report recovers the drivers and themes in this reference. Do not penalize the report "
+            "for omitting reference claims that its retrieved citations do not support, and never "
+            "reward claims that appear only in the reference but not in the citations.\n"
+        )
 
     stream_res = await run_adk_agent_stream_async(
         agent=evaluator_agent,
