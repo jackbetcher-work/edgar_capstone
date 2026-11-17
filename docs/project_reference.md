@@ -97,9 +97,9 @@ Supported query types (routing intents): `longitudinal_single_company`, `multi_c
 - **Frontend:** React 18+ / TypeScript / Tailwind CSS (Vite)
 - **Orchestration:** Google ADK / AGY SDK
 - **Models:** `gemini-3.8-flash` for financial reasoning and orchestration (`RootOrchestrator`, `FinancialAnalystAgent`), served from the Vertex AI `global` endpoint; `gemini-3.5-flash` for evaluation (LLM-as-a-Judge), coding assistance, and context compaction. Both are configurable (`EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`).
-- **Infrastructure:** Google Cloud Run, Cloud Storage, Gemini Enterprise Agent Platform (Vertex AI Search, Vector Search, Context Caching), BigQuery, Secret Manager, VPC Service Controls, OpenTelemetry, Cloud Trace
+- **Infrastructure:** Google Cloud Run, Cloud Storage, Vertex AI Search, BigQuery (`financial_metrics` + `VECTOR_SEARCH` over `filing_chunks` embeddings), Cloud Firestore (`analyst_sessions` + `analyst_feedback`), Vertex AI Context Caching, Secret Manager, Model Armor + Cloud SDP/DLP, OpenTelemetry, Cloud Trace, Cloud Monitoring (optional VPC Service Controls perimeter and opt-in Vertex AI Vector Search index deployment)
 - **IaC / Packaging:** Terraform, Docker
-- **CI/CD:** Cloud Build
+- **CI/CD:** Cloud Build (`cloudbuild.yaml`) & GitHub Actions (`.github/workflows/deploy.yml`, keyless WIF)
 
 ---
 
@@ -109,32 +109,36 @@ Supported query types (routing intents): `longitudinal_single_company`, `multi_c
 ```mermaid
 graph TD
     User([Financial Analyst]) -->|1. Chat Request| FE[React Frontend - Chat Pane + Source Viewer]
-    FE -->|2. Streaming API Request| BE[FastAPI Backend - Cloud Run]
+    FE -->|2. SSE Stream POST /api/v1/chat/stream| BE[FastAPI Backend - Cloud Run]
     subgraph Backend [FastAPI Backend - Secure Sandbox]
-        BE --> MA[Model Armor - Input Screening]
-        MA --> OR[ADK RootOrchestrator - Scope Resolution and Intent Routing]
-        OR -->|3. Session Recall| MEM[Session Memory]
+        BE --> MA[Model Armor + Cloud SDP - Input Screening]
+        MA --> SV[Scope Validation & 501-Issuer EntityCatalog]
+        SV -->|Ambiguous / Out-of-Corpus| FE
+        SV --> OR[ADK RootOrchestrator - Intent Routing]
+        OR -->|3. Session Recall| MEM[Firestore Session Memory - analyst_sessions]
         OR -->|4. Delegate| FA[FinancialAnalystAgent]
         FA -->|5a. Metrics| MT[Metric Fetch Tool]
         FA -->|5b. Variances and Anomalies| CE[Deterministic Variance Calculation Engine]
         FA -->|5c. Text Retrieval| RAG[Hybrid RAG Search Tool]
-        FA -->|5d. Thematic Deltas| DD[Disclosure Delta Pipeline]
-        FA -->|6. Full Section Context| CM[Context Cache Manager]
-        CM --> VACC[Vertex AI Context Cache]
-        CM -->|Fetch If Miss| GCS[Cloud Storage - SEC Corpus]
-        FA -->|7. Grounded Synthesis| GEM[gemini-3.8-flash]
-        GEM --> CV[Citation and Fact Verifier]
+        FA -->|5d. Thematic Deltas / Map-Reduce| DD[Disclosure Delta & Sector Map-Reduce]
+        FA -->|6. Ranked Passages / Full Section| CM[Context Cache Manager]
+        CM -->|Fetch Full Section| GCS[Cloud Storage - SEC Corpus]
+        FA -->|7. Grounded Synthesis| GEM[gemini-3.8-flash - bounded thinking]
+        GEM --> CV[Table-Aware Citation & Fact Verifier]
+        CV -.->|Async Off-Path| JUDGE[gemini-3.5-flash Judge]
     end
-    CV -->|8. Narrative + Citations + Variance Tables| FE
+    CV -->|8. Narrative + XBRL/Text Citations + Coverage Notices| FE
     subgraph RAG_Data_Foundation [Hybrid Search Layer]
-        MT --> BQ_FIN[BigQuery - Financial Metrics]
+        MT --> BQ_FIN[BigQuery - financial_metrics]
         CE --> BQ_FIN
         RAG --> VAIS[Vertex AI Search - 10-K Corpus]
-        RAG --> VVS[Vector Search - filing_chunks Embeddings]
-        DD --> VVS
+        RAG --> BQ_VEC[BigQuery VECTOR_SEARCH - filing_chunks Embeddings]
+        DD --> BQ_VEC
+        CM --> BQ_VEC
     end
     BE -->|Spans/Traces| OTEL[OpenTelemetry / Cloud Trace]
     BE -->|Logs/Metrics| BQ[BigQuery Telemetry Sink]
+    BE -->|Feedback / Sessions| FS[Cloud Firestore]
 ```
 
 ### Request Flow
@@ -148,9 +152,10 @@ graph TD
 ### Architecture Principles
 - **Calculation / Synthesis Separation:** The LLM receives pre-computed numbers and disclosure deltas as facts; it never performs arithmetic or invents comparisons.
 - **Modularity:** The calculation engine, retrieval tools, context cache manager, and ADK orchestrator are independent, allowing models and calculation logic to be updated without modifying other components.
-- **Scalability:** Hosted on Google Cloud Run with automated scaling bounds to handle multiple concurrent analyst sessions. Sector-wide thematic queries use a fan-out / map-reduce pattern (per-company, per-year summaries aggregated into a sector narrative) rather than loading every filing into one context.
-- **Resilience:** Retry policies with exponential backoff for Vertex AI and BigQuery calls. There is no offline or local-data fallback: retrieval always uses live BigQuery, Vertex AI Search, Vertex AI embeddings, and the GCS corpus, and every answer is written by live Gemini. A live answer that fails verification is withheld (`answer_verified: false`) rather than replaced with template text; partial data coverage is reported, not filled in.
-- **Hybrid Data Foundation:** Vertex AI Search, vector search, and BigQuery share common metadata keys (`ticker`, `cik`, `fiscal_year`, `gics_sector`, `section_id`, `accession_number`) so structured and unstructured results join cleanly.
+- **Scalability:** Hosted on Google Cloud Run with automated scaling bounds to handle multiple concurrent analyst sessions. Sector-wide thematic queries use a full-sector batched fan-out / map-reduce pattern (`agents/sector_map_reduce.py`: single BigQuery `ML.DISTANCE` + `QUALIFY ROW_NUMBER()` query over all matching issuers in the GICS sector, deterministic `build_company_evolution`, parallel `gemini-3.5-flash` map batches of ~14 issuers with quote verification, and `gemini-3.8-flash` reduce synthesis) rather than loading every filing into one context. Progress streams over SSE (`POST /api/v1/chat/stream`) within the 3.0 s TTFT target, while `POST /api/v1/chat` remains backward-compatible.
+- **Latency & Async Evaluation:** A persistent background `asyncio` event loop (`agents/live_runtime.py`) reuses cached ADK `Gemini` clients (`@PerLoopCachedProperty` HTTP/2 keepalive pool + OAuth2 credential cache) and bounded thinking (`thinking_budget=512`), compacting redundant nested XBRL provenance metadata out of the LLM prompt copy (~10× smaller variance payload while preserving full provenance in API/UI/rendered output). Live Flash LLM-as-a-Judge runs asynchronously off the interactive request path (flushed on shutdown); `evals/runner.py` invokes the judge directly with `reference_explanation`.
+- **Resilience:** Retry policies with exponential backoff for Vertex AI and BigQuery calls, plus bounded thread-safe query-embedding caching (`vector_db/embedder.py`). There is no offline or local-data fallback: retrieval always uses live BigQuery, Vertex AI Search, Vertex AI embeddings, and the GCS corpus, and every answer is written by live Gemini. If all findings in a live Gemini report fail verification on the first pass, a single verification-guided regeneration attempt runs with exact verifier rejection reasons; if still unverifiable, the answer is withheld (`answer_verified: false`) rather than replaced with template text; partial data coverage is reported deterministically via `coverage_notices`, not filled in.
+- **Hybrid Data Foundation:** Vertex AI Search, BigQuery `VECTOR_SEARCH` over `filing_chunks`, and BigQuery `financial_metrics` share common metadata keys (`ticker`, `cik`, `fiscal_year`, `gics_sector`, `section_id`, `accession_number`) so structured and unstructured results join cleanly.
 
 ### Agents & Tools (ADK)
 - **RootOrchestrator:** Central supervisor; scope resolution, session memory recall, and intent routing.
@@ -176,20 +181,20 @@ graph TD
   - **Classification:** coverage ≥ 0.90 → *unchanged*; a counterpart chunk sharing ≥ 0.40 of the passage's trigrams → *modified*, with word-level added/removed phrases; otherwise *added* (current-year passage) or *removed* (prior-year passage).
   - **Theme mentions:** occurrences of the theme's key terms (with simple synonyms, e.g., "AI" → "artificial intelligence", "generative AI") are counted per fiscal year.
   - **Grounding:** the output is a deterministic, citable set of grounding facts that Gemini summarizes into trend narratives. Each delta cites both the prior-year and current-year passage, and missing fiscal years are reported as data gaps.
-  - **Scope:** explicit tickers, or the top companies by theme relevance within a GICS sector (default cap of 5, `EDGAR_DISCLOSURE_DELTA_MAX_COMPANIES`). Full-sector coverage depends on the map-reduce pattern above.
-- **Reasoning Strategy:** Structured ReAct execution loop. The agent evaluates calculated variances and disclosure deltas, queries 10-K context for explanations, and formats the output.
+  - **Scope:** explicit tickers run `compare_disclosures_across_years` directly; sector-wide queries (`gics_sector != "ALL"` without explicit tickers) run the full-sector batched map-reduce pipeline (`agents/sector_map_reduce.py`), covering every in-scope issuer that has filings in BigQuery and emitting real-time `sector_map_progress` SSE events.
+- **Reasoning Strategy:** Structured ReAct execution loop (`prompts/v5/financial_analyst.yaml`). The agent evaluates calculated variances and disclosure deltas, synthesizes directly when boundary-balanced evidence leads suffice or queries 10-K context via bounded tools, and outputs constrained `AnalystReport` JSON (no uncited `notes` field).
 - **Tool Registration:** Tool definitions are registered natively inside the ADK framework using explicit Pydantic type schemas.
 - **Function Calling Logic:** Standardized exception wrappers handle API rate limits (HTTP 429) and timeouts.
 
 ### Conversational Behavior
-- **Session Memory:** Scope (tickers, sector, years, metrics, theme) persists across turns so follow-ups ("now add Microsoft", "just FY2025") refine the prior query.
-- **Clarification:** Ambiguous requests (e.g., unknown company name, unspecified period) trigger a clarifying question rather than a guess.
-- **Out-of-Corpus Handling:** Requests for unsupported metrics, filing types, non-S&P 500 issuers, or years without filings are answered with an explicit coverage statement, never with ungrounded content.
+- **Persistent Session Memory:** Scope (tickers, sector, years, metrics, theme) persists across turns and Cloud Run instances in Cloud Firestore (`analyst_sessions` collection), strictly isolated by authenticated `(user_id, session_id)` via deterministic SHA-256 document keys. Analysts can list (`GET /api/v1/sessions`) and delete (`DELETE /api/v1/sessions/{session_id}`) their own sessions. Follow-ups support additive (`"now add Microsoft"`) and subtractive (`"drop Apple"`) refinements. Deterministic context compaction tracks token digests without emitting synthetic LLM billing records.
+- **Clarification:** Ambiguous requests (e.g., no company, sector, or inherited scope) trigger a plain-English clarifying question (`status: "clarification_needed"`) with clickable suggested follow-up queries rather than guessing. Dynamic 501-issuer `EntityCatalog` resolves company names across all 11 GICS sectors and deduplicates dual-class share structures by CIK (e.g., `"Alphabet"` → `GOOGL`, while explicit `GOOG` still resolves).
+- **Out-of-Corpus Handling:** Requests for unsupported metrics (e.g., EBITDA, FCF, EPS), filing types (10-Q, 8-K, DEF 14A), non-S&P 500 issuers (e.g., Rivian, Stripe), or out-of-range years (`< FY2020`) return an explicit coverage statement (`status: "out_of_corpus"`) with clickable alternatives. Missing fiscal years (e.g., FY2026 for calendar-year filers filing in Q1 2027) and misaligned fiscal calendars emit deterministic `coverage_notices`.
 
 ### Frontend (Split-Pane Report)
-- **Chat Pane:** Query composer, starter prompts, scope bar showing active filters (tickers / sector / years / sections), streamed narrative with inline citation markers, and variance table cards.
-- **Source Viewer Pane:** Clicking a citation opens the cited 10-K section (company, fiscal year, item) and scrolls to and highlights the exact passage, with a link to the filing on SEC EDGAR.
-- **Feedback:** Thumbs-up/down and comments per response.
+- **Chat Pane:** Query composer, starter prompts, scope bar showing active filters (tickers / sector / years / sections), real-time SSE progress streaming (`POST /api/v1/chat/stream`), coverage notice banners, sector coverage pill, clickable suggested follow-up chips, variance table cards showing `period_of_report` dates and `DIFFERING FY-END DATES` badges, anomaly flag cards, and narrative with clickable inline text + XBRL citation chips.
+- **Source Viewer Pane:** Clicking a text citation opens the cited 10-K section (company, fiscal year, item) and highlights the exact passage with an SEC EDGAR link. Clicking an inline XBRL citation or `[XBRL]` provenance trigger opens the **XBRL Fact** tab displaying accession numbers, XBRL concepts, denominator concepts, derived calculation inputs, SEC EDGAR filing link, and MD&A jump button.
+- **Feedback:** Thumbs-up/down and comments per response persisted in Firestore (`analyst_feedback`).
 
 ---
 
@@ -215,17 +220,18 @@ graph TD
 - Index membership is based on the constituent snapshot, not point-in-time historical membership.
 
 ### Retrieval Strategy
-- **Hybrid Search RAG:** Combines Vertex AI Search (keyword + semantic document retrieval over the 10-K corpus), vector search over the `filing_chunks` embeddings (semantic chunk retrieval), and BigQuery (structured financial metrics).
+- **Hybrid Search RAG:** Combines **Vertex AI Search** (keyword + semantic document retrieval over the 10-K corpus), **BigQuery `VECTOR_SEARCH`** over native `sec_edgar.filing_chunks` 768-d Vertex embeddings (semantic chunk retrieval), and **BigQuery `financial_metrics`** (structured financial metrics). *(Architectural simplification: the idle Vertex AI Vector Search PSC index replica is intentionally not deployed — `deploy_vertex_vector_index = false` — eliminating ~$50–70/mo of idle compute and fallback-timeout latency while running BigQuery `VECTOR_SEARCH` and Vertex AI Search in parallel directly against the same 342,945 embeddings.)*
 - **Metadata Filtering:** All retrieval paths support filters on `ticker`, `fiscal_year` range, `gics_sector`, and `section_id` (`item_1a`, `item_7`).
-- **Role of each component:** Vertex AI Search locates relevant documents and cross-document trends; vector search returns precise, citable chunks; BigQuery supplies metrics and the authoritative metadata for joins.
-- **Deep Reading:** Gemini Context Caching holds full sections for single- and peer-company synthesis; sector-wide thematic queries rely on chunk retrieval plus map-reduce summarization.
+- **Role of each component:** Vertex AI Search locates relevant documents and cross-document trends; BigQuery `VECTOR_SEARCH` returns precise, citable chunks and powers both `query_cached_10k_context` (zero live paragraph re-embedding, zero GCS downloads during ranking) and sector-wide `ML.DISTANCE` + `QUALIFY ROW_NUMBER()` retrieval; BigQuery `financial_metrics` supplies metrics and the authoritative metadata for joins.
+- **Deep Reading:** Full 10-K sections are cached from GCS on demand for the Source Viewer Pane and citation boundary verification; sector-wide thematic queries rely on chunk retrieval plus batched map-reduce summarization.
 
 ### Citation Model
 Every citation resolves to a stable, traceable location in the source 10-K:
-- **Narrative / text claims:** `accession_number` + `section_id` (+ `section_title`) + `chunk_id` (with character offsets where available) → SEC EDGAR filing URL (`sec_filing_url`).
-- **Numeric claims:** `accession_number` + XBRL concept from `metric_provenance` (the 10-K's financial statements) for reported values; calculated values (variances, growth rates, margins) cite the reported inputs they were derived from.
+- **Narrative / text claims:** `accession_number` + `section_id` (+ `section_title`) + `chunk_id` → SEC EDGAR filing URL (`sec_filing_url`), rendered as `[TICKER FYxxxx | Section Title | chunk_id](sec_filing_url)`.
+- **Numeric claims:** `accession_number` + XBRL concept from `metric_provenance` (the 10-K's financial statements) for reported values; calculated values (variances, growth rates, margins) carry `derived_from` / `derived_margin_inputs` linking every reported input. Rendered inline on `Key Metrics` bullets as `[TICKER FYxxxx | XBRL <concept> | acc:<accession_number>](sec_filing_url)`.
+- **Table-aware verification:** Claim verification handles pipe-delimited SEC Markdown tables (`| $ | 254,098 | 21 | %`) and scales verbatim cell figures strictly by unit scales explicitly declared in the cited chunk (`in millions` / `in billions` / `in thousands`).
 - **Thematic deltas:** Cite both the prior-year and current-year passages.
-- A response that contains an uncited claim fails verification and is regenerated or the claim is removed.
+- **Zero uncited notes:** `AnalystReport` omits free-text `notes` completely; coverage notices are rendered deterministically by the system. A response whose findings all fail verification triggers one verification-guided regeneration attempt; if still unverifiable, it is strictly withheld (`answer_verified: false`).
 
 ---
 
@@ -246,9 +252,9 @@ Every citation resolves to a stable, traceable location in the source 10-K:
 - **Agent Identities:** Granular, per-agent identities enforce Least Privilege for service-to-service communication.
 
 ### Data Protection
-- **Encryption:** 100% of data is encrypted in transit using TLS 1.3. GMEK protects Data-at-Rest.
-- **VPC Service Controls (VPC-SC):** A strict service perimeter locks down Vertex AI, Cloud Run, GCS, and BigQuery.
-- **PII / Sensitive Data:** Standard filters check for sensitive internal data or financial projection leaks.
+- **Encryption:** 100% of data is encrypted in transit using **TLS 1.2+** (`RESTRICTED` SSL policy in `load_balancer.tf`, and Google Front End automatic TLS 1.3 negotiation for modern clients in `iap_direct` mode). *(Amended from strict "TLS 1.3 only" because GCP Compute Engine SSL Policy rejects `TLS_1_3` as `min_tls_version` in `hashicorp/google` 6.50.0.)* Google-managed encryption keys (GMEK) protect Data-at-Rest.
+- **VPC Service Controls (VPC-SC):** Terraform (`terraform/vpc_service_controls.tf`) defines a strict perimeter locking down Vertex AI, Cloud Run, GCS, and BigQuery (`enable_vpc_service_controls = false` by default because Argolis sandbox accounts lack org-level Access Context Manager permissions; requires an org-delegated scoped policy to enable).
+- **PII / Sensitive Data:** Model Armor + Cloud SDP (`sec_edgar_sdp_inspect` / `sec_edgar_sdp_deidentify`) redact personal PII (SSNs, personal emails, phone numbers, credentials) while explicitly exempting operational service-account and SEC/Google addresses (`.*@.*\.iam\.gserviceaccount\.com$`, `.*@(sec\.gov|.*\.googleapis\.com)$`) via an `EMAIL_ADDRESS` exclusion `rule_set`. Projection compliance filters block forward-looking forecasts, price targets, and MNPI leaks.
 - **Secrets:** Secret Manager.
 
 ### AI Safety & Prompt Management
@@ -258,8 +264,8 @@ Every citation resolves to a stable, traceable location in the source 10-K:
 - **Prompt Lifecycle:** Prompts are stored in a versioned repository and loaded dynamically.
 
 ### CI/CD
-- Deployed via Cloud Build triggered automatically upon successful Git merges.
-- The pipeline executes formatting checks, lints, the pytest suite, and golden-dataset evaluation gates.
+- Defined in both Cloud Build (`cloudbuild.yaml` + opt-in `terraform/cloudbuild.tf` 2nd-gen GitHub triggers, currently disabled pending interactive browser GitHub App OAuth setup) and GitHub Actions (`.github/workflows/deploy.yml`, keyless WIF).
+- Pull request pipelines enforce formatting checks, lints, secret scan, frontend Vitest, and backend `pytest --cov=edgar_capstone --cov-fail-under=80` against live GCP (using IAM bindings applied from `terraform/ci_live_test_access.tf`). Main-branch deploys additionally run `python scripts/run_evals.py --write-bigquery` before deploying to Cloud Run.
 
 ---
 

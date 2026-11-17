@@ -162,16 +162,15 @@ AGENT_DEFAULT_TASK_CATEGORY: dict[str, ModelTaskCategory] = {
 
 
 def low_thinking_config_for_model(model: str | BaseLlm) -> genai_types.ThinkingConfig | None:
-    """Low-effort thinking for structured Flash tasks (judge JSON, code, cache warmup).
+    """Low-effort bounded thinking for structured Gemini tasks (analyst, judge, map-reduce).
 
-    Gemini 2.5+/3.x models count thinking tokens against `max_output_tokens`. Left at the
-    default effort, they can spend the whole output budget thinking and return truncated
-    JSON. Gemini 3.x takes `thinking_level`; Gemini 2.5 takes `thinking_budget`.
+    Caps thinking tokens with `thinking_budget` so Gemini 3.x / 2.5 models deliver crisp
+    sub-2s TTFT without multi-second runaway thinking bursts or truncated JSON outputs.
     """
     name = (model.model if isinstance(model, BaseLlm) else str(model or "")).lower()
     short = name.rsplit("/", maxsplit=1)[-1]
     if short.startswith("gemini-3"):
-        return genai_types.ThinkingConfig(thinking_level=genai_types.ThinkingLevel.LOW)
+        return genai_types.ThinkingConfig(thinking_budget=512)
     if short.startswith("gemini-2.5"):
         return genai_types.ThinkingConfig(thinking_budget=1024)
     return None

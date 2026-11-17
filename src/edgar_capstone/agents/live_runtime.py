@@ -917,16 +917,41 @@ def _build_financial_reasoning_prompt(
     flags_section = _material_flags_prompt_section(material_variance_flags)
     if flags_section:
         sections.append(flags_section)
-    deltas_section = _disclosure_deltas_prompt_section(disclosure_deltas)
-    if deltas_section:
-        sections.append(deltas_section)
-    if sector_map_summaries and sector_map_summaries.get("batch_summaries"):
+    has_sector_map = bool(sector_map_summaries and sector_map_summaries.get("batch_summaries"))
+    if not has_sector_map:
+        deltas_section = _disclosure_deltas_prompt_section(disclosure_deltas)
+        if deltas_section:
+            sections.append(deltas_section)
+    if has_sector_map and sector_map_summaries is not None:
+        compact_batches = [
+            {
+                "tickers_covered": b.get("tickers_covered"),
+                "dominant_themes": b.get("dominant_themes"),
+                "wording_shifts": b.get("wording_shifts"),
+                "evidence": [
+                    {
+                        "ticker": ev.get("ticker"),
+                        "fiscal_year": ev.get("fiscal_year"),
+                        "chunk_id": ev.get("chunk_id"),
+                        "verbatim_quote": ev.get("verbatim_quote"),
+                        "takeaway": ev.get("takeaway"),
+                    }
+                    for ev in (b.get("evidence") or [])
+                ],
+            }
+            for b in sector_map_summaries.get("batch_summaries") or []
+        ]
+        compact_sector_payload = {
+            "sector_coverage": sector_map_summaries.get("sector_coverage"),
+            "delta_summary": (disclosure_deltas or {}).get("summary"),
+            "batch_summaries": compact_batches,
+        }
         sections.append(
             "## Sector-Wide Map-Reduce Batch Summaries (covering all matching issuers in the sector)\n"
             "(Synthesize sector-wide trends from these verified batch summaries. Every claim in "
             "`findings` MUST cite one of the real company `chunk_id`s provided below or in evidence leads "
             "with a verbatim `evidence_quote`.)\n"
-            f"```json\n{_compact_json(sector_map_summaries)}\n```"
+            f"```json\n{_compact_json(compact_sector_payload)}\n```"
         )
     leads = _compact_evidence_leads(cached_explanations, citations, scope=scope)
     if leads:

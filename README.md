@@ -25,7 +25,7 @@ make dev
 # 3. Or build the frontend bundle and serve the single-origin app from FastAPI (:8000)
 make start
 
-# 4. Run secret scan, backend pytest suite (live GCP + live Gemini), ESLint, and frontend Vitest suite
+# 4. Run secret scan, backend pytest suite (live GCP + live Gemini, >=80% coverage gate), ESLint, and frontend Vitest suite
 make test
 
 # 5. Run the CI lint/format gates (ruff check + format --check, terraform fmt/validate, ESLint),
@@ -38,9 +38,9 @@ make check
 > **Local Authentication Note:** Outside Cloud Run (`IAP_STRICT_MODE=false`), the UI can mint a local ES256 Workspace/Okta developer JWT via `POST /api/v1/auth/sso/dev-token` so all RBAC-protected `/api/v1/*` routes work locally without external IdP setup.
 
 ### Live Data & Gemini Configuration
-Every request reads live GCP data (BigQuery `financial_metrics` / `filing_chunks`, Vertex AI Search, Vertex AI `text-embedding-005`, and the GCS corpus bucket), and every answer is written by live Gemini through the Google ADK `Runner` (SSE streaming). There is no local corpus, no synthesized filing text, and no template-synthesis fallback. A live answer that fails claim-level verification is withheld (`answer_verified: false`, shown as **Answer Withheld** in the UI) rather than replaced. Upstream failures return HTTP `503`.
+Every request reads live GCP data (BigQuery `financial_metrics` / `filing_chunks` via `VECTOR_SEARCH`, Vertex AI Search, Vertex AI `text-embedding-005`, Cloud Firestore `analyst_sessions` / `analyst_feedback`, and the GCS corpus bucket), and every answer is written by live Gemini through the Google ADK `Runner` (SSE streaming over a persistent background `asyncio` event loop that caches `Gemini` clients for HTTP/2 keepalive reuse). There is no local corpus, no synthesized filing text, and no template-synthesis fallback. If all findings in a live Gemini report fail claim-level verification on the first pass, one verification-guided regeneration attempt runs with exact rejection reasons; if still unverifiable, the answer is withheld (`answer_verified: false`, shown as **Answer Withheld** in the UI) rather than replaced. Upstream failures return HTTP `503`.
 
-The Makefile targets (`dev`, `backend`, `start`, `test`, `eval-all`, `smoke`) set the GCP environment explicitly, because developer shells often export an unrelated `GCP_PROJECT_ID`. `test` and `eval-all` keep telemetry and feedback in memory so they don't write to the production telemetry tables.
+The Makefile targets (`dev`, `backend`, `start`, `test`, `eval-all`, `smoke`) set the GCP environment explicitly, because developer shells often export an unrelated `GCP_PROJECT_ID`. `test` and `eval-all` keep telemetry, session persistence, and feedback in memory so they don't write to the production telemetry tables.
 
 ```bash
 gcloud auth application-default login
@@ -64,7 +64,21 @@ make docker-smoke                   # Run the image and smoke-test /health + UI 
 SMOKE_LIVE_DATA=true make docker-smoke   # Mount local ADC and include the live data check
 ```
 
-`GET /health` includes a `data_backend` block with the configured project, BigQuery dataset/tables, Vertex AI Search engine, Vector Search endpoint, GCS corpus bucket, and embedding model.
+`GET /health` includes `data_backend` (project, BigQuery dataset/tables, Vertex AI Search engine, hybrid retrieval backends `["bigquery_vector_search", "vertex_ai_search"]`, GCS corpus bucket, and embedding model), `session_memory` (Firestore `analyst_sessions` persistence status), and `observability` blocks.
+
+### Core API Endpoints
+All `/api/v1/*` routes enforce authenticated identity (IAP JWT assertion, Workspace/Okta OIDC JWT, or local ES256 dev token) and Cloud Identity group RBAC:
+
+| Method & Route | Purpose |
+| :--- | :--- |
+| `POST /api/v1/chat/stream` | Primary SSE streaming endpoint. Emits immediate `connected` event (`< 50 ms`), live `progress` events (`scope_resolved`, `sector_map_start`, `sector_map_progress`, `synthesizing`), `15 s` keepalive heartbeats, and final `result` (or `error`) payload with `Cache-Control: no-cache` and `X-Accel-Buffering: no`. |
+| `POST /api/v1/chat` | Backward-compatible synchronous JSON conversational RAG endpoint (`run_conversational_rag_turn`). |
+| `GET /api/v1/sessions` | Lists persistent multi-turn conversational sessions strictly scoped to the authenticated user's email (`analyst_sessions` collection in Firestore). |
+| `DELETE /api/v1/sessions/{session_id}` | Deletes one session owned by the authenticated user (`404` if missing or owned by another user). |
+| `GET /api/v1/companies` | Dynamic ~501-issuer S&P 500 catalog & available fiscal years from live BigQuery `financial_metrics`. |
+| `GET /api/v1/section` | Loads full cached Item 1A / Item 7 10-K Markdown section from GCS for the split-pane Source Viewer. |
+| `POST /api/v1/feedback` | Persists thumbs-up/down ratings and analyst comments to Firestore (`analyst_feedback`). |
+| `GET /health` | Service readiness, `data_backend`, `session_memory`, and `observability` status. |
 
 ### Observability: Latency Tracing & Structured Logs
 Each API request is one OpenTelemetry trace, exported to **Cloud Trace**. Every log line is structured JSON carrying the same trace ID and goes to **Cloud Logging**. On Cloud Run (`K_SERVICE` set) both turn on automatically, so Cloud Build and GitHub Actions don't need extra env vars. Locally, spans stay in-process unless you choose an exporter, and logs are readable text that still includes `[trace=… span=…]`. Full details are in [`docs/observability.md`](docs/observability.md).
@@ -111,42 +125,44 @@ make refresh-golden-expectations             # Recompute golden variance numbers
 ```text
 ├── docs/project_reference.md        # Target architecture and product specification
 ├── docs/observability.md            # Tracing, structured logging, correlation surfaces & GCP lookup guide
-├── prompts/                         # Versioned agent prompts: registry.yaml + v1/ (all agents), v2/, v3/ & v4/ (FinancialAnalystAgent)
-├── evals/                           # Golden eval dataset (golden_dataset.jsonl), regression gates (thresholds.yaml), schema guide
+├── prompts/                         # Versioned agent prompts: registry.yaml (`latest` -> v5) + v1/ (all agents), v2/–v5/ (FinancialAnalystAgent)
+├── evals/                           # 43-item golden eval dataset (golden_dataset.jsonl across 6 categories), 17 regression gates (thresholds.yaml), schema guide
 ├── src/edgar_capstone/
-│   ├── server.py                    # FastAPI gateway, auth/RBAC routes, RAG & telemetry APIs
-│   ├── telemetry.py                 # Streaming BigQuery telemetry/audit sinks, Firestore feedback & LookML catalog
+│   ├── server.py                    # FastAPI gateway, auth/RBAC routes, SSE /api/v1/chat/stream, /api/v1/sessions, /api/v1/chat, shutdown flush hooks
+│   ├── telemetry.py                 # Async BigQuery telemetry/audit sinks, FirestoreSessionStore (`analyst_sessions`), Firestore feedback & LookML catalog
 │   ├── observability/               # OpenTelemetry -> Cloud Trace, trace-correlated JSON logs -> Cloud Logging
 │   │   ├── tracing.py               # TracerProvider + CloudTraceSpanExporter, propagators, FastAPI/httpx instrumentation, @traced
 │   │   ├── structured_logging.py    # Cloud Logging JSON formatter (trace/span IDs, Error Reporting), uvicorn log routing
-│   │   └── middleware.py            # Per-request log context, X-Trace-Id / Server-Timing headers, latency access log
-│   ├── agents/                      # Google ADK agents, live Runner SSE engine, ReAct & context tracking
-│   │   ├── live_runtime.py          # ADK Runner (StreamingMode.SSE), Vertex/Gemini config & retry backoff
-│   │   ├── chat_engine.py           # /api/v1/chat turn: scope, guardrails, retrieval, ReAct, judge, telemetry
-│   │   ├── react_loop.py            # Structured ReAct loop, agent-retrieval merge, structured-report verification
-│   │   ├── financial_analyst.py     # FinancialAnalystAgent (BuiltInPlanner, output_schema=AnalystReport, retrieval budget)
+│   │   └── middleware.py            # Per-request log context, X-Trace-Id / Server-Timing headers, latency access log (emitted in `finally` even on 500s)
+│   ├── agents/                      # Google ADK agents, live Runner SSE engine, ReAct, map-reduce & scope validation
+│   │   ├── live_runtime.py          # Persistent background asyncio loop, cached ADK Gemini clients, compact prompt assembly, boundary-balanced evidence leads
+│   │   ├── chat_engine.py           # Conversational RAG turn: guardrails, scope validation, balanced retrieval, map-reduce, ReAct, telemetry
+│   │   ├── scope_validation.py      # Dynamic 501-issuer EntityCatalog (with dual-class CIK dedup), all 11 GICS sectors, clarification, out-of-corpus & coverage notices
+│   │   ├── sector_map_reduce.py     # Full-sector batched map-reduce (single BQ ML.DISTANCE + QUALIFY query, parallel Flash batches + quote verifier, SSE progress)
+│   │   ├── react_loop.py            # Structured ReAct loop, single verification-guided live retry, async off-path Flash judge pool + clean atexit shutdown
+│   │   ├── financial_analyst.py     # FinancialAnalystAgent (BuiltInPlanner w/ bounded thinking_budget=512, output_schema=AnalystReport, retrieval budget)
 │   │   ├── prompt_store.py          # Versioned prompt loader (local / GCS / Vertex AI) + runtime model variables
-│   │   ├── context_memory.py        # Pro/Flash model routing, ContextLatencyTracker, session compaction
-│   │   ├── evaluation_and_coding.py # Flash LLM-as-a-Judge evaluator & SQL/Python/LookML coding assist
+│   │   ├── context_memory.py        # Model routing, low_thinking_config_for_model, ContextLatencyTracker, user-scoped Firestore session memory & deterministic compaction
+│   │   ├── evaluation_and_coding.py # Flash LLM-as-a-Judge evaluator (incl. citation_precision_score) & SQL/Python/LookML coding assist
 │   │   ├── callbacks.py             # Guardrails, first-chunk SSE TTFT capture & grounding callbacks
-│   │   ├── structured_report.py     # Claim-level verification + rendering of the analyst's structured AnalystReport
-│   │   ├── material_variances.py    # flag_material_variances: deterministic anomaly rules + MD&A explanations
+│   │   ├── structured_report.py     # Table-aware claim verification (honors SEC Markdown pipe tables & chunk scale), XBRL inline tags, deterministic coverage notices (no uncited Notes)
+│   │   ├── material_variances.py    # flag_material_variances: deterministic anomaly rules + MD&A explanations with period_of_report & XBRL provenance
 │   │   ├── disclosure_deltas.py     # compare_disclosures_across_years: YoY wording deltas with both-year citations
-│   │   └── tools.py                 # Resilient ADK FunctionTools for metrics, variances, RAG & bounded 10-K section cache
+│   │   └── tools.py                 # Pooled httpx adapters for BigQuery (native financial_metrics + VECTOR_SEARCH + ML.DISTANCE), Vertex AI Search, & pre-embedded 10-K passage ranking
 │   ├── dataset/                     # SEC EDGAR 10-K XBRL + Markdown extraction pipeline (edgartools)
 │   │   ├── paths.py                 # Install-layout-aware data root resolution (source tree, /app/data, cwd)
-│   ├── vector_db/                   # Section-aware 10-K chunker, batched Vertex AI 768-d embedder, chunk-health monitor
-│   ├── evals/                       # Golden eval models, scorers, gate runner, BigQuery golden_eval_set / eval_results I/O
-│   └── security/                    # IAP/OIDC JWT verification, Cloud Identity RBAC, SPIFFE S2S auth
+│   ├── vector_db/                   # Section-aware 10-K chunker, pooled Vertex AI 768-d embedder (with bounded query cache & 5x retries), chunk-health monitor
+│   ├── evals/                       # Golden eval models, 17-gate scorers, runner, BigQuery golden_eval_set / eval_results I/O
+│   └── security/                    # IAP/OIDC JWT verification, Cloud Identity RBAC, SPIFFE S2S auth, Model Armor + SDP (service-account email exclusion, zero `import re`)
 ├── looker/                          # LookML semantic layer (manifest, model, 6 views, 2 LookML dashboards)
-├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI (see frontend/README.md)
+├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI w/ SSE streaming & XBRL Fact inspector (14 Vitest tests; see frontend/README.md)
 ├── scripts/                         # CLI entrypoints: dataset build, vector DB build (+ --upload-only), R&D backfill, BigQuery / Vertex AI Search publishing, container smoke test, secret scanner, golden evals (run_evals, load_golden_dataset, refresh_golden_expectations)
-├── terraform/                       # GCP IaC: BigQuery + sinks, Firestore, Vector/Discovery Search, Cloud Run, IAM, IAP (direct or via HTTPS LB), VPC + Vector Search PSC, VPC-SC (off by default), Cloud Build triggers, log-based latency metric
-├── tests/                           # pytest suite run against live GCP data and live Gemini (agents, ADK, GCP adapters, telemetry, observability, APIs, IaC, packaging)
-├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + Python 3.11 runtime); no corpus data in the image
+├── terraform/                       # GCP IaC: BigQuery (native views, golden_eval_set, eval_results), Firestore, Discovery Engine, Model Armor/SDP exclusion, Cloud Run, IAM/CI live access, IAP, Cloud Monitoring p95 latency alert & dashboard, opt-in VPC-SC & Cloud Build triggers
+├── tests/                           # Live GCP + live Gemini pytest suite (`>=80%` enforced via pytest-cov; 87.40% measured across 219 tests)
+├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + Python 3.11 runtime); no corpus data & no unused google-cloud-aiplatform dependency
 ├── .dockerignore                    # Keeps secrets and gitignored heavy corpus artifacts out of the build context
-├── cloudbuild.yaml                  # Cloud Build: parallel lint/test gates (tests on live GCP) -> build (+ smoke test) -> push + deploy (main) / verify-only (PRs)
-└── .github/workflows/deploy.yml     # GitHub Actions WIF CI/CD workflow
+├── cloudbuild.yaml                  # Cloud Build: lint + pytest-cov>=80 + build/smoke -> live eval-all gate (deploy mode) -> Cloud Run deploy
+└── .github/workflows/deploy.yml     # GitHub Actions WIF CI/CD workflow (pytest-cov>=80, WIF live smoke test, main-only eval-all gate -> deploy)
 ```
 
 ---

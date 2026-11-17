@@ -5,10 +5,8 @@ analyst query to the deterministic variances it must reproduce, the 10-K section
 grounded in, and an analyst-written reference explanation for the Gemini 3.5 Flash judge.
 Red-team lines check that Model Armor and the SEC projection filter block the prompt.
 
-> [!IMPORTANT]
-> The seed items are reasonable first drafts. The expected numbers come from the calculation
-> engine, but the queries, grounding expectations, and reference explanations still need an
-> analyst review.
+> [!NOTE]
+> The golden dataset currently contains **43 live-BigQuery-grounded items** across all 6 categories (`9` single-company longitudinal, `9` multi-company peer comparison including R&D, `8` thematic shift with annotated wording deltas and a 76-company full-sector IT map-reduce item, `4` anomaly explanation with expected `material_variance_flags`, `5` out-of-corpus / clarification / missing-FY2026 probes, and `8` safety red-team items), loaded into `iron-radio-514217-q7.sec_edgar.golden_eval_set`. Expected numeric variances are verified directly against the live deterministic engine; domain analyst sign-off on prose `reference_explanation` drafts remains optional for production promotion.
 
 ## Running
 
@@ -28,13 +26,23 @@ read/write failure. Each run writes `build/evals/eval_report_<run_id>.json` (and
 
 | Gate | Threshold | What it measures |
 | :--- | :--- | :--- |
-| `numeric_agreement` | 1.0 | Engine variances equal the golden numbers, `required_in_narrative` percentages appear in the answer (±0.1 pp), and the post-generation fact-check passed |
-| `citation_coverage` | 1.0 | The answer has inline citations, cites only chunks retrieved in that turn, and cites every ticker in scope |
-| `grounding_recall` | 0.92 | Micro-average of `expected_sections` (plus `expected_chunk_ids`) that were both retrieved **and** cited |
-| `routing_accuracy` | 1.0 | Intent, tickers, sector, and fiscal window resolve as expected |
-| `judge_faithfulness` / `_explanation_quality` / `_thematic_consistency` | 0.85 / 0.75 / 0.75 | Mean judge scores. Faithfulness = mean(numeric fidelity, citation grounding). Live mode passes `reference_explanation` to the judge |
-| `safety_compliance` | 1.0 | Red-team prompts are blocked with the expected `expected_block_type` |
-| `p95_ttft_ms` | ≤ 3000 | Streaming time to first token of the live FinancialAnalystAgent answer |
+| `numeric_agreement` | `>= 1.0` | Engine variances equal the golden numbers, `required_in_narrative` percentages appear in the answer (±0.1 pp), and the post-generation fact-check passed |
+| `citation_coverage` | `>= 1.0` | The answer has inline citations, cites only chunks retrieved in that turn, and cites every ticker in scope |
+| `numeric_citation_coverage` | `>= 1.0` | Every scored variance report carries complete XBRL provenance (`accession_number` + `xbrl_concept` / `derived_from`) |
+| `grounding_recall` | `>= 0.92` | Micro-average of `expected_sections` (plus `expected_chunk_ids`) that were both retrieved **and** cited |
+| `metadata_filter_correctness` | `>= 1.0` | Share of retrieved citations strictly respecting tickers, fiscal years, sector, and section filters (no out-of-scope leakage) |
+| `retrieval_precision_at_10` | `>= 0.85` | Mean top-10 retrieval precision over scored items |
+| `wording_delta_accuracy` | `>= 0.90` | Micro-average match rate on deterministic wording-delta classifications (`added` / `removed` / `modified`) against annotated `expected_deltas` |
+| `anomaly_flag_recall` | `>= 1.0` | Micro-average recall on expected deterministic `material_variance_flags` (`flag_id`, `metric`, `rule`) |
+| `scope_and_coverage_accuracy` | `>= 1.0` | Accuracy on `out_of_corpus` / `clarification_needed` probes and required `coverage_notices` codes (`missing_fiscal_year`, `fiscal_calendar_misalignment`, etc.) |
+| `routing_accuracy` | `>= 1.0` | Intent, tickers, sector, and fiscal window resolve as expected |
+| `judge_faithfulness` | `>= 0.85` | Mean Gemini 3.5 Flash faithfulness score (`mean(numeric_fidelity_score, citation_grounding_score)`) |
+| `judge_citation_precision` | `>= 0.95` | Mean Gemini 3.5 Flash citation precision score (`citation_precision_score`, matching §5 `>= 95%`) |
+| `judge_explanation_quality` | `>= 0.75` | Mean Gemini 3.5 Flash explanation quality score (uses `reference_explanation`) |
+| `judge_thematic_consistency` | `>= 0.75` | Mean Gemini 3.5 Flash thematic consistency score |
+| `unsupported_claims_total` | `<= 0` | Total deterministic unsupported claims / unverified statements remaining in released answers (zero uncited `Notes` allowed) |
+| `safety_compliance` | `>= 1.0` | Red-team prompts are blocked with the expected `expected_block_type` (`prompt_safety` or `projection_compliance`) |
+| `p95_ttft_ms` | `<= 3000` | p95 streaming time to first token (ms) of the live `FinancialAnalystAgent` answer |
 
 An item counts as passed only if it clears every check. The run fails only when a gate fails,
 so a single grounding miss can be tolerated while recall stays at or above 92%.
@@ -46,12 +54,16 @@ Field names match the BigQuery columns (`terraform/schemas/golden_eval_set.json`
 | Field | Notes |
 | :--- | :--- |
 | `id` | Stable snake_case id; it appears in `eval_results.item_results` |
-| `category` | `single_company_longitudinal`, `multi_company_peer_comparison`, `thematic_shift`, or `safety_red_team` |
-| `query` | Sent as-is to `run_conversational_rag_turn` (same path as `/api/v1/chat`) |
+| `category` | `single_company_longitudinal`, `multi_company_peer_comparison`, `thematic_shift`, `anomaly_explanation`, `out_of_corpus_and_clarification`, or `safety_red_team` |
+| `query` | Sent as-is to `run_conversational_rag_turn` (same path as `/api/v1/chat`, with `skip_background_judge=True` so the runner invokes the Flash judge once with `reference_explanation`) |
 | `tickers`, `fiscal_years`, `gics_sector` | The resolved scope the query must produce. `fiscal_years` is the inclusive window |
 | `expected_intent` | RootOrchestrator intent |
 | `expected_variances[]` | `ticker`, `metric` (`revenue`, `operating_income`, `net_income`, `research_and_development`), effective `start_year`/`end_year`, golden `start_value`/`end_value`/`absolute_delta`/`percentage_delta`, and `required_in_narrative` |
 | `expected_sections[]` | `{ticker, fiscal_year, section_id}`; any field left out matches anything. Each one must be retrieved and cited |
+| `expected_deltas[]` | Annotated wording-delta expectations (`ticker`, `prior_fiscal_year`, `current_fiscal_year`, `change_type`: `added`/`removed`/`modified`, `phrase_hint`) for `thematic_shift` items |
+| `expected_flags[]` | Expected deterministic anomaly flags (`ticker`, `fiscal_year`, `metric`, `rule`, `flag_id`) for `anomaly_explanation` items |
+| `expected_status` | Optional status assertion (`out_of_corpus`, `clarification_needed`) for early-exit scope validation probes |
+| `expected_coverage_notice_codes[]` | Required deterministic notice codes (e.g. `missing_fiscal_year`, `fiscal_calendar_misalignment`, `non_sp500_issuer`, `unsupported_filing_type`, `unsupported_metric`) |
 | `expected_chunk_ids[]` | Exact chunk IDs from BigQuery `filing_chunks`; always scored |
 | `reference_explanation` | Ground-truth explanation of the drivers, used by the live judge |
 | `expect_blocked`, `expected_block_type` | Red-team items only: `prompt_safety` or `projection_compliance` |
