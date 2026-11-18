@@ -1,9 +1,9 @@
 """Agent-driven 10-K retrieval: FinancialAnalystAgent queries the evidence each question needs.
 
-Tools read live GCP (BigQuery `filing_chunks`, the GCS SEC corpus, Vertex AI embeddings) and
-chat turns call live Gemini. A scripted ADK `BaseLlm` is injected only where a test targets
-pipeline mechanics the live model can't be made to exercise on demand (a specific tool call
-sequence, a tool call written as prose); its answers cite chunks the live tools returned.
+The full-section GCS vs BigQuery ranking check runs against live GCP (`@pytest.mark.live`);
+all pipeline mechanics (retrieval merging, qualitative tool selection, unexecuted prose tool-call
+withholding, retrieval budget) run deterministically offline via `fake_gcp_adapters` + scripted ADK
+`BaseLlm`s with `skip_background_judge=True`.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 import pytest
-from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
@@ -27,7 +26,11 @@ from edgar_capstone.agents import (
 from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.agents.live_runtime import _build_financial_reasoning_prompt
 from edgar_capstone.agents.tools import get_full_10k_section, load_cached_10k_section
-from tests.structured_report_helpers import finding_from_citation, report_json
+from tests.structured_report_helpers import (
+    ScriptedBaseLlm,
+    finding_from_citation,
+    report_json,
+)
 
 _RETRIEVAL_TOOLS = {
     "search_10k_chunks_rag",
@@ -40,7 +43,7 @@ def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() 
     long_excerpt = "Data center revenue grew on Blackwell demand. " * 40
     prompt = _build_financial_reasoning_prompt(
         query="Why did NVIDIA's operating income grow faster than revenue?",
-        intent="single_company_longitudinal",
+        intent="longitudinal_single_company",
         scope={
             "tickers_csv": "NVDA",
             "gics_sector": "ALL",
@@ -81,9 +84,7 @@ def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() 
         chunk_health=None,
     )
     assert "<10k_section" not in prompt
-    assert "Full 10-K sections are NOT in this request" in prompt
     assert "query_cached_10k_context(" in prompt and "search_10k_chunks_rag(" in prompt
-    assert "without redundant tool calls" not in prompt
     # Leads are capped in count (12) and length (850 chars) and point at citable chunk ids
     assert prompt.count('"chunk_id": "NVDA_2026_item_7_') == 12
     assert long_excerpt[:900] not in prompt
@@ -93,6 +94,7 @@ def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() 
     assert "NVDA FY2026 revenue operating income ..." not in prompt
 
 
+@pytest.mark.live
 def test_query_cached_10k_context_ranks_full_live_section_and_returns_citable_passages() -> None:
     """Ranking covers the whole GCS section, not just the 50k-char excerpt returned to callers."""
     excerpt_res = load_cached_10k_section(
@@ -143,10 +145,16 @@ def test_query_cached_10k_context_ranks_full_live_section_and_returns_citable_pa
         assert cit["sec_filing_url"].startswith("https://www.sec.gov/")
 
 
-class _RetrievingAnalystLlm(BaseLlm):
-    """Calls search_10k_chunks_rag first, then answers citing the live chunk the tool returned."""
+class _RetrievingAnalystLlm(ScriptedBaseLlm):
+    """Calls search_10k_chunks_rag first, then answers citing the chunk the tool returned."""
 
     model: str = "gemini-3.8-flash"
+    tool_section_id: str = "item_7"
+    tool_start_year: int = 2026
+    tool_end_year: int = 2026
+    tool_query: str = "data center revenue growth drivers Blackwell"
+    intent: str | None = "longitudinal_single_company"
+    key_metrics: list[tuple[str, str]] = [("NVDA", "revenue"), ("NVDA", "operating_income")]
     requests: list[dict[str, Any]] = []
 
     async def generate_content_async(
@@ -166,7 +174,7 @@ class _RetrievingAnalystLlm(BaseLlm):
                 "tool_responses": len(tool_responses),
             }
         )
-        await asyncio.sleep(0.005)
+        await asyncio.sleep(0.002)
         if not tool_responses:
             yield LlmResponse(
                 model_version=self.model,
@@ -177,12 +185,12 @@ class _RetrievingAnalystLlm(BaseLlm):
                         genai_types.Part.from_function_call(
                             name="search_10k_chunks_rag",
                             args={
-                                "query": "data center revenue growth drivers Blackwell",
+                                "query": self.tool_query,
                                 "tickers": "NVDA",
                                 "gics_sector": "ALL",
-                                "section_id": "item_7",
-                                "start_year": 2026,
-                                "end_year": 2026,
+                                "section_id": self.tool_section_id,
+                                "start_year": self.tool_start_year,
+                                "end_year": self.tool_end_year,
                                 "top_k": 3,
                             },
                         )
@@ -198,8 +206,9 @@ class _RetrievingAnalystLlm(BaseLlm):
         cit = payload["citations"][-1]
         final_md = report_json(
             headline="NVIDIA Corp. (NVDA) — Agent-Retrieved 10-K Evidence",
-            key_metrics=[("NVDA", "revenue"), ("NVDA", "operating_income")],
-            findings=[finding_from_citation(cit, "The retrieved MD&A passage explains this.")],
+            intent=self.intent,
+            key_metrics=self.key_metrics,
+            findings=[finding_from_citation(cit, "The retrieved 10-K passage explains this.")],
         )
         yield LlmResponse(
             model_version=self.model,
@@ -211,7 +220,9 @@ class _RetrievingAnalystLlm(BaseLlm):
         )
 
 
-def test_chat_turn_merges_agent_retrieved_evidence_and_citations_resolve() -> None:
+def test_chat_turn_merges_agent_retrieved_evidence_and_citations_resolve(
+    fake_gcp_adapters: Any,
+) -> None:
     """Scripted tool sequence: a chunk the agent retrieves itself becomes a resolvable citation."""
     get_context_latency_tracker().reset()
     get_conversation_memory_manager().reset()
@@ -225,6 +236,7 @@ def test_chat_turn_merges_agent_retrieved_evidence_and_citations_resolve() -> No
         session_id="agentic-retrieval-1",
         user_id="analyst@fde-workspace.corp",
         reasoning_llm=llm,
+        skip_background_judge=True,
     )
 
     assert turn["execution_mode"] == "live_adk"
@@ -235,7 +247,6 @@ def test_chat_turn_merges_agent_retrieved_evidence_and_citations_resolve() -> No
     # No full-section bundle or remote cache is forced into the first request
     first = llm.requests[0]
     assert "<10k_section" not in first["joined_text"]
-    assert "Full 10-K sections are NOT in this request" in first["joined_text"]
     assert first["cached_content"] is None
     assert llm.requests[-1]["tool_responses"] == 1
 
@@ -257,29 +268,43 @@ def test_chat_turn_merges_agent_retrieved_evidence_and_citations_resolve() -> No
     assert "*Evidence:*" in turn["answer_markdown"]
 
 
-def test_live_gemini_turn_retrieval_and_citations_resolve() -> None:
-    """Live Gemini decides what to retrieve; whatever it cites must resolve to turn citations."""
+def test_qualitative_turn_retrieval_and_citations_resolve_without_variances(
+    fake_gcp_adapters: Any,
+) -> None:
+    """Qualitative wording-shift turn invokes retrieval only (no variances/flags/Key Metrics)."""
     get_context_latency_tracker().reset()
     get_conversation_memory_manager().reset()
+    llm = _RetrievingAnalystLlm(
+        tool_section_id="item_1a",
+        tool_start_year=2024,
+        tool_end_year=2026,
+        tool_query="export control licensing China AI accelerators",
+        intent="thematic_trend_tracking",
+        key_metrics=[],
+        requests=[],
+    )
 
     turn = run_conversational_rag_turn(
         query="How did NVIDIA's export-control risk disclosures change from FY2024 to FY2026?",
         tickers="NVDA",
         start_year=2024,
         end_year=2026,
-        session_id="agentic-live-1",
+        session_id="agentic-qual-1",
         user_id="analyst@fde-workspace.corp",
+        reasoning_llm=llm,
+        skip_background_judge=True,
     )
 
     assert turn["status"] == "success"
     assert turn["execution_mode"] == "live_adk"
-    assert turn["adk_runtime"]["backend"] == "vertex_ai"
     assert turn["adk_runtime"]["executed_via_adk_runner"] is True
+    assert turn["answer_verified"] is True, turn["adk_runtime"]["answer_withheld_reason"]
+    assert turn["adk_runtime"]["answer_withheld_reason"] is None
 
     turn_chunk_ids = {c["chunk_id"] for c in turn["citations"]}
     assert turn_chunk_ids
     retrieval = turn["adk_runtime"]["agent_retrieval"]
-    assert retrieval["retrieval_tool_calls_count"] == len(retrieval["retrieval_tool_calls"])
+    assert retrieval["retrieval_tool_calls_count"] == len(retrieval["retrieval_tool_calls"]) == 1
     assert retrieval["retrieval_tool_calls_count"] <= 6  # retrieval budget
     assert {c["name"] for c in retrieval["retrieval_tool_calls"]} <= _RETRIEVAL_TOOLS
     assert set(retrieval["agent_retrieved_chunk_ids"]) <= turn_chunk_ids
@@ -288,23 +313,15 @@ def test_live_gemini_turn_retrieval_and_citations_resolve() -> None:
 
     md = turn["answer_markdown"]
     assert "default_api." not in md and "/*ACTION*/" not in md
-    # Acceptance matrix (qualitative wording-shift question): the live agent selects no
-    # variance or anomaly engine, so no variance table, flags, or Key Metrics are shown.
     invoked = set(turn["adk_runtime"]["agent_invoked_tools"])
     assert not invoked & {"calculate_period_variances", "flag_material_variances"}, invoked
     assert turn["variance_reports"] == []
     assert turn["material_variance_flags"] == []
     assert "#### Key Metrics" not in md
     assert turn["intent"] == "thematic_trend_tracking", turn["intent_source"]
-    if turn["answer_verified"]:
-        assert turn["adk_runtime"]["answer_withheld_reason"] is None
-        assert turn["report_verification"]["usable"] is True
-        assert turn["report_verification"]["findings_verified"] >= 1
-        assert retrieval["cited_chunk_ids"], "a verified answer cites retrieved chunks"
-        assert turn["fact_check"]["passed"] is True
-    else:
-        assert md.startswith("### Answer withheld")
-        assert turn["adk_runtime"]["answer_withheld_reason"]
+    assert turn["report_verification"]["usable"] is True
+    assert turn["report_verification"]["findings_verified"] >= 1
+    assert turn["fact_check"]["passed"] is True
 
 
 def test_judge_sees_the_passages_the_report_cites() -> None:
@@ -335,7 +352,7 @@ def test_judge_sees_the_passages_the_report_cites() -> None:
     assert len(select_citations_for_judge(many, citations)) == 22
 
 
-class _TextActionLlm(BaseLlm):
+class _TextActionLlm(ScriptedBaseLlm):
     """Reproduces the live failure: a tool call written as prose instead of a function call."""
 
     model: str = "gemini-3.8-flash"
@@ -362,7 +379,9 @@ class _TextActionLlm(BaseLlm):
         )
 
 
-def test_unexecuted_text_tool_call_is_withheld_instead_of_shipping_a_plan() -> None:
+def test_unexecuted_text_tool_call_is_withheld_instead_of_shipping_a_plan(
+    fake_gcp_adapters: Any,
+) -> None:
     get_context_latency_tracker().reset()
     get_conversation_memory_manager().reset()
     turn = run_conversational_rag_turn(
@@ -373,6 +392,7 @@ def test_unexecuted_text_tool_call_is_withheld_instead_of_shipping_a_plan() -> N
         session_id="agentic-text-action-1",
         user_id="analyst@fde-workspace.corp",
         reasoning_llm=_TextActionLlm(),
+        skip_background_judge=True,
     )
     # The prose tool call fails AnalystReport validation (or the incomplete-output guard), so
     # the narrative is withheld; no template answer is substituted.

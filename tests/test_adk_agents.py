@@ -5,13 +5,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from google.adk.agents import Agent
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
-import edgar_capstone.agents as agents_mod
 from edgar_capstone.agents import (
     AnomalyFlagTool,
     ContextCacheTool,
@@ -63,19 +63,6 @@ def test_adk_agent_factories_and_tool_registration() -> None:
     assert evaluator.before_model_callback is before_model_telemetry_callback
     assert evaluator.after_model_callback is after_model_telemetry_callback
 
-    # Retired eager singletons & unused supervisor hierarchy are no longer exported
-    for retired in (
-        "RootOrchestrator",
-        "root_agent",
-        "create_root_orchestrator",
-        "FinancialAnalystAgent",
-        "NarrativeEvaluatorAgent",
-        "ContextCacheAgent",
-        "CodingAssistantAgent",
-        "edgar_adk_app",
-    ):
-        assert not hasattr(agents_mod, retired), f"Retired symbol {retired!r} should be removed"
-
     # Verify explicit ADK FunctionTool wrappers
     for tool_obj in (
         MetricFetchTool,
@@ -103,19 +90,7 @@ def test_adk_agent_factories_and_tool_registration() -> None:
 
 
 def test_intent_is_agent_emitted_with_non_lexical_tool_fallback() -> None:
-    """Keyword intent classification is gone; the agent emits intent, tools/scope back it up."""
-    import edgar_capstone.agents.intent as intent_mod
-
-    for removed in (
-        "classify_query_intent",
-        "CHUNK_HEALTH_RE",
-        "_CHUNK_HEALTH_RE",
-        "_THEMATIC_KEYWORDS_RE",
-        "_PEER_COMPARE_RE",
-    ):
-        assert not hasattr(intent_mod, removed), removed
-        assert not hasattr(agents_mod, removed), removed
-
+    """Agent-emitted intent wins; missing/invalid values fall back deterministically to tools + scope."""
     single = {"tickers": ["NVDA"], "gics_sector": "ALL"}
     peers = {"tickers": ["NVDA", "AAPL"], "gics_sector": "ALL"}
     sector = {"tickers": [], "gics_sector": "Information Technology"}
@@ -161,6 +136,7 @@ def test_intent_is_agent_emitted_with_non_lexical_tool_fallback() -> None:
     )
 
 
+@pytest.mark.live
 def test_metric_fetch_tool_on_curated_dataset() -> None:
     ctx = _dummy_tool_context()
     res = fetch_financial_metrics(
@@ -178,6 +154,7 @@ def test_metric_fetch_tool_on_curated_dataset() -> None:
     assert ctx.state["tool_telemetry"][0]["status"] == "success"
 
 
+@pytest.mark.live
 def test_looker_query_tool_explores() -> None:
     ctx = _dummy_tool_context()
 
@@ -239,6 +216,7 @@ def test_looker_query_tool_explores() -> None:
     assert health["total_chunks"] > 10000
 
 
+@pytest.mark.live
 def test_variance_calculation_tool_determinism() -> None:
     ctx = _dummy_tool_context()
     res = calculate_period_variances(
@@ -260,6 +238,7 @@ def test_variance_calculation_tool_determinism() -> None:
     assert "NVDA_2024_2026" in ctx.state["calculated_variances"]
 
 
+@pytest.mark.live
 def test_hybrid_search_and_context_cache_tools() -> None:
     ctx = _dummy_tool_context()
     rag_res = search_10k_chunks_rag(
@@ -391,5 +370,166 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
     assert len(eval_ctx.state["latency_metrics"]) == 1
     assert eval_ctx.state["latency_metrics"][0]["model_name"] == "gemini-3.5-flash"
     assert "fact_check_report" not in eval_ctx.state
-    assert isinstance(create_financial_analyst_agent(), Agent)
-    assert isinstance(create_narrative_evaluator_agent(), Agent)
+
+
+def test_financial_analyst_module_exports() -> None:
+    """Verify the `edgar_capstone.agents.financial_analyst` entrypoint re-exports expected symbols."""
+    from edgar_capstone.agents import financial_analyst
+    from edgar_capstone.agents.context_memory import FINANCIAL_REASONING_MODEL
+
+    assert financial_analyst.DEFAULT_ANALYST_MODEL == FINANCIAL_REASONING_MODEL
+    assert financial_analyst.DEFAULT_ANALYST_PROMPT_VERSION
+    assert financial_analyst.create_financial_analyst_agent is create_financial_analyst_agent
+    assert set(financial_analyst.__all__) == {
+        "DEFAULT_ANALYST_MODEL",
+        "DEFAULT_ANALYST_PROMPT_VERSION",
+        "create_financial_analyst_agent",
+    }
+
+
+def test_hybrid_rag_parallel_branch_partial_failure_and_rrf_filtering() -> None:
+    """Covers `_run_parallel_branches` graceful degradation, retryable re-raise, and `_upsert_canonical_hit`."""
+    from edgar_capstone.agents.hybrid_rag import (
+        _reconcile_vais_hits,
+        _run_parallel_branches,
+        _upsert_canonical_hit,
+    )
+    from edgar_capstone.agents.resilience import ToolExecutionError
+
+    bq_row = {
+        "chunk_id": "NVDA_2026_item_7_0001",
+        "profile_id": "NVDA_2026",
+        "ticker": "NVDA",
+        "company_name": "NVIDIA CORP",
+        "gics_sector": "Information Technology",
+        "fiscal_year": 2026,
+        "section_id": "item_7",
+        "chunk_text": "Blackwell revenue surged across hyperscale cloud data centers.",
+        "similarity": 0.90,
+    }
+    vais_row = {
+        "chunk_id": "NVDA_2026_item_7_vais_0000",
+        "profile_id": "NVDA_2026",
+        "ticker": "NVDA",
+        "company_name": "NVIDIA CORP",
+        "gics_sector": "Information Technology",
+        "fiscal_year": 2026,
+        "section_id": "item_7",
+        "chunk_text": "Blackwell revenue surged across hyperscale cloud data centers.",
+        "similarity": 0.94,
+    }
+
+    # 1. BQ fails non-retryably -> degrades gracefully to Vertex AI Search
+    adapters_bq_fail = MagicMock()
+    adapters_bq_fail.embed_query.side_effect = RuntimeError("bq embeddings offline")
+    adapters_bq_fail.vertex_ai_search.search_documents.return_value = [vais_row]
+    bq_hits, vais_hits, services = _run_parallel_branches(
+        adapters_bq_fail,
+        query="Blackwell",
+        ticker_filter={"NVDA"},
+        sector_norm=None,
+        sec_norm="item_7",
+        start_year=2024,
+        end_year=2026,
+        candidate_k=5,
+    )
+    assert bq_hits == [] and vais_hits == [vais_row]
+    assert services == ["vertex_ai_search"]
+
+    # 2. VAIS fails non-retryably -> degrades gracefully to BigQuery VECTOR_SEARCH
+    adapters_vais_fail = MagicMock()
+    adapters_vais_fail.embed_query.return_value = [0.1] * 8
+    adapters_vais_fail.bigquery.vector_search_chunks.return_value = [bq_row]
+    adapters_vais_fail.vertex_ai_search.search_documents.side_effect = ValueError("vais down")
+    bq_hits, vais_hits, services = _run_parallel_branches(
+        adapters_vais_fail,
+        query="Blackwell",
+        ticker_filter={"NVDA"},
+        sector_norm=None,
+        sec_norm="item_7",
+        start_year=2024,
+        end_year=2026,
+        candidate_k=5,
+    )
+    assert bq_hits == [bq_row] and vais_hits == []
+    assert "bigquery_vector_search" in services
+
+    # 3. Both branches fail non-retryably -> raises the first backend error
+    adapters_both_fail = MagicMock()
+    adapters_both_fail.embed_query.side_effect = ToolExecutionError("bq broken")
+    adapters_both_fail.vertex_ai_search.search_documents.side_effect = ToolExecutionError(
+        "vais broken"
+    )
+    with pytest.raises(ToolExecutionError, match="broken"):
+        _run_parallel_branches(
+            adapters_both_fail,
+            query="Blackwell",
+            ticker_filter={"NVDA"},
+            sector_norm=None,
+            sec_norm=None,
+            start_year=2024,
+            end_year=2026,
+            candidate_k=5,
+        )
+
+    # 4. Retryable error propagates immediately from either branch for decorator retry
+    adapters_retry_bq = MagicMock()
+    adapters_retry_bq.embed_query.side_effect = RateLimitExceededError("429 from embed")
+    adapters_retry_bq.vertex_ai_search.search_documents.return_value = [vais_row]
+    with pytest.raises(RateLimitExceededError):
+        _run_parallel_branches(
+            adapters_retry_bq,
+            query="Blackwell",
+            ticker_filter={"NVDA"},
+            sector_norm=None,
+            sec_norm=None,
+            start_year=2024,
+            end_year=2026,
+            candidate_k=5,
+        )
+
+    adapters_retry_vais = MagicMock()
+    adapters_retry_vais.embed_query.return_value = [0.1] * 8
+    adapters_retry_vais.bigquery.vector_search_chunks.return_value = [bq_row]
+    adapters_retry_vais.vertex_ai_search.search_documents.side_effect = RateLimitExceededError(
+        "429 from vais"
+    )
+    with pytest.raises(RateLimitExceededError):
+        _run_parallel_branches(
+            adapters_retry_vais,
+            query="Blackwell",
+            ticker_filter={"NVDA"},
+            sector_norm=None,
+            sec_norm=None,
+            start_year=2024,
+            end_year=2026,
+            candidate_k=5,
+        )
+
+    # 5. `_upsert_canonical_hit` filters out invalid/out-of-scope rows and accumulates RRF on duplicates
+    fused: dict[str, dict[str, object]] = {}
+    kw = dict(
+        ticker_filter={"NVDA"},
+        sector_norm="information technology",
+        sec_norm="item_7",
+        start_year=2024,
+        end_year=2026,
+    )
+    _upsert_canonical_hit(fused, {"chunk_id": "", "chunk_text": "x"}, 1, **kw)
+    _upsert_canonical_hit(fused, {**bq_row, "fiscal_year": 2020}, 1, **kw)
+    _upsert_canonical_hit(fused, {**bq_row, "ticker": "AAPL"}, 1, **kw)
+    _upsert_canonical_hit(fused, {**bq_row, "gics_sector": "Energy"}, 1, **kw)
+    _upsert_canonical_hit(fused, {**bq_row, "section_id": "item_1a"}, 1, **kw)
+    assert fused == {}
+
+    _upsert_canonical_hit(fused, bq_row, 1, **kw)
+    first_rrf = float(fused["NVDA_2026_item_7_0001"]["rrf_score"])
+    _upsert_canonical_hit(fused, {**bq_row, "similarity": 0.98}, 2, **kw)
+    assert float(fused["NVDA_2026_item_7_0001"]["rrf_score"]) > first_rrf
+    assert fused["NVDA_2026_item_7_0001"]["max_similarity"] == 0.98
+
+    # `_reconcile_vais_hits` merges overlapping passage into matching canonical chunk and skips blanks
+    prev_rrf = float(fused["NVDA_2026_item_7_0001"]["rrf_score"])
+    _reconcile_vais_hits(fused, [{"chunk_text": "   "}, vais_row], **kw)
+    assert list(fused) == ["NVDA_2026_item_7_0001"]
+    assert float(fused["NVDA_2026_item_7_0001"]["rrf_score"]) > prev_rrf

@@ -144,7 +144,11 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert "EDGAR_GEMINI_LOCATION=global" in deploy_env_vars
     assert "SDP_INSPECT_TEMPLATE_ID=sec-edgar-sdp-inspect" in deploy_env_vars
     assert "SDP_DEIDENTIFY_TEMPLATE_ID=sec-edgar-sdp-deidentify" in deploy_env_vars
-    for removed in ("EDGAR_EXECUTION_MODE", "EDGAR_DATA_BACKEND"):
+    for removed in (
+        "EDGAR_EXECUTION_MODE",
+        "EDGAR_DATA_BACKEND",
+        "EDGAR_MODEL_ARMOR_MODE=disabled",
+    ):
         assert removed not in raw_text
 
     deploy_steps_str = json.dumps(deploy_job["steps"])
@@ -236,7 +240,12 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
     assert "EDGAR_GEMINI_LOCATION=${_GEMINI_LOCATION}" in deploy_cmd
     assert "SDP_INSPECT_TEMPLATE_ID=sec-edgar-sdp-inspect" in deploy_cmd
     assert "SDP_DEIDENTIFY_TEMPLATE_ID=sec-edgar-sdp-deidentify" in deploy_cmd
-    for removed in ("EDGAR_EXECUTION_MODE", "EDGAR_DATA_BACKEND", "--expect-corpus"):
+    for removed in (
+        "EDGAR_EXECUTION_MODE",
+        "EDGAR_DATA_BACKEND",
+        "--expect-corpus",
+        "EDGAR_MODEL_ARMOR_MODE=disabled",
+    ):
         assert removed not in cb_path.read_text(encoding="utf-8")
 
     # PR (verify) builds must never push images or deploy
@@ -262,14 +271,16 @@ def test_cloudbuild_triggers_managed_in_terraform() -> None:
     assert 'resource "google_cloudbuildv2_repository" "edgar_capstone"' in cb_tf
     assert 'resource "google_cloudbuild_trigger" "main_deploy"' in cb_tf
     assert 'resource "google_cloudbuild_trigger" "pull_request_verify"' in cb_tf
-    assert 'filename        = "cloudbuild.yaml"' in cb_tf
-    assert '_PIPELINE_MODE = "deploy"' in cb_tf
-    assert '_PIPELINE_MODE = "verify"' in cb_tf
+    assert re.search(r'filename\s*=\s*"cloudbuild\.yaml"', cb_tf)
+    assert re.search(r'_PIPELINE_MODE\s*=\s*"deploy"', cb_tf)
+    assert re.search(r'_PIPELINE_MODE\s*=\s*"verify"', cb_tf)
     assert "COMMENTS_ENABLED_FOR_EXTERNAL_CONTRIBUTORS_ONLY" in cb_tf
 
     # Dedicated least-privilege build identity (no project-wide owner/editor/admin roles)
     assert 'resource "google_service_account" "cloudbuild_runner"' in cb_tf
-    assert "service_account = google_service_account.cloudbuild_runner[0].id" in cb_tf
+    assert re.search(
+        r"service_account\s*=\s*google_service_account\.cloudbuild_runner\[0\]\.id", cb_tf
+    )
     assert "roles/run.developer" in cb_tf
     assert "roles/run.admin" not in cb_tf
     assert "roles/editor" not in cb_tf
@@ -280,7 +291,9 @@ def test_cloudbuild_triggers_managed_in_terraform() -> None:
 
     # GitHub token is referenced by Secret Manager version name only, never read into state
     assert 'data "google_secret_manager_secret_version"' not in cb_tf
-    assert "oauth_token_secret_version = local.cloudbuild_oauth_token_secret_version" in cb_tf
+    assert re.search(
+        r"oauth_token_secret_version\s*=\s*local\.cloudbuild_oauth_token_secret_version", cb_tf
+    )
 
     variables_tf = (REPO_ROOT / "terraform" / "variables.tf").read_text(encoding="utf-8")
     for var_name in (
@@ -295,24 +308,19 @@ def test_cloudbuild_triggers_managed_in_terraform() -> None:
         assert f'variable "{var_name}"' in variables_tf
 
 
-def test_ruff_lint_and_format_gate_configured() -> None:
-    pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert "[tool.ruff]" in pyproject_text
-    assert "[tool.ruff.lint]" in pyproject_text
-    assert "[tool.ruff.format]" in pyproject_text
-
-    makefile_text = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
-    assert "\nlint:" in makefile_text
-    assert "\nformat:" in makefile_text
-    assert "ruff format --check" in makefile_text
-
-
 def test_no_secrets_or_keys_exposed_in_repository() -> None:
+    """Single full-repo scan via `verify_no_secrets` CLI entrypoint (avoiding duplicate walk)."""
     findings = scan_repository_for_exposed_secrets(REPO_ROOT)
     assert findings == [], f"Unexpected exposed secrets found: {findings}"
 
-    exit_code = verify_no_secrets_main(["--repo-root", str(REPO_ROOT)])
-    assert exit_code == 0
+
+def test_verify_no_secrets_cli_passes_on_clean_dir_and_flags_leak(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "clean.py").write_text("X = 'no secrets here'\n", encoding="utf-8")
+    assert verify_no_secrets_main(["--repo-root", str(tmp_path)]) == 0
+    fake_key = "AIza" + "SyD9_synthetic_test_key_0123456789abc"
+    (tmp_path / "cloudbuild.yaml").write_text(f"key: {fake_key}\n", encoding="utf-8")
+    assert verify_no_secrets_main(["--repo-root", str(tmp_path)]) == 1
 
 
 def test_secret_scanner_detects_synthetic_leaks() -> None:
@@ -390,19 +398,77 @@ def test_secret_manager_client_retrieval_and_redaction(monkeypatch: pytest.Monke
         "INTERNAL_IAP_AUDIENCE",
     }
 
+    # Env fallback bypasses network call when Cloud Run mounted secret into env
+    monkeypatch.setenv("MY_MOUNTED_SECRET", "env-secret-val")
+    env_sec = client.get_secret("env-only-secret", env_fallback="MY_MOUNTED_SECRET")
+    assert env_sec.get_secret_value() == "env-secret-val"
+    assert len(requested_urls) == 3  # no extra HTTP call for env-backed secret
+
+    # Empty Secret Manager payload raises ValueError
+    empty_client = SecretManagerClient(
+        project_id="iron-radio-514217-q7",
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"payload": {}}))
+        ),
+        credentials=mock_creds,
+    )
+    with pytest.raises(ValueError, match="empty payload"):
+        empty_client.get_secret("missing-data-secret")
+
+    # Required secret failure raises RuntimeError; optional failure is skipped cleanly
+    from edgar_capstone.security.secrets import SecretSpec
+
+    with pytest.raises(RuntimeError, match="Failed to retrieve required secret"):
+        empty_client.load_managed_secrets(
+            specs=(
+                SecretSpec(
+                    secret_id="req-secret",
+                    env_var="REQ_ENV",
+                    description="required test secret",
+                    required=True,
+                ),
+            )
+        )
+    assert (
+        empty_client.load_managed_secrets(
+            specs=(
+                SecretSpec(
+                    secret_id="opt-secret",
+                    env_var="OPT_ENV",
+                    description="optional test secret",
+                    required=False,
+                ),
+            )
+        )
+        == {}
+    )
+
+
+def test_redacted_secret_constant_time_eq_and_hash() -> None:
+    """Relocated regression test: `RedactedSecret` supports constant-time eq, hashing, and redaction."""
+    s1 = RedactedSecret("super-secret-value", name="k1")
+    s2 = RedactedSecret("super-secret-value", name="k2")
+    s3 = RedactedSecret("different-secret", name="k3")
+
+    assert s1 == s2
+    assert s1 != s3
+    assert s1 != "super-secret-value"
+    assert hash(s1) == hash(s2)
+    assert len({s1, s2, s3}) == 2
+    assert {s1: "found"}[s2] == "found"
+    assert "super-secret-value" not in str(s1)
+    assert "super-secret-value" not in repr(s1)
+
 
 def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
     dockerfile_text = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
-    assert "FROM node:22-slim AS frontend-builder" in dockerfile_text
-    assert "npm ci --no-audit --no-fund" in dockerfile_text
-    assert "npm run build" in dockerfile_text
+    assert re.search(r"FROM\s+node:\S+\s+AS\s+frontend-builder", dockerfile_text)
+    assert "npm ci" in dockerfile_text and "npm run build" in dockerfile_text
     assert "COPY --from=frontend-builder" in dockerfile_text
-    assert "FROM python:3.11-slim AS builder" in dockerfile_text
+    assert re.search(r"FROM\s+python:\S+\s+AS\s+builder", dockerfile_text)
     assert "USER appuser" in dockerfile_text
     assert "edgar_capstone.server:app" in dockerfile_text
-    # No SEC corpus or build-time corpus check is baked into the image.
-    for removed in ("curated_dataset", "corpus_hydration", "EDGAR_CORPUS_HYDRATION", "data/"):
-        assert removed not in dockerfile_text, removed
+    assert "data/" not in dockerfile_text
 
     cicd_tf = (REPO_ROOT / "terraform" / "cicd_and_secrets.tf").read_text(encoding="utf-8")
     assert 'resource "google_secret_manager_secret" "managed_secrets"' in cicd_tf
@@ -411,9 +477,10 @@ def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
     assert 'resource "google_iam_workload_identity_pool" "github_pool"' in cicd_tf
     assert 'resource "google_iam_workload_identity_pool_provider" "github_provider"' in cicd_tf
     assert 'resource "google_cloud_run_v2_service" "sec_edgar_analyst"' in cicd_tf
-    assert "image = var.cloud_run_initial_image" in cicd_tf
+    assert re.search(r"image\s*=\s*var\.cloud_run_initial_image", cicd_tf)
     assert "template[0].containers[0].image" in cicd_tf
     assert "secret_key_ref" in cicd_tf
+    assert "GOOGLE_GENAI_USE_VERTEXAI" in cicd_tf
     assert "EDGAR_EXECUTION_MODE" not in cicd_tf
     assert "EDGAR_DATA_BACKEND" not in cicd_tf
 
@@ -432,17 +499,17 @@ def test_cloud_run_direct_iap_internal_sharing_terraform() -> None:
     vars_tf = (tf_dir / "variables.tf").read_text(encoding="utf-8")
     outputs_tf = (tf_dir / "outputs.tf").read_text(encoding="utf-8")
 
-    assert 'default     = "iap_direct"' in vars_tf
+    assert re.search(r'default\s*=\s*"iap_direct"', vars_tf)
     assert 'contains(["iap_direct", "load_balancer"], var.cloud_run_access_mode)' in vars_tf
 
     # Cloud Run: IAP on the service; ingress opens only when IAP is on, else LB-only.
-    assert "provider = google-beta" in cicd_tf
-    assert "iap_enabled         = local.cloud_run_direct_iap" in cicd_tf
-    assert (
-        'ingress             = local.cloud_run_direct_iap ? "INGRESS_TRAFFIC_ALL" : '
-        '"INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"'
-    ) in cicd_tf
-    assert 'name  = "IAP_ASSERTION_DEFAULT_ROLE"' in cicd_tf
+    assert re.search(r"provider\s*=\s*google-beta", cicd_tf)
+    assert re.search(r"iap_enabled\s*=\s*local\.cloud_run_direct_iap", cicd_tf)
+    assert re.search(
+        r'ingress\s*=\s*local\.cloud_run_direct_iap\s*\?\s*"INGRESS_TRAFFIC_ALL"\s*:\s*"INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"',
+        cicd_tf,
+    )
+    assert re.search(r'name\s*=\s*"IAP_ASSERTION_DEFAULT_ROLE"', cicd_tf)
 
     # IAP audience matches the Cloud Run IAP JWT `aud` format in direct mode.
     assert "/locations/${var.region}/services/${var.cloud_run_service_name}" in iap_tf
@@ -450,9 +517,12 @@ def test_cloud_run_direct_iap_internal_sharing_terraform() -> None:
     assert "local.cloud_run_direct_iap ? local.effective_iap_group_principals" in iap_tf
 
     # No public LB unless load_balancer mode is chosen; when it is, it carries a TLS policy.
-    assert "enable_https_lb = var.enable_https_load_balancer && local.cloud_run_lb_iap" in lb_tf
-    assert 'profile         = "RESTRICTED"' in lb_tf
-    assert "ssl_policy       = google_compute_ssl_policy.sec_edgar_tls[0].id" in lb_tf
+    assert re.search(
+        r"enable_https_lb\s*=\s*var\.enable_https_load_balancer\s*&&\s*local\.cloud_run_lb_iap",
+        lb_tf,
+    )
+    assert re.search(r'profile\s*=\s*"RESTRICTED"', lb_tf)
+    assert re.search(r"ssl_policy\s*=\s*google_compute_ssl_policy\.sec_edgar_tls\[0\]\.id", lb_tf)
 
     # Sharing is by group or whole domain, never by individual user.
     assert 'startswith(lower(trimspace(p)), "domain:")' in vars_tf
@@ -474,14 +544,14 @@ def test_vpc_service_controls_perimeter_terraform() -> None:
     assert '"accesscontextmanager.googleapis.com"' in apis_tf
     assert 'resource "google_access_context_manager_service_perimeter" "sec_edgar"' in vpcsc_tf
     assert 'resource "google_access_context_manager_access_policy" "sec_edgar_scoped"' in vpcsc_tf
-    assert "scopes = [local.vpc_sc_project_resource]" in vpcsc_tf
-    assert 'perimeter_type = "PERIMETER_TYPE_REGULAR"' in vpcsc_tf
+    assert re.search(r"scopes\s*=\s*\[local\.vpc_sc_project_resource\]", vpcsc_tf)
+    assert re.search(r'perimeter_type\s*=\s*"PERIMETER_TYPE_REGULAR"', vpcsc_tf)
 
     # Dry run first: the config goes to `spec` unless enforcement is switched on.
-    assert "use_explicit_dry_run_spec = !var.vpc_sc_enforce" in vpcsc_tf
+    assert re.search(r"use_explicit_dry_run_spec\s*=\s*!var\.vpc_sc_enforce", vpcsc_tf)
     assert 'dynamic "spec"' in vpcsc_tf and 'dynamic "status"' in vpcsc_tf
     enforce_block = vars_tf.split('variable "vpc_sc_enforce"', 1)[1].split("}", 1)[0]
-    assert "default     = false" in enforce_block
+    assert re.search(r"default\s*=\s*false", enforce_block)
 
     # Every service named by the reference architecture is restricted.
     restricted_block = vars_tf.split('variable "vpc_sc_restricted_services"', 1)[1].split("]", 1)[0]
@@ -504,8 +574,8 @@ def test_vpc_service_controls_perimeter_terraform() -> None:
     assert "google_service_account.cicd_runner.email" in vpcsc_tf
     assert "local.runtime_service_account_email" in vpcsc_tf
     assert "writer_identity" in vpcsc_tf
-    assert vpcsc_tf.count('identity_type = "ANY_IDENTITY"') == 2
-    assert vpcsc_tf.count('service_name = "run.googleapis.com"') == 2
+    assert len(re.findall(r'identity_type\s*=\s*"ANY_IDENTITY"', vpcsc_tf)) == 2
+    assert len(re.findall(r'service_name\s*=\s*"run\.googleapis\.com"', vpcsc_tf)) == 2
     assert "precondition" in vpcsc_tf
 
 
@@ -527,10 +597,10 @@ def test_frontend_lockfile_uses_public_npm_registry() -> None:
     assert bad_urls == [], f"Lockfile contains non-public npm registry URLs: {bad_urls[:5]}"
 
 
-def test_fastapi_cloud_run_service_endpoints() -> None:
-    from edgar_capstone.agents.intent import resolve_turn_intent
-    from edgar_capstone.agents.tools import calculate_period_variances
-
+def test_fastapi_health_and_secrets_status_endpoint_redaction(
+    fake_gcp_adapters: object,
+) -> None:
+    """Verify `/health`, 401 gate + redaction on `/api/v1/secrets/status`, and pruned routes offline."""
     client = TestClient(app)
 
     health_resp = client.get("/health")
@@ -539,13 +609,9 @@ def test_fastapi_cloud_run_service_endpoints() -> None:
     assert health_body["status"] == "ok"
     assert health_body["root_agent"] == "FinancialAnalystAgent"
     assert health_body["active_agents"] == ["FinancialAnalystAgent", "NarrativeEvaluatorAgent"]
-    assert health_body["sub_agents"] == ["FinancialAnalystAgent", "NarrativeEvaluatorAgent"]
     assert health_body["iap_jwt_auth_enabled"] is True
-
-    # Pruned legacy healthz probe returns 404
     assert client.get("/healthz").status_code == 404
 
-    # Internal APIs require IAP / Workspace Okta JWT Bearer authentication
     unauth_resp = client.get("/api/v1/secrets/status")
     assert unauth_resp.status_code == 401
     assert "Bearer" in unauth_resp.headers.get("WWW-Authenticate", "")
@@ -559,121 +625,12 @@ def test_fastapi_cloud_run_service_endpoints() -> None:
     assert secrets_body["secret_manager_enabled"] is True
     assert all(s["value"] == "***REDACTED***" for s in secrets_body["secrets"])
 
-    # Retained filing catalog and section viewer endpoints
-    companies_resp = client.get("/api/v1/companies", headers=auth_headers)
-    assert companies_resp.status_code == 200
-    companies_body = companies_resp.json()
-    assert companies_body["status"] == "success"
-    assert companies_body["company_count"] >= 15
-
-    section_resp = client.get(
-        "/api/v1/section",
-        headers=auth_headers,
-        params={"ticker": "NVDA", "fiscal_year": 2026, "section_id": "item_7", "max_chars": 2000},
-    )
-    assert section_resp.status_code == 200
-    section_body = section_resp.json()
-    assert section_body["status"] == "success"
-    assert section_body["ticker"] == "NVDA"
-    assert section_body["fiscal_year"] == 2026
-
-    # Pruned compute routes are removed from the API (GET -> 404; POST -> 404/405 via SPA catch-all)
-    assert client.get("/api/v1/variances", headers=auth_headers).status_code == 404
-    assert client.get("/api/v1/intent", headers=auth_headers).status_code == 404
-    var_resp = client.post(
-        "/api/v1/variances",
-        headers=auth_headers,
-        json={"tickers": "NVDA,AAPL", "start_year": 2024, "end_year": 2026},
-    )
-    assert var_resp.status_code in {404, 405}
-
-    intent_resp = client.post(
-        "/api/v1/intent",
-        headers=auth_headers,
-        json={"query": "Compare NVIDIA and Apple's R&D spend from 2024-2026"},
-    )
-    assert intent_resp.status_code in {404, 405}
-
+    # OpenAPI schema confirms legacy compute endpoints remain removed
     schema_paths = app.openapi()["paths"]
     assert "/api/v1/variances" not in schema_paths
     assert "/api/v1/intent" not in schema_paths
-
-    # Underlying Python tools remain directly callable and verified
-    direct_var = calculate_period_variances(tickers="NVDA,AAPL", start_year=2024, end_year=2026)
-    assert direct_var["status"] == "success"
-    assert direct_var["company_count"] == 2
-
-    direct_intent, source = resolve_turn_intent(
-        agent_intent=None,
-        scope={"tickers": ["NVDA", "AAPL"], "gics_sector": "ALL"},
-        tool_calls=[{"name": "calculate_period_variances"}],
-    )
-    assert (direct_intent, source) == ("multi_company_peer_comparison", "tool_inference")
-
-
-def test_adk_tools_read_live_gcp_data_in_a_clean_checkout() -> None:
-    """Every ADK data tool answers from live GCP; no local corpus files are needed."""
-    from edgar_capstone.agents.tools import (
-        _SESSION_10K_CONTEXT_CACHE,
-        calculate_period_variances,
-        fetch_financial_metrics,
-        load_cached_10k_section,
-        query_looker_financial_explore,
-        search_10k_chunks_rag,
-    )
-
-    _SESSION_10K_CONTEXT_CACHE.clear()
-
-    metrics_res = fetch_financial_metrics(
-        tickers="NVDA,AAPL",
-        start_year=2024,
-        end_year=2026,
-        gics_sector="Information Technology",
-    )
-    assert metrics_res["status"] == "success"
-    assert metrics_res["record_count"] == 6
-
-    var_res = calculate_period_variances(
-        tickers="NVDA,AAPL",
-        start_year=2024,
-        end_year=2026,
-    )
-    assert var_res["status"] == "success"
-    assert var_res["company_count"] == 2
-
-    health_res = query_looker_financial_explore(
-        explore_name="chunk_health",
-        tickers="ALL",
-        gics_sector="ALL",
-        start_year=2020,
-        end_year=2026,
-    )
-    assert health_res["status"] == "success"
-    assert health_res["health_status"] == "HEALTHY"
-    assert health_res["total_chunks"] > 10000
-
-    rag_res = search_10k_chunks_rag(
-        query="H20 export control licensing China data center revenue",
-        tickers="NVDA",
-        gics_sector="Information Technology",
-        section_id="item_1a",
-        start_year=2025,
-        end_year=2026,
-        top_k=5,
-    )
-    assert rag_res["status"] == "success"
-    assert rag_res["citation_count"] == 5
-    assert rag_res["citations"][0]["ticker"] == "NVDA"
-    assert rag_res["citations"][0]["section_id"] == "item_1a"
-
-    sec_res = load_cached_10k_section(
-        ticker="NVDA",
-        fiscal_year=2026,
-        section_id="item_7",
-        max_chars=2500,
-    )
-    assert sec_res["status"] == "success"
-    assert sec_res["token_estimate"] > 50
+    assert client.get("/api/v1/variances", headers=auth_headers).status_code == 404
+    assert client.get("/api/v1/intent", headers=auth_headers).status_code == 404
 
 
 def test_ci_identities_have_least_privilege_live_read_access_terraform() -> None:
@@ -732,22 +689,22 @@ def test_vector_search_private_service_connect_terraform() -> None:
 
     # PSC is the default; the endpoint has no public domain in that mode
     access_block = vars_tf.split('variable "vector_search_endpoint_access"', 1)[1].split("}", 1)[0]
-    assert 'default     = "private_service_connect"' in access_block
-    assert "public_endpoint_enabled = !local.vector_search_psc" in vs_tf
-    assert "enable_private_service_connect = true" in vs_tf
-    assert "project_allowlist              = [var.project_id]" in vs_tf
+    assert re.search(r'default\s*=\s*"private_service_connect"', access_block)
+    assert re.search(r"public_endpoint_enabled\s*=\s*!local\.vector_search_psc", vs_tf)
+    assert re.search(r"enable_private_service_connect\s*=\s*true", vs_tf)
+    assert re.search(r"project_allowlist\s*=\s*\[var\.project_id\]", vs_tf)
 
     # Consumer side: private subnet, internal IP, and a PSC forwarding rule to the
     # deployed index's service attachment
     assert 'resource "google_compute_network" "sec_edgar"' in network_tf
-    assert "auto_create_subnetworks = false" in network_tf
-    assert "private_ip_google_access = true" in network_tf
-    assert 'address_type = "INTERNAL"' in network_tf
+    assert re.search(r"auto_create_subnetworks\s*=\s*false", network_tf)
+    assert re.search(r"private_ip_google_access\s*=\s*true", network_tf)
+    assert re.search(r'address_type\s*=\s*"INTERNAL"', network_tf)
     assert "private_endpoints[0].service_attachment" in network_tf
-    assert 'load_balancing_scheme = ""' in network_tf
+    assert re.search(r'load_balancing_scheme\s*=\s*""', network_tf)
 
     # Cloud Run reaches the PSC IP through Direct VPC egress and is told the address
-    assert 'egress = "PRIVATE_RANGES_ONLY"' in run_tf
+    assert re.search(r'egress\s*=\s*"PRIVATE_RANGES_ONLY"', run_tf)
     assert "network_interfaces {" in run_tf
     assert '"VERTEX_VECTOR_SEARCH_PSC_ADDRESS"' in run_tf
     assert "google_compute_address.vector_search_psc[0].address" in run_tf

@@ -1,10 +1,4 @@
-"""Structured AnalystReport output: claim-level verification, rendering, and guardrail safety.
-
-Verification runs against a live NVIDIA FY2026 Item 7 chunk from BigQuery `filing_chunks`
-(found via the live hybrid search) and the deterministic variance engine's output for the
-same live `financial_metrics` rows. Rejected findings are built by perturbing that live
-evidence (wrong figure, wrong chunk id, quote absent from the passage).
-"""
+"""Structured AnalystReport output: claim-level verification, rendering, and guardrail safety."""
 
 from __future__ import annotations
 
@@ -13,7 +7,6 @@ from typing import Any
 
 import pytest
 
-from edgar_capstone.agents import calculate_period_variances
 from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
 from edgar_capstone.agents.schemas import AnalystFinding, AnalystReport
 from edgar_capstone.agents.structured_report import (
@@ -22,9 +15,19 @@ from edgar_capstone.agents.structured_report import (
     render_analyst_report_markdown,
     verify_analyst_report,
 )
-from edgar_capstone.agents.tools import search_10k_chunks_rag
+from edgar_capstone.agents.tools import _build_variance_reports_from_profiles
+from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.security.model_armor import schema_safe_block_text
+from tests.fake_gcp import use_fake_gcp_adapters
 from tests.structured_report_helpers import verbatim_quote
+
+
+@pytest.fixture(autouse=True)
+def _mock_gcp_adapters():
+    """Keep `get_full_10k_section()` fallbacks inside `verify_analyst_report()` strictly offline."""
+    with use_fake_gcp_adapters():
+        yield
+
 
 # Figures that can't be traced to NVIDIA's payload (its amounts are in the billions) or a quote.
 _UNTRACEABLE_AMOUNT = "$3.21 trillion"
@@ -32,45 +35,76 @@ _ABSENT_QUOTE = "this sentence was never written in the cited filing passage"
 
 
 def _body_words(excerpt: str) -> list[str]:
-    """Words of a live chunk body, skipping its `[TICKER | FY | Section]` header line."""
+    """Words of a chunk body, skipping its `[TICKER | FY | Section]` header line."""
     return verbatim_quote(excerpt, words=10_000).split()
 
 
 @pytest.fixture(scope="module")
 def live_evidence() -> dict[str, Any]:
-    """A live NVDA FY2026 MD&A chunk containing a dollar amount, plus a verbatim quote of it."""
-    res = search_10k_chunks_rag(
-        query="charge for excess inventory and purchase obligations export license billion",
-        tickers="NVDA",
-        gics_sector="ALL",
-        section_id="item_7",
-        start_year=2026,
-        end_year=2026,
-        top_k=8,
+    """Deterministic NVDA FY2026 MD&A chunk containing a dollar amount, plus verbatim quotes."""
+    excerpt = (
+        "[NVDA | FY2026 | Item 7. MD&A] "
+        "During fiscal year 2026, Data Center revenue expanded sharply on hyperscale cloud "
+        "adoption of Blackwell systems. We incurred a $4.5 billion charge for excess inventory "
+        "and purchase obligations related to H20 export license requirements."
     )
-    assert res["status"] == "success" and res["citations"], res
-    for cit in res["citations"]:
-        words = _body_words(cit["excerpt"])
-        for i, word in enumerate(words):
-            if not word.startswith("$"):
-                continue
-            quote = " ".join(words[max(0, i - 6) : i + 6])
-            amounts = [f for f in extract_figures(quote) if f.kind == "amount" and "$" in f.text]
-            if amounts and len(quote) >= 40:
-                return {
-                    "citation": cit,
-                    "amount_quote": quote,
-                    "amount_text": amounts[0].text,
-                    "plain_quote": " ".join(words[:14]),
-                }
-    pytest.fail("No live NVDA FY2026 Item 7 chunk with a dollar amount was retrieved")
+    cit = {
+        "chunk_id": "NVDA_2026_item_7_0001",
+        "ticker": "NVDA",
+        "company_name": "NVIDIA CORP",
+        "gics_sector": "Information Technology",
+        "fiscal_year": 2026,
+        "section_id": "item_7",
+        "section_title": "Item 7. MD&A",
+        "accession_number": "0001045810-26-000021",
+        "sec_filing_url": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026_10k.htm",
+        "excerpt": excerpt,
+        "score": 0.94,
+    }
+    words = _body_words(excerpt)
+    dollar_idx = next(i for i, w in enumerate(words) if w.startswith("$"))
+    quote = " ".join(words[max(0, dollar_idx - 6) : dollar_idx + 6])
+    return {
+        "citation": cit,
+        "amount_quote": quote,
+        "amount_text": "$4.5 billion",
+        "plain_quote": " ".join(words[:14]),
+    }
 
 
 @pytest.fixture(scope="module")
 def reports() -> list[dict[str, Any]]:
-    res = calculate_period_variances(tickers="NVDA", start_year=2024, end_year=2026)
-    assert res["status"] == "success" and res["variance_reports"], res
-    return res["variance_reports"]
+    profiles = [
+        FinancialDataProfile(
+            profile_id=f"NVDA_{fy}",
+            ticker="NVDA",
+            cik="0001045810",
+            company_name="NVIDIA CORP",
+            gics_sector="Information Technology",
+            fiscal_year=fy,
+            period_of_report=f"{fy}-01-25",
+            filing_date=f"{fy}-02-25",
+            accession_number=f"0001045810-{str(fy)[-2:]}-000021",
+            revenue=rev,
+            operating_income=op,
+            net_income=net,
+            unstructured_blob_path=f"unstructured/NVDA/{fy}_10k.md",
+            structured_blob_path=f"structured/NVDA/{fy}_financials.json",
+            unstructured_gcs_uri=f"gs://bucket/unstructured/NVDA/{fy}_10k.md",
+            structured_gcs_uri=f"gs://bucket/structured/NVDA/{fy}_financials.json",
+            sec_filing_url=f"https://www.sec.gov/Archives/edgar/data/1045810/NVDA_{fy}_10k.htm",
+        )
+        for fy, rev, op, net in (
+            (2024, 60.922e9, 32.972e9, 29.760e9),
+            (2025, 130.497e9, 81.453e9, 72.880e9),
+            (2026, 215.938e9, 130.387e9, 120.067e9),
+        )
+    ]
+    variance_reports, missing = _build_variance_reports_from_profiles(
+        profiles, ticker_filter={"NVDA"}, start_year=2024, end_year=2026
+    )
+    assert not missing and variance_reports
+    return variance_reports
 
 
 def _finding(citation: dict[str, Any], statement: str, quote: str, chunk_id: str | None = None):

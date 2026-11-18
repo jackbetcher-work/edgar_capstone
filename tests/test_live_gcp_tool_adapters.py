@@ -15,13 +15,12 @@ import math
 import os
 import re
 import urllib.parse
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
-from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.auth.exceptions import DefaultCredentialsError
@@ -40,13 +39,18 @@ from edgar_capstone.agents import (
     load_cached_10k_section,
     query_cached_10k_context,
     query_looker_financial_explore,
-    reset_gcp_tool_adapters,
     run_adk_agent_stream,
     search_10k_chunks_rag,
 )
+from edgar_capstone.agents.context_memory import FINANCIAL_REASONING_MODEL
 from edgar_capstone.agents.tools import _SECTION_CHUNKS_CACHE, _SESSION_10K_CONTEXT_CACHE
 from edgar_capstone.dataset.extractor import format_combined_10k_markdown
-from tests.structured_report_helpers import finding_from_citation, report_json
+from tests.fake_gcp import preserve_gcp_caches
+from tests.structured_report_helpers import (
+    ScriptedBaseLlm,
+    finding_from_citation,
+    report_json,
+)
 
 _EMBEDDING_DIMS = 768
 
@@ -204,17 +208,18 @@ def _sample_nvda_2026_markdown() -> str:
 
 
 @pytest.fixture(autouse=True)
-def _cleanup_gcp_adapter_registry() -> Any:
-    """Ensure injected GCP adapters never leak across tests."""
-    reset_gcp_tool_adapters()
-    yield
-    reset_gcp_tool_adapters()
+def _cleanup_gcp_adapter_registry() -> Iterator[None]:
+    """Ensure injected GCP adapters never leak across tests without wiping warm live caches."""
+    with preserve_gcp_caches():
+        yield
 
 
 def test_gcp_tool_config_and_status_metadata_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """`GcpToolConfig.from_env()` reads the resource env vars; status metadata is always `gcp`."""
+    from edgar_capstone.gcp.defaults import resolve_gcp_project_id
+
     for key in (
         "BIGQUERY_DATASET_ID",
         "VERTEX_AI_SEARCH_ENGINE_ID",
@@ -225,7 +230,7 @@ def test_gcp_tool_config_and_status_metadata_resolution(
         monkeypatch.delenv(key, raising=False)
 
     default_cfg = GcpToolConfig.from_env()
-    assert default_cfg.project_id == os.environ["GCP_PROJECT_ID"]
+    assert default_cfg.project_id == (os.environ.get("GCP_PROJECT_ID") or resolve_gcp_project_id())
     assert default_cfg.bq_dataset_id == "sec_edgar"
     assert default_cfg.embedding_dimensions == 768
     meta = get_gcp_adapters_status_metadata()
@@ -234,8 +239,6 @@ def test_gcp_tool_config_and_status_metadata_resolution(
     assert meta["bigquery"]["financial_metrics_table"] == "financial_metrics"
     assert meta["hybrid_retrieval_backends"] == ["bigquery_vector_search", "vertex_ai_search"]
     assert "vertex_vector_search" not in meta
-    for removed in ("live_gcp_active", "strict_gcp", "data_backend_mode"):
-        assert removed not in meta
 
     monkeypatch.setenv("BIGQUERY_DATASET_ID", "sec_edgar_staging")
     monkeypatch.setenv("VERTEX_AI_SEARCH_ENGINE_ID", "engine-x")
@@ -1007,10 +1010,10 @@ def test_context_cache_miss_loads_from_bigquery_and_gcs_and_queries_cached_secti
     assert hit_log.count("bq_fetch_section_chunks") == bq_chunk_fetches
 
 
-class _LiveToolCallingAnalystLlm(BaseLlm):
+class _LiveToolCallingAnalystLlm(ScriptedBaseLlm):
     """ADK `BaseLlm` that invokes `calculate_period_variances` + `search_10k_chunks_rag` and synthesizes grounded output."""
 
-    model: str = "gemini-2.5-pro"
+    model: str = FINANCIAL_REASONING_MODEL
 
     async def generate_content_async(
         self,
@@ -1079,8 +1082,8 @@ class _LiveToolCallingAnalystLlm(BaseLlm):
         )
 
 
-def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_search() -> None:
-    """Verify `FinancialAnalystAgent` and `load_cached_10k_section` hit BigQuery, Vertex AI Search, Vector Search, and GCS through the ADK Runner."""
+def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_gcs() -> None:
+    """Verify `FinancialAnalystAgent` and `load_cached_10k_section` hit BigQuery `VECTOR_SEARCH`, Vertex AI Search, embeddings, and GCS through the ADK Runner."""
     get_context_latency_tracker().reset()
     get_conversation_memory_manager().reset()
     _SESSION_10K_CONTEXT_CACHE.pop("NVDA_2026_item_1a", None)
@@ -1172,35 +1175,6 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_vector_sear
         if ":predict" in url and "text-embedding-005" in url:
             gcp_services_contacted.add("vertex_ai_embeddings")
             return httpx.Response(200, json={"predictions": [{"embeddings": {"values": q_vec}}]})
-
-        if ":findNeighbors" in url:
-            gcp_services_contacted.add("vertex_vector_search")
-            return httpx.Response(
-                200,
-                json={
-                    "nearestNeighbors": [
-                        {
-                            "id": "rag_query",
-                            "neighbors": [
-                                {
-                                    "datapoint": {
-                                        "datapointId": "NVDA_2026_item_7_0001",
-                                        "embeddingMetadata": {
-                                            "profile_id": "NVDA_2026",
-                                            "ticker": "NVDA",
-                                            "company_name": "NVIDIA CORP",
-                                            "fiscal_year": 2026,
-                                            "section_id": "item_7",
-                                            "section_title": "Item 7. MD&A",
-                                        },
-                                    },
-                                    "distance": 0.09,
-                                }
-                            ],
-                        }
-                    ]
-                },
-            )
 
         if "discoveryengine.googleapis.com" in url:
             gcp_services_contacted.add("vertex_ai_search")
@@ -1454,3 +1428,167 @@ def test_bigquery_vector_search_sector_top_per_ticker() -> None:
     assert rows[0]["period_of_report"] == "2026-01-25"
     assert rows[0]["accession_number"] == "0001045810-26-000021"
     assert rows[1]["ticker"] == "AAPL"
+
+
+def test_vertex_ai_search_passage_extraction_fallback_and_errors() -> None:
+    """Covers `extractive_answers`, HTML-stripped `snippets`, `chunk_text`, `doc_id` parsing, filters, and errors."""
+    from edgar_capstone.agents.adapters.registry import (
+        GcpAdapterHttpError,
+        GcpEndpointNotReadyError,
+    )
+    from edgar_capstone.agents.adapters.vertex_search import VertexAISearchAdapter
+
+    # 1. No engine_id or datastore_id configured -> raises GcpEndpointNotReadyError
+    empty_cfg = GcpToolConfig(
+        project_id="iron-radio-514217-q7", vais_engine_id="", vais_datastore_id=""
+    )
+    empty_adapter = VertexAISearchAdapter(empty_cfg, credentials=_FakeGcpCredentials())
+    with pytest.raises(GcpEndpointNotReadyError):
+        empty_adapter.search_documents(
+            "AI risks",
+            tickers=set(),
+            gics_sector=None,
+            section_id=None,
+            start_year=2024,
+            end_year=2026,
+        )
+
+    # 2. 404 fallback across engine -> datastore -> non-404 / exhausted 404 raises GcpAdapterHttpError
+    def _all_404(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"message": "not found"}})
+
+    fail_adapter = VertexAISearchAdapter(
+        GcpToolConfig(
+            project_id="iron-radio-514217-q7",
+            vais_engine_id="eng-missing",
+            vais_datastore_id="ds-missing",
+        ),
+        http_client=httpx.Client(transport=httpx.MockTransport(_all_404)),
+        credentials=_FakeGcpCredentials(),
+    )
+    with pytest.raises(GcpAdapterHttpError):
+        fail_adapter.search_documents(
+            "AI",
+            tickers=set(),
+            gics_sector=None,
+            section_id=None,
+            start_year=2024,
+            end_year=2026,
+        )
+
+    # 3. Passage extraction: doc_id fallback, extractive_answers, HTML snippet stripping, chunk_text, & filters
+    def _mixed_results(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    # Missing both ticker/fy and unparseable id -> skipped
+                    {"document": {"id": "malformed", "structData": {}, "derivedStructData": {}}},
+                    # Out of year range -> skipped
+                    {
+                        "document": {
+                            "id": "NVDA_2019",
+                            "structData": {"ticker": "NVDA", "fiscal_year": 2019},
+                        }
+                    },
+                    # Wrong ticker -> skipped
+                    {
+                        "document": {
+                            "id": "AAPL_2025",
+                            "structData": {"ticker": "AAPL", "fiscal_year": 2025},
+                        }
+                    },
+                    # Wrong sector -> skipped
+                    {
+                        "document": {
+                            "id": "NVDA_2025",
+                            "structData": {
+                                "ticker": "NVDA",
+                                "fiscal_year": 2025,
+                                "gics_sector": "Energy",
+                            },
+                        }
+                    },
+                    # Parsed via doc_id fallback (`NVDA_2026_10K`) with answers + HTML snippet + chunk_text
+                    {
+                        "document": {
+                            "id": "NVDA_2026_10K",
+                            "structData": {
+                                "gics_sector": "Information Technology",
+                                "chunk_text": "Item 1A Risk factors include foundry supply concentration.",
+                            },
+                            "derivedStructData": {
+                                "extractive_answers": [
+                                    {
+                                        "content": "Export control risks restrict China AI shipments.",
+                                        "section_id": "item_1a",
+                                    }
+                                ],
+                                "snippets": [
+                                    {
+                                        "snippet": "<b>Regulatory</b> risks and <em>export</em> litigation adversely affect demand."
+                                    }
+                                ],
+                            },
+                        }
+                    },
+                ]
+            },
+        )
+
+    ok_adapter = VertexAISearchAdapter(
+        GcpToolConfig(project_id="iron-radio-514217-q7"),
+        http_client=httpx.Client(transport=httpx.MockTransport(_mixed_results)),
+        credentials=_FakeGcpCredentials(),
+    )
+    passages = ok_adapter.search_documents(
+        "export risks",
+        tickers={"NVDA"},
+        gics_sector="Information Technology",
+        section_id="item_1a",
+        start_year=2024,
+        end_year=2026,
+    )
+    assert len(passages) == 3
+    texts = [p["chunk_text"] for p in passages]
+    assert any("Export control risks" in t for t in texts)
+    assert any("Regulatory risks and export litigation" in t and "<b>" not in t for t in texts)
+    assert any("foundry supply concentration" in t for t in texts)
+    assert all(p["ticker"] == "NVDA" and p["fiscal_year"] == 2026 for p in passages)
+
+
+def test_gcp_tool_adapters_embed_texts_error_translation_and_context_manager() -> None:
+    """Covers `embed_texts` empty list, 429/503/timeout/runtime error translation, and context manager."""
+    from unittest.mock import MagicMock
+
+    from edgar_capstone.agents.resilience import (
+        RateLimitExceededError,
+        ToolExecutionError,
+        UpstreamTimeoutError,
+    )
+
+    fake_embedder = MagicMock()
+    with GcpToolAdapters(
+        GcpToolConfig(project_id="iron-radio-514217-q7"),
+        embedder=fake_embedder,
+        credentials=_FakeGcpCredentials(),
+    ) as adapters:
+        assert adapters.embed_texts([]) == []
+
+        fake_embedder.embed_texts.side_effect = httpx.ReadTimeout("timed out")
+        with pytest.raises(UpstreamTimeoutError):
+            adapters.embed_texts(["q1"])
+
+        fake_embedder.embed_texts.side_effect = RuntimeError("Vertex HTTP 429 quota exceeded")
+        with pytest.raises(RateLimitExceededError):
+            adapters.embed_texts(["q2"])
+
+        fake_embedder.embed_texts.side_effect = RuntimeError("Vertex HTTP 503 unavailable")
+        with pytest.raises(UpstreamTimeoutError):
+            adapters.embed_texts(["q3"])
+
+        fake_embedder.embed_texts.side_effect = RuntimeError("Vertex HTTP 400 invalid argument")
+        with pytest.raises(ToolExecutionError):
+            adapters.embed_texts(["q4"])
+
+    fake_embedder.close.assert_called_once()

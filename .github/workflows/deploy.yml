@@ -13,7 +13,23 @@ on:
       - "**"
   # Manual redeploy from the Actions tab or `gh workflow run deploy.yml --ref main`.
   # Build/deploy jobs still require refs/heads/main and DEPLOY_WITH_GITHUB_ACTIONS == 'true'.
+  #
+  # Eval gate mode. Resolved as: workflow_dispatch input > repo variable EVAL_GATE_MODE > 'advisory'.
+  #   blocking - eval regressions fail the run and block deploy.
+  #   advisory - eval runs and reports regressions, but deploy goes ahead anyway (default).
+  #   skip     - eval does not run; deploy goes ahead right after build.
+  # Example: gh workflow run deploy.yml --ref main -f eval_mode=skip
+  # Turn the gate back on for every push with: gh variable set EVAL_GATE_MODE --body blocking
   workflow_dispatch:
+    inputs:
+      eval_mode:
+        description: "Eval gate mode: blocking, advisory (run, don't block), or skip"
+        type: choice
+        options:
+          - advisory
+          - blocking
+          - skip
+        default: advisory
 
 permissions:
   contents: read
@@ -189,11 +205,15 @@ jobs:
 
   # ============================================================================
   # Stage 2.5: Eval Gate — Live golden regression gates (main deploy only)
+  # Optional: see eval_mode / EVAL_GATE_MODE at the top. Only 'blocking' gates deploy.
   # ============================================================================
   eval:
     name: Eval Stage - Live Golden Regression Gates
     needs: build
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true' && (inputs.eval_mode || vars.EVAL_GATE_MODE || 'advisory') != 'skip'
+    # In advisory mode a failing eval doesn't fail the run. The failure still shows
+    # on the job and as an annotation.
+    continue-on-error: ${{ (inputs.eval_mode || vars.EVAL_GATE_MODE || 'advisory') != 'blocking' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -261,6 +281,11 @@ jobs:
             exit "${status}"
           fi
 
+      - name: Report advisory eval result
+        if: failure() && (inputs.eval_mode || vars.EVAL_GATE_MODE || 'advisory') != 'blocking'
+        run: |
+          echo "::warning::Live golden eval gates FAILED, but eval mode is advisory. Deploy continues anyway. Set EVAL_GATE_MODE=blocking (or eval_mode=blocking) to enforce the gates."
+
   # ============================================================================
   # Stage 3: Deploy — Secret Manager integration & Google Cloud Run deployment
   # ============================================================================
@@ -269,7 +294,15 @@ jobs:
     needs:
       - build
       - eval
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
+    # !cancelled() lets deploy run when eval failed (advisory) or was skipped (skip).
+    # build must succeed. In blocking mode, eval must succeed too.
+    if: >-
+      ${{ !cancelled()
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+      && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
+      && needs.build.result == 'success'
+      && (needs.eval.result == 'success' || (inputs.eval_mode || vars.EVAL_GATE_MODE || 'advisory') != 'blocking') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

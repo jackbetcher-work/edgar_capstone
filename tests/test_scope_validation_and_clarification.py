@@ -251,7 +251,7 @@ def test_build_coverage_notices_covers_missing_fy2026_calendar_misalignment_and_
                 "available_fiscal_years": [2024, 2025],
                 "missing_fiscal_years": [2026],
                 "period_end_dates": {"2024": "2024-12-31", "2025": "2025-12-31"},
-                "research_and_development_variance": None,
+                "research_and_development_variance": {"direction": "unavailable"},
             },
         ],
         missing_tickers=["FAKE"],
@@ -268,7 +268,10 @@ def test_build_coverage_notices_covers_missing_fy2026_calendar_misalignment_and_
     assert "missing_ticker" in codes
     assert "missing_fiscal_year" in codes
     assert "fiscal_calendar_misalignment" in codes
+    assert "missing_metric" in codes
     assert "sector_coverage_summary" in codes
+    rd_notice = next(n for n in notices if n["code"] == "missing_metric")
+    assert rd_notice["tickers"] == ["META"]
     fy_msg = next(n["message"] for n in notices if n["code"] == "missing_fiscal_year")
     assert "Q1 2027" in fy_msg
 
@@ -302,3 +305,93 @@ def test_dual_class_cik_deduplication_prefers_canonical_ticker() -> None:
     # Explicit ticker GOOG still resolves when explicitly requested
     found_explicit, _ = catalog.detect_tickers_in_query("Compare MSFT and GOOG revenue in 2025")
     assert set(found_explicit) == {"MSFT", "GOOG"}
+
+
+def test_scope_validation_visa_v_ticker_guards_roman_numerals() -> None:
+    """Relocated regression test: standalone 'V' resolves to Visa only in financial/peer context."""
+    profiles = [
+        SimpleNamespace(
+            ticker="NVDA",
+            company_name="NVIDIA Corporation",
+            gics_sector="Information Technology",
+            cik="0001045810",
+            fiscal_year=2026,
+        ),
+        SimpleNamespace(
+            ticker="V",
+            company_name="Visa Inc.",
+            gics_sector="Financials",
+            cik="0001403161",
+            fiscal_year=2025,
+        ),
+        SimpleNamespace(
+            ticker="MA",
+            company_name="Mastercard Incorporated",
+            gics_sector="Financials",
+            cik="0001141391",
+            fiscal_year=2025,
+        ),
+    ]
+    catalog = EntityCatalog(profiles)
+
+    found_part, _ = catalog.detect_tickers_in_query("Explain Part V risk factors for NVDA")
+    assert found_part == ["NVDA"]
+
+    found_sec, _ = catalog.detect_tickers_in_query("Summarize Section V of the filing")
+    assert "V" not in found_sec
+
+    found_peer, _ = catalog.detect_tickers_in_query("Compare NVDA and V revenue in FY2025")
+    assert set(found_peer) == {"NVDA", "V"}
+
+    found_brand, _ = catalog.detect_tickers_in_query("How did Visa revenue change?")
+    assert "V" in found_brand
+
+    found_dollar, _ = catalog.detect_tickers_in_query("Show $V operating margin in FY2025")
+    assert "V" in found_dollar
+
+
+def test_detect_tickers_explicit_prefix_dollar_unknown_and_dotted_tickers() -> None:
+    """Covers `$UNKNOWN`, `ticker XYZ`, ambiguous lowercase skip, and dotted ticker `BRK.B`."""
+    profiles = [
+        *_sample_profiles(),
+        SimpleNamespace(ticker="", company_name="Blank", gics_sector="Unknown"),
+        SimpleNamespace(
+            ticker="BRK.B",
+            company_name="Berkshire Hathaway Inc.",
+            gics_sector="Financials",
+            cik="0001067983",
+            fiscal_year=2025,
+        ),
+        SimpleNamespace(
+            ticker="V",
+            company_name="Visa Inc.",
+            gics_sector="Financials",
+            cik="0001403161",
+            fiscal_year=2025,
+        ),
+    ]
+    catalog = EntityCatalog(profiles)
+
+    found_dollar, unknown_dollar = catalog.detect_tickers_in_query(
+        "Compare $NVDA and $FAKES revenue"
+    )
+    assert found_dollar == ["NVDA"]
+    assert "FAKES" in unknown_dollar
+
+    found_exp, unknown_exp = catalog.detect_tickers_in_query(
+        "Check ticker NVDA vs ticker ZZZZ and stock all vs ticker BRK.B"
+    )
+    assert "NVDA" in found_exp
+    assert "ZZZZ" in unknown_exp
+    # Lowercase ambiguous word after `stock` (`stock all`) must be ignored
+    assert "ALL" not in found_exp
+
+    found_dotted, unknown_dotted = catalog.detect_tickers_in_query(
+        "How did BRK.B operating income change in FY2025?"
+    )
+    assert found_dotted == ["BRK-B"] or found_dotted == ["BRK.B"]
+    assert unknown_dotted == []
+
+    # Standalone 'V' after pre-context (`vs V`) with topic cue resolves to Visa
+    found_pre, _ = catalog.detect_tickers_in_query("Revenue trends for NVDA vs V in FY2025")
+    assert set(found_pre) == {"NVDA", "V"}

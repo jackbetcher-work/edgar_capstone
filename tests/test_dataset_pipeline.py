@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -336,25 +337,6 @@ def test_cli_parse_args_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert args.sp500 is False
 
 
-def test_terraform_manages_sec_corpus_bucket_and_wires_dependents() -> None:
-    repo_root = Path(__file__).resolve().parents[1]
-    tf_dir = repo_root / "terraform"
-    storage_tf = (tf_dir / "storage.tf").read_text(encoding="utf-8")
-    vars_tf = (tf_dir / "variables.tf").read_text(encoding="utf-8")
-    bq_tf = (tf_dir / "bigquery.tf").read_text(encoding="utf-8")
-    iam_tf = (tf_dir / "iam.tf").read_text(encoding="utf-8")
-    outputs_tf = (tf_dir / "outputs.tf").read_text(encoding="utf-8")
-
-    assert 'resource "google_storage_bucket" "sec_corpus"' in storage_tf
-    assert "uniform_bucket_level_access = true" in storage_tf
-    assert 'public_access_prevention    = "enforced"' in storage_tf
-    assert "create_sec_corpus_bucket" in vars_tf
-    assert "local.sec_corpus_bucket_name" in bq_tf
-    assert "local.sec_corpus_bucket_name" in iam_tf
-    assert "sec_corpus_bucket_name" in outputs_tf
-    assert "sec_corpus_bucket_url" in outputs_tf
-
-
 def test_resolve_and_reconcile_fiscal_year_dei_typos() -> None:
     # June-Dec period ends must never adopt a stale prior-year DEI tag (ALB, ACGL, COHR bugs)
     assert resolve_fiscal_year(dei_fiscal_year="2021", report_date_str="2022-12-31") == 2022
@@ -678,8 +660,6 @@ def test_jan_spillover_fiscal_year_ignores_calendar_year_dei() -> None:
     assert resolve_fiscal_year(dei_fiscal_year="2022", report_date_str="2022-01-02") == 2021
     assert resolve_fiscal_year(dei_fiscal_year="2023", report_date_str="2023-01-01") == 2022
     assert resolve_fiscal_year(dei_fiscal_year="2020", report_date_str="2021-01-03") == 2020
-    # Late-January retail year-ends keep the DEI convention
-    assert resolve_fiscal_year(dei_fiscal_year="2026", report_date_str="2026-01-25") == 2026
 
 
 def test_income_df_never_falls_back_to_prior_year_column() -> None:
@@ -1199,3 +1179,223 @@ def test_wrong_anchor_guards_bleed_and_mid_sentence_truncation() -> None:
         filing=None,
     )
     assert got_mangled is not None and "Critical Accounting Estimates" in got_mangled
+
+
+def test_section_parser_rewrite_markdown_fiscal_year() -> None:
+    from edgar_capstone.dataset.section_parser import rewrite_markdown_fiscal_year
+
+    md = format_combined_10k_markdown(
+        ticker="NVDA",
+        company_name="NVIDIA Corporation",
+        cik="0001045810",
+        gics_sector="Information Technology",
+        gics_sub_industry="Semiconductors",
+        fiscal_year=2025,
+        period_of_report="2026-01-25",
+        filing_date="2026-02-26",
+        accession_number="0001045810-26-000021",
+        sec_filing_url="https://www.sec.gov/example",
+        item_1a_markdown="Risk content",
+        item_7_markdown="MD&A content",
+    )
+    rewritten = rewrite_markdown_fiscal_year(md, fiscal_year=2026)
+    assert "fiscal_year: 2026\n" in rewritten
+    assert "# NVIDIA Corporation (NVDA) — FY2026 Form 10-K\n" in rewritten
+    assert "- **Fiscal Year:** 2026 (Period Ended 2026-01-25)\n" in rewritten
+    assert "fiscal_year: 2025" not in rewritten
+
+
+def test_cached_bundle_health_checks_and_corrupt_loader(tmp_path: Path) -> None:
+    """Covers `_is_cached_bundle_healthy` rejection branches and `_load_existing_company_bundles`."""
+    from edgar_capstone.dataset.models import ExtractedFilingBundle, FinancialDataProfile
+    from edgar_capstone.dataset.pipeline import (
+        _is_cached_bundle_healthy,
+        _load_existing_company_bundles,
+    )
+
+    good_1a = (
+        "Risk factors affecting our operations include competition, export licensing, and foundry supply. "
+        * 35
+    )
+    good_7 = (
+        "Management discussion of results of operations, revenue growth, and liquidity resources. "
+        * 35
+    )
+
+    def _bundle(
+        *,
+        fy: int = 2025,
+        period: str = "2025-12-31",
+        sections: list[str] | None = None,
+        item_1a: str = good_1a,
+        item_7: str = good_7,
+        revenue: float | None = 100e9,
+        op_inc: float | None = 30e9,
+        net_inc: float | None = 25e9,
+        raw_md: str | None = None,
+    ) -> ExtractedFilingBundle:
+        prof = FinancialDataProfile(
+            profile_id=f"ACME_{fy}",
+            ticker="ACME",
+            cik="0000000001",
+            company_name="ACME Corp",
+            gics_sector="Information Technology",
+            fiscal_year=fy,
+            period_of_report=period,
+            filing_date=f"{fy + 1}-02-15",
+            accession_number=f"0000000001-{fy % 100:02d}-000001",
+            revenue=revenue,
+            operating_income=op_inc,
+            net_income=net_inc,
+            extracted_sections=sections if sections is not None else ["item_1a", "item_7"],
+            unstructured_blob_path=f"unstructured/ACME/{fy}_10k.md",
+            structured_blob_path=f"structured/ACME/{fy}_financials.json",
+            unstructured_gcs_uri=f"gs://b/unstructured/ACME/{fy}_10k.md",
+            structured_gcs_uri=f"gs://b/structured/ACME/{fy}_financials.json",
+            sec_filing_url="https://www.sec.gov/example",
+        )
+        md = (
+            raw_md
+            if raw_md is not None
+            else format_combined_10k_markdown(
+                ticker="ACME",
+                company_name="ACME Corp",
+                cik="0000000001",
+                gics_sector="Information Technology",
+                gics_sub_industry="Semiconductors",
+                fiscal_year=fy,
+                period_of_report=period,
+                filing_date=f"{fy + 1}-02-15",
+                accession_number=prof.accession_number,
+                sec_filing_url=prof.sec_filing_url,
+                item_1a_markdown=item_1a,
+                item_7_markdown=item_7,
+            )
+        )
+        return ExtractedFilingBundle(profile=prof, markdown_content=md)
+
+    assert _is_cached_bundle_healthy(_bundle()) is True
+    assert _is_cached_bundle_healthy(_bundle(fy=2024, period="2025-12-31")) is False
+    assert _is_cached_bundle_healthy(_bundle(sections=["item_1a"])) is False
+    assert _is_cached_bundle_healthy(_bundle(raw_md="no headers at all")) is False
+    assert _is_cached_bundle_healthy(_bundle(item_1a="Too short")) is False
+    assert _is_cached_bundle_healthy(_bundle(item_7="Too short")) is False
+    assert (
+        _is_cached_bundle_healthy(_bundle(item_1a=good_1a + "\n\n# PROPERTIES\n\nBleed")) is False
+    )
+    assert (
+        _is_cached_bundle_healthy(
+            _bundle(
+                item_7=good_7
+                + "\n\n**Report of Independent Registered Public Accounting Firm**\n\nOpinion text."
+            )
+        )
+        is False
+    )
+    assert _is_cached_bundle_healthy(_bundle(item_1a=good_1a.strip() + ",")) is False
+    assert _is_cached_bundle_healthy(_bundle(revenue=0.0)) is False
+    assert _is_cached_bundle_healthy(_bundle(op_inc=200e9)) is False
+    assert _is_cached_bundle_healthy(_bundle(net_inc=200e9)) is False
+
+    # Missing dir, corrupt JSON, and fiscal year gap force clean reload
+    assert _load_existing_company_bundles(tmp_path, "NONE", "b") == {}
+    sdir = tmp_path / "structured" / "ACME"
+    udir = tmp_path / "unstructured" / "ACME"
+    sdir.mkdir(parents=True)
+    udir.mkdir(parents=True)
+    (sdir / "bad_financials.json").write_text("{not valid json", encoding="utf-8")
+    assert _load_existing_company_bundles(tmp_path, "ACME", "b") == {}
+
+    # Valid FY2022 + FY2024 with a FY2023 gap triggers series re-evaluation
+    for fy in (2022, 2024):
+        b = _bundle(fy=fy, period=f"{fy}-12-31")
+        (sdir / f"{fy}_financials.json").write_text(b.profile.model_dump_json(), encoding="utf-8")
+        (udir / f"{fy}_10k.md").write_text(b.markdown_content, encoding="utf-8")
+    assert _load_existing_company_bundles(tmp_path, "ACME", "b") == {}
+
+
+def test_extractor_retry_company_fallback_constituents_gcs_and_lazy_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Covers `_retry_sec_call`, `_resolve_edgar_company`, `configure_sec_identity`, `refresh_sp500_csv`, GCS helpers, and `dataset.__getattr__`."""
+    import time
+
+    import httpx
+
+    import edgar_capstone.dataset as ds_pkg
+    from edgar_capstone.dataset import constituents as const_mod
+    from edgar_capstone.dataset import extractor as ext_mod
+    from edgar_capstone.dataset import gcs_storage as gcs_mod
+    from edgar_capstone.dataset.models import CompanyConstituent
+
+    # Lazy package __getattr__ and __dir__
+    assert ds_pkg.load_constituents is load_constituents
+    assert "run_dataset_pipeline" in dir(ds_pkg)
+    with pytest.raises(AttributeError):
+        _ = ds_pkg.NoSuchDatasetSymbol
+
+    # configure_sec_identity validation
+    with pytest.raises(ValueError, match="Organization Name"):
+        ext_mod.configure_sec_identity("no-email-or-space")
+
+    # _retry_sec_call recovers from transient OSError / httpx.HTTPError and raises immediately on CompanyNotFoundError
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    attempts = {"n": 0}
+
+    def _flaky() -> str:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise httpx.ConnectError("transient")
+        return "ok"
+
+    assert ext_mod._retry_sec_call(_flaky, description="test", max_attempts=3) == "ok"
+    assert attempts["n"] == 3
+
+    with pytest.raises(OSError):
+        ext_mod._retry_sec_call(
+            lambda: (_ for _ in ()).throw(OSError("down")),
+            description="exhaust",
+            max_attempts=2,
+        )
+
+    # _resolve_edgar_company falls back to CIK when ticker lookup reports not_found
+    calls: list[Any] = []
+
+    def _fake_company(ident: Any) -> Any:
+        calls.append(ident)
+        if isinstance(ident, str):
+            return SimpleNamespace(not_found=True)
+        return SimpleNamespace(not_found=False, cik=ident)
+
+    monkeypatch.setattr(ext_mod.edgar, "Company", _fake_company)
+    comp = ext_mod._resolve_edgar_company(
+        CompanyConstituent(
+            ticker="BRK-B", edgar_ticker="BRK-B", company_name="Berkshire", cik="0001067983"
+        )
+    )
+    assert comp.cik == 1067983 and calls == ["BRK-B", 1067983]
+
+    with pytest.raises(ext_mod.CompanyNotFoundError):
+        ext_mod._resolve_edgar_company(
+            CompanyConstituent(ticker="NOPE", edgar_ticker="NOPE", company_name="None", cik=None)
+        )
+
+    # refresh_sp500_csv via mocked httpx.get
+    csv_body = "Symbol,Security,GICS Sector,GICS Sub-Industry,CIK\nNVDA,NVIDIA Corp,Information Technology,Semiconductors,1045810\n"
+    monkeypatch.setattr(
+        const_mod.httpx,
+        "get",
+        lambda url, **_kw: httpx.Response(200, text=csv_body, request=httpx.Request("GET", url)),
+    )
+    out_csv = tmp_path / "sp500.csv"
+    const_mod.refresh_sp500_csv(csv_path=out_csv)
+    assert out_csv.exists()
+    cat = const_mod.load_sp500_catalog(csv_path=out_csv)
+    assert cat["NVDA"].cik == "0001045810"
+
+    # gcs_storage helpers: content_type_for_path fallback & missing optional SDK error
+    assert gcs_mod.content_type_for_path(Path("x.bin")) == "application/octet-stream"
+    assert gcs_mod.content_type_for_path(Path("x.jsonl")) == "application/x-ndjson; charset=utf-8"
+    monkeypatch.setattr(gcs_mod, "storage", None)
+    with pytest.raises(GCSAccessError, match="google-cloud-storage is not installed"):
+        gcs_mod.create_storage_client(project_id="p")

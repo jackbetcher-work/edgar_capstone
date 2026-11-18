@@ -12,6 +12,7 @@ from edgar_capstone.agents import create_financial_analyst_agent
 from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.agents.disclosure_deltas import (
     SectionMaterial,
+    _resolve_target_tickers,
     align_year_pair,
     build_company_evolution,
     compare_disclosures_across_years,
@@ -34,6 +35,7 @@ from edgar_capstone.agents.tools import (
 )
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.security.agent_identity import authorize_agent_tool_invocation
+from tests.structured_report_helpers import ScriptedAnalystLlm
 
 _CITATION_RE = re.compile(r"\[[^\]|]+\|[^\]|]+\|\s*([^\]|]+?)\s*\]\(")
 
@@ -187,8 +189,11 @@ def test_thresholds_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert thr.margin_bps == 500.0
 
 
+@pytest.mark.live
 def test_flag_tool_reads_bigquery_and_matches_the_variance_engine() -> None:
-    res = flag_material_variances(tickers="NVDA,ZZZZ", start_year=2024, end_year=2026)
+    res = flag_material_variances(
+        tickers="NVDA,ZZZZ", start_year=2024, end_year=2026, explain_top_flags=False
+    )
     assert res["status"] == "success"
     assert res["missing_tickers"] == ["ZZZZ"]
     assert res["returned_flags"] <= 10 and res["total_flags"] >= res["returned_flags"]
@@ -384,6 +389,7 @@ def test_build_company_evolution_reports_missing_years_and_mentions() -> None:
                 assert cid in cited_ids
 
 
+@pytest.mark.live
 def test_compare_disclosures_tool_on_live_corpus() -> None:
     res = compare_disclosures_across_years(
         theme="export controls China AI",
@@ -493,46 +499,161 @@ def _assert_citations_resolve(resp: dict[str, Any]) -> None:
         assert any(c.startswith("acc:") for c in cited)
 
 
-def test_live_anomaly_turn_attaches_explained_material_flags() -> None:
-    """Anomaly / inflection question: the live agent invokes variances AND anomaly flags."""
-    resp = run_conversational_rag_turn(
-        query="Why did Intel's net income turn negative between 2023 and 2025?",
-        tickers="INTC",
-        start_year=2023,
-        end_year=2025,
+def test_disclosure_deltas_theme_mentions_when_full_text_empty() -> None:
+    """When GCS full_text is unavailable, theme mention counts fall back to chunk excerpts."""
+    terms = extract_theme_terms("AI risk disclosures")
+    mat_2025 = SectionMaterial(
+        ticker="NVDA",
+        company_name="NVIDIA Corporation",
+        fiscal_year=2025,
+        section_id="item_1a",
+        full_text="",
+        chunks=[
+            {
+                "chunk_id": "NVDA_2025_item_1a_0001",
+                "ticker": "NVDA",
+                "fiscal_year": 2025,
+                "section_id": "item_1a",
+                "excerpt": "Artificial intelligence and generative AI regulations affect AI sales.",
+            }
+        ],
     )
-    assert resp["status"] == "success"
-    assert resp["execution_mode"] == "live_adk"
-    invoked = set(resp["adk_runtime"]["agent_invoked_tools"])
-    assert "flag_material_variances" in invoked, resp["adk_runtime"]["adk_tool_calls"]
-    summary = resp["material_variance_summary"]
-    assert summary["total_flags"] >= len(resp["material_variance_flags"]) > 0
-    assert any(
-        f["ticker"] == "INTC" and f["metric"] == "net_income"
-        for f in resp["material_variance_flags"]
+    evo, _ = build_company_evolution(
+        ticker="NVDA",
+        company_name="NVIDIA Corporation",
+        gics_sector="Information Technology",
+        window_years=[2025],
+        available_years=[2025],
+        theme_terms=terms,
+        sections={(2025, "item_1a"): mat_2025},
+        theme_passages={2025: mat_2025.chunks},
     )
-    assert any(s["tool"] == "flag_material_variances" for s in resp["agent_trace"])
-    known = {c["chunk_id"] for c in resp["citations"]}
-    for flag in resp["material_variance_flags"]:
-        if flag.get("explanation"):
-            # MD&A explanations are cited passages from the live corpus.
-            assert flag["explanation"]["chunk_id"] in known
-    _assert_citations_resolve(resp)
-    if resp["answer_verified"]:
-        assert resp["fact_check"]["passed"] is True
-    else:
-        assert resp["answer_markdown"].startswith("### Answer withheld")
+    assert evo.theme_mentions.get("2025", 0) == 3
 
 
-def test_live_chat_turn_runs_disclosure_delta_pipeline_for_thematic_queries() -> None:
+def test_resolve_target_tickers_and_multi_section_evolution_merge(
+    fake_gcp_adapters: Any,
+) -> None:
+    """Covers `_resolve_target_tickers` explicit/theme_relevance paths, empty theme error, and multi-section merge."""
+    empty_err = compare_disclosures_across_years(
+        theme="   ",
+        tickers="NVDA",
+        gics_sector="ALL",
+        section_id="item_1a",
+        start_year=2024,
+        end_year=2026,
+    )
+    assert empty_err["status"] == "error"
+
+    explicit, selected, mode = _resolve_target_tickers(
+        theme="export controls",
+        tickers="NVDA,AMD,INTC",
+        gics_sector="ALL",
+        sec_filter="item_1a",
+        start_year=2024,
+        end_year=2026,
+        max_companies=2,
+    )
+    assert mode == "explicit"
+    assert explicit == ["AMD", "INTC", "NVDA"]
+    assert selected == ["AMD", "INTC"]
+
+    explicit_all, rel_selected, rel_mode = _resolve_target_tickers(
+        theme="export controls China AI accelerators",
+        tickers="ALL",
+        gics_sector="Information Technology",
+        sec_filter="item_1a",
+        start_year=2024,
+        end_year=2026,
+        max_companies=3,
+    )
+    assert rel_mode == "theme_relevance"
+    assert explicit_all == []
+    assert 1 <= len(rel_selected) <= 3
+
+    # Multi-section evolution merges item_1a and item_7 counts for the same year pair
+    m24_1a = _material(2024, [_BASE])
+    m25_1a = _material(2025, [_MODIFIED])
+    m24_7 = SectionMaterial(
+        ticker="ACME",
+        company_name="ACME Corp",
+        fiscal_year=2024,
+        section_id="item_7",
+        full_text=_BASE,
+        chunks=[{**m24_1a.chunks[0], "chunk_id": "ACME_2024_item_7_0000", "section_id": "item_7"}],
+    )
+    m25_7 = SectionMaterial(
+        ticker="ACME",
+        company_name="ACME Corp",
+        fiscal_year=2025,
+        section_id="item_7",
+        full_text=_NEW,
+        chunks=[
+            {
+                **m25_1a.chunks[0],
+                "chunk_id": "ACME_2025_item_7_0000",
+                "section_id": "item_7",
+                "chunk_text": _NEW,
+            }
+        ],
+    )
+    evo, cited = build_company_evolution(
+        ticker="ACME",
+        company_name="ACME Corp",
+        gics_sector="Information Technology",
+        window_years=[2024, 2025],
+        available_years=[2024, 2025],
+        theme_terms=extract_theme_terms("AI export controls"),
+        sections={
+            (2024, "item_1a"): m24_1a,
+            (2025, "item_1a"): m25_1a,
+            (2024, "item_7"): m24_7,
+            (2025, "item_7"): m25_7,
+        },
+        theme_passages={
+            2024: [_as_passage(m24_1a, 0), _as_passage(m24_7, 0)],
+            2025: [_as_passage(m25_1a, 0), _as_passage(m25_7, 0)],
+        },
+    )
+    assert len(evo.year_pairs) == 1
+    assert sum(evo.year_pairs[0].counts.values()) >= 2
+    assert {c["section_id"] for c in cited} == {"item_1a", "item_7"}
+
+
+def test_chat_turn_runs_disclosure_delta_pipeline_for_thematic_queries(
+    fake_gcp_adapters: Any,
+) -> None:
+    """Thematic chat turn: scripted agent invokes `compare_disclosures_across_years` over mock GCP."""
+    llm = ScriptedAnalystLlm(
+        tool_calls=[
+            (
+                "compare_disclosures_across_years",
+                {
+                    "theme": "export control licensing China AI accelerators",
+                    "tickers": "NVDA",
+                    "gics_sector": "ALL",
+                    "section_id": "item_1a",
+                    "start_year": 2024,
+                    "end_year": 2026,
+                },
+            )
+        ],
+        intent="thematic_trend_tracking",
+        headline="NVIDIA export-control risk language expanded from FY2024 to FY2026.",
+        statement="Export control licensing restrictions expanded across China shipments.",
+    )
     resp = run_conversational_rag_turn(
         query="How has the wording on AI export control risk changed for NVIDIA since 2024?",
         tickers="NVDA",
         section_id="item_1a",
         start_year=2024,
         end_year=2026,
+        reasoning_llm=llm,
+        skip_background_judge=True,
     )
+    assert resp["status"] == "success"
     assert resp["intent"] == "thematic_trend_tracking"
+    assert resp["answer_verified"] is True, resp["adk_runtime"]["answer_withheld_reason"]
     deltas = resp["disclosure_deltas"]
     assert deltas is not None and deltas["status"] == "success"
     assert deltas["summary"]["year_pairs"] >= 1

@@ -8,8 +8,8 @@ from typing import Any
 from unittest.mock import patch
 
 import httpx
+import pytest
 from fastapi.testclient import TestClient
-from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
@@ -20,11 +20,12 @@ from edgar_capstone.agents.tools import (
     GcpToolAdapters,
     GcpToolConfig,
     configure_gcp_tool_adapters,
-    reset_gcp_tool_adapters,
 )
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.security.auth import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
+from tests.fake_gcp import preserve_gcp_caches
+from tests.structured_report_helpers import ScriptedBaseLlm
 
 
 class _FakeCreds:
@@ -32,7 +33,7 @@ class _FakeCreds:
     token = "fake-token"
 
 
-class _ScriptedMapFlashLlm(BaseLlm):
+class _ScriptedMapFlashLlm(ScriptedBaseLlm):
     """Returns one verified quote + one hallucinated/fabricated chunk_id per map batch."""
 
     model: str = "gemini-3.5-flash"
@@ -221,15 +222,15 @@ def test_sector_map_reduce_batches_emits_progress_and_verifies_quotes() -> None:
             )
         return httpx.Response(404, text=url)
 
-    configure_gcp_tool_adapters(
-        GcpToolAdapters(
-            GcpToolConfig(project_id="iron-radio-514217-q7", embedding_dimensions=8),
-            http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-            credentials=_FakeCreds(),
-        )
-    )
     progress_events: list[tuple[str, str, dict[str, Any] | None]] = []
-    try:
+    with preserve_gcp_caches():
+        configure_gcp_tool_adapters(
+            GcpToolAdapters(
+                GcpToolConfig(project_id="iron-radio-514217-q7", embedding_dimensions=8),
+                http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+                credentials=_FakeCreds(),
+            )
+        )
         profiles = [
             _profile("NVDA", "NVIDIA CORP", 2024),
             _profile("NVDA", "NVIDIA CORP", 2026),
@@ -248,8 +249,6 @@ def test_sector_map_reduce_batches_emits_progress_and_verifies_quotes() -> None:
             map_llm=_ScriptedMapFlashLlm(),
             on_progress=lambda st, msg, meta: progress_events.append((st, msg, meta)),
         )
-    finally:
-        reset_gcp_tool_adapters()
 
     assert result["status"] == "success"
     assert len(sql_queries) == 1 and "ML.DISTANCE" in sql_queries[0]
@@ -398,3 +397,56 @@ def test_sse_chat_stream_and_user_scoped_sessions_endpoints() -> None:
     assert alice_del.status_code == 200
     assert alice_del.json()["status"] == "deleted"
     assert client.get("/api/v1/sessions", headers=alice_headers).json()["session_count"] == 0
+
+
+def test_chat_stream_handles_none_trace_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SSE stream emits a valid `connected` progress event when `current_trace_metadata()` is None."""
+    from edgar_capstone.api.routers import chat as chat_router
+
+    monkeypatch.setattr(chat_router, "current_trace_metadata", lambda: None)
+    monkeypatch.setattr(
+        chat_router,
+        "run_conversational_rag_turn",
+        lambda **_kw: {
+            "status": "success",
+            "intent": "longitudinal_single_company",
+            "resolved_scope": {"tickers": ["NVDA"]},
+            "answer_verified": True,
+            "answer_markdown": "ok",
+        },
+    )
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/chat/stream",
+        headers=_auth_headers(),
+        json={"query": "Show NVDA revenue"},
+    )
+    assert resp.status_code == 200
+    events = _parse_sse(resp.text)
+    assert events[0][0] == "progress"
+    assert events[0][1]["stage"] == "connected"
+    assert events[0][1]["meta"]["trace_id"] is None
+    assert any(name == "result" and payload["status"] == "success" for name, payload in events)
+
+
+def test_chat_stream_sanitizes_internal_exception_secret(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SSE stream must not leak raw internal exception details (e.g., credentials) to clients."""
+    from edgar_capstone.api.routers import chat as chat_router
+
+    def _boom(**_kw: Any) -> dict[str, Any]:
+        raise ValueError("db connection failed: SECRET_PASSWORD")
+
+    monkeypatch.setattr(chat_router, "run_conversational_rag_turn", _boom)
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/chat/stream",
+        headers=_auth_headers(),
+        json={"query": "Show NVDA revenue"},
+    )
+    assert resp.status_code == 200
+    assert "SECRET_PASSWORD" not in resp.text
+    events = _parse_sse(resp.text)
+    err_events = [payload for name, payload in events if name == "error"]
+    assert len(err_events) == 1
+    assert err_events[0]["error"] == "internal_server_error"
+    assert "SECRET_PASSWORD" not in err_events[0]["message"]

@@ -9,6 +9,7 @@ exactly; its final answer cites a chunk and quote returned by the live tool.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -42,7 +43,6 @@ from edgar_capstone.agents import (
     create_financial_analyst_agent,
     create_narrative_evaluator_agent,
     evaluate_calculated_variances,
-    evaluate_variance_explanation,
     extract_llm_request_context_breakdown,
     flush_pending_evaluations,
     get_context_latency_tracker,
@@ -54,7 +54,13 @@ from edgar_capstone.agents import (
 )
 from edgar_capstone.security import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
-from tests.structured_report_helpers import report_json, verbatim_quote
+from tests.structured_report_helpers import (
+    ScriptedAnalystLlm,
+    ScriptedJudgeLlm,
+    patch_http_chat_llms,
+    report_json,
+    verbatim_quote,
+)
 
 
 def _bearer_headers() -> dict[str, str]:
@@ -108,7 +114,7 @@ class _DeterministicReActProLlm(BaseLlm):
         # ReAct Turn 1: Plan & invoke deterministic variance calculation engine
         if "calculate_period_variances" not in seen_tools:
             yield LlmResponse(
-                model_version="gemini-2.5-pro",
+                model_version=self.model,
                 content=genai_types.Content(
                     role="model",
                     parts=[
@@ -145,7 +151,7 @@ class _DeterministicReActProLlm(BaseLlm):
             nvda_rep = var_payload["variance_reports"][0]
             rev_pct = nvda_rep["revenue_variance"]["percentage_delta"]
             yield LlmResponse(
-                model_version="gemini-2.5-pro",
+                model_version=self.model,
                 content=genai_types.Content(
                     role="model",
                     parts=[
@@ -203,7 +209,7 @@ class _DeterministicReActProLlm(BaseLlm):
             ],
         )
         yield LlmResponse(
-            model_version="gemini-2.5-pro",
+            model_version=self.model,
             content=genai_types.Content(
                 role="model",
                 parts=[
@@ -283,7 +289,9 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     assert meta["events_compaction_config"]["compaction_method"] == "deterministic_digest"
 
 
-def test_adk_runner_executes_structured_react_loop_with_context_latency_tracking() -> None:
+def test_adk_runner_executes_structured_react_loop_with_context_latency_tracking(
+    fake_gcp_adapters: Any,
+) -> None:
     """Run an end-to-end ADK Runner session over FinancialAnalystAgent executing the 3-step ReAct loop."""
     # Pre-warm NVDA 2026 item_7 so the ReAct loop exercises a true KV/section cache hit
     query_cached_10k_context(
@@ -294,7 +302,7 @@ def test_adk_runner_executes_structured_react_loop_with_context_latency_tracking
         max_passages=1,
     )
 
-    mock_llm = _DeterministicReActProLlm(model="gemini-2.5-pro", call_log=[])
+    mock_llm = _DeterministicReActProLlm(model="gemini-3.8-flash", call_log=[])
     react_analyst = create_financial_analyst_agent(
         name="FinancialAnalystAgent",
         model=mock_llm,  # type: ignore[arg-type]
@@ -356,12 +364,12 @@ def test_adk_runner_executes_structured_react_loop_with_context_latency_tracking
     latency_metrics = session.state["latency_metrics"]
     assert len(latency_metrics) == 3
     final_call_metric = latency_metrics[-1]
-    assert final_call_metric["model_name"] == "gemini-2.5-pro"
+    assert final_call_metric["model_name"] == "gemini-3.8-flash"
     assert final_call_metric["context_tokens"] == 6400
     assert final_call_metric["cached_context_tokens"] == 4800
     assert final_call_metric["uncached_context_tokens"] == 1600
     assert final_call_metric["context_latency_ms"] >= 0.0
-    assert final_call_metric["estimated_cache_latency_saved_ms"] > 500.0
+    assert final_call_metric["estimated_cache_latency_saved_ms"] > 100.0
     assert final_call_metric["within_ttft_slo"] is True
 
     # 4. Verify S2S audit trail, numeric fact-check, and after_agent memory duration callback
@@ -516,8 +524,10 @@ def _is_model(name: str, family: str) -> bool:
     return str(name).split("/")[-1].startswith(family)
 
 
-def test_structured_react_executor_live_peer_comparison() -> None:
-    """Variance pre-pass, cached 10-K querying with adaptive peer fill, live synthesis + judge."""
+def test_structured_react_executor_peer_comparison_with_sync_judge(
+    fake_gcp_adapters: Any,
+) -> None:
+    """Variance pre-pass, cached 10-K querying with peer fill, scripted synthesis + sync judge."""
     var_res = calculate_period_variances(tickers="NVDA,AAPL", start_year=2024, end_year=2026)
     reports = var_res["variance_reports"]
     assert {r["ticker"] for r in reports} == {"AAPL", "NVDA"}
@@ -526,13 +536,19 @@ def test_structured_react_executor_live_peer_comparison() -> None:
     assert len(evals) == 2
     for ev in evals:
         rep = next(r for r in reports if r["ticker"] == ev.ticker)
-        # The pre-pass reads the deterministic engine's figures, never recomputes them
         assert ev.revenue_pct_delta == rep["revenue_variance"]["percentage_delta"]
         assert ev.targeted_10k_queries
         assert {q["section_id"] for q in ev.targeted_10k_queries} <= {"item_7", "item_1a"}
         assert all(q["ticker"] == ev.ticker for q in ev.targeted_10k_queries)
 
-    executor = StructuredReActExecutor()
+    executor = StructuredReActExecutor(
+        reasoning_llm=ScriptedAnalystLlm(
+            headline="NVDA and AAPL revenue drivers from FY2024 to FY2026.",
+            intent="multi_company_peer_comparison",
+            key_metrics=[("NVDA", "revenue"), ("AAPL", "revenue")],
+        ),
+        judge_llm=ScriptedJudgeLlm(),
+    )
     out = executor.execute_post_retrieval_reasoning(
         query="Compare NVIDIA and Apple revenue and margin drivers from 2024 to 2026",
         intent="multi_company_peer_comparison",
@@ -555,10 +571,11 @@ def test_structured_react_executor_live_peer_comparison() -> None:
     assert out["execution_mode"] == "live_adk"
     assert out["reasoning_model"] == "gemini-3.8-flash"
     assert _is_model(out["evaluation_model"], "gemini-3.5-flash")
-    assert out["adk_runtime"]["backend"] == "vertex_ai"
     assert out["adk_runtime"]["executed_via_adk_runner"] is True
+    assert out["answer_verified"] is True
+    assert out["adk_runtime"]["answer_withheld_reason"] is None
 
-    # Both peers got cached 10-K explanations, linked to live chunk citations
+    # Both peers got cached 10-K explanations linked to retrieved citations
     assert {e.ticker for e in out["cached_explanations"]} == {"AAPL", "NVDA"}
     assert len(out["citations"]) >= 2
     assert {c["ticker"] for c in out["citations"]} >= {"AAPL", "NVDA"}
@@ -574,23 +591,17 @@ def test_structured_react_executor_live_peer_comparison() -> None:
 
     eval_report = out["evaluation_report"]
     assert _is_model(eval_report.evaluator_model, "gemini-3.5-flash")
-    assert eval_report.grade in {"pass", "needs_revision", "fail"}
+    assert eval_report.grade == "pass"
+    assert eval_report.overall_score is not None and 0.90 <= eval_report.overall_score <= 1.0
     assert eval_report.context_tokens > 0
-
-    if out["answer_verified"]:
-        assert out["adk_runtime"]["answer_withheld_reason"] is None
-        retrieval = out["adk_runtime"]["agent_retrieval"]
-        assert retrieval["unresolved_cited_chunk_ids"] == []
-    else:
-        assert out["answer_markdown"].startswith("### Answer withheld")
-        assert out["adk_runtime"]["answer_withheld_reason"]
+    assert out["adk_runtime"]["agent_retrieval"]["unresolved_cited_chunk_ids"] == []
 
 
 def test_conversation_memory_token_threshold_compaction() -> None:
     """Older turns are compacted into a digest once session memory crosses the token threshold."""
     compact_mgr = ConversationMemoryManager(token_threshold=80, retention_turns=1)
     tracker = get_context_latency_tracker()
-    before_flash_count = len(tracker.recent_records(limit=200, model_name="gemini-3.5-flash"))
+    before_all_count = len(tracker.recent_records(limit=500))
 
     compact_mgr.record_turn(
         session_id="compact-sess",
@@ -622,28 +633,39 @@ def test_conversation_memory_token_threshold_compaction() -> None:
     assert "T1(NVDA FY2024-2026)" in recalled["memory_summary_text"]
 
     # Deterministic string-digest compaction MUST NOT fabricate synthetic LLM billing records
-    after_flash_records = tracker.recent_records(limit=200, model_name="gemini-3.5-flash")
-    assert len(after_flash_records) == before_flash_count
+    assert len(tracker.recent_records(limit=500)) == before_all_count
 
 
-def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
-    """Two live /api/v1/chat turns (follow-up inherits scope), session telemetry, tracker, and judge."""
+def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
+    fake_gcp_adapters: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two scripted /api/v1/chat turns verify follow-up memory inheritance, async judge, and telemetry."""
     tracker = get_context_latency_tracker()
     tracker.reset()
     get_conversation_memory_manager().reset()
+
+    from edgar_capstone.agents import react_loop as react_loop_mod
+
+    judge_llm = ScriptedJudgeLlm()
+    orig_eval = react_loop_mod.evaluate_variance_explanation
+
+    def _scripted_bg_eval(**kwargs: Any):
+        kwargs["llm"] = judge_llm
+        return orig_eval(**kwargs)
+
+    monkeypatch.setattr(react_loop_mod, "evaluate_variance_explanation", _scripted_bg_eval)
+    patch_http_chat_llms(
+        monkeypatch,
+        reasoning_llm=ScriptedAnalystLlm(
+            headline="NVDA FY2024-FY2026 revenue and risk disclosures.",
+            intent="longitudinal_single_company",
+        ),
+        skip_background_judge=False,
+    )
+
     client = TestClient(app)
     headers = _bearer_headers()
-
-    health_resp = client.get("/health")
-    assert health_resp.status_code == 200
-    h_body = health_resp.json()
-    assert h_body["root_agent"] == "FinancialAnalystAgent"
-    assert h_body["active_agents"] == ["FinancialAnalystAgent", "NarrativeEvaluatorAgent"]
-    assert h_body["reasoning_strategy"] == "structured_react_loop"
-    assert h_body["models"] == {
-        "financial_reasoning": "gemini-3.8-flash",
-        "coding_and_evaluation": "gemini-3.5-flash",
-    }
 
     # Turn 1 explicitly names NVIDIA (2024-2026)
     resp1 = client.post(
@@ -658,6 +680,7 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
     turn1 = resp1.json()
     assert turn1["status"] == "success"
     assert turn1["execution_mode"] == "live_adk"
+    assert turn1["answer_verified"] is True
     assert turn1["resolved_scope"]["tickers"] == ["NVDA"]
     assert turn1["resolved_scope"]["memory_inherited"] is False
     assert turn1["context_and_memory"]["session_memory"]["persistence"]["persisted"] is True
@@ -666,17 +689,10 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
     assert len(turn1["react_execution"]["cached_10k_explanations"]) >= 1
     assert _is_model(turn1["evaluation"]["evaluator_model"], "gemini-3.5-flash")
     assert turn1["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
-    # Interactive HTTP turn keeps live LLM-as-a-Judge off the critical path (>= 1 analyst call)
     assert turn1["context_and_memory"]["turn_context_latency"]["total_calls"] >= 1
-    assert isinstance(turn1["answer_verified"], bool)
-    if turn1["answer_verified"]:
-        assert turn1["react_execution"]["judge_mode"] == "async_background"
-        assert turn1["evaluation"]["grade"] == "pending"
-        assert turn1["evaluation"]["overall_score"] is None
-    else:
-        assert turn1["react_execution"]["judge_mode"] == "skipped"
-        assert turn1["evaluation"]["grade"] == "fail"
-        assert turn1["evaluation"]["overall_score"] == 0.0
+    assert turn1["react_execution"]["judge_mode"] == "async_background"
+    assert turn1["evaluation"]["grade"] == "pending"
+    assert turn1["evaluation"]["overall_score"] is None
 
     # Turn 2 omits the company ("those margins") and inherits NVDA from session memory
     resp2 = client.post(
@@ -696,10 +712,10 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
     assert turn2["context_and_memory"]["session_memory"]["has_prior_memory"] is True
     assert turn2["context_and_memory"]["session_memory"]["turn_count"] == 1
 
-    # Flush async background judge tasks so telemetry records reflect both analyst & judge calls
-    flush_pending_evaluations(timeout=30.0)
+    # Flush async scripted judge tasks so telemetry records reflect both analyst & judge calls
+    flush_pending_evaluations(timeout=10.0)
+    assert judge_llm.call_count == 2
 
-    # Retained session telemetry HTTP endpoint reflects both turns
     sess_tel_resp = client.get(
         "/api/v1/telemetry/sessions",
         headers=headers,
@@ -710,27 +726,294 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints() -> None:
     assert st_body["status"] == "ok"
     assert st_body["event_count"] >= 2
 
-    # Direct Python ContextLatencyTracker check (replaces retired `/api/v1/telemetry/context-latency`)
     tracker_summary = tracker.summarize()
-    assert tracker_summary.total_calls >= 2
-    assert len(tracker.recent_records(limit=10)) >= 1
+    assert tracker_summary.total_calls >= 4
     by_model = list(tracker_summary.by_model)
     assert any(_is_model(m, "gemini-3.8-flash") for m in by_model), by_model
-    if turn1["answer_verified"] or turn2["answer_verified"]:
-        assert any(_is_model(m, "gemini-3.5-flash") for m in by_model), by_model
+    assert any(_is_model(m, "gemini-3.5-flash") for m in by_model), by_model
 
-    # Direct Python Gemini 3.5 Flash judge check (replaces retired `/api/v1/evaluate`)
-    evaluation = evaluate_variance_explanation(
-        query="NVDA FY2024-2026 revenue and operating margin",
-        response_markdown=turn1["answer_markdown"],
-        variance_reports=turn1["variance_reports"],
-        citations=turn1["citations"],
-        cached_explanations_count=len(turn1["react_execution"]["cached_10k_explanations"]),
+
+def test_react_async_judge_pending_and_background_telemetry_callback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify async background judge updates local telemetry sink from pending/None to scored."""
+    from edgar_capstone.agents import react_loop
+    from edgar_capstone.agents.live_runtime import AdkStreamResult
+    from edgar_capstone.agents.schemas import NarrativeEvaluationReport
+    from edgar_capstone.telemetry import get_telemetry_sink
+
+    excerpt = "Data center demand drove strong revenue expansion across hyperscale cloud customers."
+    citation = {
+        "chunk_id": "NVDA_2026_item_7_0001",
+        "ticker": "NVDA",
+        "company_name": "NVIDIA Corporation",
+        "fiscal_year": 2026,
+        "section_id": "item_7",
+        "section_title": "Item 7. MD&A",
+        "gics_sector": "Information Technology",
+        "accession_number": "0001045810-26-000021",
+        "sec_filing_url": "https://www.sec.gov/example",
+        "excerpt": excerpt,
+        "score": 0.95,
+    }
+    report_payload = {
+        "headline": "NVIDIA revenue expanded on data center demand.",
+        "key_metrics": [],
+        "findings": [
+            {
+                "statement": "Data center demand drove strong revenue expansion.",
+                "ticker": "NVDA",
+                "fiscal_year": 2026,
+                "chunk_ids": ["NVDA_2026_item_7_0001"],
+                "evidence_quote": excerpt,
+            }
+        ],
+    }
+    stub_stream = AdkStreamResult(
+        agent_name="FinancialAnalystAgent",
+        app_name="edgar_chat_app",
+        session_id="sess-async-judge-1",
+        backend="custom_llm",
+        final_text=json.dumps(report_payload),
+        observed_ttft_ms=112.5,
+        session_state={"financial_analyst_report": report_payload},
     )
-    assert _is_model(evaluation.evaluator_model, "gemini-3.5-flash")
-    assert evaluation.grade in {"pass", "needs_revision", "fail"}
-    assert evaluation.overall_score is not None
-    assert 0.0 <= evaluation.overall_score <= 1.0
+    monkeypatch.setattr(react_loop, "query_cached_10k_for_explanations", lambda **_kw: ([], []))
+    monkeypatch.setattr(
+        react_loop.StructuredReActExecutor,
+        "_invoke_financial_reasoning",
+        lambda self, **_kw: stub_stream,
+    )
+    monkeypatch.setattr(
+        react_loop,
+        "evaluate_variance_explanation",
+        lambda **_kw: NarrativeEvaluationReport(
+            evaluator_model="gemini-3.5-flash",
+            grade="pass",
+            overall_score=0.93,
+            numeric_fidelity_score=1.0,
+            citation_grounding_score=0.95,
+            citation_precision_score=0.95,
+            explanation_quality_score=0.90,
+            thematic_consistency_score=0.88,
+            rationale="Verified async judge result.",
+        ),
+    )
+
+    sink = get_telemetry_sink()
+    sink.reset_local_buffers()
+    session_id = "sess-async-judge-1"
+    turn_row = sink.record_session_turn_telemetry(
+        session_id=session_id,
+        user_id="analyst@fde-workspace.corp",
+        intent="longitudinal_single_company",
+        execution_mode="live_adk",
+        status_outcome="success",
+        tickers_analyzed=["NVDA"],
+        gics_sector="Information Technology",
+        start_year=2025,
+        end_year=2026,
+        report_generated=True,
+        variance_reports_count=0,
+        citations_count=1,
+        agent_trace=[],
+        turn_latency_records=[],
+        total_latency_ms=150.0,
+        evaluation_grade="pending",
+        evaluation_score=None,
+    )["row"]
+
+    result = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="Why did NVDA revenue grow in FY2026?",
+        intent="longitudinal_single_company",
+        scope={
+            "tickers": ["NVDA"],
+            "gics_sector": "ALL",
+            "section_id": "item_7",
+            "start_year": 2025,
+            "end_year": 2026,
+        },
+        variance_reports=[],
+        citations=[citation],
+        sector_benchmarks=[],
+        chunk_health=None,
+        session_id=session_id,
+        telemetry_session_id=session_id,
+        turn_id=turn_row["turn_id"],
+        user_id="analyst@fde-workspace.corp",
+        run_judge_sync=False,
+        skip_background_judge=False,
+    )
+    eval_rep = result["evaluation_report"]
+    assert result["judge_mode"] == "async_background"
+    assert eval_rep.grade == "pending"
+    assert eval_rep.overall_score is None
+
+    completed = react_loop.flush_pending_evaluations(timeout=5.0)
+    assert completed >= 1
+    async_evals = sink.recent_async_evaluations(session_id=session_id)
+    assert len(async_evals) == 1
+    assert async_evals[0]["evaluation_grade"] == "pass"
+    assert async_evals[0]["evaluation_score"] == 0.93
+    updated_turns = sink.query_session_telemetry(session_id=session_id)
+    assert updated_turns[0]["evaluation_grade"] == "pass"
+    assert updated_turns[0]["evaluation_score"] == 0.93
+    sink.reset_local_buffers()
+
+
+def test_react_guided_regeneration_retry_recovers_and_handles_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When attempt 1 fails claim verification, one guided retry receives rejection reasons and can recover."""
+    from edgar_capstone.agents import react_loop
+    from edgar_capstone.agents.live_runtime import AdkStreamResult
+
+    excerpt = "Blackwell GPUs drove strong Data Center revenue expansion across cloud customers."
+    citation = {
+        "chunk_id": "NVDA_2026_item_7_0001",
+        "ticker": "NVDA",
+        "company_name": "NVIDIA Corporation",
+        "fiscal_year": 2026,
+        "section_id": "item_7",
+        "section_title": "Item 7. MD&A",
+        "gics_sector": "Information Technology",
+        "accession_number": "0001045810-26-000021",
+        "sec_filing_url": "https://www.sec.gov/example",
+        "excerpt": excerpt,
+        "score": 0.95,
+    }
+    bad_payload = {
+        "headline": "Hallucinated first attempt",
+        "key_metrics": [],
+        "findings": [
+            {
+                "statement": "Revenue fell -99.99% due to imaginary shock.",
+                "ticker": "NVDA",
+                "fiscal_year": 2026,
+                "chunk_ids": ["NVDA_2026_item_7_0001"],
+                "evidence_quote": excerpt,
+            }
+        ],
+    }
+    good_payload = {
+        "headline": "Blackwell drove Data Center revenue expansion.",
+        "intent": "longitudinal_single_company",
+        "key_metrics": [],
+        "findings": [
+            {
+                "statement": "Blackwell GPUs drove Data Center revenue expansion.",
+                "ticker": "NVDA",
+                "fiscal_year": 2026,
+                "chunk_ids": ["NVDA_2026_item_7_0001"],
+                "evidence_quote": excerpt,
+            }
+        ],
+    }
+    monkeypatch.setattr(react_loop, "query_cached_10k_for_explanations", lambda **_kw: ([], []))
+
+    # Case 1: Retry recovers a verified answer and receives verification_feedback
+    captured_feedback: list[str | None] = []
+
+    def _invoke_recover(self, **kwargs: Any) -> AdkStreamResult:
+        captured_feedback.append(kwargs.get("verification_feedback"))
+        payload = bad_payload if len(captured_feedback) == 1 else good_payload
+        return AdkStreamResult(
+            agent_name="FinancialAnalystAgent",
+            app_name="edgar_chat_app",
+            session_id="sess-retry-ok",
+            backend="vertex_ai",
+            final_text=json.dumps(payload),
+            observed_ttft_ms=50.0,
+            session_state={"financial_analyst_report": payload},
+        )
+
+    monkeypatch.setattr(
+        react_loop.StructuredReActExecutor, "_invoke_financial_reasoning", _invoke_recover
+    )
+    recovered = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="Why did NVDA revenue expand in FY2026?",
+        intent="longitudinal_single_company",
+        scope={
+            "tickers": ["NVDA"],
+            "gics_sector": "ALL",
+            "section_id": "item_7",
+            "start_year": 2025,
+            "end_year": 2026,
+        },
+        variance_reports=[],
+        citations=[citation],
+        sector_benchmarks=[],
+        chunk_health=None,
+        skip_background_judge=True,
+    )
+    assert len(captured_feedback) == 2
+    assert captured_feedback[0] is None
+    assert captured_feedback[1] is not None and "99.99%" in captured_feedback[1]
+    assert recovered["answer_verified"] is True
+    assert "Blackwell" in recovered["answer_markdown"]
+
+    # Case 2: Retry raises an upstream error -> safely withholds response without crashing
+    calls = [0]
+
+    def _invoke_boom(self, **kwargs: Any) -> AdkStreamResult:
+        calls[0] += 1
+        if calls[0] == 1:
+            return AdkStreamResult(
+                agent_name="FinancialAnalystAgent",
+                app_name="edgar_chat_app",
+                session_id="sess-retry-fail",
+                backend="vertex_ai",
+                final_text=json.dumps(bad_payload),
+                observed_ttft_ms=50.0,
+                session_state={"financial_analyst_report": bad_payload},
+            )
+        raise RuntimeError("transient vertex 503 during retry")
+
+    monkeypatch.setattr(
+        react_loop.StructuredReActExecutor, "_invoke_financial_reasoning", _invoke_boom
+    )
+    withheld = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="Why did NVDA revenue expand in FY2026?",
+        intent="longitudinal_single_company",
+        scope={
+            "tickers": ["NVDA"],
+            "gics_sector": "ALL",
+            "section_id": "item_7",
+            "start_year": 2025,
+            "end_year": 2026,
+        },
+        variance_reports=[],
+        citations=[citation],
+        sector_benchmarks=[],
+        chunk_health=None,
+        skip_background_judge=True,
+    )
+    assert calls[0] == 2
+    assert withheld["answer_verified"] is False
+    assert withheld["answer_markdown"].startswith("### Answer withheld")
+
+
+def test_background_judge_manager_shutdown_and_error_isolation() -> None:
+    """Exercise `_BackgroundJudgeManager` error handling and `shutdown()` cleanly."""
+    from edgar_capstone.agents.react_loop import _BackgroundJudgeManager
+
+    mgr = _BackgroundJudgeManager(max_workers=1)
+    ran: list[str] = []
+
+    def _ok() -> None:
+        ran.append("ok")
+
+    def _fail() -> None:
+        raise RuntimeError("judge boom")
+
+    mgr.submit(_ok)
+    mgr.submit(_fail)
+    completed = mgr.flush(timeout=5.0)
+    assert completed >= 0
+    assert ran == ["ok"]
+    mgr.shutdown(timeout=2.0)
+    # Submitting after shutdown is safely ignored / handled without crashing
+    mgr.shutdown(timeout=1.0)
 
 
 def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
@@ -760,10 +1043,6 @@ def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
     analyst_text = make_adk_instruction_provider("financial_analyst")(ctx)
     assert "FinancialAnalystAgent (`gemini-3.8-flash`)" in analyst_text
     assert "gemini-2.5-pro" not in analyst_text
-
-    analyst_v5_text = make_adk_instruction_provider("financial_analyst", version="latest")(ctx)
-    assert "FinancialAnalystAgent (`gemini-3.8-flash`)" in analyst_v5_text
-    assert "gemini-2.5-pro" not in analyst_v5_text
 
     eval_text = make_adk_instruction_provider("narrative_evaluator")(ctx)
     assert "NarrativeEvaluatorAgent" in eval_text

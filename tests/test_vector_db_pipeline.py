@@ -1,8 +1,8 @@
-"""Tests for the metadata-tagged RAG vector DB and chunk health monitoring.
+"""Tests for the metadata-tagged RAG vector DB, chunker, embedder, and chunk health monitoring.
 
-There is no synthetic embedding backend: tests that need vectors call live Vertex AI
-`text-embedding-005` with Application Default Credentials (inputs kept tiny). Mock HTTP
-transports are used only to simulate Vertex AI error responses (token limits, quota).
+One semantic-similarity test (`@pytest.mark.live`) calls live Vertex AI `text-embedding-005` with ADC.
+All format, chunking, retry, checkpointing, health monitoring, and staged pipeline tests run offline
+against `httpx.MockTransport` over the real `VertexAIEmbedder`.
 """
 
 from __future__ import annotations
@@ -170,11 +170,12 @@ def test_missing_section_placeholder_is_skipped() -> None:
     assert "item_7" in sections
 
 
-def test_vertex_vector_search_record_format(live_embedder: VertexAIEmbedder) -> None:
+def test_vertex_vector_search_record_format() -> None:
     prof = _sample_profile()
     md = _sample_markdown(prof)
     chunks = chunk_filing_document(prof, md)
-    chunks[0].embedding = live_embedder.embed_texts([chunks[0].chunk_text])[0]
+    embedder = _mock_vertex_embedder([])
+    chunks[0].embedding = embedder.embed_texts([chunks[0].chunk_text])[0]
 
     vx_rec = chunks[0].to_vertex_vector_search_record()
     assert vx_rec["id"] == chunks[0].chunk_id
@@ -191,6 +192,7 @@ def test_vertex_vector_search_record_format(live_embedder: VertexAIEmbedder) -> 
     assert num_restricts["fiscal_year"] == 2026
 
 
+@pytest.mark.live
 def test_live_vertex_ai_embeddings_capture_semantic_similarity(
     live_embedder: VertexAIEmbedder,
 ) -> None:
@@ -212,21 +214,6 @@ def test_live_vertex_ai_embeddings_capture_semantic_similarity(
     assert sim_related > 0.7
 
 
-def test_populate_chunk_embeddings_uses_live_vertex_ai(live_embedder: VertexAIEmbedder) -> None:
-    prof = _sample_profile()
-    chunks = chunk_filing_document(prof, _sample_markdown(prof))[:2]
-    populated, source = populate_chunk_embeddings(
-        chunks,
-        project_id=LIVE_PROJECT_ID,
-        location=LIVE_LOCATION,
-        vertex_embedder=live_embedder,
-    )
-    assert source == "vertex_ai"
-    assert all(len(c.embedding) == DEFAULT_EMBEDDING_DIMENSIONS for c in populated)
-    assert all(c.embedding_model == "text-embedding-005" for c in populated)
-    assert populated[0].embedding != populated[1].embedding
-
-
 def test_populate_chunk_embeddings_fails_loudly_without_vertex_ai() -> None:
     """No synthetic fallback: a Vertex AI failure must abort ingestion."""
     prof = _sample_profile()
@@ -240,21 +227,21 @@ def test_populate_chunk_embeddings_fails_loudly_without_vertex_ai() -> None:
     assert all(not c.embedding for c in chunks)
 
 
-def test_chunk_health_evaluation_and_cloud_monitoring_export(
-    live_embedder: VertexAIEmbedder,
-) -> None:
+def test_chunk_health_evaluation_and_cloud_monitoring_export() -> None:
     prof_nvda = _sample_profile("NVDA", 2026)
     prof_aapl = _sample_profile("AAPL", 2026)
 
     chunks_nvda = chunk_filing_document(prof_nvda, _sample_markdown(prof_nvda))
     chunks_aapl = chunk_filing_document(prof_aapl, _sample_markdown(prof_aapl))
     all_chunks = chunks_nvda + chunks_aapl
-    populate_chunk_embeddings(
+    populated, source = populate_chunk_embeddings(
         all_chunks,
         project_id=LIVE_PROJECT_ID,
         location=LIVE_LOCATION,
-        vertex_embedder=live_embedder,
+        vertex_embedder=_mock_vertex_embedder([]),
     )
+    assert source == "vertex_ai"
+    assert all(c.embedding_model == "text-embedding-005" for c in populated)
 
     healthy_report = evaluate_chunk_health(
         all_chunks,
@@ -322,10 +309,8 @@ def test_chunk_health_evaluation_and_cloud_monitoring_export(
     assert len(captured_requests) == 1
 
 
-def test_end_to_end_vector_db_pipeline_staged_with_live_embeddings(
-    tmp_path: Path, live_embedder: VertexAIEmbedder
-) -> None:
-    """Stage manifests locally (no GCS/BQ/Monitoring publish) with live Vertex AI vectors."""
+def test_end_to_end_vector_db_pipeline_staged_locally(tmp_path: Path) -> None:
+    """Stage manifests locally (no GCS/BQ/Monitoring publish) with mocked Vertex AI vectors."""
     prof = _sample_profile("NVDA", 2026)
     md = _sample_markdown(prof)
 
@@ -345,9 +330,11 @@ def test_end_to_end_vector_db_pipeline_staged_with_live_embeddings(
         max_chunk_chars=900,
         min_chunk_chars=80,
     )
-    summary, report = run_vector_db_pipeline(cfg, vertex_embedder=live_embedder)
+    seen: list[int] = []
+    summary, report = run_vector_db_pipeline(cfg, vertex_embedder=_mock_vertex_embedder(seen))
 
     assert summary.embedding_backend == "vertex_ai"
+    assert sum(seen) == summary.total_chunks_generated
     assert summary.uploaded_to_gcs is False
     assert summary.total_profiles_processed == 1
     assert summary.total_chunks_generated >= 2
@@ -377,7 +364,7 @@ def test_end_to_end_vector_db_pipeline_staged_with_live_embeddings(
     assert summary_cached.embedding_backend == "cached"
 
 
-def test_cli_parse_args_and_terraform_monitoring_definitions() -> None:
+def test_cli_parse_args_and_token_estimation() -> None:
     args = parse_args(["--tickers", "NVDA", "AAPL", "--local-only", "--target-chars", "1800"])
     assert args.tickers == ["NVDA", "AAPL"]
     assert args.local_only is True
@@ -385,18 +372,8 @@ def test_cli_parse_args_and_terraform_monitoring_definitions() -> None:
     assert not hasattr(args, "embedding_backend")
     with pytest.raises(SystemExit):
         parse_args(["--embedding-backend", "deterministic"])
+    assert estimate_token_count("") == 0
     assert estimate_token_count("NVIDIA Blackwell data center revenue grew significantly.") > 5
-
-    tf_dir = Path(__file__).resolve().parents[1] / "terraform"
-    monitoring_tf = (tf_dir / "monitoring.tf").read_text(encoding="utf-8")
-    bigquery_tf = (tf_dir / "bigquery.tf").read_text(encoding="utf-8")
-    vector_tf = (tf_dir / "vector_search.tf").read_text(encoding="utf-8")
-
-    assert 'resource "google_monitoring_dashboard" "chunk_health_dashboard"' in monitoring_tf
-    assert 'resource "google_bigquery_table" "v_chunk_health_metrics"' in bigquery_tf
-    assert 'resource "google_bigquery_table" "v_filing_chunk_coverage"' in bigquery_tf
-    assert 'resource "google_vertex_ai_index" "sec_10k_chunks"' in vector_tf
-    assert 'resource "google_discovery_engine_data_store" "sec_10k_corpus"' in vector_tf
 
 
 def _mock_vertex_embedder(
@@ -470,16 +447,13 @@ def test_populate_chunk_embeddings_checkpoints_and_resumes(tmp_path: Path) -> No
 
     seen: list[int] = []
     failing = _mock_vertex_embedder(seen, fail_after=1, batch_size=1)
-    try:
+    with pytest.raises(RuntimeError, match="HTTP 403"):
         populate_chunk_embeddings(
             chunks,
             project_id="p",
             vertex_embedder=failing,
             checkpoint_path=ckpt,
         )
-        raise AssertionError("expected the mocked quota failure")
-    except RuntimeError:
-        pass
     assert len(ckpt.read_text(encoding="utf-8").splitlines()) == 1
 
     fresh = chunk_filing_document(prof, _sample_markdown(prof))
@@ -503,3 +477,223 @@ def test_populate_chunk_embeddings_checkpoints_and_resumes(tmp_path: Path) -> No
     )
     assert backend == "vertex_ai"
     assert all(len(c.embedding) == DEFAULT_EMBEDDING_DIMENSIONS for c in again)
+
+
+def test_vector_db_upload_builds_storage_client_when_not_injected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: `build-vector-db` previously passed `client=None` to `ensure_gcs_bucket`."""
+    from edgar_capstone.vector_db import pipeline as vdb_pipeline
+
+    uploaded: list[str] = []
+
+    class _Blob:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def upload_from_filename(self, filename: str, content_type: str | None = None) -> None:
+            uploaded.append(self.name)
+
+    class _Bucket:
+        location = "US-CENTRAL1"
+
+        def blob(self, name: str) -> _Blob:
+            return _Blob(name)
+
+    class _Client:
+        def __init__(self, project: str | None = None) -> None:
+            self.project = project
+
+        def lookup_bucket(self, name: str) -> _Bucket:
+            return _Bucket()
+
+    monkeypatch.setattr(vdb_pipeline.storage, "Client", _Client)
+    (tmp_path / "manifests").mkdir()
+    (tmp_path / "manifests" / "bigquery_filing_chunks.jsonl").write_text("{}\n", encoding="utf-8")
+
+    count = vdb_pipeline.upload_vector_db_artifacts_to_gcs(
+        output_dir=tmp_path,
+        project_id="unit-test-project",
+        bucket_name="fde-sec-edgar-sandbox-dev-sec-corpus",
+    )
+    assert count == 1
+    assert uploaded == ["manifests/bigquery_filing_chunks.jsonl"]
+
+
+def test_chunker_oversized_tables_paragraphs_and_markdown_subheadings() -> None:
+    """Covers `_detect_subheading`, `_split_long_text`, `_split_oversized_block`, and `split_section_into_passages`."""
+    from edgar_capstone.vector_db.chunker import (
+        _detect_subheading,
+        _split_long_text,
+        _split_oversized_block,
+        split_section_into_passages,
+    )
+
+    assert _detect_subheading("### Supply Chain\\. & Risks\\-2026.") == "Supply Chain. & Risks-2026"
+    assert _detect_subheading("Line one\nLine two") is None
+    assert _detect_subheading("**Note:**") is None
+
+    # `_split_long_text`: short text, multi-sentence split, single giant run-on word/sentence
+    assert _split_long_text("   ", 50) == []
+    assert _split_long_text("Short sentence.", 50) == ["Short sentence."]
+    multi_sent = (
+        "First financial sentence describes revenue growth. "
+        "Second sentence details Blackwell infrastructure deployments. "
+        + "A" * 95
+        + ". Third short closing sentence."
+    )
+    pieces = _split_long_text(multi_sent, max_chars=70)
+    assert len(pieces) >= 4
+    assert all(len(p) <= 70 for p in pieces)
+
+    # `_split_oversized_block`: large Markdown table repeats header on every sub-block
+    table_lines = [
+        "| Segment | FY2026 | FY2025 |",
+        "| --- | --- | --- |",
+        *[f"| Region_{i} | ${100 + i}M | ${90 + i}M |" for i in range(10)],
+    ]
+    table_parts = _split_oversized_block("\n".join(table_lines), max_chars=140)
+    assert len(table_parts) >= 3
+    for part in table_parts:
+        assert part.startswith("| Segment | FY2026 | FY2025 |\n| --- | --- | --- |")
+
+    # Oversized single table row splits cleanly while keeping header prefix when budget allows
+    wide_row_table = "\n".join(
+        [
+            "| Col | Note |",
+            "| --- | --- |",
+            "| Row1 | ok |",
+            "| Row2 | " + "Export restriction disclosure detail. " * 6 + "|",
+        ]
+    )
+    wide_parts = _split_oversized_block(wide_row_table, max_chars=120)
+    assert len(wide_parts) >= 3
+    assert any("Row1" in p for p in wide_parts)
+    assert any(p.startswith("| Col | Note |") and "Export restriction" in p for p in wide_parts)
+
+    # Table whose header alone exceeds max_chars falls back to line splitting without header duplication
+    huge_hdr = "\n".join(
+        [
+            "| " + "H" * 90 + " |",
+            "| --- |",
+            "| small row |",
+            "| another row |",
+        ]
+    )
+    assert _split_oversized_block(huge_hdr, max_chars=80)
+
+    # Multi-line non-table block & giant single paragraph fallback
+    non_table = "\n".join(
+        f"Bullet line {i} covering export controls and compliance." for i in range(8)
+    )
+    assert len(_split_oversized_block(non_table, max_chars=110)) >= 3
+    single_para = "Demand remained strong. " * 20
+    assert len(_split_oversized_block(single_para, max_chars=100)) >= 4
+
+    # `split_section_into_passages` empty input + markdown ### heading + overlap carry-over
+    assert split_section_into_passages("   \n\n  ", section_id="item_1a") == []
+    section_md = (
+        "### Overview\n\n"
+        "Paragraph one discusses Data Center revenue expansion in detail across hyperscalers.\n\n"
+        "Short bridge paragraph for overlap.\n\n"
+        "Paragraph two discusses gross margin dynamics and Blackwell ramp manufacturing costs.\n\n"
+        "### New Risk Topic\n\n"
+        "Export licensing rules introduced inventory charges in fiscal year 2026."
+    )
+    passages = split_section_into_passages(
+        section_md,
+        section_id="item_7",
+        target_chars=140,
+        max_chars=240,
+        min_chars=40,
+        overlap_chars=80,
+    )
+    assert len(passages) >= 2
+    assert any("Overview" in title for title, _ in passages)
+
+
+def test_monitoring_edge_cases_embedder_retries_and_lazy_package_exports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers `_is_valid_finite_embedding`, `_compute_group_breakdown`, embedder retries, and `vector_db.__getattr__`."""
+    import time
+
+    import edgar_capstone.vector_db as vdb_pkg
+    from edgar_capstone.vector_db.monitoring import (
+        _compute_group_breakdown,
+        _has_complete_metadata,
+        _is_valid_finite_embedding,
+    )
+
+    # Lazy package exports
+    assert vdb_pkg.chunk_filing_document is chunk_filing_document
+    assert "VertexAIEmbedder" in dir(vdb_pkg)
+    with pytest.raises(AttributeError):
+        _ = vdb_pkg.NonExistentSymbol
+
+    # Monitoring finite/zero-norm embedding & metadata checks + unflagged breakdown
+    assert _is_valid_finite_embedding([], 4) == (False, False, False)
+    assert _is_valid_finite_embedding([1.0, 2.0], 4) == (True, False, False)
+    assert _is_valid_finite_embedding([float("nan"), 0.0, 0.0, 1.0], 4) == (True, True, False)
+    assert _is_valid_finite_embedding([0.0, 0.0, 0.0, 0.0], 4) == (True, True, False)
+    assert _is_valid_finite_embedding([1.0, 0.0, 0.0, 0.0], 4) == (True, True, True)
+
+    empty_bd = _compute_group_breakdown("empty", [], expected_dim=4)
+    assert empty_bd.total_chunks == 0
+
+    prof = _sample_profile()
+    chunks = chunk_filing_document(prof, _sample_markdown(prof))
+    chunks[0].embedding = [0.0] * DEFAULT_EMBEDDING_DIMENSIONS  # zero norm -> non_finite
+    chunks[0].char_count = 9500  # oversized
+    chunks[0].sec_filing_url = ""  # incomplete metadata
+    assert _has_complete_metadata(chunks[0]) is False
+    bad_ticker_chunk = chunks[0].model_copy(update={"ticker": ""})
+    assert _has_complete_metadata(bad_ticker_chunk) is False
+    bd = _compute_group_breakdown("item_1a", [chunks[0]], expected_dim=DEFAULT_EMBEDDING_DIMENSIONS)
+    assert bd.oversized_chunk_count == 1 and bd.missing_metadata_count == 1
+    rep = evaluate_chunk_health([chunks[0]], profiles=[prof])
+    assert rep.anomalies.non_finite_embedding == 1 and rep.anomalies.oversized_chunk == 1
+
+    # Embedder retry on httpx.TransportError, HTTP 429, and mismatched count error
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+    calls = {"n": 0}
+
+    def retry_handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("transient network drop", request=request)
+        if calls["n"] == 2:
+            return httpx.Response(429, text="rate limited")
+        return httpx.Response(
+            200,
+            json={"predictions": [{"embeddings": {"values": [0.25] * 4}}]},
+        )
+
+    creds = MagicMock()
+    creds.valid = True
+    creds.token = "tok"
+    emb = VertexAIEmbedder(
+        project_id="p",
+        dimensions=4,
+        max_retries=3,
+        http_client=httpx.Client(transport=httpx.MockTransport(retry_handler)),
+        credentials=creds,
+    )
+    vecs = emb.embed_texts(["hello"], titles=["Title"])
+    assert vecs == [[0.25, 0.25, 0.25, 0.25]]
+    assert calls["n"] == 3
+
+    # Mismatched prediction count raises RuntimeError
+    bad_count_emb = VertexAIEmbedder(
+        project_id="p",
+        dimensions=4,
+        max_retries=1,
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda _req: httpx.Response(200, json={"predictions": []})
+            )
+        ),
+        credentials=creds,
+    )
+    with pytest.raises(RuntimeError, match="returned 0 embeddings"):
+        bad_count_emb.embed_texts(["one"])

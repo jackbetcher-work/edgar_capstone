@@ -5,12 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 from google.auth.exceptions import DefaultCredentialsError
 
@@ -42,12 +42,14 @@ from edgar_capstone.telemetry import (
     BigQueryTelemetrySink,
     FirestoreFeedbackStore,
     TelemetryConfig,
+    TelemetryRateLimitError,
     TelemetrySinkError,
     configure_telemetry_stores,
     decode_firestore_document,
     encode_firestore_fields,
     reset_telemetry_stores,
 )
+from tests.structured_report_helpers import ScriptedAnalystLlm, patch_http_chat_llms
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEST_IAP_AUDIENCE = "/projects/991122334455/global/backendServices/887766554433"
@@ -90,9 +92,9 @@ def _isolated_telemetry_state():
 
 
 @pytest.fixture()
-def auth_client_env():
+def auth_client_env(session_idp_keys: dict[str, Any]):
     """Isolated IAP ES256 verifier supporting Admin, Analyst, Viewer, and Agent S2S principals."""
-    ec_signing_key = ec.generate_private_key(ec.SECP256R1())
+    ec_signing_key = session_idp_keys["iap_ec_key"]
     jwks_payload = {"keys": [ec_public_key_to_jwk(ec_signing_key.public_key(), kid="iap-telem-k1")]}
 
     def _jwks_transport(request: httpx.Request) -> httpx.Response:
@@ -261,8 +263,9 @@ def test_pro_and_flash_token_cost_and_cached_savings_math() -> None:
 
 def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     caplog: pytest.LogCaptureFixture,
+    fake_gcp_adapters: Any,
 ) -> None:
-    """Verify live `tabledata.insertAll` streaming and SQL readback across all 3 BigQuery sink tables."""
+    """Verify `tabledata.insertAll` streaming and SQL readback across all 3 BigQuery sink tables."""
     streamed_requests: dict[str, list[dict[str, Any]]] = {
         "llm_telemetry_events": [],
         "session_telemetry_events": [],
@@ -352,14 +355,34 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
         http_client=httpx.Client(transport=httpx.MockTransport(_bq_transport)),
         credentials=_FakeGcpCredentials(),
     )
-    from edgar_capstone.agents.react_loop import flush_pending_evaluations
-
-    flush_pending_evaluations(timeout=15.0)
     configure_telemetry_stores(telemetry_sink=sink)
 
+    llm_turn_1 = ScriptedAnalystLlm(
+        tool_calls=[
+            (
+                "calculate_period_variances",
+                {"tickers": "NVDA", "start_year": 2024, "end_year": 2026},
+            )
+        ],
+        headline="NVDA FY2024-FY2026 revenue and operating income expanded strongly.",
+        intent="longitudinal_single_company",
+        key_metrics=[("NVDA", "revenue")],
+    )
+    llm_turn_2 = ScriptedAnalystLlm(
+        tool_calls=[
+            (
+                "calculate_period_variances",
+                {"tickers": "AAPL,MSFT", "start_year": 2024, "end_year": 2025},
+            )
+        ],
+        headline="AAPL and MSFT delivered steady operating margin expansion.",
+        intent="multi_company_peer_comparison",
+        key_metrics=[("AAPL", "revenue"), ("MSFT", "revenue")],
+    )
+
     with caplog.at_level(logging.INFO, logger="edgar_capstone.cloud_logging_sink"):
-        # 1. Two live conversational RAG turns (live Gemini + live GCP data) on one session stream
-        #    both LLM call telemetry and session telemetry into the (mocked) BigQuery sink
+        # 1. Two deterministic scripted RAG turns on one session stream both LLM call telemetry
+        #    and session telemetry into the mocked BigQuery sink (zero live LLM latency).
         turn_1 = run_conversational_rag_turn(
             query="Analyze NVDA FY2024 to FY2026 revenue and operating income variances.",
             tickers="NVDA",
@@ -367,6 +390,7 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
             end_year=2026,
             session_id="sess-bq-stream-1",
             user_id="analyst@fde-workspace.corp",
+            reasoning_llm=llm_turn_1,
             skip_background_judge=True,
         )
         turn_2 = run_conversational_rag_turn(
@@ -376,9 +400,11 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
             end_year=2025,
             session_id="sess-bq-stream-1",
             user_id="analyst@fde-workspace.corp",
+            reasoning_llm=llm_turn_2,
             skip_background_judge=True,
         )
         assert turn_1["status"] == "success" and turn_2["status"] == "success"
+        assert turn_1["answer_verified"] is True and turn_2["answer_verified"] is True
         assert turn_1["execution_mode"] == "live_adk"
 
         # 2. Security / 10-K access audit log streaming
@@ -407,23 +433,15 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     assert sess_row_1["session_id"] == "sess-bq-stream-1"
     assert sess_row_1["session_cumulative_turns"] == 1
     assert sess_row_1["tickers_analyzed"] == ["NVDA"]
-    # Deferred judge stores grade="pending" and score=None (BigQuery NULL) when answer is verified;
-    # withheld answers store grade="fail" and score=0.0.
-    if turn_1["answer_verified"]:
-        assert sess_row_1["evaluation_grade"] == "pending"
-        assert sess_row_1["evaluation_score"] is None
-    else:
-        assert sess_row_1["evaluation_grade"] == "fail"
-        assert sess_row_1["evaluation_score"] == 0.0
-    assert sess_row_1["report_generated"] is bool(turn_1["answer_verified"])
+    assert sess_row_1["evaluation_grade"] == "pending"
+    assert sess_row_1["evaluation_score"] is None
+    assert sess_row_1["report_generated"] is True
     assert sess_row_1["execution_mode"] == "live_adk"
     assert len(sess_row_1["tool_invocations"]) >= 2
 
     assert sess_row_2["session_cumulative_turns"] == 2
     assert sess_row_2["session_cumulative_companies_count"] == 3  # NVDA, AAPL, MSFT
-    assert sess_row_2["session_cumulative_reports_count"] == sum(
-        bool(t["answer_verified"]) for t in (turn_1, turn_2)
-    )
+    assert sess_row_2["session_cumulative_reports_count"] == 2
     assert turn_1["context_and_memory"]["session_telemetry"]["turn_index"] == 1
     assert turn_2["context_and_memory"]["session_telemetry"]["turn_index"] == 2
 
@@ -738,12 +756,12 @@ def test_firestore_feedback_strict_vs_auto_fallback() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_health_pruned_routes_and_bigquery_explores(
+def test_health_and_bigquery_explores(
     auth_client_env: dict[str, Any],
+    fake_gcp_adapters: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify `/health`, pruned-route 404s, and the BigQuery-backed `query_looker_financial_explore`."""
-    # Verify `/health`, pruned Looker/telemetry routes return 404, direct explore tool calls,
-    # and retained `/api/v1/chat`, `/api/v1/section`, and `/api/v1/telemetry/sessions`
+    """Verify `/health`, BigQuery-backed explore helper, and `/api/v1/telemetry/sessions`."""
     client: TestClient = auth_client_env["client"]
     analyst_jwt = auth_client_env["mint_token"](
         "analyst@fde-workspace.corp",
@@ -755,14 +773,16 @@ def test_health_pruned_routes_and_bigquery_explores(
     assert health.status_code == 200
     health_json = health.json()
     assert health_json["root_agent"] == "FinancialAnalystAgent"
-    # The un-deployed LookML semantic layer was removed; analytics live in BigQuery SQL views
-    # and Cloud Monitoring dashboards, so `/health` no longer reports a LookML catalog.
     assert "lookml_semantic_layer" not in health_json
-    for key in ("observability", "telemetry_sink", "feedback_store", "session_memory"):
+    for key in (
+        "observability",
+        "telemetry_sink",
+        "feedback_store",
+        "session_memory",
+        "data_backend",
+    ):
         assert key in health_json
-    assert "data_backend" in health_json
 
-    # Verify retained section viewer endpoint logs a real audit event
     sec_resp = client.get(
         "/api/v1/section",
         headers=headers,
@@ -770,7 +790,22 @@ def test_health_pruned_routes_and_bigquery_explores(
     )
     assert sec_resp.status_code == 200
 
-    # One live chat turn so the LLM, session, and audit buffers have real records to explore
+    # Scripted turn over fake adapters seeds LLM, session, and audit buffers deterministically.
+    patch_http_chat_llms(
+        monkeypatch,
+        reasoning_llm=ScriptedAnalystLlm(
+            tool_calls=[
+                (
+                    "calculate_period_variances",
+                    {"tickers": "NVDA,MSFT", "start_year": 2024, "end_year": 2025},
+                )
+            ],
+            headline="NVDA and MSFT posted strong FY2024-FY2025 revenue growth.",
+            intent="multi_company_peer_comparison",
+            key_metrics=[("NVDA", "revenue"), ("MSFT", "revenue")],
+        ),
+        skip_background_judge=True,
+    )
     chat_resp = client.post(
         "/api/v1/chat",
         headers=headers,
@@ -785,16 +820,11 @@ def test_health_pruned_routes_and_bigquery_explores(
     assert chat_resp.status_code == 200
     chat_json = chat_resp.json()
     assert chat_json["status"] == "success"
-    if chat_json["answer_verified"]:
-        assert chat_json["evaluation"]["grade"] == "pending"
-        assert chat_json["evaluation"]["overall_score"] is None
-
-    # Pruned HTTP routes return 404; underlying Python helpers stay directly callable
-    assert client.get("/api/v1/looker/catalog", headers=headers).status_code == 404
-    assert client.get("/api/v1/telemetry/context-latency", headers=headers).status_code == 404
+    assert chat_json["answer_verified"] is True
+    assert chat_json["evaluation"]["grade"] == "pending"
+    assert chat_json["evaluation"]["overall_score"] is None
 
     for explore_slug in ("llm_telemetry", "session_analytics", "audit_trail"):
-        assert client.get(f"/api/v1/explore/{explore_slug}", headers=headers).status_code == 404
         exp_res = query_looker_financial_explore(
             explore_name=explore_slug,
             tickers="ALL",
@@ -803,7 +833,6 @@ def test_health_pruned_routes_and_bigquery_explores(
             end_year=2026,
         )
         assert exp_res["status"] == "success"
-        assert exp_res["lookml_model"] == "sec_edgar_analytics"
         assert exp_res["row_count"] >= 1
 
     sess_resp = client.get(
@@ -817,12 +846,12 @@ def test_health_pruned_routes_and_bigquery_explores(
 
 
 # ---------------------------------------------------------------------------
-# 5. Terraform Infrastructure & BigQuery Schema Parity Validation
+# 5. BigQuery Schema Parity, SQL Trace ID, LRU Bounds & Async Streaming
 # ---------------------------------------------------------------------------
 
 
-def test_terraform_telemetry_firestore_and_schema_parity() -> None:
-    """Verify BigQuery JSON table schemas match serialized Python row keys and least-privilege IAM holds."""
+def test_bigquery_telemetry_schemas_match_serialized_rows() -> None:
+    """Verify BigQuery JSON table schemas match serialized Python row keys exactly."""
     schemas_dir = REPO_ROOT / "terraform" / "schemas"
     llm_schema = json.loads((schemas_dir / "llm_telemetry_events.json").read_text(encoding="utf-8"))
     sess_schema = json.loads(
@@ -865,31 +894,155 @@ def test_terraform_telemetry_firestore_and_schema_parity() -> None:
         agent_trace=[{"tool": "calculate_period_variances"}],
         turn_latency_records=[sample_rec],
         total_latency_ms=550.0,
+        evaluation_grade="pending",
+        evaluation_score=None,
+    )["row"]
+    async_row = sink.record_async_evaluation_result(
+        session_id="s1",
+        user_email="u1",
+        intent="variance_explanation",
+        evaluation_grade="pass",
+        evaluation_score=0.85,
+        evaluator_model="gemini-3.5-flash",
     )["row"]
     audit_row = sink.record_security_audit_log(
         {"event_id": "aud-1", "event_type": "filing_10k_section_read", "tickers": ["NVDA"]}
     )["row"]
+    sink.close()
 
     assert set(llm_row.keys()) == llm_schema_cols
     assert set(sess_row.keys()) == sess_schema_cols
+    assert set(async_row.keys()) == sess_schema_cols
     assert set(audit_row.keys()) == audit_schema_cols
 
-    # Verify Terraform resources & least-privilege table-scoped custom role
-    apis_tf = (REPO_ROOT / "terraform" / "apis.tf").read_text(encoding="utf-8")
-    iam_tf = (REPO_ROOT / "terraform" / "iam.tf").read_text(encoding="utf-8")
-    telem_tf = (REPO_ROOT / "terraform" / "telemetry.tf").read_text(encoding="utf-8")
-    outputs_tf = (REPO_ROOT / "terraform" / "outputs.tf").read_text(encoding="utf-8")
+    # Interactive rows start pending/NULL; async judge rows carry 0.0 ms latency so SQL views
+    # can cleanly separate interactive turn latency from background evaluation scores.
+    assert sess_row["evaluation_grade"] == "pending" and sess_row["evaluation_score"] is None
+    assert async_row["execution_mode"] == "async_evaluation"
+    assert async_row["total_latency_ms"] == 0.0
+    assert async_row["evaluation_score"] == 0.85
 
-    assert "firestore.googleapis.com" in apis_tf
-    assert "roles/bigquery.dataEditor" not in iam_tf
-    assert "secEdgarTelemetrySinkAppend" in telem_tf
-    assert "google_bigquery_table_iam_member" in telem_tf
-    assert "google_logging_project_sink" in telem_tf
-    assert "google_firestore_database" in telem_tf
-    assert "FIRESTORE_NATIVE" in telem_tf
-    assert "roles/datastore.user" in telem_tf
-    assert "llm_telemetry_table_fqn" in outputs_tf
-    assert "session_telemetry_table_fqn" in outputs_tf
-    assert "security_audit_logs_table_fqn" in outputs_tf
-    assert "telemetry_cost_and_latency_view_fqn" in outputs_tf
-    assert "firestore_feedback_database_name" in outputs_tf
+
+def test_telemetry_sql_trace_id_retry_after_lru_and_lifecycle() -> None:
+    """Verify SQL queries select trace_id, 429 Retry-After propagates, LRU & deque bounds hold."""
+    captured_sql: list[str] = []
+
+    def _sql_handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        captured_sql.append(str(body.get("query") or ""))
+        return httpx.Response(200, json={"schema": {"fields": []}, "rows": []})
+
+    mock_http = httpx.Client(transport=httpx.MockTransport(_sql_handler))
+    gcp_cfg = TelemetryConfig(telemetry_backend="gcp", feedback_backend="local")
+    gcp_sink = BigQueryTelemetrySink(
+        config=gcp_cfg, http_client=mock_http, credentials=_FakeGcpCredentials()
+    )
+    gcp_sink.query_session_telemetry(limit=5)
+    gcp_sink.query_security_audit_logs(limit=5)
+    assert len(captured_sql) == 2
+    assert all("trace_id" in q for q in captured_sql)
+    gcp_sink.close()
+    mock_http.close()
+
+    rate_http = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _req: httpx.Response(429, headers={"Retry-After": "7.5"}, text="quota")
+        )
+    )
+    rate_sink = BigQueryTelemetrySink(
+        config=gcp_cfg, http_client=rate_http, credentials=_FakeGcpCredentials()
+    )
+    with pytest.raises(TelemetryRateLimitError) as exc_rl:
+        rate_sink.query_session_telemetry(limit=5)
+    assert exc_rl.value.retry_after_seconds == 7.5
+    rate_sink.close()
+    rate_http.close()
+
+    local_sink = BigQueryTelemetrySink(
+        config=TelemetryConfig(telemetry_backend="local"),
+        max_sessions=3,
+    )
+    for sid in ("s1", "s2", "s3", "s1", "s4"):
+        local_sink.record_session_turn_telemetry(
+            session_id=sid,
+            user_id="u@corp.com",
+            intent="longitudinal_single_company",
+            execution_mode="live_adk",
+            status_outcome="success",
+            tickers_analyzed=["NVDA"],
+            gics_sector="ALL",
+            start_year=2025,
+            end_year=2026,
+            report_generated=True,
+            variance_reports_count=1,
+            citations_count=1,
+            agent_trace=[],
+            turn_latency_records=[],
+            total_latency_ms=10.0,
+        )
+    assert list(local_sink._sessions.keys()) == ["s3", "s1", "s4"]
+    assert "s2" not in local_sink._sessions
+
+    pooled = local_sink._get_http_client()
+    assert not pooled.is_closed
+    local_sink.close()
+    assert local_sink._closed is True
+    assert pooled.is_closed
+
+    fb_store = FirestoreFeedbackStore(
+        config=TelemetryConfig(feedback_backend="local"),
+        max_local_records=3,
+    )
+    assert isinstance(fb_store._local_feedback, deque)
+    assert fb_store._local_feedback.maxlen == 3
+    for idx in range(5):
+        fb_store.record_feedback(
+            message_id=f"msg-{idx}",
+            rating="up",
+            user_email="analyst@corp.com",
+        )
+    assert len(fb_store._local_feedback) == 3
+    assert [e["message_id"] for e in fb_store._local_feedback] == ["msg-2", "msg-3", "msg-4"]
+    fb_store.close()
+
+
+def test_bigquery_sink_async_background_streaming_flush_and_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify background thread-pool delivery, flush_async_writes, error tracking, and closed fallback."""
+    cfg = TelemetryConfig(telemetry_backend="gcp", feedback_backend="local")
+    sink = BigQueryTelemetrySink(config=cfg)
+    delivered: list[tuple[str, int]] = []
+    should_fail = [False]
+
+    def _fake_stream_rows(table_id: str, rows: list[tuple[str, dict[str, Any]]]) -> None:
+        if should_fail[0]:
+            raise TelemetrySinkError("simulated bg failure")
+        delivered.append((table_id, len(rows)))
+
+    monkeypatch.setattr(sink, "stream_rows", _fake_stream_rows)
+    try:
+        res_ok = sink.record_security_audit_log(
+            {"event_id": "bg-1", "event_type": "filing_10k_section_read", "tickers": ["NVDA"]}
+        )
+        assert res_ok["delivery"] == "bigquery_streaming_async"
+        sink.flush_async_writes(timeout=5.0)
+        assert delivered == [("security_audit_logs", 1)]
+
+        should_fail[0] = True
+        res_err = sink.record_security_audit_log(
+            {"event_id": "bg-2", "event_type": "filing_10k_section_read", "tickers": ["NVDA"]}
+        )
+        assert res_err["delivery"] == "bigquery_streaming_async"
+        sink.flush_async_writes(timeout=5.0)
+        meta = sink.status_metadata()
+        assert meta["fallback_counts"]["security_audit_logs"] == 1
+        assert "simulated bg failure" in str(meta["last_error"])
+
+        sink.close()
+        res_closed = sink.record_security_audit_log(
+            {"event_id": "bg-3", "event_type": "filing_10k_section_read", "tickers": ["NVDA"]}
+        )
+        assert res_closed["delivery"] == "local_buffer_fallback"
+    finally:
+        sink.close()

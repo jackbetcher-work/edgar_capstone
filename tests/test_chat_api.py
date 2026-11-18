@@ -1,18 +1,25 @@
 """Tests for the FastAPI conversational Hybrid RAG chat and 10-K section viewer endpoints.
 
-Data comes from live GCP (BigQuery `sec_edgar`, Vertex AI Search, GCS) and the chat turn
-calls live Gemini on Vertex AI.
+Includes fast deterministic tests (scripted LLM + `fake_gcp_adapters`) for request validation,
+peer comparison synthesis, early-return clarification/out-of-corpus handling, and SPA serving,
+plus `@pytest.mark.live` smoke checks against live BigQuery, GCS, and Model Armor.
 """
 
 from __future__ import annotations
 
 import re
+import threading
+import time
+from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
+from edgar_capstone.agents.chat_engine import EntityCatalogCache
 from edgar_capstone.agents.tools import calculate_period_variances, get_active_gcp_tool_adapters
 from edgar_capstone.security import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
+from tests.structured_report_helpers import ScriptedAnalystLlm, patch_http_chat_llms
 
 _CHUNK_ID_RE = re.compile(r"\b[A-Z]{1,5}(?:[.-][A-Z]{1,2})?_\d{4}_item_(?:1a|7)_\d{4}\b")
 
@@ -26,7 +33,9 @@ def _bearer_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {jwt_token}"}
 
 
+@pytest.mark.live
 def test_companies_catalog_endpoint() -> None:
+    """Live BigQuery smoke check: `/api/v1/companies` matches `sec_edgar.financial_metrics`."""
     client = TestClient(app)
     resp = client.get("/api/v1/companies", headers=_bearer_headers())
     assert resp.status_code == 200
@@ -37,7 +46,6 @@ def test_companies_catalog_endpoint() -> None:
     assert {"NVDA", "AAPL", "MSFT", "AMZN", "LLY"}.issubset(tickers)
     assert "Information Technology" in body["gics_sectors"]
 
-    # The catalog is served from BigQuery: NVDA's latest figures match `financial_metrics`.
     nvda = next(c for c in body["companies"] if c["ticker"] == "NVDA")
     assert {2024, 2025, 2026} <= set(nvda["fiscal_years"])
     (bq_latest,) = get_active_gcp_tool_adapters().bigquery.fetch_profiles(
@@ -47,8 +55,26 @@ def test_companies_catalog_endpoint() -> None:
     assert nvda["cik"] == bq_latest.cik
 
 
-def test_conversational_rag_peer_comparison_and_fact_check() -> None:
-    """One live Gemini turn: assert live-data invariants rather than drifting narrative text."""
+def test_conversational_rag_peer_comparison_and_fact_check(
+    fake_gcp_adapters: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deterministic full-HTTP peer comparison verifying variance parity, citations, and auth."""
+    patch_http_chat_llms(
+        monkeypatch,
+        reasoning_llm=ScriptedAnalystLlm(
+            tool_calls=[
+                (
+                    "calculate_period_variances",
+                    {"tickers": "NVDA,AAPL", "start_year": 2024, "end_year": 2026},
+                )
+            ],
+            headline="NVIDIA and Apple both expanded revenue from FY2024 to FY2026.",
+            intent="multi_company_peer_comparison",
+            key_metrics=[("NVDA", "revenue"), ("AAPL", "revenue")],
+        ),
+        skip_background_judge=True,
+    )
     client = TestClient(app)
     resp = client.post(
         "/api/v1/chat",
@@ -73,9 +99,7 @@ def test_conversational_rag_peer_comparison_and_fact_check() -> None:
     assert body["intent"] == "multi_company_peer_comparison"
     assert set(body["resolved_scope"]["tickers"]) == {"NVDA", "AAPL"}
     assert body["adk_runtime"]["executed_via_adk_runner"] is True
-    assert body["adk_runtime"]["backend"] == "vertex_ai"
 
-    # Variance tables equal the deterministic engine's output for the same live BigQuery rows.
     assert len(body["variance_reports"]) == 2
     expected = calculate_period_variances(tickers="NVDA,AAPL", start_year=2024, end_year=2026)
     assert expected["status"] == "success"
@@ -85,34 +109,55 @@ def test_conversational_rag_peer_comparison_and_fact_check() -> None:
         for metric in ("revenue_variance", "operating_income_variance", "net_income_variance"):
             assert rep[metric] == exp[metric], (rep["ticker"], metric)
 
-    # Retrieval is grounded in live chunks for both issuers.
     assert len(body["citations"]) >= 4
     cited_tickers = {c["ticker"] for c in body["citations"]}
     assert {"NVDA", "AAPL"}.issubset(cited_tickers)
     returned_chunk_ids = {c["chunk_id"] for c in body["citations"]}
     assert all(c["sec_filing_url"].startswith("https://www.sec.gov/") for c in body["citations"])
 
-    # Every chunk id the live answer cites must resolve to a returned citation.
     answer_chunk_ids = set(_CHUNK_ID_RE.findall(body["answer_markdown"]))
-    assert answer_chunk_ids <= returned_chunk_ids, answer_chunk_ids - returned_chunk_ids
-    if body["answer_verified"]:
-        assert body["adk_runtime"]["answer_withheld_reason"] is None
-        assert body["fact_check"]["passed"] is True, body["fact_check"]
-        assert body["evaluation"]["grade"] == "pending"
-        assert body["evaluation"]["overall_score"] is None
-        assert answer_chunk_ids
-    else:
-        # A live answer that fails verification is withheld rather than replaced by a template.
-        assert body["answer_markdown"].startswith("### Answer withheld")
-        assert body["adk_runtime"]["answer_withheld_reason"]
-        assert body["evaluation"]["grade"] == "fail"
-        assert body["evaluation"]["overall_score"] == 0.0
+    assert answer_chunk_ids and answer_chunk_ids <= returned_chunk_ids
+    assert body["answer_verified"] is True
+    assert body["adk_runtime"]["answer_withheld_reason"] is None
+    assert body["fact_check"]["passed"] is True, body["fact_check"]
+    assert body["evaluation"]["grade"] == "pending"
+    assert body["evaluation"]["overall_score"] is None
 
     assert len(body["agent_trace"]) >= 4
     assert body["authenticated_principal"]["email"] == "analyst@fde-workspace.corp"
 
 
-def test_conversational_rag_model_armor_blocks_injection() -> None:
+def test_chat_early_returns_clarification_and_out_of_corpus(
+    fake_gcp_adapters: Any,
+) -> None:
+    """Ambiguous or out-of-corpus queries exit cleanly before invoking the reasoning model."""
+    client = TestClient(app)
+    headers = _bearer_headers()
+
+    clarify = client.post(
+        "/api/v1/chat",
+        headers=headers,
+        json={"query": "How did margins perform across the company?"},
+    )
+    assert clarify.status_code == 200
+    c_body = clarify.json()
+    assert c_body["status"] == "clarification"
+    assert c_body["citations"] == []
+
+    ooc = client.post(
+        "/api/v1/chat",
+        headers=headers,
+        json={"query": "Compare Stripe's FY2025 revenue and margins"},
+    )
+    assert ooc.status_code == 200
+    o_body = ooc.json()
+    assert o_body["status"] == "out_of_corpus"
+    assert o_body["citations"] == []
+
+
+@pytest.mark.live
+def test_conversational_rag_model_armor_blocks_injection(live_model_armor: None) -> None:
+    """Live Google Cloud Model Armor smoke check over `POST /api/v1/chat`."""
     client = TestClient(app)
     resp = client.post(
         "/api/v1/chat",
@@ -132,7 +177,9 @@ def test_conversational_rag_model_armor_blocks_injection() -> None:
     assert body["citations"] == []
 
 
+@pytest.mark.live
 def test_cached_10k_section_viewer_and_feedback_endpoints() -> None:
+    """Live GCS smoke check for `/api/v1/section` and local `/api/v1/feedback`."""
     client = TestClient(app)
     headers = _bearer_headers()
     sec_resp = client.get(
@@ -164,6 +211,104 @@ def test_cached_10k_section_viewer_and_feedback_endpoints() -> None:
     assert fb_resp.json()["recorded"]["user_email"] == "analyst@fde-workspace.corp"
 
 
+def test_request_validation_rejects_inverted_years_and_bad_section_params() -> None:
+    """Inverted year ranges and out-of-bounds `/api/v1/section` query params return HTTP 422."""
+    client = TestClient(app)
+    headers = _bearer_headers()
+
+    assert (
+        client.post(
+            "/api/v1/chat",
+            headers=headers,
+            json={"query": "Compare NVDA revenue", "start_year": 2026, "end_year": 2024},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.get(
+            "/api/v1/section",
+            headers=headers,
+            params={"ticker": "NVDA", "fiscal_year": 1999, "section_id": "item_7"},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.get(
+            "/api/v1/section",
+            headers=headers,
+            params={"ticker": "NVDA", "fiscal_year": 2025, "max_chars": 999999},
+        ).status_code
+        == 422
+    )
+    assert (
+        client.get(
+            "/api/v1/section",
+            headers=headers,
+            params={"ticker": "   ", "fiscal_year": 2025},
+        ).status_code
+        == 422
+    )
+
+
+def test_entity_catalog_cache_single_flight_and_error_handling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent cold misses coalesce into one fetch; failures return empty or re-raise."""
+    from edgar_capstone.agents import chat_engine
+
+    cache = EntityCatalogCache(ttl_seconds=60.0)
+    # allow_fetch=False on empty cache returns empty without hitting BigQuery
+    cat_empty, profs_empty = cache.get_catalog_and_profiles(allow_fetch=False)
+    assert profs_empty == [] and cat_empty is not None
+
+    fetch_count = [0]
+    barrier = threading.Barrier(2)
+
+    class _SlowBQ:
+        def fetch_profiles(self, **_kw: Any) -> list[Any]:
+            fetch_count[0] += 1
+            time.sleep(0.02)
+            return []
+
+    monkeypatch.setattr(
+        chat_engine,
+        "get_active_gcp_tool_adapters",
+        lambda: type("_A", (), {"bigquery": _SlowBQ()})(),
+    )
+    results: list[int] = []
+
+    def _worker() -> None:
+        barrier.wait()
+        _, profs = cache.get_catalog_and_profiles(allow_fetch=True)
+        results.append(len(profs))
+
+    t1 = threading.Thread(target=_worker)
+    t2 = threading.Thread(target=_worker)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    assert fetch_count[0] == 1
+    assert results == [0, 0]
+
+    # Upstream error: returns empty when raise_on_error=False, raises when raise_on_error=True
+    cache.clear()
+
+    class _FailBQ:
+        def fetch_profiles(self, **_kw: Any) -> list[Any]:
+            raise RuntimeError("bq down")
+
+    monkeypatch.setattr(
+        chat_engine,
+        "get_active_gcp_tool_adapters",
+        lambda: type("_A", (), {"bigquery": _FailBQ()})(),
+    )
+    _, fallback = cache.get_catalog_and_profiles(allow_fetch=True, raise_on_error=False)
+    assert fallback == []
+    with pytest.raises(RuntimeError, match="bq down"):
+        cache.load_profiles()
+
+
 def test_single_origin_terminal_ui_bundle_serving(tmp_path, monkeypatch) -> None:
     dist_dir = tmp_path / "dist"
     assets_dir = dist_dir / "assets"
@@ -190,3 +335,11 @@ def test_single_origin_terminal_ui_bundle_serving(tmp_path, monkeypatch) -> None
 
     # Pruned legacy `/healthz` must return 404 even when frontend/dist exists (never SPA-shadowed)
     assert client.get("/healthz").status_code == 404
+
+    import tomllib
+    from pathlib import Path
+
+    pyproject = tomllib.loads(
+        (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    assert app.version == pyproject["project"]["version"]

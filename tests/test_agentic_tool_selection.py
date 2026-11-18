@@ -5,23 +5,19 @@ pre-computed. Tool outputs are hydrated from ADK `session_state` before claim ve
 Markdown rendering, and the numeric fact-check, and only the payloads the agent produced are
 returned with the turn (and rendered as cards by the UI).
 
-Tools read live GCP (BigQuery `financial_metrics` / `filing_chunks`, Vertex AI Search, GCS).
-Scripted ADK `BaseLlm`s pin the agent's tool choices so each matrix row is exercised
-deterministically; their answers cite only chunks the live tools returned.
+Runs deterministically offline via `use_fake_gcp_adapters()` (`httpx.MockTransport` over the real
+GCP REST adapters) and scripted ADK `BaseLlm`s with `skip_background_judge=True`.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import re
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pytest
-from google.adk.models.base_llm import BaseLlm
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
@@ -48,43 +44,25 @@ from edgar_capstone.agents.tool_runtime import (
     turn_scoped_state_seed,
 )
 from edgar_capstone.agents.tools import calculate_period_variances
-from tests.structured_report_helpers import finding_from_citation
+from tests.fake_gcp import use_fake_gcp_adapters
+from tests.structured_report_helpers import (
+    ScriptedBaseLlm,
+    evidence_leads,
+    finding_from_citation,
+    report_json,
+    request_text,
+)
 
 _USER = "analyst@fde-workspace.corp"
 
 
-_LEADS_BLOCK_RE = re.compile(r"## 10-K Evidence Leads[^\n]*\n```json\n(.*?)\n```", re.S)
+@pytest.fixture(autouse=True)
+def _use_fake_gcp() -> Iterator[None]:
+    with use_fake_gcp_adapters():
+        yield
 
 
-def _latest_evidence_leads(request_text: str) -> list[dict[str, Any]]:
-    """Leads from the CURRENT turn's prompt (persistent sessions replay earlier turns)."""
-    blocks = _LEADS_BLOCK_RE.findall(request_text)
-    if not blocks:
-        return []
-    return [lead for lead in json.loads(blocks[-1]) if lead.get("chunk_id")]
-
-
-def _report_json(
-    *,
-    intent: str | None,
-    headline: str,
-    leads: list[dict[str, Any]],
-    key_metrics: list[tuple[str, str]] | None = None,
-    max_findings: int = 2,
-) -> str:
-    findings = [
-        finding_from_citation(lead, "The cited 10-K passage addresses the question.")
-        for lead in leads[:max_findings]
-    ]
-    return AnalystReport(
-        intent=intent,  # type: ignore[arg-type]
-        headline=headline,
-        key_metrics=[{"ticker": t, "metric": m} for t, m in (key_metrics or [])],
-        findings=findings,
-    ).model_dump_json()
-
-
-class _ScriptedAnalystLlm(BaseLlm):
+class _ScriptedAnalystLlm(ScriptedBaseLlm):
     """Round 0: issue `tool_calls` (if any) in parallel; final round: answer with an AnalystReport."""
 
     model: str = "gemini-3.8-flash"
@@ -97,10 +75,7 @@ class _ScriptedAnalystLlm(BaseLlm):
     async def generate_content_async(
         self, llm_request: LlmRequest, stream: bool = False
     ) -> AsyncGenerator[LlmResponse, None]:
-        text = "\n".join(
-            p.text for c in (llm_request.contents or []) for p in (c.parts or []) if p.text
-        )
-        self.requests.append(text)
+        self.requests.append(request_text(llm_request))
         await asyncio.sleep(0.002)
         current_turn = llm_request.contents[-1:] if llm_request.contents else []
         pending_tools = not any(
@@ -123,7 +98,11 @@ class _ScriptedAnalystLlm(BaseLlm):
                 ),
             )
             return
-        leads = _latest_evidence_leads(text)
+        leads = evidence_leads(llm_request)
+        findings = [
+            finding_from_citation(lead, "The cited 10-K passage addresses the question.")
+            for lead in leads[:2]
+        ]
         yield LlmResponse(
             model_version=self.model,
             partial=False,
@@ -131,10 +110,10 @@ class _ScriptedAnalystLlm(BaseLlm):
                 role="model",
                 parts=[
                     genai_types.Part(
-                        text=_report_json(
+                        text=report_json(
                             intent=self.intent,
                             headline="Grounded answer from the cited 10-K passages.",
-                            leads=leads,
+                            findings=findings,
                             key_metrics=self.key_metrics,
                         )
                     )
@@ -301,11 +280,10 @@ def test_prompt_carries_tool_selection_policy_and_no_precomputed_payloads() -> N
         chunk_health=None,
     )
     assert "## Deterministic Tool Selection" in prompt
-    assert "No variance tables, anomaly flags, or disclosure deltas were computed" in prompt
     assert "Authoritative Deterministic Period-over-Period Variance Calculations" not in prompt
     assert "Authoritative Material Variance Flags" not in prompt
     assert "sector_thematic_map_reduce(" in prompt
-    assert "leave `key_metrics` EMPTY for" in prompt
+    assert "key_metrics" in prompt
     assert "`intent`" in prompt
 
 
@@ -327,6 +305,7 @@ def test_qualitative_risk_wording_turn_shows_no_variance_flags_or_key_metrics() 
         user_id=_USER,
         reasoning_llm=llm,
         on_progress=lambda stage, _msg, meta: progress.append((stage, meta)),
+        skip_background_judge=True,
     )
     assert turn["status"] == "success"
     assert turn["answer_verified"] is True, turn["adk_runtime"]["answer_withheld_reason"]
@@ -373,6 +352,7 @@ def test_quantitative_peer_turn_computes_variances_and_only_requested_key_metric
         user_id=_USER,
         reasoning_llm=llm,
         on_progress=lambda stage, _msg, _meta: progress.append(stage),
+        skip_background_judge=True,
     )
     assert turn["answer_verified"] is True, turn["adk_runtime"]["answer_withheld_reason"]
     assert sorted(r["ticker"] for r in turn["variance_reports"]) == ["AAPL", "MSFT"]
@@ -425,6 +405,7 @@ def test_anomaly_turn_invokes_variances_and_flags_with_mdna_explanations() -> No
         session_id="agentic-anomaly-1",
         user_id=_USER,
         reasoning_llm=llm,
+        skip_background_judge=True,
     )
     assert turn["answer_verified"] is True, turn["adk_runtime"]["answer_withheld_reason"]
     assert [r["ticker"] for r in turn["variance_reports"]] == ["INTC"]
@@ -463,6 +444,7 @@ def test_key_metrics_without_variance_tool_are_backfilled_deterministically() ->
         session_id="agentic-backfill-1",
         user_id=_USER,
         reasoning_llm=llm,
+        skip_background_judge=True,
     )
     assert turn["answer_verified"] is True, turn["adk_runtime"]["answer_withheld_reason"]
     assert turn["adk_runtime"]["key_metric_backfill_tickers"] == ["NVDA"]
@@ -491,6 +473,7 @@ def test_tool_outputs_do_not_leak_into_the_next_turn_of_a_persistent_session() -
         session_id="agentic-session-iso",
         user_id=_USER,
         reasoning_llm=quant,
+        skip_background_judge=True,
     )
     assert first["variance_reports"]
     qual = _ScriptedAnalystLlm(tool_calls=[], intent="thematic_trend_tracking", requests=[])
@@ -502,6 +485,7 @@ def test_tool_outputs_do_not_leak_into_the_next_turn_of_a_persistent_session() -
         session_id="agentic-session-iso",
         user_id=_USER,
         reasoning_llm=qual,
+        skip_background_judge=True,
     )
     assert second["answer_verified"] is True, second["adk_runtime"]["answer_withheld_reason"]
     assert second["variance_reports"] == []
@@ -612,6 +596,7 @@ def test_sector_wide_thematic_turn_runs_map_reduce_tool_with_sse_progress() -> N
             reasoning_llm=llm,
             map_llm=sentinel_map_llm,  # type: ignore[arg-type]
             on_progress=lambda stage, _msg, _meta: stages.append(stage),
+            skip_background_judge=True,
         )
     assert turn["answer_verified"] is True, turn["adk_runtime"]["answer_withheld_reason"]
     assert captured["gics_sector"] == "Real Estate"

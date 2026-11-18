@@ -10,10 +10,9 @@ from typing import Any
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 
-from edgar_capstone import security as security_pkg
 from edgar_capstone.security import (
     GOOGLE_IAP_ISSUER,
     GOOGLE_IAP_JWKS_URI,
@@ -30,7 +29,6 @@ from edgar_capstone.security import (
     sign_jwt_es256,
     sign_jwt_rs256,
 )
-from edgar_capstone.security import auth as security_auth_mod
 from edgar_capstone.server import app
 
 TEST_IAP_AUDIENCE = "/projects/991122334455/global/backendServices/887766554433"
@@ -44,11 +42,11 @@ def _b64url(data: bytes) -> str:
 
 
 @pytest.fixture()
-def idp_keyring():
-    """Generate ephemeral in-memory ES256 (IAP) and RS256 (Google Workspace & Okta) keypairs."""
-    iap_ec_key = ec.generate_private_key(ec.SECP256R1())
-    google_rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    okta_rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+def idp_keyring(session_idp_keys: dict[str, Any]):
+    """Reuse session-scoped ES256 (IAP) and RS256 (Google Workspace & Okta) keypairs."""
+    iap_ec_key = session_idp_keys["iap_ec_key"]
+    google_rsa_key = session_idp_keys["google_rsa_key"]
+    okta_rsa_key = session_idp_keys["okta_rsa_key"]
 
     jwks_by_uri: dict[str, dict[str, Any]] = {
         GOOGLE_IAP_JWKS_URI: {
@@ -449,7 +447,9 @@ def test_cryptographic_attacks_temporal_bounds_and_key_rotation(idp_keyring) -> 
     assert rotated_user.email == "rotated@acme-corp.com"
 
 
-def test_workspace_domain_rbac_production_lockdown_logout_and_audit_trail(idp_keyring) -> None:
+def test_workspace_domain_rbac_production_lockdown_logout_and_audit_trail(
+    idp_keyring, fake_gcp_adapters
+) -> None:
     """Enforce Workspace hd domain + Okta group RBAC (403), Cloud Run dev-broker lockdown, logout revocation, and 10-K audit logs."""
     verifier: IAPJwtVerifier = idp_keyring["verifier"]
     app.dependency_overrides[get_auth_verifier] = lambda: verifier
@@ -584,7 +584,7 @@ TEST_CLOUD_RUN_IAP_AUDIENCE = (
 )
 
 
-def test_cloud_run_iap_assertion_only_browser_session(idp_keyring) -> None:
+def test_cloud_run_iap_assertion_only_browser_session(idp_keyring, fake_gcp_adapters) -> None:
     """Behind IAP on Cloud Run the browser sends only X-Goog-IAP-JWT-Assertion (no Bearer)."""
     settings = dataclasses.replace(
         idp_keyring["settings"],
@@ -602,8 +602,8 @@ def test_cloud_run_iap_assertion_only_browser_session(idp_keyring) -> None:
                 "iss": GOOGLE_IAP_ISSUER,
                 "sub": "accounts.google.com:5566778899",
                 "aud": aud,
-                "email": "accounts.google.com:colleague@jackbetcher.altostrat.com",
-                "hd": "jackbetcher.altostrat.com",
+                "email": "accounts.google.com:colleague@partner.example.com",
+                "hd": "partner.example.com",
                 "iat": now,
                 "exp": now + 600,
             },
@@ -623,7 +623,7 @@ def test_cloud_run_iap_assertion_only_browser_session(idp_keyring) -> None:
         me = client.get("/api/v1/auth/me", headers=headers)
         assert me.status_code == 200, me.text
         user = me.json()["user"]
-        assert user["email"] == "colleague@jackbetcher.altostrat.com"
+        assert user["email"] == "colleague@partner.example.com"
         assert user["identity_provider"] == "google_iap"
         assert user["iap_assertion_verified"] is True
         assert user["roles"] == ["authenticated", "analyst"]
@@ -652,7 +652,7 @@ def test_cloud_run_iap_assertion_only_browser_session(idp_keyring) -> None:
                 "iss": "https://accounts.google.com",
                 "sub": "10987654321",
                 "aud": TEST_CLOUD_RUN_IAP_AUDIENCE,
-                "email": "colleague@jackbetcher.altostrat.com",
+                "email": "colleague@partner.example.com",
                 "email_verified": True,
                 "groups": ["sec-edgar-analysts"],
                 "iat": now,
@@ -832,14 +832,10 @@ def test_sso_token_exchange_endpoint_and_audit_trail(idp_keyring) -> None:
         app.dependency_overrides.pop(get_auth_verifier, None)
 
 
-def test_dual_iap_and_bearer_never_escalates_privileges_and_require_roles_removed(
+def test_dual_iap_and_bearer_never_escalates_privileges(
     idp_keyring,
 ) -> None:
     """Dual IAP + Bearer must keep Bearer RBAC strictly authoritative (no escalation from IAP)."""
-    # Verify legacy dead-code `require_roles` dependency has been deleted from security exports
-    assert not hasattr(security_auth_mod, "require_roles")
-    assert not hasattr(security_pkg, "require_roles")
-
     settings = dataclasses.replace(
         idp_keyring["settings"],
         required_analyst_groups=(),
@@ -977,3 +973,104 @@ def test_dual_iap_and_bearer_never_escalates_privileges_and_require_roles_remove
         assert client.get("/api/v1/admin/rbac/policies", headers=dual_sa_headers).status_code == 403
     finally:
         app.dependency_overrides.pop(get_auth_verifier, None)
+
+
+def test_sso_dev_token_emits_audit_events_on_401_and_403(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/sso/dev-token` records audit events on invalid email (401) and strict-mode block (403)."""
+    client = TestClient(app)
+    clear_security_audit_events()
+    try:
+        d401 = client.post(
+            "/api/v1/auth/sso/dev-token",
+            json={
+                "email": "invalid-email-no-at",
+                "name": "Bad",
+                "groups": ["sec-edgar-analysts"],
+            },
+        )
+        assert d401.status_code == 401
+        assert any(
+            e.get("event_type") == "sso_dev_token_failed" and e.get("status") == "denied_401"
+            for e in get_security_audit_events(limit=20)
+        )
+
+        monkeypatch.setenv("IAP_STRICT_MODE", "true")
+        d403 = client.post(
+            "/api/v1/auth/sso/dev-token",
+            json={
+                "email": "analyst@fde-workspace.corp",
+                "name": "Blocked",
+                "groups": ["sec-edgar-analysts"],
+            },
+        )
+        assert d403.status_code == 403
+        assert any(
+            e.get("event_type") == "sso_dev_token_forbidden" and e.get("status") == "denied_403"
+            for e in get_security_audit_events(limit=20)
+        )
+    finally:
+        clear_security_audit_events()
+
+
+def test_jwt_codec_strict_decoding_jwk_and_signature_error_paths(
+    session_idp_keys: dict[str, Any],
+) -> None:
+    """Cover malformed base64url, JWK validation (ValueError, never KeyError), and JWS mismatches."""
+    from edgar_capstone.security.jwt_codec import (
+        b64url_decode,
+        jwk_to_public_key,
+        parse_jwt_header_and_claims,
+        verify_es256_signature,
+        verify_jws_signature,
+    )
+
+    for bad_seg in ("", "a", "abc!def", "ab=cd"):
+        with pytest.raises(ValueError):
+            b64url_decode(bad_seg)
+    with pytest.raises(ValueError):
+        b64url_decode(123)  # type: ignore[arg-type]
+
+    list_b64 = _b64url(b"[]")
+    with pytest.raises(ValueError):
+        parse_jwt_header_and_claims(list_b64, list_b64)
+    with pytest.raises(ValueError):
+        parse_jwt_header_and_claims(_b64url(b"\xff\xfe"), list_b64)
+
+    for bad_jwk in (
+        "not-a-dict",
+        {"kty": "RSA"},
+        {"kty": "RSA", "n": _b64url(b"\x01"), "e": _b64url(b"\x00")},
+        {"kty": "EC", "crv": "P-384"},
+        {"kty": "EC", "crv": "P-256"},
+        {"kty": "EC", "crv": "P-256", "x": _b64url(b"\x01" * 32), "y": _b64url(b"\x01" * 32)},
+        {"kty": "oct"},
+    ):
+        with pytest.raises(ValueError):
+            jwk_to_public_key(bad_jwk)  # type: ignore[arg-type]
+
+    ec_pub = session_idp_keys["iap_ec_key"].public_key()
+    rsa_pub = session_idp_keys["google_rsa_key"].public_key()
+
+    with pytest.raises(ValueError):
+        verify_es256_signature(b"hdr.pay", b"short", ec_pub)
+    with pytest.raises(ValueError):
+        verify_es256_signature(b"hdr.pay", b"\x00" * 64, ec_pub)
+
+    with pytest.raises(ValueError, match="does not match ES256"):
+        verify_jws_signature(
+            alg="ES256", signing_input=b"a.b", signature_bytes=b"\x01" * 64, public_key=rsa_pub
+        )
+    with pytest.raises(ValueError, match="does not match RS256"):
+        verify_jws_signature(
+            alg="RS256", signing_input=b"a.b", signature_bytes=b"sig", public_key=ec_pub
+        )
+    with pytest.raises(ValueError, match="RS256 JWT signature verification failed"):
+        verify_jws_signature(
+            alg="RS256", signing_input=b"a.b", signature_bytes=b"bad" * 64, public_key=rsa_pub
+        )
+    with pytest.raises(ValueError, match="Unsupported JWT signing algorithm"):
+        verify_jws_signature(
+            alg="HS256", signing_input=b"a.b", signature_bytes=b"sig", public_key=rsa_pub
+        )

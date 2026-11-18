@@ -498,3 +498,53 @@ def test_cli_all_runs_both_steps(
     assert calls["reload"]["timeout_seconds"] == 900 and calls["reload"]["wait"] is True
     assert calls["import"]["reconciliation_mode"] == "INCREMENTAL"
     assert calls["search"]["query"] == "Agilent risk factors"
+
+
+def test_cloud_publish_timeout_non_raising_and_discovery_engine_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers `run_bigquery_load_job(raise_on_timeout=False)` and Discovery Engine LRO timeout + retry."""
+    fake_bq = _BigQueryFake([{"status": {"state": "RUNNING"}}])
+    clock_bq = iter(range(0, 10_000, 60))
+    monkeypatch.setattr(cloud_publish.time, "monotonic", lambda: float(next(clock_bq)))
+    res = run_bigquery_load_job(
+        project_id=PROJECT,
+        dataset_id="sec_edgar",
+        table_id="filing_chunks",
+        source_uris=["gs://b/x"],
+        ignore_unknown_values=True,
+        max_bad_records=5,
+        poll_timeout_seconds=100,
+        raise_on_timeout=False,
+        http_client=_client(fake_bq),
+        credentials=_FakeCredentials(),
+    )
+    assert not res.done and res.state == "RUNNING"
+    load_cfg = fake_bq.inserted[0]["configuration"]["load"]
+    assert load_cfg["ignoreUnknownValues"] is True and load_cfg["maxBadRecords"] == 5
+
+    # `trigger_bigquery_chunks_load_job` returns the job_id without raising on timeout (`raise_on_timeout=False`)
+    clock_chunks = iter(range(0, 10_000, 60))
+    monkeypatch.setattr(cloud_publish.time, "monotonic", lambda: float(next(clock_chunks)))
+    job_id = trigger_bigquery_chunks_load_job(
+        project_id=PROJECT,
+        dataset_id="sec_edgar",
+        table_id="filing_chunks",
+        source_gcs_uri=f"gs://{BUCKET}/manifests/bigquery_filing_chunks.jsonl",
+        poll_timeout_seconds=100,
+        http_client=_client(_BigQueryFake([{"status": {"state": "RUNNING"}}])),
+        credentials=_FakeCredentials(),
+    )
+    assert job_id.startswith("load_filing_chunks_")
+
+    # Discovery Engine LRO poll timeout raises CloudPublishTimeoutError
+    clock_de = iter(range(0, 10_000, 50))
+    monkeypatch.setattr(cloud_publish.time, "monotonic", lambda: float(next(clock_de)))
+    with pytest.raises(CloudPublishTimeoutError):
+        import_vertex_ai_search_documents(
+            project_id=PROJECT,
+            bucket_name=BUCKET,
+            timeout_seconds=100,
+            http_client=_client(_DiscoveryEngineFake([{"name": "op", "done": False}])),
+            credentials=_FakeCredentials(),
+        )

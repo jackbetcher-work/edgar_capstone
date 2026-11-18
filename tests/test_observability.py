@@ -7,10 +7,14 @@ import inspect
 import io
 import json
 import logging
+import sys
 from collections.abc import Iterator
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 
@@ -27,22 +31,56 @@ from edgar_capstone.observability import (
     start_span,
     traced,
 )
-from edgar_capstone.observability.structured_logging import ERROR_REPORTING_TYPE
+from edgar_capstone.observability.structured_logging import (
+    ERROR_REPORTING_TYPE,
+    TraceAwareTextFormatter,
+    _level_name_for,
+    _severity_for,
+    resolve_log_level,
+)
+from edgar_capstone.observability.tracing import (
+    TraceCorrelation,
+    TracingConfig,
+    _build_exporter,
+    _env_ratio,
+    bind_fallback_trace,
+    reset_fallback_trace,
+    sanitize_attributes,
+)
 from edgar_capstone.security import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
+from tests.structured_report_helpers import ScriptedAnalystLlm, patch_http_chat_llms
 
 UPSTREAM_TRACE_ID = "4bf92f3577b34da6a3ce929d0e0e4736"
 UPSTREAM_SPAN_ID = "00f067aa0ba902b7"
 
-_SPAN_EXPORTER = InMemorySpanExporter()
+
+class _GatedInMemorySpanExporter(InMemorySpanExporter):
+    """Records spans only while `enabled` is True so unrelated test modules don't accumulate memory."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.enabled = False
+
+    def export(self, spans):  # type: ignore[override]
+        if not self.enabled:
+            return SpanExportResult.SUCCESS
+        return super().export(spans)
+
+
+_SPAN_EXPORTER = _GatedInMemorySpanExporter()
 configure_tracing(extra_span_exporters=[_SPAN_EXPORTER])
 
 
 @pytest.fixture()
 def spans() -> Iterator[InMemorySpanExporter]:
     _SPAN_EXPORTER.clear()
-    yield _SPAN_EXPORTER
-    _SPAN_EXPORTER.clear()
+    _SPAN_EXPORTER.enabled = True
+    try:
+        yield _SPAN_EXPORTER
+    finally:
+        _SPAN_EXPORTER.enabled = False
+        _SPAN_EXPORTER.clear()
 
 
 @pytest.fixture()
@@ -84,11 +122,14 @@ def _formatter_line(record_logger: logging.Logger, formatter: logging.Formatter,
     try:
         record_logger.setLevel(logging.DEBUG)
         msg = kwargs.pop("msg", "hello")
+        level = kwargs.pop("level", "info")
         if kwargs.pop("exception", False):
             try:
                 raise ValueError("boom")
             except ValueError:
                 record_logger.exception(msg, **kwargs)
+        elif level == "error":
+            record_logger.error(msg, **kwargs)
         else:
             record_logger.info(msg, **kwargs)
     finally:
@@ -97,7 +138,7 @@ def _formatter_line(record_logger: logging.Logger, formatter: logging.Formatter,
 
 
 # ---------------------------------------------------------------------------
-# Structured logging formatter
+# Structured logging formatters, severity mapping & Error Reporting
 # ---------------------------------------------------------------------------
 
 
@@ -129,29 +170,99 @@ def test_json_formatter_emits_cloud_logging_trace_fields() -> None:
     assert payload["time"].endswith("+00:00")
 
 
-def test_json_formatter_without_span_has_no_trace_and_reports_errors() -> None:
-    formatter = CloudLoggingJsonFormatter(project_id="test-project", service_name="svc")
-    test_logger = logging.getLogger("edgar_capstone.tests.json_formatter_err")
-    payload = _formatter_line(test_logger, formatter, msg="tool failed", exception=True)
-
-    assert "logging.googleapis.com/trace" not in payload
-    assert payload["severity"] == "ERROR"
-    assert "ValueError: boom" in payload["message"]
-    assert payload["@type"] == ERROR_REPORTING_TYPE
-    assert payload["serviceContext"]["service"] == "svc"
-
-
-def test_json_formatter_cannot_override_reserved_keys() -> None:
-    formatter = CloudLoggingJsonFormatter(project_id="test-project")
-    test_logger = logging.getLogger("edgar_capstone.tests.json_formatter_reserved")
-    payload = _formatter_line(
-        test_logger,
-        formatter,
-        msg="real message",
-        extra={"json_fields": {"severity": "DEBUG", "message": "spoofed"}},
+def test_error_logs_follow_cloud_logging_and_error_reporting_conventions() -> None:
+    """Plain ERROR logs stay normal entries; exceptions emit Error Reporting with immutable location."""
+    formatter = CloudLoggingJsonFormatter(
+        project_id="test-project", service_name="svc", service_version="rev-1"
     )
-    assert payload["severity"] == "INFO"
-    assert payload["message"] == "real message"
+    test_logger = logging.getLogger("edgar_capstone.tests.json_formatter_err")
+
+    # Outside any span or fallback trace: no trace key emitted
+    no_span = _formatter_line(test_logger, formatter, msg="tool failed", exception=True)
+    assert "logging.googleapis.com/trace" not in no_span
+    assert no_span["@type"] == ERROR_REPORTING_TYPE
+
+    trace_token = bind_fallback_trace(
+        TraceCorrelation(trace_id="a" * 32, span_id="b" * 16, sampled=True)
+    )
+    try:
+        plain = _formatter_line(
+            test_logger,
+            formatter,
+            msg="GET /api/v1/chat -> 503",
+            level="error",
+            extra={"json_fields": {"context": "should-not-win"}},
+        )
+        with_exc = _formatter_line(
+            test_logger,
+            formatter,
+            msg="tool failed",
+            exception=True,
+            extra={"json_fields": {"context": "should-not-win"}},
+        )
+    finally:
+        reset_fallback_trace(trace_token)
+
+    for payload in (plain, with_exc):
+        assert payload["severity"] == "ERROR"
+        assert payload["logging.googleapis.com/trace"] == f"projects/test-project/traces/{'a' * 32}"
+        assert payload["logging.googleapis.com/spanId"] == "b" * 16
+        assert payload["logging.googleapis.com/trace_sampled"] is True
+        assert payload["serviceContext"] == {"service": "svc", "version": "rev-1"}
+
+    assert "@type" not in plain
+    assert plain["context"] == "should-not-win"
+
+    assert with_exc["@type"] == ERROR_REPORTING_TYPE
+    assert "ValueError: boom" in with_exc["message"]
+    location = with_exc["context"]["reportLocation"]
+    assert location["functionName"] == "_formatter_line"
+    assert isinstance(location["lineNumber"], int)
+
+
+def test_formatters_protect_reserved_keys_and_do_not_mutate_log_record() -> None:
+    rec = logging.LogRecord("edgar.test", logging.INFO, __file__, 10, "hello %s", ("world",), None)
+    rec.json_fields = {
+        "trace_id": "hijacked",
+        "logger": "spoofed",
+        "severity": "FAKE",
+        "message": "spoofed",
+        "custom_field": 99,
+    }
+    before = dict(rec.__dict__)
+    token = bind_fallback_trace(
+        TraceCorrelation(trace_id=UPSTREAM_TRACE_ID, span_id=UPSTREAM_SPAN_ID, sampled=True)
+    )
+    try:
+        text_out = TraceAwareTextFormatter().format(rec)
+        assert UPSTREAM_TRACE_ID in text_out
+        assert dict(rec.__dict__) == before
+
+        json_out = json.loads(CloudLoggingJsonFormatter(project_id="proj-x").format(rec))
+        assert json_out["trace_id"] == UPSTREAM_TRACE_ID
+        assert json_out["logger"] == "edgar.test"
+        assert json_out["severity"] == "INFO"
+        assert json_out["message"] == "hello world"
+        assert json_out["custom_field"] == 99
+    finally:
+        reset_fallback_trace(token)
+
+
+def test_severity_and_level_name_helpers() -> None:
+    assert _severity_for(logging.NOTSET) == "DEFAULT"
+    assert _severity_for(5) == "DEBUG"
+    assert _severity_for(25) == "INFO"
+    assert _severity_for(35) == "WARNING"
+    assert _severity_for(45) == "ERROR"
+    assert _severity_for(60) == "CRITICAL"
+
+    assert _level_name_for(logging.NOTSET) == "NOTSET"
+    assert _level_name_for(logging.WARNING) == "WARNING"
+    assert _level_name_for(37) == "LEVEL_37"
+
+    assert resolve_log_level(logging.DEBUG) == logging.DEBUG
+    assert resolve_log_level("20") == logging.INFO
+    assert resolve_log_level("WARNING") == logging.WARNING
 
 
 def test_configure_logging_routes_uvicorn_through_json_handler() -> None:
@@ -169,10 +280,14 @@ def test_configure_logging_routes_uvicorn_through_json_handler() -> None:
         configure_logging()
 
 
-def test_parse_trace_headers() -> None:
+def test_parse_trace_headers_and_bounds() -> None:
     w3c = parse_traceparent(f"00-{UPSTREAM_TRACE_ID}-{UPSTREAM_SPAN_ID}-01")
-    assert w3c is not None and w3c.trace_id == UPSTREAM_TRACE_ID and w3c.sampled
-    assert parse_traceparent("00-" + "0" * 32 + f"-{UPSTREAM_SPAN_ID}-01") is None
+    assert w3c == TraceCorrelation(
+        trace_id=UPSTREAM_TRACE_ID, span_id=UPSTREAM_SPAN_ID, sampled=True
+    )
+    assert parse_traceparent(f"ff-{UPSTREAM_TRACE_ID}-{UPSTREAM_SPAN_ID}-01") is None
+    assert parse_traceparent(f"00-{'0' * 32}-{UPSTREAM_SPAN_ID}-01") is None
+    assert parse_traceparent(f"00-{UPSTREAM_TRACE_ID}-{'0' * 16}-01") is None
     assert parse_traceparent("garbage") is None
 
     gcp = parse_cloud_trace_context(f"{UPSTREAM_TRACE_ID.upper()}/12345;o=1")
@@ -181,7 +296,59 @@ def test_parse_trace_headers() -> None:
     assert gcp.span_id == format(12345, "016x")
     assert gcp.sampled is True
     assert parse_cloud_trace_context(f"{UPSTREAM_TRACE_ID}") is not None
+    assert parse_cloud_trace_context(f"{UPSTREAM_TRACE_ID}/0;o=1") is None
+    assert parse_cloud_trace_context(f"{UPSTREAM_TRACE_ID}/{1 << 64};o=1") is None
+    assert parse_cloud_trace_context(f"{'0' * 32}/12;o=1") is None
     assert parse_cloud_trace_context("not-a-trace") is None
+
+
+def test_tracing_config_env_ratio_exporter_and_attribute_coercion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("EDGAR_TEST_RATIO", raising=False)
+    assert _env_ratio("EDGAR_TEST_RATIO", 0.5) == 0.5
+    monkeypatch.setenv("EDGAR_TEST_RATIO", "bad-float")
+    assert _env_ratio("EDGAR_TEST_RATIO", 0.5) == 0.5
+    monkeypatch.setenv("EDGAR_TEST_RATIO", "1.75")
+    assert _env_ratio("EDGAR_TEST_RATIO", 0.5) == 1.0
+    monkeypatch.setenv("EDGAR_TEST_RATIO", "-0.25")
+    assert _env_ratio("EDGAR_TEST_RATIO", 0.5) == 0.0
+
+    exp_none, name_none = _build_exporter(TracingConfig(resolved_exporter="none"))
+    assert exp_none is None and name_none == "none"
+
+    exp_con, name_con = _build_exporter(TracingConfig(resolved_exporter="console"))
+    assert exp_con is not None and name_con == "console"
+
+    # Simulate missing optional OTLP package
+    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.otlp.proto.http.trace_exporter", None)
+    exp_otlp, name_otlp = _build_exporter(TracingConfig(resolved_exporter="otlp"))
+    assert exp_otlp is None and name_otlp == "none"
+
+    # Simulate Cloud Trace exporter via stub module (avoids live GCP client creation)
+    fake_cloud_mod = SimpleNamespace(CloudTraceSpanExporter=lambda **kw: SimpleNamespace(kwargs=kw))
+    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.cloud_trace", fake_cloud_mod)
+    exp_gcp, name_gcp = _build_exporter(TracingConfig(resolved_exporter="gcp", project_id="p-1"))
+    assert name_gcp == "gcp" and exp_gcp is not None
+
+    long_str = "x" * 700
+    clean = sanitize_attributes(
+        {
+            "drop_me": None,
+            "flag": True,
+            "count": 3,
+            "long": long_str,
+            "str_list": ["NVDA", "AAPL", None],
+            "mixed_list": [1, "AAPL"],
+            "obj": SimpleNamespace(id=7),
+        }
+    )
+    assert "drop_me" not in clean
+    assert clean["flag"] is True and clean["count"] == 3
+    assert clean["long"].endswith("…") and len(clean["long"]) == 513
+    assert clean["str_list"] == ["NVDA", "AAPL"]
+    assert clean["mixed_list"] == ["1", "AAPL"]
+    assert "id=7" in clean["obj"]
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +376,6 @@ def test_traced_decorator_preserves_signatures_and_records_args(
     assert finished["unit.compute"].attributes["edgar.fiscal_year"] == 2026
     assert any(name.endswith("compute_async") for name in finished)
 
-    # ADK FunctionTool schema introspection still sees the real tool parameters.
     params = inspect.signature(calculate_period_variances).parameters
     assert {"tickers", "start_year", "end_year"} <= set(params)
 
@@ -237,7 +403,6 @@ def test_run_coro_sync_keeps_parent_span_across_worker_thread() -> None:
     async def outer() -> tuple[str, str | None]:
         with start_span("unit.outer") as span:
             parent_trace = format(span.get_span_context().trace_id, "032x")
-            # Called from inside a running loop -> executes on a worker thread.
             return parent_trace, _run_coro_sync(inner())
 
     parent_trace, inner_trace = asyncio.run(outer())
@@ -252,7 +417,24 @@ def test_run_coro_sync_keeps_parent_span_across_worker_thread() -> None:
 def test_chat_request_continues_upstream_trace_end_to_end(
     spans: InMemorySpanExporter,
     json_log_stream: io.StringIO,
+    fake_gcp_adapters: Any,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    patch_http_chat_llms(
+        monkeypatch,
+        reasoning_llm=ScriptedAnalystLlm(
+            tool_calls=[
+                (
+                    "calculate_period_variances",
+                    {"tickers": "NVDA,AAPL", "start_year": 2024, "end_year": 2026},
+                )
+            ],
+            headline="NVDA and AAPL expanded revenue and operating income from FY2024 to FY2026.",
+            intent="multi_company_peer_comparison",
+            key_metrics=[("NVDA", "revenue"), ("AAPL", "revenue")],
+        ),
+        skip_background_judge=True,
+    )
     client = TestClient(app)
     headers = {
         **_bearer_headers(),
@@ -325,10 +507,8 @@ def test_chat_request_continues_upstream_trace_end_to_end(
         == f"projects/test-project/traces/{UPSTREAM_TRACE_ID}"
     )
     assert access[0]["request"]["path"] == "/api/v1/chat"
-    # Every app log emitted while serving the request is correlated with the same trace.
     assert all(ln.get("trace_id") == UPSTREAM_TRACE_ID for ln in lines)
 
-    # BigQuery telemetry rows (mirrored to the Cloud Logging sink) carry the same trace_id.
     sink_rows = {
         ln["log_sink_target"]: ln["event_payload"]
         for ln in lines
@@ -339,7 +519,6 @@ def test_chat_request_continues_upstream_trace_end_to_end(
     )
     assert all(row["trace_id"] == UPSTREAM_TRACE_ID for row in sink_rows.values())
 
-    # Model calls are visible on the trace with model, token, and TTFT attributes.
     llm_events = [ev for s in trace_spans for ev in s.events if ev.name == "llm.call"]
     assert llm_events
     assert all("gen_ai.request.model" in ev.attributes for ev in llm_events)
@@ -349,7 +528,7 @@ def test_chat_request_continues_upstream_trace_end_to_end(
 def test_x_cloud_trace_context_header_is_honoured(spans: InMemorySpanExporter) -> None:
     client = TestClient(app)
     resp = client.get(
-        "/api/v1/companies",
+        "/api/v1/auth/me",
         headers={
             **_bearer_headers(),
             "X-Cloud-Trace-Context": f"{UPSTREAM_TRACE_ID}/987654321;o=1",
@@ -369,7 +548,6 @@ def test_health_probe_is_untraced_but_still_log_correlated(
         "/health", headers={"traceparent": f"00-{UPSTREAM_TRACE_ID}-{UPSTREAM_SPAN_ID}-01"}
     )
     assert resp.status_code == 200
-    # Falls back to the inbound header so Cloud Run request logs still line up.
     assert resp.headers["X-Trace-Id"] == UPSTREAM_TRACE_ID
     assert not [s for s in spans.get_finished_spans() if s.kind == SpanKind.SERVER]
     observability = resp.json()["observability"]
@@ -381,12 +559,11 @@ def test_health_probe_is_untraced_but_still_log_correlated(
 def test_new_trace_started_without_upstream_context(spans: InMemorySpanExporter) -> None:
     client = TestClient(app)
     resp = client.get(
-        "/api/v1/companies",
+        "/api/v1/auth/me",
         headers={**_bearer_headers(), "Origin": "http://localhost:5173"},
     )
     assert resp.status_code == 200
     trace_id = resp.headers["X-Trace-Id"]
     assert len(trace_id) == 32 and trace_id != UPSTREAM_TRACE_ID
     assert resp.headers["X-Request-Id"] == trace_id
-    # The browser UI may read the trace ID cross-origin (Vite dev server -> FastAPI).
     assert "x-trace-id" in resp.headers["access-control-expose-headers"].lower()

@@ -288,9 +288,6 @@ function mockBackend(overrides: RouteOverrides = {}) {
             { event: 'result', data: CHAT_RESPONSE },
           ])
     }
-    if (url === '/api/v1/chat') {
-      return overrides.chat ? overrides.chat() : json(CHAT_RESPONSE)
-    }
     if (url.startsWith('/api/v1/section')) {
       return overrides.section ? overrides.section() : json(SECTION_RESPONSE)
     }

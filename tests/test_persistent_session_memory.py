@@ -6,14 +6,13 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
-from edgar_capstone.agents.context_memory import (
-    ConversationMemoryManager,
-    get_context_latency_tracker,
-)
+from edgar_capstone.agents.context_memory import ConversationMemoryManager
 from edgar_capstone.telemetry import (
     FirestoreSessionStore,
     TelemetryConfig,
+    TelemetrySinkError,
     session_firestore_doc_id,
 )
 
@@ -142,35 +141,35 @@ def test_firestore_session_store_crud_and_multi_instance_hydration() -> None:
     assert any(m == "DELETE" for m, _ in calls)
 
 
-def test_deterministic_compaction_emits_zero_fake_llm_billing_records() -> None:
-    tracker = get_context_latency_tracker()
-    before = len(tracker.recent_records(limit=500))
-    mgr = ConversationMemoryManager(token_threshold=40, retention_turns=1)
+def test_firestore_session_store_local_noop_and_upstream_error_tracking() -> None:
+    """Verify local-mode no-ops and error propagation / last_error tracking on Firestore 503."""
+    local_store = FirestoreSessionStore(
+        TelemetryConfig(telemetry_backend="local", feedback_backend="local")
+    )
+    assert local_store.is_live_enabled() is False
+    assert local_store.load_session("alice@corp", "s1") is None
+    local_store.save_session("alice@corp", "s1", {"user_id": "alice@corp"})
+    assert local_store.delete_session("alice@corp", "s1") is False
+    assert local_store.list_sessions("alice@corp") == []
 
-    mgr.record_turn(
-        session_id="cost-check",
-        user_id="alice@corp",
-        query="Analyze AAPL revenue FY2024 to FY2026",
-        intent="longitudinal_single_company",
-        tickers=["AAPL"],
-        gics_sector="Information Technology",
-        start_year=2024,
-        end_year=2026,
-        variance_highlights=["AAPL +22.45%"],
-        answer_markdown="Services drove gross margin expansion. " * 20,
+    fail_client = httpx.Client(
+        transport=httpx.MockTransport(lambda _req: httpx.Response(503, text="unavailable"))
     )
-    res = mgr.record_turn(
-        session_id="cost-check",
-        user_id="alice@corp",
-        query="Now add NVDA",
-        intent="multi_company_peer_comparison",
-        tickers=["AAPL", "NVDA"],
-        gics_sector="Information Technology",
-        start_year=2024,
-        end_year=2026,
-        variance_highlights=["NVDA +254.45%"],
-        answer_markdown="Blackwell drove Data Center demand. " * 20,
+    live_store = FirestoreSessionStore(
+        TelemetryConfig(telemetry_backend="local", feedback_backend="gcp"),
+        http_client=fail_client,
+        credentials=_FakeCreds(),
     )
-    assert res["compaction_triggered"] is True
-    assert res["compaction_method"] == "deterministic_digest"
-    assert len(tracker.recent_records(limit=500)) == before
+    try:
+        with pytest.raises(TelemetrySinkError):
+            live_store.load_session("alice@corp", "s1")
+        assert live_store.status_metadata()["last_error"]
+
+        with pytest.raises(TelemetrySinkError):
+            live_store.save_session("alice@corp", "s1", {"user_id": "alice@corp"})
+        with pytest.raises(TelemetrySinkError):
+            live_store.delete_session("alice@corp", "s1")
+        with pytest.raises(TelemetrySinkError):
+            live_store.list_sessions("alice@corp")
+    finally:
+        fail_client.close()

@@ -59,6 +59,13 @@ include = ["edgar_capstone*", "scripts*"]
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
 testpaths = ["tests"]
+markers = [
+    "live: exercises live GCP services (BigQuery, Vertex AI Search, GCS, Model Armor, Gemini)",
+]
+filterwarnings = [
+    "ignore:GOOGLE_GENAI_USE_VERTEXAI is deprecated:DeprecationWarning:google\\.adk",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:Warning",
+]
 
 # ------------------------------------------------------------------------------
 # Ruff lint + format gate (`make lint`, Cloud Build `lint-python`, GitHub Actions)

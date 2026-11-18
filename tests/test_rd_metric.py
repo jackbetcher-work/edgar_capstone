@@ -285,3 +285,98 @@ def test_vertex_ai_search_record_carries_rd_only_when_reported() -> None:
     without_rd = VertexAISearchManifestRecord.from_profile(_profile("JPM", 2026))
     assert with_rd.structData["research_and_development"] == 1.0e9
     assert "research_and_development" not in without_rd.structData
+
+
+def test_xbrl_facts_dotted_ticker_matches_brk_b_profile(tmp_path: Path) -> None:
+    """Relocated regression test: dotted ticker `BRK.B` matches hyphenated `BRK-B` staged directory."""
+    prof_dir = tmp_path / "structured" / "BRK-B"
+    prof_dir.mkdir(parents=True)
+    profile = _profile(
+        "BRK-B",
+        2025,
+        cik="0001067983",
+        period="2025-12-31",
+        accn="0000950170-26-000123",
+        revenue=370_000_000_000.0,
+    )
+    prof_path = prof_dir / "2025_financials.json"
+    prof_path.write_text(profile.model_dump_json(indent=2), encoding="utf-8")
+
+    company_facts = _companyfacts(
+        {
+            "ResearchAndDevelopmentExpense": [
+                _fact(
+                    420_000_000,
+                    start="2025-01-01",
+                    end="2025-12-31",
+                    accn="0000950170-26-000123",
+                    filed="2026-02-22",
+                )
+            ]
+        }
+    )
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _req: httpx.Response(200, json=company_facts))
+    ) as mock_http:
+        summary = backfill_research_and_development(
+            tmp_path,
+            tickers=["BRK.B"],
+            client=mock_http,
+            requests_per_second=1000.0,
+        )
+    assert summary.profiles_scanned == 1
+    assert summary.profiles_updated == 1
+    assert summary.profiles_with_value == 1
+    reloaded = FinancialDataProfile.model_validate_json(prof_path.read_text(encoding="utf-8"))
+    assert reloaded.research_and_development == 420_000_000.0
+
+    # Idempotent re-run with `overwrite_extracted=False` does not rewrite unchanged files
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _req: httpx.Response(200, json=company_facts))
+    ) as mock_http2:
+        again = backfill_research_and_development(
+            tmp_path,
+            tickers=["BRK.B"],
+            client=mock_http2,
+            overwrite_extracted=False,
+            requests_per_second=1000.0,
+        )
+    assert again.updated_paths == []
+
+
+def test_fetch_company_facts_retry_404_and_invalid_cik(monkeypatch) -> None:
+    """Covers `fetch_company_facts` invalid CIK, 404 -> None, 429/503 retry recovery, and exhaustion."""
+    import time
+
+    import pytest
+
+    from edgar_capstone.dataset.xbrl_facts import fetch_company_facts
+
+    monkeypatch.setattr(time, "sleep", lambda _s: None)
+
+    with httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={}))) as c:
+        with pytest.raises(ValueError, match="Invalid CIK"):
+            fetch_company_facts("not-a-cik", client=c)
+
+    with httpx.Client(transport=httpx.MockTransport(lambda _r: httpx.Response(404))) as c404:
+        assert fetch_company_facts("1045810", client=c404) is None
+
+    calls = {"n": 0}
+
+    def _retry_handler(req: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("reset", request=req)
+        if calls["n"] == 2:
+            return httpx.Response(429, request=req)
+        return httpx.Response(200, json={"facts": {}}, request=req)
+
+    with httpx.Client(transport=httpx.MockTransport(_retry_handler)) as c_retry:
+        assert fetch_company_facts("1045810", client=c_retry, max_attempts=3) == {"facts": {}}
+        assert calls["n"] == 3
+
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda req: httpx.Response(503, request=req))
+    ) as c_503:
+        with pytest.raises(httpx.HTTPStatusError):
+            fetch_company_facts("1045810", client=c_503, max_attempts=2)
