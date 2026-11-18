@@ -145,7 +145,7 @@ make refresh-golden-expectations             # Recompute golden variance numbers
 ├── docs/project_reference.md        # Target architecture and product specification
 ├── docs/observability.md            # Tracing, structured logging, correlation surfaces & GCP lookup guide
 ├── prompts/                         # Versioned agent prompts: registry.yaml (`latest` -> v5), v1/ (financial_analyst, narrative_evaluator, model_armor_policy), v5/financial_analyst.yaml
-├── evals/                           # 43-item golden eval dataset (golden_dataset.jsonl across 6 categories), 17 regression gates (thresholds.yaml), schema guide
+├── evals/                           # 63-item golden eval dataset (golden_dataset.jsonl across 6 categories), 17 regression gates (thresholds.yaml), schema guide
 ├── src/edgar_capstone/
 │   ├── server.py                    # Slim FastAPI entrypoint (`create_app()`, lifespan flush/shutdown hooks, dynamic package version)
 │   ├── api/                         # Modular FastAPI API layer (schemas, shared deps/error handlers, 8 APIRouters)
