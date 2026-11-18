@@ -57,7 +57,7 @@ Field names match the BigQuery columns (`terraform/schemas/golden_eval_set.json`
 | `category` | `single_company_longitudinal`, `multi_company_peer_comparison`, `thematic_shift`, `anomaly_explanation`, `out_of_corpus_and_clarification`, or `safety_red_team` |
 | `query` | Sent as-is to `run_conversational_rag_turn` (same path as `/api/v1/chat`, with `skip_background_judge=True` so the runner invokes the Flash judge once with `reference_explanation`) |
 | `tickers`, `fiscal_years`, `gics_sector` | The resolved scope the query must produce. `fiscal_years` is the inclusive window |
-| `expected_intent` | RootOrchestrator intent |
+| `expected_intent` | Deterministic query intent (`classify_query_intent` in `agents/intent.py`) |
 | `expected_variances[]` | `ticker`, `metric` (`revenue`, `operating_income`, `net_income`, `research_and_development`), effective `start_year`/`end_year`, golden `start_value`/`end_value`/`absolute_delta`/`percentage_delta`, and `required_in_narrative` |
 | `expected_sections[]` | `{ticker, fiscal_year, section_id}`; any field left out matches anything. Each one must be retrieved and cited |
 | `expected_deltas[]` | Annotated wording-delta expectations (`ticker`, `prior_fiscal_year`, `current_fiscal_year`, `change_type`: `added`/`removed`/`modified`, `keyword_hint`) for `thematic_shift` items |

@@ -1,5 +1,8 @@
 # Project Reference: SEC EDGAR Natural Language Analyst
 
+> [!NOTE]
+> This document is the target product and architecture reference specification. It is okay for the implemented architecture to diverge from this specification as long as the divergence is intentional and documented (e.g., simplifying the agent hierarchy, refactoring internal modules, or adjusting infrastructure defaults).
+
 ## 1. Overview
 A conversational, agentic interface that lets financial analysts ask complex natural language questions across SEC 10-K filings and structured financial data, replacing static dashboards. The system automates period-over-period financial variance reporting and longitudinal thematic analysis using hybrid search, deterministic calculation, and grounded Gemini synthesis.
 

@@ -20,12 +20,12 @@ flowchart TD
     T --> G["guardrail.inspect_user_prompt (+ Model Armor / SDP HTTP spans)"]
     T --> R["chat.resolve_scope / orchestrator.classify_intent"]
     T --> V["tool.calculate_period_variances"]
+    T --> AN["anomaly.attach_explanations"]
     T --> C["chat.retrieve_citations / tool.search_10k_chunks_rag (+ BigQuery, Vertex AI Search HTTP spans)"]
     T --> X["react.execute"]
     X --> E["react.evaluate_variances"]
     X --> Q["react.query_cached_10k / tool.query_cached_10k_context"]
     X --> M["sector.map_reduce (for GICS sector thematic queries)"]
-    X --> F["react.format_grounded_output"]
     X --> L["adk.run_agent_stream -> ADK invoke_agent / call_llm / execute_tool (+ Vertex AI Gemini HTTP spans)"]
     X -.->|Async off critical path| J["evaluation.narrative_judge"]
     T --> B["BigQuery insertAll HTTP spans (async pool -> telemetry + audit sinks)"]
@@ -33,11 +33,11 @@ flowchart TD
 ```
 
 - **Server span:** `opentelemetry-instrumentation-fastapi`. It continues the upstream W3C `traceparent` (or the legacy `X-Cloud-Trace-Context`), so Cloud Run's own request span and the app spans share one trace. Health probes and static assets are excluded (`EDGAR_TRACE_EXCLUDED_URLS`).
-- **App spans:** `@traced(...)` on the chat engine, intent router, ReAct steps, Model Armor guardrail, JWT verification, evaluator, and coding assistant. `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span that records attempts, `tool.retry` events, and error status.
+- **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.retrieve_citations`), intent router (`orchestrator.classify_intent`), anomaly explanation linker (`anomaly.attach_explanations`), ReAct steps (`react.execute`, `react.evaluate_variances`, `react.query_cached_10k`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and narrative evaluator. `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls (such as `prompt_store.py`).
 - **Model calls:** ADK's built-in `gcp.vertex.agent` spans (`invoke_agent`, `call_llm`, `execute_tool`) attach to the same global provider. Every recorded model call also adds an `llm.call` span event with `gen_ai.request.model`, input/output/cached/thinking tokens, `edgar.ttft_ms`, latency, and cost.
 - **Outbound HTTP:** `opentelemetry-instrumentation-httpx` creates client spans for Vertex AI (google-genai), BigQuery, Firestore, Model Armor, SDP, Secret Manager, and IAM Credentials, and propagates context on them.
 - **Thread hops:** `_run_coro_sync` (persistent background ADK `asyncio` event loop), `POST /api/v1/chat/stream` SSE worker threads, `sector.map_reduce` batch pools, and the off-critical-path background Flash judge pool all copy `contextvars` (`contextvars.copy_context().run` / `loop.create_task(coro, context=ctx)`), so live ADK runs, map-reduce batches, and background evaluations stay correlated under the parent request trace.
-- **Error access logging:** `RequestTelemetryMiddleware` emits `http_request_completed` inside a `finally` block so latency metrics and trace-linked access logs are recorded even when an unhandled exception raises HTTP `500`.
+- **Error & mid-stream access logging:** `RequestTelemetryMiddleware` emits `http_request_completed` inside a `finally` block so latency metrics and trace-linked access logs are recorded even when an unhandled exception raises HTTP `500`. If an exception occurs mid-stream after headers are already flushed (e.g., SSE on `/api/v1/chat/stream`), the original HTTP status code is preserved and the log sets `unhandled_exception: true` and `stream_aborted: true` (alongside an `http_request_failed` exception log at `ERROR`).
 - **Shutdown flushing:** FastAPI's lifespan shutdown hook flushes pending background judge futures (`flush_pending_evaluations`), async BigQuery streaming inserts (`flush_async_writes`), and OpenTelemetry trace spans (`flush_tracing`).
 
 ## Structured log format
@@ -50,7 +50,7 @@ Example `http_request_completed` access log line as written to stdout (`EDGAR_LO
   "message": "POST /api/v1/chat -> 200 (704.8 ms)",
   "time": "2026-11-16T20:04:41.603000+00:00",
   "logger": "edgar_capstone.access",
-  "logging.googleapis.com/sourceLocation": {"file": ".../middleware.py", "line": "161", "function": "_log_access"},
+  "logging.googleapis.com/sourceLocation": {"file": ".../middleware.py", "line": "178", "function": "_log_access"},
   "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
   "span_id": "00d73528256086a3",
   "logging.googleapis.com/trace": "projects/iron-radio-514217-q7/traces/4bf92f3577b34da6a3ce929d0e0e4736",
@@ -59,9 +59,14 @@ Example `http_request_completed` access log line as written to stdout (`EDGAR_LO
   "request": {"request_id": "4bf92f3577b34da6a3ce929d0e0e4736", "method": "POST", "path": "/api/v1/chat"},
   "event": "http_request_completed",
   "http_method": "POST",
+  "http_path": "/api/v1/chat",
   "http_route": "/api/v1/chat",
   "http_status": 200,
-  "latency_ms": 704.77
+  "latency_ms": 704.77,
+  "unhandled_exception": false,
+  "stream_aborted": false,
+  "user_agent": "Mozilla/5.0 ...",
+  "remote_ip": "10.128.0.12"
 }
 ```
 

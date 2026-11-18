@@ -2,7 +2,7 @@
 
 Conversational financial analysis workspace for querying SEC Form 10-K filings (Item 1A Risk Factors and Item 7 MD&A) alongside deterministic period-over-period financial metrics (Revenue, Operating Income, Net Income, and R&D expense).
 
-This document covers how to run, test, and operate the app, and lists the few remaining gaps against [`docs/project_reference.md`](docs/project_reference.md).
+This document covers how to run, test, and operate the app, and lists the few remaining gaps against [`docs/project_reference.md`](docs/project_reference.md). Intentional architectural divergence from the reference spec is fine as long as the trade-off is deliberate and documented.
 
 ---
 
@@ -176,7 +176,7 @@ make refresh-golden-expectations             # Recompute golden variance numbers
 │   │   └── middleware.py            # Per-request log context, `X-Trace-Id` / `Server-Timing` headers, latency access log (emitted in `finally` even on 500s)
 │   ├── agents/                      # PEP 562 lazy-loaded Google ADK agents, live Runner SSE engine, ReAct, map-reduce & scope validation
 │   │   ├── adapters/                # Modular GCP tool adapters: `bigquery.py`, `vertex_search.py`, `gcs.py`, `registry.py`
-│   │   ├── factories.py             # ADK agent factories (`build_edgar_agent`, `create_financial_analyst_agent`, `create_narrative_evaluator_agent`)
+│   │   ├── factories.py             # ADK agent factories (`build_edgar_agent`, `create_financial_analyst_agent` w/ `BuiltInPlanner` default thinking & `output_schema=AnalystReport`, `create_narrative_evaluator_agent`)
 │   │   ├── intent.py                # Deterministic query intent classification (`classify_query_intent`)
 │   │   ├── prompt_builders.py       # Compact prompt assembly, boundary-balanced evidence leads, judge citation selection
 │   │   ├── evaluation.py            # Flash LLM-as-a-Judge evaluator (`evaluate_variance_explanation`, `citation_precision_score`)
@@ -185,14 +185,19 @@ make refresh-golden-expectations             # Recompute golden variance numbers
 │   │   ├── scope_validation.py      # Dynamic 501-issuer `EntityCatalog` (dual-class CIK dedup, guarded `V`/Visa detection), all 11 GICS sectors, clarification & coverage notices
 │   │   ├── sector_map_reduce.py     # Full-sector batched map-reduce (single BQ `ML.DISTANCE` + `QUALIFY` query, parallel Flash batches + quote verifier, SSE progress)
 │   │   ├── react_loop.py            # Structured ReAct loop, single verification-guided live retry, async off-path Flash judge pool (`pending`/`None` -> `record_async_evaluation_result`) + clean atexit shutdown
-│   │   ├── financial_analyst.py     # `FinancialAnalystAgent` defaults (`BuiltInPlanner` w/ native default thinking, `output_schema=AnalystReport`)
+│   │   ├── financial_analyst.py     # Thin backward-compatibility re-export shim (`DEFAULT_ANALYST_MODEL`, `DEFAULT_ANALYST_PROMPT_VERSION`, `create_financial_analyst_agent`)
 │   │   ├── prompt_store.py          # Versioned prompt loader (local / GCS / Vertex AI) w/ `latest` registry resolution & `@retry_transient_errors` fallback
 │   │   ├── context_memory.py        # Model routing, `low_thinking_config_for_model`, `ContextLatencyTracker`, user-scoped Firestore session memory & deterministic compaction
 │   │   ├── callbacks.py             # Guardrails, first-chunk SSE TTFT capture & grounding callbacks
+│   │   ├── citations.py             # Canonical inline 10-K citation tag formatter & excerpt cleanup helpers
+│   │   ├── resilience.py            # `@with_tool_resilience` (ADK error dicts + `tool.<name>` spans) & `@retry_transient_errors` (propagating retry wrapper)
+│   │   ├── schemas.py               # Pydantic schemas for metrics, variances, citations, `AnalystReport`, and `NarrativeEvaluationReport`
 │   │   ├── structured_report.py     # Table-aware claim verification (honors SEC Markdown pipe tables & chunk scale), XBRL inline tags, deterministic coverage notices
+│   │   ├── variance_engine.py       # Deterministic financial metric conversion & multi-period / YoY variance calculation engine
+│   │   ├── hybrid_rag.py            # Parallel hybrid RAG retrieval combining BigQuery `VECTOR_SEARCH` and Vertex AI Search
 │   │   ├── material_variances.py    # `flag_material_variances`: deterministic anomaly rules + MD&A explanations with `period_of_report` & XBRL provenance
 │   │   ├── disclosure_deltas.py     # `compare_disclosures_across_years`: YoY wording deltas with both-year citations & chunk-fallback theme mention counts
-│   │   └── tools.py                 # ADK `FunctionTool` facade re-exporting `adapters/*` and pre-embedded 10-K passage ranking
+│   │   └── tools.py                 # ADK `FunctionTool` facade re-exporting `adapters/*`, `variance_engine.py`, `hybrid_rag.py`, and pre-embedded 10-K passage ranking
 │   ├── dataset/                     # SEC EDGAR 10-K XBRL + Markdown extraction pipeline (optional `[ingest]` extra for `edgartools`/`pandas`/`storage`)
 │   │   ├── fiscal_years.py          # Fiscal year focus resolution & reconciliation helpers
 │   │   ├── section_parser.py        # Item 1A / Item 7 Markdown cleaning, boundary truncation, and `rewrite_markdown_fiscal_year`
@@ -244,7 +249,7 @@ The app is never anonymous. IAP sits on the Cloud Run service, so anyone who ope
 
 ## Remaining Gaps vs. `docs/project_reference.md`
 
-Outstanding items remaining against [`docs/project_reference.md`](docs/project_reference.md). Section numbers (§) and objective IDs (B1–B3, T1–T3) refer to the reference spec.
+Outstanding items remaining against [`docs/project_reference.md`](docs/project_reference.md). Section numbers (§) and objective IDs (B1–B3, T1–T3) refer to the reference spec. *(Intentional architectural divergences — such as retiring unused supervisor agents or keeping Vertex AI Vector Search undeployed in favor of BigQuery `VECTOR_SEARCH` — are deliberate and documented rather than tracked as gaps.)*
 
 | Area | Spec | Priority | Status | Next Action |
 | :--- | :--- | :--- | :--- | :--- |

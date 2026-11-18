@@ -85,6 +85,7 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `context-cache-agent-sa`: `ContextCacheManager` / `ContextCacheAgent` identity (bucket-scoped `roles/storage.objectViewer` on `sec_corpus_bucket`, `roles/aiplatform.user`; zero BigQuery, Discovery Engine, or Secret Manager access).
   - `model-armor-guardrail-sa`: `ModelArmorGuardrail` identity (`roles/aiplatform.user` and `roles/logging.logWriter` only; zero data plane access).
   - Directed S2S `roles/iam.serviceAccountTokenCreator` edges (`sec-analyst-sa` -> agents, `RootOrchestrator` -> sub-agents, `FinancialAnalystAgent` -> `ContextCacheAgent` / `ModelArmorGuardrail`).
+  - *Note:* `root-orchestrator-agent-sa` and `context-cache-agent-sa` remain provisioned in Terraform and enforced in `security/agent_identity.py` for SPIFFE S2S workload identity attestation and IAM compatibility even though the unused legacy `RootOrchestrator` and `ContextCacheAgent` ADK classes were retired.
 - **Google Cloud Secret Manager & Keyless CI/CD Pipeline (`terraform/cicd_and_secrets.tf`):**
   - `google_secret_manager_secret.managed_secrets`: Provisions `sec-edgar-user-agent`, `sec-edgar-gemini-api-key`, and `sec-edgar-iap-audience` with automatic replication and zero plaintext secret values in IaC.
   - `google_artifact_registry_repository.sec_edgar_repo`: Docker container repository (`us-central1-docker.pkg.dev/iron-radio-514217-q7/sec-edgar-repo`).
@@ -126,6 +127,7 @@ terraform plan
 terraform apply
 
 # 3. Populate curated SEC 10-K filings & vector DB manifests into the Terraform-managed bucket and BigQuery
+# (Requires the optional `[ingest]` extra for edgartools/pandas/google-cloud-storage: `pip install -e ".[ingest]"` or `".[dev]"`)
 ../.venv/bin/python ../scripts/build_sec_dataset.py --sp500 --no-create-bucket
 # (Embeddings always come from Vertex AI text-embedding-005; the build fails if it is unavailable)
 ../.venv/bin/python ../scripts/build_vector_db.py

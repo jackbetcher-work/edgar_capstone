@@ -30,17 +30,25 @@ src/
 │   ├── GroundedMarkdown.tsx     # Markdown subset (###/#### headings, blockquotes, bullets, bold/code/italic) + clickable inline text & XBRL citation chips
 │   ├── MaterialFlagsCard.tsx    # Deterministic anomaly flags with period_of_report, xbrl_concept & clickable [XBRL] triggers
 │   ├── VarianceTableCard.tsx    # Deterministic variance table per company with period_of_report dates, DIFFERING FY-END DATES badge & [XBRL] triggers
-│   └── SourceInspectorPane.tsx  # Right pane: 3 tabs — Cited Chunk, Full 10-K Section, and XBRL Fact provenance tab
+│   ├── SourceInspectorPane.tsx  # Right pane shell hosting the 3 modular tabs under `inspector/`
+│   └── inspector/
+│       ├── CitationsTab.tsx     # Cited chunk list with section filter and excerpt navigation
+│       ├── FilingReaderTab.tsx  # Full 10-K Markdown section viewer with keyword search & highlight
+│       └── XbrlFactTab.tsx      # XBRL provenance inspector (accession, concept, derived calculation inputs, MD&A jump)
 ├── services/
+│   ├── httpClient.ts            # Shared authenticated fetch, `ApiAuthError` (401/403), and FastAPI/GCP JSON error extraction
 │   ├── authService.ts           # Bearer token storage, /api/v1/auth/* calls, OIDC fragment handling
-│   └── edgarApi.ts              # SSE streaming (/api/v1/chat/stream), /api/v1/chat, /sessions, /companies, /section, /feedback (live backend only; no offline fallback)
+│   └── edgarApi.ts              # SSE streaming (/api/v1/chat/stream), /companies, /section, /feedback (live backend only; no offline fallback)
 ├── types/edgar.ts               # API response, SSE progress, NumericCitation, CoverageNotice & XBRL types
-└── utils/formatters.ts          # USD / percent / bps / period-end date formatting, combined text+XBRL citation parser & status badges
+└── utils/
+    ├── citationTokens.ts        # Builds canonical inline-citation tokens for the source pane
+    ├── formatters.ts            # USD / percent / bps / period-end date formatting, combined text+XBRL citation parser & status badges
+    └── xbrlFactSelection.ts     # Maps variance rows, anomaly flags, and inline XBRL chips to `XbrlFactSelection` records
 ```
 
 ## How answers are rendered
 
-The UI streams turns over **`POST /api/v1/chat/stream`** (SSE) with live progress events (`connected`, `scope_resolved`, `sector_map_progress`, `synthesizing`, `result`, `error`). `POST /api/v1/chat` remains supported as a non-streaming endpoint.
+The UI streams turns over **`POST /api/v1/chat/stream`** (SSE) with live progress events (`connected`, `scope_resolved`, `sector_map_progress`, `synthesizing`, `result`, `error`). The backend also retains `POST /api/v1/chat` and `/api/v1/sessions` for non-streaming / programmatic API clients, though their unused frontend wrappers were removed from `edgarApi.ts`.
 
 Responses return `answer_markdown` containing:
 - **Inline text citation tags:** `[TICKER FYxxxx | Section Title | chunk_id](sec_filing_url)` — opens the **Cited Chunk** / **Full Section** view in `SourceInspectorPane`.
