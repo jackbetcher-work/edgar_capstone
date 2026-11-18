@@ -179,7 +179,7 @@ See [`docs/observability.md`](docs/observability.md) for configuration variables
 
 ## Evaluation
 
-`make eval-all` runs the 63-item golden dataset ([`evals/golden_dataset.jsonl`](evals/golden_dataset.jsonl)) through the live chat pipeline. It exits non-zero if any gate in [`evals/thresholds.yaml`](evals/thresholds.yaml) regresses. The gates cover:
+`make eval-all` runs the 30-item golden dataset ([`evals/golden_dataset.jsonl`](evals/golden_dataset.jsonl)) through the live chat pipeline. It exits non-zero if any gate in [`evals/thresholds.yaml`](evals/thresholds.yaml) regresses. The gates cover:
 
 - Numeric agreement
 - Citation coverage and grounding recall

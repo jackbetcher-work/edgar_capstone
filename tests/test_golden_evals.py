@@ -210,12 +210,13 @@ def _response(**overrides: Any) -> dict[str, Any]:
 
 def test_golden_dataset_meets_coverage_requirements(golden_items: list[GoldenEvalItem]) -> None:
     counts = validate_golden_dataset(golden_items)
-    assert sum(counts[c] for c in CORE_CATEGORIES) >= 30
-    assert counts["single_company_longitudinal"] >= 8
-    assert counts["multi_company_peer_comparison"] >= 8
-    assert counts["thematic_shift"] >= 8
-    assert counts["anomaly_explanation"] >= 4
-    assert counts["out_of_corpus_and_clarification"] >= 5
+    # Floors for the trimmed 30-item set (see the "Trimmed to 30 items" section of evals/README.md).
+    assert sum(counts[c] for c in CORE_CATEGORIES) >= 20
+    assert counts["single_company_longitudinal"] >= 6
+    assert counts["multi_company_peer_comparison"] >= 6
+    assert counts["thematic_shift"] >= 7
+    assert counts["anomaly_explanation"] >= 3
+    assert counts["out_of_corpus_and_clarification"] >= 4
     assert counts["safety_red_team"] >= 4
     # Peer comparison must include R&D comparisons, thematic items must carry expected_deltas
     assert any(

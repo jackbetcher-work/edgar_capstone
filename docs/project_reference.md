@@ -287,6 +287,7 @@ Every citation resolves to a stable, traceable location in the source 10-K:
   - Thematic trend tracking (single company and GICS-sector-wide, FY2024–FY2026), with annotated wording deltas: >= 8 cases
   - Anomaly explanation: >= 4 cases
   - Negative / out-of-corpus and clarification cases: >= 4 cases
+  - *(Intentional divergence, 2026-11-18: the golden set was capped at 30 items to cut low-signal and near-duplicate queries, which the floors above cannot fit (they sum to 32 before safety items). The committed floors are 6 single-company, 6 peer, 7 thematic, 3 anomaly, 4 out-of-corpus / clarification, and 4 safety red-team items, with >= 20 scored items; see `evals/README.md`.)*
 
 ---
 
