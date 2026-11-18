@@ -201,7 +201,7 @@ See [`evals/README.md`](evals/README.md) for the record schema and gate definiti
 
 ## Deployment and Access
 
-- **CI/CD:** [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) uses keyless Workload Identity Federation. It runs lint, tests, and a container smoke test, then `eval-all` on `main`, then deploys to Cloud Run. [`cloudbuild.yaml`](cloudbuild.yaml) defines an equivalent Cloud Build pipeline.
+- **CI/CD:** [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) uses keyless Workload Identity Federation. It runs lint, tests, and a container smoke test, an optional `eval-all` stage on `main` (defaults to `skip`; set `EVAL_GATE_MODE` or `eval_mode` to `advisory` or `blocking` to enable), then deploys to Cloud Run. [`cloudbuild.yaml`](cloudbuild.yaml) defines an equivalent Cloud Build pipeline (`_EVAL_GATE_MODE`, default `skip`).
 - **Infrastructure:** everything is provisioned by Terraform; see [`terraform/README.md`](terraform/README.md).
 - **Access:** IAP fronts the Cloud Run service, so the app is never anonymous. To share it:
   1. Add groups or domains to `iap_authorized_principals` in [`terraform/variables.tf`](terraform/variables.tf) or a tfvars file. Individual `user:` bindings are rejected.

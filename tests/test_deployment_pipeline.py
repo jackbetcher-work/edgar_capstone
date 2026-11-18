@@ -116,15 +116,33 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert "-e GOOGLE_APPLICATION_CREDENTIALS=/tmp/adc.json" in build_run
     assert "ADC_DIR" not in build_run
 
-    # Stage 2.5: eval (depends on build, runs live golden eval regression gates before deploy)
+    # Stage 2.5: eval (depends on build, optional golden eval regression gates before deploy; default skip)
+    eval_input = triggers["workflow_dispatch"]["inputs"]["eval_mode"]
+    assert eval_input["default"] == "skip"
+    assert set(eval_input["options"]) == {"skip", "advisory", "blocking"}
+
     eval_job = jobs["eval"]
     assert eval_job.get("needs") == "build"
+    assert "(inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'skip'" in eval_job["if"]
+    assert (
+        eval_job["continue-on-error"]
+        == "${{ (inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'blocking' }}"
+    )
     eval_steps_str = json.dumps(eval_job["steps"])
     assert "scripts/run_evals.py --write-bigquery" in eval_steps_str
+    advisory_step = next(
+        s for s in eval_job["steps"] if s.get("name") == "Report advisory eval result"
+    )
+    assert (
+        "(inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'blocking'" in advisory_step["if"]
+    )
 
     # Stage 3: deploy (depends on build and eval, uses keyless WIF + Secret Manager + Cloud Run)
     deploy_job = jobs["deploy"]
     assert deploy_job.get("needs") == ["build", "eval"]
+    assert "!cancelled()" in deploy_job["if"]
+    assert "needs.build.result == 'success'" in deploy_job["if"]
+    assert "(inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'blocking'" in deploy_job["if"]
     deploy_uses = [step.get("uses", "") for step in deploy_job["steps"]]
     assert any("google-github-actions/auth@" in u for u in deploy_uses)
     assert any("google-github-actions/get-secretmanager-secrets@" in u for u in deploy_uses)
@@ -223,9 +241,12 @@ def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
 
     eval_step = steps_by_id["eval"]
     assert eval_step["waitFor"] == ["build"]
+    assert cb["substitutions"]["_EVAL_GATE_MODE"] == "skip"
     eval_cmd = " ".join(eval_step["args"])
     assert "scripts/run_evals.py --write-bigquery" in eval_cmd
     assert eval_cmd.index('"${_PIPELINE_MODE}" != "deploy"') < eval_cmd.index("run_evals.py")
+    assert eval_cmd.index('case "${_EVAL_GATE_MODE}" in') < eval_cmd.index("run_evals.py")
+    assert '"${_EVAL_GATE_MODE}" = "blocking"' in eval_cmd
 
     deploy_step = steps_by_id["deploy"]
     assert deploy_step["waitFor"] == ["build", "eval"]

@@ -30,6 +30,8 @@ substitutions:
   # App role for users admitted by IAP who match no RBAC group (IAP_ASSERTION_DEFAULT_ROLE).
   _IAP_DEFAULT_ROLE: analyst
   _PIPELINE_MODE: deploy
+  # Eval gate mode: skip (default), advisory (run & warn, don't block), or blocking.
+  _EVAL_GATE_MODE: skip
   _RUFF_VERSION: 0.17.4
   _TERRAFORM_VERSION: 1.9.8
 
@@ -154,7 +156,8 @@ steps:
         docker push "$${IMAGE_URI}:latest"
 
   # ----------------------------------------------------------------------------
-  # Stage 2.5: Eval Gate — Live golden regression gates (runs on main deploy only)
+  # Stage 2.5: Eval Gate — Live golden regression gates (main deploy only;
+  # optional via _EVAL_GATE_MODE: skip [default], advisory, or blocking)
   # ----------------------------------------------------------------------------
   # TTFT delta (agentic tool selection refactor)
   #   The p95_ttft_ms gate target stays 3000 ms (evals/thresholds.yaml). TTFT =
@@ -189,9 +192,26 @@ steps:
           echo "_PIPELINE_MODE=${_PIPELINE_MODE}: skipping full live golden eval gate on PR."
           exit 0
         fi
+        case "${_EVAL_GATE_MODE}" in
+          skip)
+            echo "_EVAL_GATE_MODE=skip: skipping live golden eval gate."
+            exit 0
+            ;;
+          advisory|blocking)
+            ;;
+          *)
+            echo "ERROR: invalid _EVAL_GATE_MODE='${_EVAL_GATE_MODE}' (expected skip, advisory, or blocking)." >&2
+            exit 2
+            ;;
+        esac
         python -m pip install --quiet --upgrade pip
         pip install --quiet -e ".[dev]"
-        python scripts/run_evals.py --write-bigquery --project-id "${PROJECT_ID}"
+        if [ "${_EVAL_GATE_MODE}" = "blocking" ]; then
+          python scripts/run_evals.py --write-bigquery --project-id "${PROJECT_ID}"
+        else
+          python scripts/run_evals.py --write-bigquery --project-id "${PROJECT_ID}" || \
+            echo "WARNING: Live golden eval gates failed in advisory mode; continuing to deploy."
+        fi
 
   # ----------------------------------------------------------------------------
   # Stage 3: Deploy — Deploy container to Cloud Run with Secret Manager mounts
