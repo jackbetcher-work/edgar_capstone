@@ -43,6 +43,14 @@ from edgar_capstone.agents.citations import merge_citations
 from edgar_capstone.agents.hybrid_rag import _execute_live_gcp_hybrid_rag
 from edgar_capstone.agents.resilience import with_tool_resilience
 from edgar_capstone.agents.schemas import GroundedCitation
+from edgar_capstone.agents.tool_runtime import (
+    STATE_CALCULATED_VARIANCES,
+    STATE_CHUNK_HEALTH,
+    STATE_LOOKER_RESULTS,
+    STATE_VARIANCE_MISSING_TICKERS,
+    cached_turn_profiles,
+    variance_map,
+)
 from edgar_capstone.agents.variance_engine import (
     _build_variance_reports_from_profiles,
     _compute_single_metric_variance,
@@ -480,14 +488,14 @@ def query_looker_financial_explore(
             services_hit=["bigquery"],
         )
 
-    if (
-        tool_context is not None
-        and hasattr(tool_context, "state")
-        and explore_key != "chunk_health"
-    ):
-        history = list(tool_context.state.get("looker_query_results", []))
-        history.append(result)
-        tool_context.state["looker_query_results"] = history
+    if tool_context is not None and hasattr(tool_context, "state"):
+        if explore_key == "chunk_health":
+            if result.get("status") == "success":
+                tool_context.state[STATE_CHUNK_HEALTH] = result
+        else:
+            history = list(tool_context.state.get(STATE_LOOKER_RESULTS) or [])
+            history.append(result)
+            tool_context.state[STATE_LOOKER_RESULTS] = history
     return result
 
 
@@ -500,8 +508,11 @@ def calculate_period_variances(
 ) -> dict[str, Any]:
     """Performs deterministic period-over-period variance calculations for Revenue, Operating Income, Net Income, and R&D expense.
 
-    Separates arithmetic calculation from LLM narrative synthesis. Always call this tool first
-    before explaining financial changes so narrative claims match deterministic numbers 100%.
+    Separates arithmetic calculation from LLM narrative synthesis. Call this tool whenever the
+    question asks about reported financial figures (revenue, operating income, net income,
+    R&D spend, margins, growth, CAGR, or a peer financial comparison) so narrative claims match
+    deterministic numbers 100%. Do NOT call it for purely qualitative questions (risk-factor
+    wording, disclosure themes) that do not ask about financial figures.
 
     Args:
         tickers: Comma-separated ticker symbols (e.g., 'NVDA' or 'NVDA,AAPL').
@@ -518,12 +529,23 @@ def calculate_period_variances(
             "message": "Please specify at least one ticker symbol (e.g., 'NVDA' or 'NVDA,AAPL').",
         }
 
-    # Fetch start_year - 1 so the initial year's YoY step delta is populated
-    profiles = _gcp_adapters().bigquery.fetch_profiles(
-        tickers=ticker_filter,
-        start_year=start_year - 1,
-        end_year=end_year,
-    )
+    # Fetch start_year - 1 so the initial year's YoY step delta is populated. Inside a chat
+    # turn the cached BigQuery profile catalog is reused (same `financial_metrics` rows, 0 RPCs).
+    lo_year = int(start_year) - 1
+    cached = cached_turn_profiles()
+    if cached:
+        profiles = [
+            p
+            for p in cached
+            if normalize_edgar_ticker(p.ticker) in ticker_filter
+            and lo_year <= int(p.fiscal_year) <= int(end_year)
+        ]
+    else:
+        profiles = _gcp_adapters().bigquery.fetch_profiles(
+            tickers=ticker_filter,
+            start_year=lo_year,
+            end_year=end_year,
+        )
     _record_gcp_backend_invocation(
         tool_context,
         tool_name="calculate_period_variances",
@@ -539,10 +561,13 @@ def calculate_period_variances(
     )
 
     if tool_context is not None and hasattr(tool_context, "state"):
-        calc_state = dict(tool_context.state.get("calculated_variances", {}))
-        for rep in reports:
-            calc_state[f"{rep['ticker']}_{rep['start_year']}_{rep['end_year']}"] = rep
-        tool_context.state["calculated_variances"] = calc_state
+        calc_state = dict(tool_context.state.get(STATE_CALCULATED_VARIANCES) or {})
+        calc_state.update(variance_map(reports))
+        tool_context.state[STATE_CALCULATED_VARIANCES] = calc_state
+        prior_missing = set(tool_context.state.get(STATE_VARIANCE_MISSING_TICKERS) or [])
+        tool_context.state[STATE_VARIANCE_MISSING_TICKERS] = sorted(
+            prior_missing | set(missing_tickers)
+        )
 
     return {
         "status": "success",

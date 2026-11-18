@@ -150,8 +150,10 @@ def test_dockerfile_dockerignore_and_makefile_ship_no_corpus() -> None:
         "COPY --chown=appuser:appgroup data/",
     ):
         assert removed not in dockerfile, removed
-    for asset in ("prompts/ ./prompts/", "looker/ ./looker/", "/frontend/dist ./frontend/dist"):
+    for asset in ("prompts/ ./prompts/", "/frontend/dist ./frontend/dist"):
         assert asset in runtime_stage
+    # The un-deployed LookML semantic layer was removed; it must not ship in the image.
+    assert "looker/" not in dockerfile
     assert "COPY --from=builder --chown=appuser:appgroup /opt/venv /opt/venv" in runtime_stage
     assert runtime_stage.index("COPY --from=builder") < runtime_stage.index("USER appuser")
 

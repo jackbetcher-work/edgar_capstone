@@ -116,6 +116,9 @@ def _is_cached_bundle_healthy(bundle: ExtractedFilingBundle) -> bool:
         return False
     if truncate_at_section_boundary(sec_7, item_id="item_7") != sec_7:
         return False
+    # Mid-sentence truncation (trailing comma from edgartools cutting inside a cross-reference).
+    if sec_1a.endswith(",") or sec_7.endswith(","):
+        return False
     # If one section is full-sized SEC text (>=2k chars) and the other is a tiny fragment (<1.5k),
     # treat as truncated so full-document/exhibit fallback can recover it.
     if (

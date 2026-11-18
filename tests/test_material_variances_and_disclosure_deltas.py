@@ -493,17 +493,24 @@ def _assert_citations_resolve(resp: dict[str, Any]) -> None:
         assert any(c.startswith("acc:") for c in cited)
 
 
-def test_live_chat_turn_attaches_explained_material_flags() -> None:
+def test_live_anomaly_turn_attaches_explained_material_flags() -> None:
+    """Anomaly / inflection question: the live agent invokes variances AND anomaly flags."""
     resp = run_conversational_rag_turn(
-        query="How did NVIDIA's revenue, operating income, and net income change from 2024 to 2026?",
-        tickers="NVDA",
-        start_year=2024,
-        end_year=2026,
+        query="Why did Intel's net income turn negative between 2023 and 2025?",
+        tickers="INTC",
+        start_year=2023,
+        end_year=2025,
     )
     assert resp["status"] == "success"
     assert resp["execution_mode"] == "live_adk"
+    invoked = set(resp["adk_runtime"]["agent_invoked_tools"])
+    assert "flag_material_variances" in invoked, resp["adk_runtime"]["adk_tool_calls"]
     summary = resp["material_variance_summary"]
     assert summary["total_flags"] >= len(resp["material_variance_flags"]) > 0
+    assert any(
+        f["ticker"] == "INTC" and f["metric"] == "net_income"
+        for f in resp["material_variance_flags"]
+    )
     assert any(s["tool"] == "flag_material_variances" for s in resp["agent_trace"])
     known = {c["chunk_id"] for c in resp["citations"]}
     for flag in resp["material_variance_flags"]:

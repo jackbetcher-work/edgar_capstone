@@ -98,6 +98,39 @@ output "chunk_health_monitoring_dashboard_id" {
   value       = google_monitoring_dashboard.chunk_health_dashboard.id
 }
 
+output "chunk_health_monitoring_dashboard_url" {
+  description = "Cloud Console URL of the RAG vector DB chunk health dashboard."
+  value       = local.chunk_health_dashboard_console_url
+}
+
+output "llm_observability_dashboard_id" {
+  description = "Resource ID of the Cloud Monitoring dashboard for LLM telemetry, cost, sessions, and security audit."
+  value       = google_monitoring_dashboard.llm_observability_dashboard.id
+}
+
+output "llm_observability_dashboard_url" {
+  description = "Cloud Console URL of the LLM telemetry, cost, sessions, and security audit dashboard."
+  value       = "https://console.cloud.google.com/monitoring/dashboards/builder/${element(split("/", google_monitoring_dashboard.llm_observability_dashboard.id), 3)}?project=${var.project_id}"
+}
+
+output "observability_log_based_metrics" {
+  description = "Names of the low-cardinality sec_edgar/* log-based metrics backing the Cloud Monitoring dashboards and alert policies."
+  value = sort(concat(
+    [google_logging_metric.api_request_latencies.name],
+    [for m in google_logging_metric.telemetry_distributions : m.name],
+    [for m in google_logging_metric.telemetry_counters : m.name],
+  ))
+}
+
+output "observability_alert_policy_ids" {
+  description = "Resource names of the Cloud Monitoring alert policies (p95 latency, 5xx errors, auth/guardrail blocks)."
+  value = {
+    api_latency_p95       = google_monitoring_alert_policy.api_latency_p95.name
+    api_5xx_errors        = google_monitoring_alert_policy.api_5xx_errors.name
+    security_audit_blocks = google_monitoring_alert_policy.security_audit_blocks.name
+  }
+}
+
 output "analyst_service_account_email" {
   description = "Email of the custom SEC Analyst runtime service account (sec-analyst-sa@<project>.iam.gserviceaccount.com)."
   value       = local.runtime_service_account_email
@@ -202,8 +235,28 @@ output "security_audit_logs_table_fqn" {
 }
 
 output "telemetry_cost_and_latency_view_fqn" {
-  description = "Fully-qualified BigQuery BI view aggregating daily LLM token cost, cached-token savings, and p95 latency for Looker."
+  description = "Fully-qualified BigQuery SQL semantic view aggregating exact daily LLM token cost, cached-token savings, and p95 latency (source of truth for cumulative USD totals)."
   value       = "${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.v_telemetry_cost_and_latency.table_id}"
+}
+
+output "session_analytics_summary_view_fqn" {
+  description = "Fully-qualified BigQuery SQL view rolling up interactive turns vs async LLM-as-a-Judge evaluations by day, intent, and execution mode."
+  value       = "${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.v_session_analytics_summary.table_id}"
+}
+
+output "security_audit_summary_view_fqn" {
+  description = "Fully-qualified BigQuery SQL view rolling up security audit events (denials, guardrail blocks, principals, SPIFFE attestations) by day, event type, status, and identity provider."
+  value       = "${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.v_security_audit_summary.table_id}"
+}
+
+output "ops_logs_dataset_id" {
+  description = "Dedicated BigQuery dataset receiving the Cloud Logging -> BigQuery project sink (null when enable_bigquery_logging_sink = false)."
+  value       = var.enable_bigquery_logging_sink ? google_bigquery_dataset.sec_edgar_ops_logs[0].dataset_id : null
+}
+
+output "logging_sink_writer_identity" {
+  description = "Writer identity of sec-edgar-telemetry-audit-bq-sink (granted roles/bigquery.dataEditor on the ops-logs dataset only)."
+  value       = var.enable_bigquery_logging_sink ? google_logging_project_sink.telemetry_and_audit_to_bigquery[0].writer_identity : null
 }
 
 output "firestore_feedback_database_name" {

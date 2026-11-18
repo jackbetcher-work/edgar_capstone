@@ -193,6 +193,60 @@ def compact_evidence_leads(
     return leads
 
 
+def _scope_structure_label(scope: dict[str, Any]) -> str:
+    tickers = [t for t in str(scope.get("tickers_csv") or "ALL").split(",") if t and t != "ALL"]
+    sector = str(scope.get("gics_sector") or "ALL")
+    if not tickers and sector not in ("ALL", "", "*"):
+        return f"sector-wide (no companies named; GICS sector `{sector}`)"
+    if len(tickers) > 1:
+        return f"multi-company ({len(tickers)} companies)"
+    if len(tickers) == 1:
+        return "single company"
+    return "corpus-wide (no company or sector filter)"
+
+
+def build_tool_selection_policy(scope: dict[str, Any], *, has_prior_outputs: bool = False) -> str:
+    """Agent-driven deterministic tool policy: invoke engines ONLY when the question needs them."""
+    tickers_csv = scope.get("tickers_csv", "ALL")
+    years = f"start_year={scope.get('start_year')}, end_year={scope.get('end_year')}"
+    preamble = (
+        "The deterministic outputs you already produced this turn are included above; do NOT "
+        "re-invoke those tools. Invoke another engine only if the question needs it."
+        if has_prior_outputs
+        else "No variance tables, anomaly flags, or disclosure deltas were computed for this "
+        "request. Invoke a deterministic engine ONLY when the question needs its output; "
+        "whatever you invoke is shown to the user as a table or card next to your answer, "
+        "so do not invoke engines the question does not ask about."
+    )
+    return "\n".join(
+        [
+            "## Deterministic Tool Selection (you decide; nothing is pre-computed)",
+            preamble,
+            "- `calculate_period_variances(tickers, start_year, end_year)`: call when the question "
+            "asks about reported financial figures (revenue, operating income, net income, R&D "
+            "spend, margins, growth, CAGR) or compares companies on them. Do NOT call it for "
+            "purely qualitative questions (risk-factor wording, disclosure themes, strategy). "
+            f"Scope: `tickers={tickers_csv}`, `{years}`.",
+            "- `flag_material_variances(tickers, start_year, end_year, explain_top_flags)`: call "
+            "ONLY when the question asks about anomalies: unusual swings, inflections, a profit "
+            "turning into a loss (or back), margin shifts, or why a figure spiked or collapsed. "
+            "Usually pair it with `calculate_period_variances`. Keep `explain_top_flags=true` so "
+            "the top flags arrive with MD&A passages (`explanation.chunk_id`).",
+            "- `compare_disclosures_across_years(theme, tickers, gics_sector, section_id, "
+            "start_year, end_year)`: call when the question asks how specific companies' 10-K "
+            "wording on a theme changed across fiscal years.",
+            "- `sector_thematic_map_reduce(theme, gics_sector, section_id, start_year, end_year)`: "
+            "call for sector-wide thematic questions (no companies named, a GICS sector in scope); "
+            "it scans every issuer in the sector. Do not also call "
+            "`compare_disclosures_across_years` for the same sector theme.",
+            "- `query_looker_financial_explore(explore_name, ...)`: `sector_benchmarks` / "
+            "`peer_comparison` for sector-level financial benchmarks, `chunk_health` for vector "
+            "index / corpus health questions.",
+            f"- Scope structure: {_scope_structure_label(scope)}.",
+        ]
+    )
+
+
 def build_retrieval_instructions(
     scope: dict[str, Any],
     variance_evaluations: list[dict[str, Any]],
@@ -210,12 +264,11 @@ def build_retrieval_instructions(
     ]
     lines = [
         "## 10-K Retrieval Guidance (Synthesize First When Leads Suffice)",
-        "Full 10-K sections are NOT in this request. The **10-K Evidence Leads**, "
-        "**Material Variance Flag excerpts**, **Disclosure Deltas**, and **Sector Map-Reduce "
-        "Summaries** above already include verbatim retrieved filing passages with canonical "
-        "`chunk_id`s. If they already cover every ticker and fiscal year needed to answer the "
-        "user's question accurately, synthesize your `AnalystReport` directly WITHOUT calling "
-        "extra tools.",
+        "Full 10-K sections are NOT in this request. The **10-K Evidence Leads** above (and any "
+        "tool output you request: flag explanations, disclosure deltas, sector map-reduce "
+        "summaries) include verbatim filing passages with canonical `chunk_id`s. If they already "
+        "cover every ticker and fiscal year needed to answer the user's question accurately, "
+        "synthesize your `AnalystReport` directly WITHOUT calling extra retrieval tools.",
         "Call retrieval tools ONLY to fill a specific missing gap (e.g. a missing start/end fiscal "
         "year or an unretrieved ticker/section):",
         "- `query_cached_10k_context(ticker, fiscal_year, section_id, variance_query, max_passages)`: "
@@ -224,11 +277,6 @@ def build_retrieval_instructions(
         "- `search_10k_chunks_rag(query, tickers, gics_sector, section_id, start_year, end_year, "
         "top_k)`: hybrid search across filings, for peer comparisons, thematic questions, and "
         "changes across fiscal years.",
-        "- `compare_disclosures_across_years(theme, tickers, gics_sector, section_id, start_year, "
-        "end_year)`: deterministic year-over-year wording comparison (added / removed / modified "
-        "passages with both-year chunk_ids). Use only if disclosure deltas are not already above.",
-        "- `flag_material_variances(tickers, start_year, end_year)`: deterministic anomaly flags "
-        "for companies or years the payload does not cover.",
         f"- Scope: tickers `{scope.get('tickers_csv', 'ALL')}`, sector "
         f"`{scope.get('gics_sector', 'ALL')}`, sections `{scope.get('section_id', 'ALL')}`, "
         f"fiscal years `FY{scope.get('start_year')}`–`FY{scope.get('end_year')}`.",
@@ -396,8 +444,9 @@ def build_financial_reasoning_prompt(
     sections: list[str] = [
         f"## Analyst Query\n{query.strip()}",
         (
-            f"## Resolved Scope & Intent\n"
-            f"- Intent: `{intent}`\n"
+            f"## Resolved Scope\n"
+            f"- Scope structure: {_scope_structure_label(scope)} (provisional routing "
+            f"hint: `{intent}`; classify the final intent yourself in `AnalystReport.intent`)\n"
             f"- Tickers: `{scope.get('tickers_csv', 'ALL')}`\n"
             f"- GICS Sector: `{scope.get('gics_sector', 'ALL')}`\n"
             f"- Section Filter: `{scope.get('section_id', 'ALL')}`\n"
@@ -463,6 +512,19 @@ def build_financial_reasoning_prompt(
             "## 10-K Evidence Leads (pre-retrieved passages — cite directly or extend with tools)\n"
             f"```json\n{_compact_json(leads)}\n```"
         )
+    sections.append(
+        build_tool_selection_policy(
+            scope,
+            has_prior_outputs=bool(
+                variance_reports
+                or material_variance_flags
+                or disclosure_deltas
+                or sector_map_summaries
+                or sector_benchmarks
+                or chunk_health
+            ),
+        )
+    )
     sections.append(build_retrieval_instructions(scope, variance_evaluations))
     if verification_feedback:
         sections.append(
@@ -475,7 +537,11 @@ def build_financial_reasoning_prompt(
         )
     sections.append(
         "## Answer Format\n"
-        "Answer with a concise `AnalystReport` JSON (`headline`, `key_metrics`, `findings`). "
+        "Answer with a concise `AnalystReport` JSON (`intent`, `headline`, `key_metrics`, "
+        "`findings`). `intent` is one of `thematic_trend_tracking` (wording / disclosure or "
+        "theme change across years or a sector; takes precedence), "
+        "`multi_company_peer_comparison`, `longitudinal_single_company`, or "
+        "`chunk_health_monitoring`. "
         "There is NO `notes` field: every qualitative claim must be a verified finding in `findings` "
         "with `chunk_ids` from your tools or the evidence leads plus a verbatim `evidence_quote` "
         "(10-40 words) copied exactly from one of those chunks. For multi-year or peer queries, "
@@ -485,7 +551,9 @@ def build_financial_reasoning_prompt(
         "must appear in its quote or in the deterministic payload / flags. Findings that fail "
         "verification are dropped. `key_metrics` are references only (`ticker` + `metric`); exact "
         "values, `period_of_report` dates, and XBRL provenance citations are rendered automatically "
-        "from the engine."
+        "from `calculate_period_variances`. List ONLY the metrics the question asks about (e.g. "
+        "only `research_and_development` for an R&D question) and leave `key_metrics` EMPTY for "
+        "qualitative, risk-factor, or wording-change questions."
     )
     return "\n\n".join(sections)
 
@@ -536,6 +604,22 @@ def build_narrative_evaluation_prompt(
     reference_explanation: str | None = None,
 ) -> str:
     """Assemble the evaluation prompt for `NarrativeEvaluatorAgent` (Gemini 3.5 Flash)."""
+    if variance_reports:
+        variance_block = (
+            "### Deterministic Variance Calculations\n"
+            f"```json\n{json.dumps(variance_reports, default=str)}\n```\n\n"
+        )
+    else:
+        variance_block = (
+            "### Deterministic Variance Calculations\n"
+            "None for this turn: the analyst did not invoke the variance engine because the "
+            "question is qualitative (risk factors, disclosure wording, themes). This is "
+            "expected. Do NOT penalize the report for lacking variance tables, Key Metrics, or "
+            "XBRL figures; score `numeric_fidelity_score` only on figures the report actually "
+            "states (1.0 when every stated figure matches its cited passage, or when it states "
+            "none), and score `explanation_quality_score` on how well the cited passages answer "
+            "the question asked.\n\n"
+        )
     eval_prompt = (
         "Evaluate the following synthesized SEC 10-K variance report against the deterministic "
         "calculation outputs and retrieved citations. Return JSON matching NarrativeEvaluationReport, "
@@ -543,8 +627,7 @@ def build_narrative_evaluation_prompt(
         "actually supports the exact claim alongside it, 0.0 to 1.0) and `unsupported_claims_count` "
         "(integer count of narrative claims not supported by the cited passage or deterministic payload).\n\n"
         f"### Analyst Query\n{query}\n\n"
-        "### Deterministic Variance Calculations\n"
-        f"```json\n{json.dumps(variance_reports, default=str)}\n```\n\n"
+        f"{variance_block}"
         f"### Retrieved 10-K Citations (cached_explanations_count={cached_explanations_count})\n"
         f"```json\n{json.dumps(judge_citations, default=str)}\n```\n\n"
         f"### Synthesized Narrative Report Under Evaluation\n{response_markdown}\n"
@@ -575,6 +658,7 @@ __all__ = [
     "build_material_flags_prompt_section",
     "build_narrative_evaluation_prompt",
     "build_retrieval_instructions",
+    "build_tool_selection_policy",
     "compact_evidence_leads",
     "compact_variance_reports_for_prompt",
     "select_citations_for_judge",

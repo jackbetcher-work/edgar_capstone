@@ -41,6 +41,7 @@ import type {
   ParsedInlineCitationToken,
   ParsedInlineXbrlToken,
 } from './utils/formatters'
+import { getRenderableVarianceReports } from './utils/deterministicEvidence'
 import { buildXbrlFactFromInlineToken } from './utils/xbrlFactSelection'
 
 const DEFAULT_FILTERS: SearchScopeFilters = {
@@ -366,9 +367,10 @@ export function App() {
         )
       )
 
-      if (resp.citations.length > 0) {
-        setActiveCitations(resp.citations)
-        setActiveChunkId(resp.citations[0].chunk_id)
+      const respCitations = resp.citations ?? []
+      if (respCitations.length > 0) {
+        setActiveCitations(respCitations)
+        setActiveChunkId(respCitations[0].chunk_id)
         setSourceTab('citations')
         setIsSourcePaneOpen(true)
       }
@@ -414,7 +416,10 @@ export function App() {
     token: ParsedInlineXbrlToken,
     turn: ConversationTurn
   ) => {
-    const reports = turn.response?.variance_reports ?? []
+    // variance_reports is only populated when the agent invoked
+    // calculate_period_variances; with no report, the fact is built from the
+    // inline XBRL token alone.
+    const reports = getRenderableVarianceReports(turn.response)
     const matchedRep = reports.find(
       (r) => r.ticker.toUpperCase() === token.ticker.toUpperCase()
     )

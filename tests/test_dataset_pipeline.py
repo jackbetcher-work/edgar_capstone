@@ -865,3 +865,337 @@ def test_revenue_reconciled_against_total_revenues_and_other_top_line() -> None:
     assert rev == 11.075e9
     assert prov.revenue == "us-gaap:Revenues"
     assert not any("outside 0.5x-1.5x" in n for n in prov.notes)
+
+
+def test_section_parser_parenthesized_escaped_and_quoted_item_headings() -> None:
+    risk_body = "Material business and market risks could adversely affect our operations. " * 40
+    # Parenthesized `Item 1(a)` + inline quoted cross-ref heading + split bold + `| --- | --- |` glue
+    hal_md = (
+        "| Item 1(a). | Risk Factors | 9 |\n"
+        "| Item 1(b). | Unresolved Staff Comments | 19 |\n\n"
+        "See “\n\n### Item 1(a). Risk Factors.\u201d\n\n"
+        "**Hydraulic fracturing** business description text. "
+        * 40
+        + "\n\n| 9 | Table of Contents | Item 1(a) \\| Risk Factors |\n"
+        "| --- | --- | **Item 1\\(a\\)\\. Risk ** **Factors** **\\.**\n\n"
+        + risk_body
+        + "\n\n**Item 1\\(b\\)\\. Unresolved Staff Comments\\.**\n\nNone\\.\n"
+    )
+    empty_tenk = SimpleNamespace(sections={}, risk_factors=None, management_discussion=None)
+    filing = SimpleNamespace(markdown=lambda: hal_md, attachments=[])
+    extracted = _extract_single_section(
+        empty_tenk,
+        section_keys=("part_i_item_1a", "item_1a"),
+        fallback_attr="risk_factors",
+        item_key="Item 1A",
+        item_id="item_1a",
+        filing=filing,
+        markdown_cache={},
+    )
+    assert extracted is not None
+    assert "Material business and market risks" in extracted
+    assert "Hydraulic fracturing" not in extracted
+    assert "Unresolved Staff Comments" not in extracted
+
+    # Boundary truncation also trims parenthesized `Item 1(b)` and `Item 7(a)` bleed
+    bled_1a = risk_body + "\n\n**ITEM 1 \\(B\\)\\. UNRESOLVED STAFF COMMENTS**\n\nNone\\."
+    assert "UNRESOLVED STAFF" not in truncate_at_section_boundary(bled_1a, item_id="item_1a")
+    bled_7 = (
+        _MDNA_BODY + "\n\n**ITEM 7 \\(A\\)\\. QUANTITATIVE AND QUALITATIVE DISCLOSURES**\n\nFX."
+    )
+    assert "QUANTITATIVE" not in truncate_at_section_boundary(bled_7, item_id="item_7")
+
+    # Escaped periods (`Item 1\.A\.` / `Item 1\.B\.`)
+    rol_md = (
+        "| Item 1.A. | Risk Factors. | 10 |\n"
+        "| Item 1.B. | Unresolved Staff Comments. | 15 |\n\n"
+        + ("Company overview prose. " * 250)
+        + "\n\nItem 1\\.A\\. Risk Factors\n\n"
+        + risk_body
+        + "\n\nItem 1\\.B\\. Unresolved Staff Comments\n\nNone\\.\n"
+    )
+    rol_extracted = _extract_single_section(
+        empty_tenk,
+        section_keys=("part_i_item_1a", "item_1a"),
+        fallback_attr="risk_factors",
+        item_key="Item 1A",
+        item_id="item_1a",
+        filing=SimpleNamespace(markdown=lambda: rol_md, attachments=[]),
+        markdown_cache={},
+    )
+    assert rol_extracted is not None and "Material business and market risks" in rol_extracted
+
+
+def test_section_parser_multiline_split_and_inline_glued_headings() -> None:
+    empty_tenk = SimpleNamespace(sections={}, risk_factors=None, management_discussion=None)
+    body = _MDNA_BODY * 2
+
+    # 1. Apostrophe broken onto its own line (`# ITEM 7. MANAGEMENT\n\n<u>’</u>\n\n**S DISCUSSION...**`)
+    jbht_md = (
+        ("Intro text padding. " * 300) + "\n\n# ITEM 7. MANAGEMENT\n\n<u>\u2019</u>\n\n"
+        "**S DISCUSSION AND ANALYSIS OF FINANCIAL CONDITION AND RESULTS OF OPERATIONS**\n\n"
+        + body
+        + "\n\n# ITEM 7A. QUANTITATIVE AND QUALITATIVE DISCLOSURES ABOUT MARKET RISK\n\nRates.\n"
+    )
+    got_jbht = _extract_single_section(
+        empty_tenk,
+        section_keys=("part_ii_item_7", "item_7"),
+        fallback_attr="management_discussion",
+        item_key="Item 7",
+        item_id="item_7",
+        filing=SimpleNamespace(markdown=lambda: jbht_md, attachments=[]),
+        markdown_cache={},
+    )
+    assert got_jbht is not None and "Critical Accounting Estimates" in got_jbht
+    assert "QUANTITATIVE" not in got_jbht
+
+    # 2. Inline-glued heading after `<u>Index</u>` + wrapped Annual Report title + split bold words
+    de_md = (
+        ("Padding content before item 7. " * 200) + "\n\nTable of Contents\n\n"
+        "**MANAGEMENT\u2019S** **DISCUSSION** **AND** **ANALYSIS** "
+        "Management\u2019s Discussion and Analysis overview. "
+        + body
+        + "\n\nTable of Contents COMPANY\n\n**STATEMENTS**\n\n## OF\n\n"
+        "**CONSOLIDATED**\n\n**INCOM**\n\n**E**\n\n| Net sales | $100 |\n"
+    )
+    got_de = _extract_single_section(
+        empty_tenk,
+        section_keys=("part_ii_item_7", "item_7"),
+        fallback_attr="management_discussion",
+        item_key="Item 7",
+        item_id="item_7",
+        filing=SimpleNamespace(markdown=lambda: de_md, attachments=[]),
+        markdown_cache={},
+    )
+    assert got_de is not None and "Critical Accounting Estimates" in got_de
+    assert "Net sales" not in got_de
+    assert not got_de.rstrip().endswith("**")
+
+    # 3. Reversed MD&A clause order + wrapped heading + bare plain-text RISK FACTORS & auditor headings
+    risk_body = "Supply chain and fuel price volatility risks could affect our earnings. " * 60
+    fdx_md = (
+        ("Padding before financial section. " * 200)
+        + "\n\n| Management\u2019s Discussion and Analysis of Results of Operations and Financial Condition |  |\n"
+        "| Overview of Financial Section | 55 |\n"
+        "| Risk Factors | 88 |\n\n"
+        "MANAGEMENT\u2019S DISCUSSION AND ANALYSIS OF RESULTS OF OPERATIONS AND\n\n"
+        "FINANCIAL CONDITION\n\n"
+        + body
+        + "\n\nRISK FACTORS\n\n"
+        + risk_body
+        + "\n\nMANAGEMENT\u2019S REPORT ON INTERNAL\n\nCONTROL OVER FINANCIAL REPORTING\n\nDone.\n"
+    )
+    cache: dict[str, object] = {}
+    filing_fdx = SimpleNamespace(markdown=lambda: fdx_md, attachments=[])
+    got_fdx_7 = _extract_single_section(
+        empty_tenk,
+        section_keys=("part_ii_item_7", "item_7"),
+        fallback_attr="management_discussion",
+        item_key="Item 7",
+        item_id="item_7",
+        filing=filing_fdx,
+        markdown_cache=cache,
+    )
+    got_fdx_1a = _extract_single_section(
+        empty_tenk,
+        section_keys=("part_i_item_1a", "item_1a"),
+        fallback_attr="risk_factors",
+        item_key="Item 1A",
+        item_id="item_1a",
+        filing=filing_fdx,
+        markdown_cache=cache,
+    )
+    assert got_fdx_7 is not None
+    assert "Overview of Financial Section | 55" not in got_fdx_7
+    assert "Critical Accounting Estimates" in got_fdx_7
+    assert "Supply chain and fuel price" not in got_fdx_7
+    assert got_fdx_1a is not None
+    assert "Supply chain and fuel price" in got_fdx_1a
+    assert "CONTROL OVER FINANCIAL REPORTING" not in got_fdx_1a
+
+
+def test_section_parser_ex13_short_title_caption_and_inline_risk_heading() -> None:
+    body = _MDNA_BODY * 2
+    risk_body = "An investment in the Company involves substantial market risk. " * 60
+
+    # 1. Cross-ref quoted caption ("Financial Review") in EX-13
+    stub_wfc = (
+        "Information in response to this Item 7 can be found in the 2025 Annual Report "
+        "to Shareholders under \u201cFinancial Review.\u201d That information is incorporated by reference."
+    )
+    ex13_wfc = (
+        "| 2 | Financial Review | 114 | Notes |\n| 62 | Risk Factors | 134 | Notes |\n\n"
+        "**Financial Review**\n\n"
+        + body
+        + "\n\n| Risk Factors |\n\n"
+        + risk_body
+        + "\n\n| Controls and Procedures |\n\nEffective.\n"
+    )
+    tenk_wfc = SimpleNamespace(
+        sections={"part_ii_item_7": SimpleNamespace(markdown=lambda: stub_wfc)},
+        risk_factors=None,
+        management_discussion=stub_wfc,
+    )
+    filing_wfc = SimpleNamespace(
+        markdown=lambda: "Short 10-K shell. " * 100,
+        attachments=[
+            SimpleNamespace(document_type="EX-13", document="ar.htm", markdown=lambda: ex13_wfc)
+        ],
+    )
+    got_wfc_7 = _extract_single_section(
+        tenk_wfc,
+        section_keys=("part_ii_item_7", "item_7"),
+        fallback_attr="management_discussion",
+        item_key="Item 7",
+        item_id="item_7",
+        filing=filing_wfc,
+        markdown_cache={},
+    )
+    assert got_wfc_7 is not None and "Critical Accounting Estimates" in got_wfc_7
+    assert "substantial market risk" not in got_wfc_7
+
+    # 2. EX-13 running page-header table with page numbers ("Management Discussion" -> "Report of Management | 39 |")
+    ex13_ibm = (
+        "| MANAGEMENT DISCUSSION |  |\n| --- | --- |\n| Overview | 6 |\n| Report of Management | 39 |\n\n"
+        "| 6 | Management Discussion Example Corp |\n\n" + body + "\n\n<u>Table of Contents</u>\n\n"
+        "| Report of Management Example Corp | 39 |\n\n"
+        "**Management Responsibility for Financial Information**\n\nAudit text.\n"
+    )
+    tenk_ibm = SimpleNamespace(
+        sections={},
+        risk_factors=None,
+        management_discussion="Refer to pages 6 through 38 incorporated herein by reference.",
+    )
+    filing_ibm = SimpleNamespace(
+        markdown=lambda: "Short 10-K shell. " * 100,
+        attachments=[
+            SimpleNamespace(
+                document_type="EX-13", document="ibm_ex13.htm", markdown=lambda: ex13_ibm
+            )
+        ],
+    )
+    got_ibm_7 = _extract_single_section(
+        tenk_ibm,
+        section_keys=("part_ii_item_7", "item_7"),
+        fallback_attr="management_discussion",
+        item_key="Item 7",
+        item_id="item_7",
+        filing=filing_ibm,
+        markdown_cache={},
+    )
+    assert got_ibm_7 is not None
+    assert "Overview | 6" not in got_ibm_7
+    assert "Critical Accounting Estimates" in got_ibm_7
+    assert "Management Responsibility" not in got_ibm_7
+
+    # 3. Inline-glued EX-13 `# Risk Factors  An investment...` ending at `Managing Committee`
+    ex13_usb = (
+        ("Padding before risk factors. " * 300)
+        + "employed 68,108 people\\. # Risk Factors  "
+        + risk_body
+        + "\n\n| 150 |\n\nManaging Committee Jane Doe CEO bio.\n"
+    )
+    filing_usb = SimpleNamespace(
+        markdown=lambda: "Short 10-K shell. " * 100,
+        attachments=[
+            SimpleNamespace(
+                document_type="EX-13", document="usb_ex13.htm", markdown=lambda: ex13_usb
+            )
+        ],
+    )
+    got_usb_1a = _extract_single_section(
+        SimpleNamespace(sections={}, risk_factors=None, management_discussion=None),
+        section_keys=("part_i_item_1a", "item_1a"),
+        fallback_attr="risk_factors",
+        item_key="Item 1A",
+        item_id="item_1a",
+        filing=filing_usb,
+        markdown_cache={},
+    )
+    assert got_usb_1a is not None and "substantial market risk" in got_usb_1a
+    assert "CEO bio" not in got_usb_1a
+
+
+def test_wrong_anchor_guards_bleed_and_mid_sentence_truncation() -> None:
+    # Forward cross-ref opening inside Item 1 Business rejected as Item 1A
+    bad_1a = (
+        'Risk factors associated with our business are discussed in Item 1.A. "Risk Factors."\n\n'
+        + ("Our strategic objectives and business overview. " * 150)
+    )
+    assert not is_substantive_section_markdown(bad_1a, item_id="item_1a")
+
+    # Item 6 Selected Financial Data rejected as Item 7
+    bad_7_item6 = (
+        "The following selected historical consolidated financial data should be read in conjunction "
+        + ("with our financial statements. " * 120)
+    )
+    assert not is_substantive_section_markdown(bad_7_item6, item_id="item_7")
+
+    # Footnote body (`8. Income Taxes`) rejected when short Item 7
+    bad_7_note = (
+        "Company has operating and finance leases. " * 80
+        + "\n\n8. Income Taxes\n\nDeferred tax asset details.\n"
+    )
+    assert not is_substantive_section_markdown(bad_7_note, item_id="item_7")
+
+    # Bare plain-text auditor report trims Item 7 bleed; `# PROPERTIES` trims Item 1A bleed
+    body = "Liquidity and capital resources discussion. " * 80
+    assert (
+        truncate_at_section_boundary(
+            body + "\n\nReport of Independent Registered Public Accounting Firm\n\nWe audited...",
+            item_id="item_7",
+        )
+        == body.strip()
+    )
+    assert (
+        truncate_at_section_boundary(
+            body + "\n\n# PROPERTIES\n\nStore counts.",
+            item_id="item_1a",
+        )
+        == body.strip()
+    )
+
+    # Trailing comma mid-sentence truncation defers to full-document fallback
+    truncated_1a = (
+        "Investing in our securities involves risk. " * 80
+    ) + "please see Part II, Item 7,"
+    full_1a = (
+        ("Padding before risk factors. " * 250)
+        + "\n\n### ITEM 1A\u2014RISK FACTORS\n\n"
+        + ("Complete risk factor discussion text. " * 160)
+        + "\n\n### ITEM 1B\u2014UNRESOLVED STAFF COMMENTS\n\nNone.\n"
+    )
+    tenk_trunc = SimpleNamespace(
+        sections={"risk_factors": SimpleNamespace(markdown=lambda: truncated_1a)},
+        risk_factors=truncated_1a,
+        management_discussion=None,
+    )
+    got_full_1a = _extract_single_section(
+        tenk_trunc,
+        section_keys=("part_i_item_1a", "item_1a"),
+        fallback_attr="risk_factors",
+        item_key="Item 1A",
+        item_id="item_1a",
+        filing=SimpleNamespace(markdown=lambda: full_1a, attachments=[]),
+        markdown_cache={},
+    )
+    assert got_full_1a is not None and "Complete risk factor discussion text" in got_full_1a
+
+    # Prefix-mangled `part_ii_item_7m` section key is discovered (while `part_ii_item_7a` is excluded)
+    tenk_mangled = SimpleNamespace(
+        sections={
+            "part_ii_item_7a": SimpleNamespace(markdown=lambda: "Market risk table. " * 150),
+            "part_ii_item_7m": SimpleNamespace(markdown=lambda: _MDNA_BODY),
+        },
+        risk_factors=None,
+        management_discussion="Short intro.",
+    )
+    got_mangled = _extract_single_section(
+        tenk_mangled,
+        section_keys=("part_ii_item_7", "item_7"),
+        fallback_attr="management_discussion",
+        item_key="Item 7",
+        item_id="item_7",
+        filing=None,
+    )
+    assert got_mangled is not None and "Critical Accounting Estimates" in got_mangled

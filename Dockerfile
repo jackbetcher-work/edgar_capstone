@@ -64,11 +64,11 @@ RUN groupadd --gid 10001 appgroup && \
 WORKDIR /app
 
 # Runtime assets only: the installed package (incl. `scripts.container_smoke_test`),
-# the compiled Terminal UI, versioned prompts, and the LookML semantic layer.
+# the compiled Terminal UI, and versioned prompts. Analytics live in BigQuery SQL views
+# and Cloud Monitoring dashboards (Terraform-managed), so no BI semantic layer ships here.
 COPY --from=builder --chown=appuser:appgroup /opt/venv /opt/venv
 COPY --from=frontend-builder --chown=appuser:appgroup /frontend/dist ./frontend/dist
 COPY --chown=appuser:appgroup prompts/ ./prompts/
-COPY --chown=appuser:appgroup looker/ ./looker/
 
 USER appuser
 

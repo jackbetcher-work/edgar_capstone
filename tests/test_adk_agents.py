@@ -28,7 +28,6 @@ from edgar_capstone.agents import (
     before_model_safety_and_latency_callback,
     before_model_telemetry_callback,
     calculate_period_variances,
-    classify_query_intent,
     create_financial_analyst_agent,
     create_narrative_evaluator_agent,
     fetch_financial_metrics,
@@ -37,7 +36,10 @@ from edgar_capstone.agents import (
     search_10k_chunks_rag,
     with_tool_resilience,
 )
-from edgar_capstone.agents.intent import classify_query_intent as intent_classify_query_intent
+from edgar_capstone.agents.intent import (
+    infer_intent_from_tool_calls,
+    resolve_turn_intent,
+)
 from edgar_capstone.agents.tools import get_active_gcp_tool_adapters
 
 
@@ -95,29 +97,67 @@ def test_adk_agent_factories_and_tool_registration() -> None:
     assert "search_10k_chunks_rag" in tool_names
     assert "query_cached_10k_context" in tool_names
     assert "compare_disclosures_across_years" in tool_names
+    assert "sector_thematic_map_reduce" in tool_names
     # Targeted retrieval only: the synthesis agent cannot pull whole 10-K sections
     assert "load_cached_10k_section" not in tool_names
 
 
-def test_intent_routing_classification() -> None:
-    assert classify_query_intent is intent_classify_query_intent
-    assert (
-        classify_query_intent("Compare NVIDIA and Apple's R&D spend from 2024-2026")
-        == "multi_company_peer_comparison"
+def test_intent_is_agent_emitted_with_non_lexical_tool_fallback() -> None:
+    """Keyword intent classification is gone; the agent emits intent, tools/scope back it up."""
+    import edgar_capstone.agents.intent as intent_mod
+
+    for removed in (
+        "classify_query_intent",
+        "CHUNK_HEALTH_RE",
+        "_CHUNK_HEALTH_RE",
+        "_THEMATIC_KEYWORDS_RE",
+        "_PEER_COMPARE_RE",
+    ):
+        assert not hasattr(intent_mod, removed), removed
+        assert not hasattr(agents_mod, removed), removed
+
+    single = {"tickers": ["NVDA"], "gics_sector": "ALL"}
+    peers = {"tickers": ["NVDA", "AAPL"], "gics_sector": "ALL"}
+    sector = {"tickers": [], "gics_sector": "Information Technology"}
+
+    # The agent's structured intent wins when it is a canonical value
+    assert resolve_turn_intent(agent_intent="thematic_trend_tracking", scope=single) == (
+        "thematic_trend_tracking",
+        "agent",
     )
+    # Unknown / missing agent intent -> deterministic inference from tools + scope structure
+    assert resolve_turn_intent(agent_intent="bogus", scope=peers) == (
+        "multi_company_peer_comparison",
+        "tool_inference",
+    )
+    assert infer_intent_from_tool_calls(single) == "longitudinal_single_company"
+    assert infer_intent_from_tool_calls(sector) == "thematic_trend_tracking"
     assert (
-        classify_query_intent(
-            "How has the wording on AI risk changed across all tech companies since 2024?"
-        )
+        infer_intent_from_tool_calls(single, [{"name": "compare_disclosures_across_years"}])
         == "thematic_trend_tracking"
     )
     assert (
-        classify_query_intent("Explain NVIDIA's FY2024 to FY2026 revenue variance")
-        == "longitudinal_single_company"
+        infer_intent_from_tool_calls(
+            {"tickers": [], "gics_sector": "ALL"},
+            [{"name": "query_looker_financial_explore", "args": {"explore_name": "chunk_health"}}],
+        )
+        == "chunk_health_monitoring"
     )
     assert (
-        classify_query_intent("Show me the vector database chunk health metrics")
-        == "chunk_health_monitoring"
+        infer_intent_from_tool_calls(
+            sector,
+            [
+                {
+                    "name": "query_looker_financial_explore",
+                    "args": {"explore_name": "sector_benchmarks"},
+                }
+            ],
+        )
+        == "multi_company_peer_comparison"
+    )
+    # Query wording never changes the inferred intent (no lexical classification)
+    assert infer_intent_from_tool_calls(single, [{"name": "calculate_period_variances"}]) == (
+        "longitudinal_single_company"
     )
 
 

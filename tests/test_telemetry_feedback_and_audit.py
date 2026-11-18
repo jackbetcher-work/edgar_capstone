@@ -1,4 +1,4 @@
-"""Tests for BigQuery Telemetry & Audit Streaming Sinks, Firestore Feedback Store, and LookML Semantic Layer."""
+"""Tests for BigQuery Telemetry & Audit Streaming Sinks, Firestore Feedback Store, and /health."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from typing import Any
 
 import httpx
 import pytest
-import yaml
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
 from google.auth.exceptions import DefaultCredentialsError
@@ -47,7 +46,6 @@ from edgar_capstone.telemetry import (
     configure_telemetry_stores,
     decode_firestore_document,
     encode_firestore_fields,
-    load_lookml_project_catalog,
     reset_telemetry_stores,
 )
 
@@ -736,63 +734,15 @@ def test_firestore_feedback_strict_vs_auto_fallback() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 4. Real LookML Semantic Layer, Dashboards & New Explores
+# 4. /health Surface, Pruned Routes & BigQuery-backed Explore Tool
 # ---------------------------------------------------------------------------
 
 
-def test_lookml_catalog_views_models_and_dashboards_validity(
+def test_health_pruned_routes_and_bigquery_explores(
     auth_client_env: dict[str, Any],
 ) -> None:
-    """Verify LookML manifest, model explores, view SQL table bindings, and YAML dashboard schemas."""
-    catalog = load_lookml_project_catalog()
-    assert catalog["status"] == "ok"
-    assert catalog["manifest_present"] is True
-    assert catalog["model_count"] == 1
-    assert catalog["view_count"] == 6
-    assert catalog["dashboard_count"] == 2
-
-    model_info = catalog["models"][0]
-    assert model_info["model_name"] == "sec_edgar_analytics"
-    expected_explores = {
-        "yoy_variances",
-        "sector_benchmarks",
-        "peer_comparison",
-        "chunk_health",
-        "llm_telemetry_and_cost",
-        "session_analytics",
-        "security_audit_logs",
-    }
-    assert set(model_info["explores"]) == expected_explores
-
-    # Every LookML view's sql_table_name must correspond to a real Terraform BigQuery table or view
-    bq_tf = (REPO_ROOT / "terraform" / "bigquery.tf").read_text(encoding="utf-8")
-    telem_tf = (REPO_ROOT / "terraform" / "telemetry.tf").read_text(encoding="utf-8")
-    combined_tf = bq_tf + "\n" + telem_tf
-
-    for view in catalog["views"]:
-        sql_table = view["sql_table_name"]
-        assert sql_table is not None, f"Missing sql_table_name in {view['file']}"
-        bare_table = sql_table.strip("`").split(".")[-1]
-        assert bare_table in combined_tf, (
-            f"LookML view {view['view_name']} references {bare_table}, which is not defined in Terraform"
-        )
-        assert view["dimension_count"] >= 4
-        assert view["measure_count"] >= 3
-
-    # Parse both `.dashboard.lookml` files as YAML and validate elements reference `sec_edgar_analytics`
-    for dash_meta in catalog["dashboards"]:
-        dash_path = REPO_ROOT / dash_meta["file"]
-        parsed_docs = yaml.safe_load(dash_path.read_text(encoding="utf-8"))
-        assert isinstance(parsed_docs, list) and len(parsed_docs) == 1
-        dash_obj = parsed_docs[0]
-        assert "dashboard" in dash_obj
-        elements = dash_obj.get("elements", [])
-        assert len(elements) >= 4
-        for elem in elements:
-            assert elem["model"] == "sec_edgar_analytics"
-            assert elem["explore"] in expected_explores
-
-    # Verify `/health`, pruned Looker/telemetry routes return 404, direct Looker explore calls,
+    """Verify `/health`, pruned-route 404s, and the BigQuery-backed `query_looker_financial_explore`."""
+    # Verify `/health`, pruned Looker/telemetry routes return 404, direct explore tool calls,
     # and retained `/api/v1/chat`, `/api/v1/section`, and `/api/v1/telemetry/sessions`
     client: TestClient = auth_client_env["client"]
     analyst_jwt = auth_client_env["mint_token"](
@@ -805,11 +755,12 @@ def test_lookml_catalog_views_models_and_dashboards_validity(
     assert health.status_code == 200
     health_json = health.json()
     assert health_json["root_agent"] == "FinancialAnalystAgent"
-    assert health_json["lookml_semantic_layer"]["model_count"] == 1
-    assert health_json["lookml_semantic_layer"]["view_count"] == 6
-    assert health_json["lookml_semantic_layer"]["dashboard_count"] == 2
-    assert "telemetry_sink" in health_json
-    assert "feedback_store" in health_json
+    # The un-deployed LookML semantic layer was removed; analytics live in BigQuery SQL views
+    # and Cloud Monitoring dashboards, so `/health` no longer reports a LookML catalog.
+    assert "lookml_semantic_layer" not in health_json
+    for key in ("observability", "telemetry_sink", "feedback_store", "session_memory"):
+        assert key in health_json
+    assert "data_backend" in health_json
 
     # Verify retained section viewer endpoint logs a real audit event
     sec_resp = client.get(
@@ -841,12 +792,6 @@ def test_lookml_catalog_views_models_and_dashboards_validity(
     # Pruned HTTP routes return 404; underlying Python helpers stay directly callable
     assert client.get("/api/v1/looker/catalog", headers=headers).status_code == 404
     assert client.get("/api/v1/telemetry/context-latency", headers=headers).status_code == 404
-
-    direct_catalog = load_lookml_project_catalog()
-    assert direct_catalog["status"] == "ok"
-    assert direct_catalog["model_count"] == 1
-    assert direct_catalog["view_count"] == 6
-    assert direct_catalog["dashboard_count"] == 2
 
     for explore_slug in ("llm_telemetry", "session_analytics", "audit_trail"):
         assert client.get(f"/api/v1/explore/{explore_slug}", headers=headers).status_code == 404

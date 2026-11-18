@@ -56,6 +56,9 @@ _ADK_RUNTIME_KEYS = {
     "structured_report",
     "report_verification",
     "agent_retrieval",
+    "agent_invoked_tools",
+    "agent_intent",
+    "key_metric_backfill_tickers",
 }
 
 
@@ -280,7 +283,12 @@ def test_conversational_rag_turn_executes_live_gemini_end_to_end() -> None:
     assert turn["report_verification"]["usable"] is True
     assert not turn["answer_markdown"].startswith("### Answer withheld")
 
-    # Key metrics are the deterministic engine's figures for the same live BigQuery rows
+    # The live agent chose the variance engine for this quantitative question; key metrics are
+    # the deterministic engine's figures for the same live BigQuery rows.
+    assert "calculate_period_variances" in runtime["agent_invoked_tools"] or runtime[
+        "key_metric_backfill_tickers"
+    ] == ["NVDA"], runtime["adk_tool_calls"]
+    assert turn["intent"] == "longitudinal_single_company"
     direct = calculate_period_variances(tickers="NVDA", start_year=2024, end_year=2026)
     nvda = direct["variance_reports"][0]
     turn_nvda = next(r for r in turn["variance_reports"] if r["ticker"] == "NVDA")
@@ -357,8 +365,9 @@ def test_unverifiable_live_answer_is_withheld_not_replaced() -> None:
     reasons = " ".join(verification["findings"][0]["reasons"])
     assert "figures not in the quote" in reasons and "99.99%" in reasons
     assert "too short" not in reasons and "not found" not in reasons  # only the figure fails
-    # Deterministic outputs for the turn are still returned
-    assert turn["variance_reports"] and turn["citations"]
+    # The scripted agent invoked no deterministic engine, so no variance table is attached;
+    # the retrieved evidence for the turn is still returned.
+    assert turn["variance_reports"] == [] and turn["citations"]
 
 
 def test_live_narrative_evaluator() -> None:

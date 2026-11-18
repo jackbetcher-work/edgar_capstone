@@ -26,6 +26,11 @@ import { DisclosureDeltaCard } from './DisclosureDeltaCard'
 import { GroundedMarkdown } from './GroundedMarkdown'
 import { MaterialFlagsCard } from './MaterialFlagsCard'
 import { VarianceTableCard } from './VarianceTableCard'
+import {
+  getRenderableMaterialFlags,
+  getRenderableVarianceReports,
+  isRenderableDisclosureDeltas,
+} from '../utils/deterministicEvidence'
 
 interface ChatTurnItemProps {
   turn: ConversationTurn
@@ -103,6 +108,20 @@ export function ChatTurnItem({
 
   const resp = turn.response
   const intentMeta = resp ? getIntentDisplayMeta(resp.intent) : null
+  const citations = resp?.citations ?? []
+  // Deterministic engines are agent-invoked tools: only render a card when the
+  // agent actually called the corresponding tool and it produced output.
+  const varianceReports = getRenderableVarianceReports(resp)
+  const materialFlags = getRenderableMaterialFlags(resp)
+  const rawDisclosureDeltas = resp?.disclosure_deltas
+  const disclosureDeltas = isRenderableDisclosureDeltas(rawDisclosureDeltas)
+    ? rawDisclosureDeltas
+    : null
+  const showVarianceCard = varianceReports.length > 0
+  const showFlagsCard = materialFlags.length > 0
+  const showDisclosureCard = disclosureDeltas !== null
+  const hasDeterministicEvidence =
+    showVarianceCard || showFlagsCard || showDisclosureCard
 
   return (
     <article
@@ -163,7 +182,7 @@ export function ChatTurnItem({
                 <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
                 <span className="truncate">
                   {turn.progressMessage ||
-                    'COMPUTING XBRL VARIANCES & RETRIEVING 10-K FILINGS...'}
+                    'ANALYZING QUERY & RETRIEVING 10-K EVIDENCE...'}
                 </span>
               </div>
               <div className="flex items-center gap-2 text-[10px] text-ink-muted shrink-0">
@@ -285,14 +304,14 @@ export function ChatTurnItem({
                 </span>
               )}
 
-              {resp.citations.length > 0 && (
+              {citations.length > 0 && (
                 <button
                   id={`btn-focus-citations-${turn.id}`}
                   type="button"
-                  onClick={() => onFocusTurnCitations(resp.citations)}
+                  onClick={() => onFocusTurnCitations(citations)}
                   className="px-1.5 py-0.2 text-[10px] uppercase btn-terminal-key cursor-pointer"
                 >
-                  [{resp.citations.length} SOURCES]
+                  [{citations.length} SOURCES]
                 </button>
               )}
 
@@ -379,52 +398,64 @@ export function ChatTurnItem({
             </div>
           )}
 
-          {/* Deterministic Variance Table */}
-          {resp.variance_reports.length > 0 && (
-            <VarianceTableCard
+          {/* Grounded Markdown Narrative (direct answer) with Interactive Inline Citations */}
+          <div id={`grounded-answer-${turn.id}`} role="region" aria-label="Grounded Answer">
+            <GroundedMarkdown
               turnId={turn.id}
-              reports={resp.variance_reports}
-              onInspectFilingSection={onInspectFilingSection}
-              onInspectXbrlFact={onInspectXbrlFact}
+              markdown={resp.answer_markdown ?? ''}
+              activeChunkId={activeChunkId}
+              onSelectCitation={(token) =>
+                onSelectInlineCitation(token, citations)
+              }
+              onSelectXbrlCitation={
+                onSelectXbrlCitation
+                  ? (token) => onSelectXbrlCitation(token, turn)
+                  : undefined
+              }
             />
-          )}
+          </div>
 
-          {/* Deterministic Anomaly Flags */}
-          {resp.material_variance_flags && resp.material_variance_flags.length > 0 && (
-            <MaterialFlagsCard
-              turnId={turn.id}
-              flags={resp.material_variance_flags}
-              totalFlags={resp.material_variance_summary?.total_flags}
-              citations={resp.citations}
-              onSelectCitation={(token) => onSelectInlineCitation(token, resp.citations)}
-              onInspectXbrlFact={onInspectXbrlFact}
-            />
-          )}
+          {/* Supporting deterministic evidence — only for tools the agent invoked */}
+          {hasDeterministicEvidence && (
+            <div
+              id={`deterministic-evidence-${turn.id}`}
+              className="mt-3"
+              role="region"
+              aria-label="Deterministic Evidence"
+            >
+              {/* Deterministic Variance Table (calculate_period_variances) */}
+              {showVarianceCard && (
+                <VarianceTableCard
+                  turnId={turn.id}
+                  reports={varianceReports}
+                  onInspectFilingSection={onInspectFilingSection}
+                  onInspectXbrlFact={onInspectXbrlFact}
+                />
+              )}
 
-          {/* Year-over-Year Disclosure Deltas (thematic tracking) */}
-          {resp.disclosure_deltas && (
-            <DisclosureDeltaCard
-              turnId={turn.id}
-              result={resp.disclosure_deltas}
-              citations={resp.citations}
-              onSelectCitation={(token) => onSelectInlineCitation(token, resp.citations)}
-            />
-          )}
+              {/* Deterministic Anomaly Flags (flag_material_variances) */}
+              {showFlagsCard && (
+                <MaterialFlagsCard
+                  turnId={turn.id}
+                  flags={materialFlags}
+                  totalFlags={resp.material_variance_summary?.total_flags}
+                  citations={citations}
+                  onSelectCitation={(token) => onSelectInlineCitation(token, citations)}
+                  onInspectXbrlFact={onInspectXbrlFact}
+                />
+              )}
 
-          {/* Grounded Markdown Narrative with Interactive Inline Citations */}
-          <GroundedMarkdown
-            turnId={turn.id}
-            markdown={resp.answer_markdown}
-            activeChunkId={activeChunkId}
-            onSelectCitation={(token) =>
-              onSelectInlineCitation(token, resp.citations)
-            }
-            onSelectXbrlCitation={
-              onSelectXbrlCitation
-                ? (token) => onSelectXbrlCitation(token, turn)
-                : undefined
-            }
-          />
+              {/* Year-over-Year Disclosure Deltas (compare_disclosures_across_years) */}
+              {disclosureDeltas && (
+                <DisclosureDeltaCard
+                  turnId={turn.id}
+                  result={disclosureDeltas}
+                  citations={citations}
+                  onSelectCitation={(token) => onSelectInlineCitation(token, citations)}
+                />
+              )}
+            </div>
+          )}
 
           {/* Interactive Suggested Follow-Up Chips (Clarification / Out-of-Corpus) */}
           {resp.suggested_followups && resp.suggested_followups.length > 0 && (

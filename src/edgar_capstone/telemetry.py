@@ -1,19 +1,18 @@
-"""Streaming BigQuery Telemetry & Audit Sinks, Firestore Feedback/Session Stores, and LookML Re-exports.
+"""Streaming BigQuery Telemetry & Audit Sinks and Firestore Feedback/Session Stores.
 
 Implements:
 1. Streaming LLM token/cost/latency telemetry (`llm_telemetry_events`), conversational session &
    tool-usage analytics (`session_telemetry_events`), async LLM-as-a-Judge evaluation updates,
    and 10-K security/access audit trails (`security_audit_logs`) to Google BigQuery sink tables
-   via REST v2 `tabledata.insertAll` plus structured Cloud Logging JSON emission for
-   `google_logging_project_sink` durability.
+   via REST v2 `tabledata.insertAll` plus structured Cloud Logging JSON emission (the source of
+   the `sec_edgar/*` log-based metrics and the `google_logging_project_sink` ops-log export).
 2. Persistent analyst feedback (`analyst_feedback`) and multi-instance conversational session
    storage (`analyst_sessions`) backed by Google Cloud Firestore Native REST v1
    (`documents` & `:runQuery`) built on the shared `FirestoreCollectionStore` transport.
 3. Sink selection (`auto` | `gcp` | `local`): Cloud Run streams to BigQuery & Firestore, while
    `local` keeps telemetry and feedback in memory so test and developer runs don't write to the
    production telemetry tables.
-4. Backward-compatible re-exports of the LookML semantic layer catalog (`edgar_capstone.lookml`)
-   and Firestore wire codec (`edgar_capstone.gcp.firestore`).
+4. Backward-compatible re-exports of the Firestore wire codec (`edgar_capstone.gcp.firestore`).
 """
 
 from __future__ import annotations
@@ -68,11 +67,6 @@ from edgar_capstone.gcp.rest_client import (
     GcpTimeoutError,
     parse_retry_after,
 )
-from edgar_capstone.lookml import (
-    clear_lookml_catalog_cache,
-    load_lookml_project_catalog,
-    resolve_looker_project_dir,
-)
 from edgar_capstone.observability.tracing import add_span_event, current_trace_correlation
 
 if TYPE_CHECKING:
@@ -116,7 +110,6 @@ __all__ = [
     "TelemetryRateLimitError",
     "TelemetrySinkError",
     "TelemetryTimeoutError",
-    "clear_lookml_catalog_cache",
     "cloud_sink_logger",
     "configure_telemetry_stores",
     "decode_firestore_document",
@@ -127,10 +120,8 @@ __all__ = [
     "get_feedback_store",
     "get_session_store",
     "get_telemetry_sink",
-    "load_lookml_project_catalog",
     "parse_retry_after",
     "reset_telemetry_stores",
-    "resolve_looker_project_dir",
     "session_firestore_doc_id",
 ]
 
@@ -883,7 +874,8 @@ class BigQueryTelemetrySink(GcpRestClient):
         """Log completed background Flash LLM-as-a-Judge grade & score asynchronously.
 
         In BigQuery, interactive turns store ``evaluation_grade="pending"`` and
-        ``evaluation_score=NULL`` (ignored by Looker ``AVG(evaluation_score)``); once the
+        ``evaluation_score=NULL`` (excluded from BigQuery ``AVG(evaluation_score)`` in
+        ``v_session_analytics_summary``); once the
         background judge finishes, this method updates the matching local turn in place
         (without inflating local turn counts or latency averages), emits a structured Cloud
         Logging sink entry with the full judge rationale, and streams a schema-valid row to
@@ -1125,7 +1117,7 @@ class BigQueryTelemetrySink(GcpRestClient):
         )
 
     def query_llm_telemetry_explore(self, *, limit: int = 50) -> list[dict[str, Any]]:
-        """Query aggregated model/agent cost, cached-token savings, and latency rows for Looker."""
+        """Query aggregated model/agent cost, cached-token savings, and latency rows (SQL view)."""
         bounded = max(1, min(int(limit), 200))
         sql = (
             "SELECT CAST(telemetry_date AS STRING) AS telemetry_date, "

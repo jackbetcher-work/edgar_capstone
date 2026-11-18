@@ -20,7 +20,6 @@ from edgar_capstone.agents.prompt_store import get_prompt_store_status_metadata
 from edgar_capstone.agents.tools import get_gcp_adapters_status_metadata
 from edgar_capstone.api.dependencies import get_runtime_sa_config
 from edgar_capstone.gcp.defaults import resolve_gcp_project_id
-from edgar_capstone.lookml import load_lookml_project_catalog
 from edgar_capstone.observability import (
     logging_status_metadata,
     tracing_status_metadata,
@@ -39,7 +38,6 @@ def health(
 ) -> dict[str, Any]:
     """Cloud Run external health check and readiness probe endpoint."""
     model_meta = get_model_strategy_metadata()
-    lookml_cat = load_lookml_project_catalog()
     active_agents = list(ACTIVE_AGENT_NAMES)
     return {
         "status": "ok",
@@ -61,12 +59,6 @@ def health(
         "telemetry_sink": get_telemetry_sink().status_metadata(),
         "feedback_store": get_feedback_store().status_metadata(),
         "session_memory": get_conversation_memory_manager().persistence_status(),
-        "lookml_semantic_layer": {
-            "status": lookml_cat["status"],
-            "model_count": lookml_cat.get("model_count", 0),
-            "view_count": lookml_cat.get("view_count", 0),
-            "dashboard_count": lookml_cat.get("dashboard_count", 0),
-        },
         "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
         "iap_jwt_auth_enabled": True,
         "data_backend": get_gcp_adapters_status_metadata(),

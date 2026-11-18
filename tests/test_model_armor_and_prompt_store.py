@@ -169,6 +169,7 @@ def test_zero_regex_prompt_injection_patterns_and_dynamic_agent_instructions() -
     for prompt_id, version in (
         ("financial_analyst", "v1"),
         ("financial_analyst", "v5"),
+        ("financial_analyst", "v6"),
         ("narrative_evaluator", "v1"),
     ):
         prompt_str = load_agent_prompt(prompt_id, version=version)
@@ -583,8 +584,8 @@ def test_versioned_prompt_store_local_gcs_and_vertex_backends(tmp_path: Path) ->
         "model_armor_policy",
     }
     fa_entry = next(item for item in registered_entries if item["prompt_id"] == "financial_analyst")
-    assert fa_entry["latest"] == "v5"
-    assert {"v1", "v5"} <= set(fa_entry["available_versions"])
+    assert fa_entry["latest"] == "v6"
+    assert {"v1", "v5", "v6"} <= set(fa_entry["available_versions"])
 
     fa_art = load_agent_prompt_artifact("financial_analyst", version="1.0.0")
     assert fa_art.version == "1.0.0"
@@ -593,14 +594,22 @@ def test_versioned_prompt_store_local_gcs_and_vertex_backends(tmp_path: Path) ->
     assert "FinancialAnalystAgent (`gemini-2.5-pro`)" in fa_art.rendered_text
 
     fa_latest = load_agent_prompt_artifact("financial_analyst", version="latest")
-    assert fa_latest.version == "5.0.0"
+    assert fa_latest.version == "6.0.0"
     assert fa_latest.source_backend == "local"
     assert "FinancialAnalystAgent (`gemini-3.8-flash`)" in fa_latest.rendered_text
+    # v6: agent-driven deterministic tool selection, selective key metrics, emitted intent
+    assert "nothing is pre-computed" in fa_latest.rendered_text
+    assert "sector_thematic_map_reduce(" in fa_latest.rendered_text
+    assert "Leave `key_metrics` EMPTY" in fa_latest.rendered_text
+    assert "`intent`" in fa_latest.rendered_text
+    # The judge no longer penalizes qualitative turns that have no variance payload
+    ne_latest = load_agent_prompt("narrative_evaluator", version="latest")
+    assert "Never penalize a report for an empty variance payload" in ne_latest
 
     # Mustache variable override on active prompts
     fa_custom = load_agent_prompt(
         "financial_analyst",
-        version="v5",
+        version="v6",
         variables={"analyst_model": "gemini-custom-test"},
     )
     assert "FinancialAnalystAgent (`gemini-custom-test`)" in fa_custom

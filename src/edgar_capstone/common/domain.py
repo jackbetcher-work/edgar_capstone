@@ -62,6 +62,7 @@ RETRIEVAL_TOOL_NAMES: frozenset[str] = frozenset(
         "load_cached_10k_section",
         "compare_disclosures_across_years",
         "flag_material_variances",
+        "sector_thematic_map_reduce",
     }
 )
 

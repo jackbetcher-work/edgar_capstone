@@ -14,6 +14,8 @@ from pydantic import BaseModel
 from edgar_capstone.agents.callbacks import (
     after_model_fact_check_callback,
     after_model_telemetry_callback,
+    agent_tool_progress_before_tool_callback,
+    agent_tool_timing_after_tool_callback,
     before_agent_telemetry_callback,
     before_model_safety_and_latency_callback,
     before_model_telemetry_callback,
@@ -33,6 +35,7 @@ from edgar_capstone.agents.schemas import (
     ModelTaskCategory,
     NarrativeEvaluationReport,
 )
+from edgar_capstone.agents.sector_tool import SectorThematicMapReduceTool
 from edgar_capstone.agents.tools import (
     HybridSearchTool,
     LookerQueryTool,
@@ -41,8 +44,8 @@ from edgar_capstone.agents.tools import (
     VarianceCalculationTool,
 )
 
-# The analyst follows the registry's `latest` prompt (v5: structured AnalystReport without `notes`,
-# anomaly flags + disclosure deltas) rather than the store-wide default `v1`.
+# The analyst follows the registry's `latest` prompt (v6: agent-driven deterministic tool
+# selection, selective key metrics, structured intent) rather than the store-wide default `v1`.
 DEFAULT_ANALYST_PROMPT_VERSION = "latest"
 
 
@@ -60,6 +63,7 @@ def build_edgar_agent(
     planner: BasePlanner | None = None,
     generate_content_config: genai_types.GenerateContentConfig | None = None,
     before_tool_callback: Any | None = None,
+    after_tool_callback: Any | None = None,
     include_fact_check_callback: bool = True,
 ) -> Agent:
     """Build an ADK `Agent` with dynamic model resolution, versioned prompt, and standard callbacks.
@@ -105,6 +109,8 @@ def build_edgar_agent(
         kwargs["generate_content_config"] = generate_content_config
     if before_tool_callback is not None:
         kwargs["before_tool_callback"] = before_tool_callback
+    if after_tool_callback is not None:
+        kwargs["after_tool_callback"] = after_tool_callback
     return Agent(**kwargs)
 
 
@@ -135,6 +141,9 @@ def create_financial_analyst_agent(
             "evidence each question needs (Item 1A Risk Factors & Item 7 MD&A passages), and "
             "format strictly cited reports."
         ),
+        # Deterministic engines are invoked by the agent ONLY when the question needs them
+        # (nothing is pre-computed); each writes its full output to session_state, which the
+        # chat pipeline hydrates before claim verification and rendering.
         tools=[
             VarianceCalculationTool,
             AnomalyFlagTool,
@@ -147,6 +156,8 @@ def create_financial_analyst_agent(
             QueryCached10KTool,
             # Deterministic year-over-year wording comparison with both-year chunk_ids.
             DisclosureDeltaTool,
+            # Full-sector batched map-reduce for sector-wide thematic questions (SSE progress).
+            SectorThematicMapReduceTool,
         ],
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.1,
@@ -160,7 +171,9 @@ def create_financial_analyst_agent(
         before_tool_callback=[
             before_tool_agent_identity_callback,
             retrieval_budget_before_tool_callback,
+            agent_tool_progress_before_tool_callback,
         ],
+        after_tool_callback=agent_tool_timing_after_tool_callback,
         include_fact_check_callback=True,
     )
 

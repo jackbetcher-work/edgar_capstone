@@ -546,4 +546,75 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
     expect(await screen.findByText('PROJECTION BLOCK')).toBeTruthy()
     expect(screen.getByText(/Projection Compliance Guardrail/i)).toBeTruthy()
   })
+
+  it('handles null-intent scope_resolved and agent_tool SSE stages, rendering a qualitative answer without deterministic cards', async () => {
+    const RISK_CITATION = {
+      ...NVDA_CITATION,
+      chunk_id: 'NVDA_2026_item_1a_0003',
+      section_id: 'item_1a',
+      section_title: 'Item 1A. Risk Factors',
+      excerpt: 'Export controls could adversely affect our data center business.',
+    }
+    mockBackend({
+      chat: () =>
+        sse([
+          {
+            event: 'progress',
+            data: {
+              stage: 'scope_resolved',
+              message: 'Scope resolved: NVDA FY2024–FY2026',
+              meta: { intent: null, tickers: ['NVDA'] },
+              elapsed_ms: 40,
+            },
+          },
+          {
+            event: 'progress',
+            data: {
+              stage: 'agent_tool',
+              message: 'Agent invoked retrieve_10k_passages',
+              meta: { tool: 'retrieve_10k_passages' },
+              elapsed_ms: 120,
+            },
+          },
+          {
+            event: 'result',
+            data: {
+              ...CHAT_RESPONSE,
+              intent: 'longitudinal_single_company',
+              intent_source: 'agent',
+              answer_markdown: `### Export-Control Risk\n\nNVIDIA added export-control risk language [NVDA FY2026 | Item 1A Risk Factors | NVDA_2026_item_1a_0003](${NVDA_FILING_URL}) while revenue reached $215.9B [NVDA FY2026 | XBRL us-gaap:Revenues | acc:0001045810-26-000021](${NVDA_FILING_URL})`,
+              coverage_notices: [],
+              sector_coverage: null,
+              variance_reports: [],
+              material_variance_flags: [],
+              material_variance_summary: null,
+              disclosure_deltas: null,
+              citations: [RISK_CITATION],
+            },
+          },
+        ]),
+    })
+    render(<App />)
+
+    const cmdInput = await screen.findByLabelText(
+      /Ask a natural language financial or SEC 10-K question/i
+    )
+    fireEvent.change(cmdInput, {
+      target: { value: 'What export-control risks did NVIDIA disclose?' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /^<GO>$/ }))
+
+    expect(await screen.findByText('Export-Control Risk')).toBeTruthy()
+    expect(screen.getByText(/Fact-Check Verified/i)).toBeTruthy()
+    expect(screen.queryByText(/Deterministic Variance Calculation Engine/i)).toBeNull()
+    expect(screen.queryByLabelText('Material Variance Flags')).toBeNull()
+    expect(screen.queryByText(/Disclosure Delta Engine/i)).toBeNull()
+    expect(document.querySelector('[id^="deterministic-evidence-"]')).toBeNull()
+
+    // Inline XBRL chip with no variance report still opens the fact inspector
+    // (variance_reports lookup gracefully no-ops when the tool was not called).
+    fireEvent.click(await screen.findByTitle(/Inspect XBRL fact NVDA FY2026/i))
+    expect(await screen.findByText(/SEC XBRL NUMERIC PROVENANCE/i)).toBeTruthy()
+    expect(screen.getByText('0001045810-26-000021')).toBeTruthy()
+  })
 })

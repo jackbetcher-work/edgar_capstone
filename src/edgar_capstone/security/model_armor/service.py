@@ -156,6 +156,7 @@ class ModelArmorGuardrailService:
                 record_security_audit_event(
                     event_type=fail_closed_event,
                     user=None,
+                    inherit_request_principal=True,
                     resource=self.config.template_resource_name,
                     status_outcome="blocked_fail_closed",
                     detail=str(exc)[:200],
@@ -178,6 +179,7 @@ class ModelArmorGuardrailService:
             record_security_audit_event(
                 event_type=f"model_armor_{stage}_blocked",
                 user=None,
+                inherit_request_principal=True,
                 resource=self.config.template_resource_name,
                 status_outcome="blocked",
                 detail=f"categories={list(ma_summary.blocking_categories)}",
@@ -197,6 +199,7 @@ class ModelArmorGuardrailService:
                 record_security_audit_event(
                     event_type=f"projection_filter_{stage}_blocked",
                     user=None,
+                    inherit_request_principal=True,
                     resource=self.config.template_resource_name,
                     status_outcome="blocked",
                     detail=proj_res.reason,
@@ -232,6 +235,7 @@ class ModelArmorGuardrailService:
                     record_security_audit_event(
                         event_type=sdp_fail_event,
                         user=None,
+                        inherit_request_principal=True,
                         resource=self.config.template_resource_name,
                         status_outcome="blocked_fail_closed",
                         detail=str(exc)[:200],
@@ -249,6 +253,7 @@ class ModelArmorGuardrailService:
                 record_security_audit_event(
                     event_type=f"sdp_sensitive_{stage}_blocked",
                     user=None,
+                    inherit_request_principal=True,
                     resource=self.config.template_resource_name,
                     status_outcome="blocked",
                     detail=f"info_types={list(sorted_types)}",

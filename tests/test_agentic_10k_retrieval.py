@@ -288,6 +288,14 @@ def test_live_gemini_turn_retrieval_and_citations_resolve() -> None:
 
     md = turn["answer_markdown"]
     assert "default_api." not in md and "/*ACTION*/" not in md
+    # Acceptance matrix (qualitative wording-shift question): the live agent selects no
+    # variance or anomaly engine, so no variance table, flags, or Key Metrics are shown.
+    invoked = set(turn["adk_runtime"]["agent_invoked_tools"])
+    assert not invoked & {"calculate_period_variances", "flag_material_variances"}, invoked
+    assert turn["variance_reports"] == []
+    assert turn["material_variance_flags"] == []
+    assert "#### Key Metrics" not in md
+    assert turn["intent"] == "thematic_trend_tracking", turn["intent_source"]
     if turn["answer_verified"]:
         assert turn["adk_runtime"]["answer_withheld_reason"] is None
         assert turn["report_verification"]["usable"] is True
@@ -376,8 +384,10 @@ def test_unexecuted_text_tool_call_is_withheld_instead_of_shipping_a_plan() -> N
     assert turn["answer_markdown"].startswith("### Answer withheld")
     assert "default_api." not in turn["answer_markdown"]
     assert "/*ACTION*/" not in turn["answer_markdown"]
-    # Deterministic outputs for the turn are unaffected by the withheld narrative
-    assert turn["variance_reports"] and turn["variance_reports"][0]["ticker"] == "NVDA"
+    # Nothing is pre-computed: the agent invoked no deterministic engine, so no variance
+    # table or flags are attached, while the retrieved evidence is still returned.
+    assert turn["variance_reports"] == []
+    assert turn["material_variance_flags"] == []
     assert turn["citations"]
 
 

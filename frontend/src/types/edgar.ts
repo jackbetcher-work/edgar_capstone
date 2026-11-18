@@ -396,6 +396,12 @@ export interface DisclosureDeltaResult {
   citations?: GroundedCitation[]
 }
 
+/**
+ * SSE progress event. `stage` is open-ended: known stages include
+ * `scope_resolved` (meta.intent may be null — the agent decides intent later),
+ * `agent_tool` (meta: { tool: string }) and `sector_map`; unknown stages are
+ * displayed by their `message` like any other.
+ */
 export interface ChatProgressEvent {
   stage: string
   message: string
@@ -403,10 +409,14 @@ export interface ChatProgressEvent {
   elapsed_ms?: number
 }
 
+/** Who determined the turn intent (agent tool calls vs. turn-gate scope checks). */
+export type IntentSource = 'agent' | 'tool_inference' | 'scope_gate'
+
 export interface ChatTurnResponse {
   status: 'success' | 'blocked' | 'clarification' | 'out_of_corpus' | 'error'
   model_armor_blocked: boolean
   intent: QueryIntentType
+  intent_source?: IntentSource
   orchestrator: string
   resolved_scope: ResolvedQueryScope
   answer_markdown: string
@@ -424,11 +434,17 @@ export interface ChatTurnResponse {
     findings_rejected?: number
     unsupported_claims_count?: number
   } | null
-  variance_reports: CompanyVarianceReport[]
+  // Deterministic engine outputs are agent-invoked tools: each is empty/null
+  // unless the agent called the matching tool during the turn.
+  /** `[]` unless the agent called `calculate_period_variances`. */
+  variance_reports?: CompanyVarianceReport[]
   sector_benchmarks?: SectorBenchmarkRow[]
+  /** `[]` unless the agent called `flag_material_variances`. */
   material_variance_flags?: MaterialVarianceFlag[]
   material_variance_summary?: MaterialVarianceSummary | null
+  /** `null` unless the agent called `compare_disclosures_across_years` / sector map-reduce. */
   disclosure_deltas?: DisclosureDeltaResult | null
+  /** May be empty (e.g. turn-gate / pure-XBRL turns). */
   citations: GroundedCitation[]
   candidates_searched?: number
   context_cache: ContextCacheInfo | null

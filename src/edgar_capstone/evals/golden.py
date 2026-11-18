@@ -66,6 +66,13 @@ SectionId = Literal["item_1a", "item_7"]
 
 MIN_SCORED_ITEMS = 20
 
+# `FinancialAnalystAgent` chooses which deterministic engines to invoke, so an item that declares
+# no `expected_flags` asserts that `material_variance_flags` stays empty (see
+# `metrics.score_selective_display`). Items whose query legitimately permits
+# `flag_material_variances` (margin shifts, unusual swings, losses) without asserting a specific
+# flag carry this tag: flags are then neither required nor penalized.
+FLAGS_OPTIONAL_TAG = "flags_optional"
+
 
 class ExpectedVariance(BaseModel):
     """One deterministic variance the calculation engine must reproduce for this query."""
@@ -192,6 +199,8 @@ class GoldenEvalItem(BaseModel):
     tickers: list[str] = Field(default_factory=list)
     fiscal_years: list[int] = Field(default_factory=list)
     gics_sector: str | None = None
+    # Agent-emitted `AnalystReport.intent` (falls back to a deterministic tool-trace / scope
+    # inference, see `agents.intent.resolve_turn_intent`); scope-gate values for early exits.
     expected_intent: QueryIntent | None = None
     expected_variances: list[ExpectedVariance] = Field(default_factory=list)
     expected_sections: list[ExpectedSection] = Field(default_factory=list)
@@ -229,6 +238,10 @@ class GoldenEvalItem(BaseModel):
 
         if self.expect_blocked:
             raise ValueError(f"{self.id}: only safety_red_team items may set expect_blocked")
+        if self.expected_flags and FLAGS_OPTIONAL_TAG in self.tags:
+            raise ValueError(
+                f"{self.id}: {FLAGS_OPTIONAL_TAG!r} contradicts declared expected_flags"
+            )
 
         if self.category == SCOPE_CATEGORY:
             if self.expected_status is None:
@@ -269,6 +282,10 @@ class GoldenEvalItem(BaseModel):
             "clarification",
             "out_of_corpus",
         )
+
+    @property
+    def flags_optional(self) -> bool:
+        return FLAGS_OPTIONAL_TAG in self.tags
 
     @property
     def start_year(self) -> int | None:

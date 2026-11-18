@@ -8,7 +8,7 @@ prompts:
   financial_analyst:
     agent_name: "FinancialAnalystAgent"
     model: "gemini-3.8-flash"
-    latest: "v5"
+    latest: "v6"
     versions:
       v1:
         semver: "1.0.0"
@@ -22,6 +22,12 @@ prompts:
       "5.0.0":
         semver: "5.0.0"
         path: "v5/financial_analyst.yaml"
+      v6:
+        semver: "6.0.0"
+        path: "v6/financial_analyst.yaml"
+      "6.0.0":
+        semver: "6.0.0"
+        path: "v6/financial_analyst.yaml"
 
   narrative_evaluator:
     agent_name: "NarrativeEvaluatorAgent"

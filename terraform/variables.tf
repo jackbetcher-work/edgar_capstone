@@ -339,12 +339,22 @@ variable "cloud_identity_rbac_groups" {
 }
 
 variable "labels" {
-  description = "Standard resource labels applied across BigQuery resources."
+  description = "Standard resource labels applied across BigQuery, Cloud Run, and monitoring resources. Keys must stay unique after hyphen->underscore normalization: Cloud Logging copies Cloud Run labels onto LogEntry.labels, and the BigQuery log sink maps both `managed_by` and `managed-by` to the same `labels.managed_by` column (table_invalid_schema)."
   type        = map(string)
   default = {
     project     = "sec-edgar-analyst"
     environment = "dev"
     managed_by  = "terraform"
+  }
+
+  validation {
+    condition     = length(distinct([for k in keys(var.labels) : replace(k, "-", "_")])) == length(keys(var.labels))
+    error_message = "Label keys must be unique after replacing '-' with '_' (e.g. do not set both managed_by and managed-by); colliding keys break the Cloud Logging -> BigQuery sink schema."
+  }
+
+  validation {
+    condition     = !contains(keys(var.labels), "managed-by") && !contains(keys(var.labels), "commit-sha")
+    error_message = "Use underscore label keys only: `managed-by` / `commit-sha` are reserved for removal by the CI/CD deploy steps (they collide with managed_by / commit_sha in the BigQuery log sink)."
   }
 }
 
@@ -535,7 +545,7 @@ variable "private_subnet_cidr" {
 # Observability Alerting (observability.tf)
 # ------------------------------------------------------------------------------
 variable "monitoring_notification_channels" {
-  description = "Optional Cloud Monitoring notification channel resource names (projects/<id>/notificationChannels/<id>) attached to latency alert policies."
+  description = "Optional Cloud Monitoring notification channel resource names (projects/<id>/notificationChannels/<id>) attached to the latency, 5xx error, and security audit block alert policies."
   type        = list(string)
   default     = []
 }
@@ -544,4 +554,36 @@ variable "api_latency_p95_alert_threshold_ms" {
   description = "p95 server-side latency threshold (ms) for the /api/v1/chat alert policy on logging.googleapis.com/user/sec_edgar/api_request_latencies."
   type        = number
   default     = 30000
+}
+
+variable "api_5xx_alert_threshold" {
+  description = "Number of HTTP 5xx responses from sec-edgar-analyst within a 5-minute window that triggers the server-error alert policy (log-based metric sec_edgar/api_request_latencies, http_status >= 500)."
+  type        = number
+  default     = 5
+}
+
+variable "security_block_alert_threshold" {
+  description = "Number of denied (401/403) or guardrail-blocked security audit events within a 5-minute window that triggers the elevated auth/guardrail block alert policy (log-based metric sec_edgar/security_audit_events)."
+  type        = number
+  default     = 20
+}
+
+# ------------------------------------------------------------------------------
+# Cloud Logging -> BigQuery operational log export
+# ------------------------------------------------------------------------------
+variable "ops_logs_dataset_id" {
+  description = "Dedicated BigQuery dataset receiving the Cloud Logging project sink (sec-edgar-telemetry-audit-bq-sink). Kept separate from var.dataset_id so the sink writer identity never has write access to curated financial tables."
+  type        = string
+  default     = "sec_edgar_ops_logs"
+}
+
+variable "ops_logs_retention_days" {
+  description = "Default partition expiration (days) for the auto-created, partitioned Cloud Logging export tables in var.ops_logs_dataset_id. 0 keeps partitions forever."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.ops_logs_retention_days >= 0
+    error_message = "ops_logs_retention_days must be >= 0."
+  }
 }

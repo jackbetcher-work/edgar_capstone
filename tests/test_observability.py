@@ -292,7 +292,7 @@ def test_chat_request_continues_upstream_trace_end_to_end(
         "chat.rag_turn",
         "guardrail.inspect_user_prompt",
         "chat.resolve_scope",
-        "orchestrator.classify_intent",
+        "orchestrator.infer_intent_from_tools",
         "tool.calculate_period_variances",
         "chat.retrieve_citations",
         "react.execute",

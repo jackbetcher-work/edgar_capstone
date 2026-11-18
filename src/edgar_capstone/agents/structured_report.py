@@ -5,7 +5,9 @@ which makes the answer checkable claim by claim:
 
 - **Key metrics** are references (ticker + metric). The figures, period-end dates, and XBRL
   provenance citations (`accession_number` + `xbrl_concept`) are filled in from the
-  deterministic variance engine, so the model never writes those numbers itself.
+  deterministic variance engine, so the model never writes those numbers itself. The
+  `#### Key Metrics` block is rendered only when the agent explicitly selects metrics; there is
+  no default metric fallback, so qualitative answers carry no unsolicited figures.
 - **Findings** each carry `chunk_ids` and a verbatim `evidence_quote`. A finding is kept only
   when every chunk_id resolves to a passage retrieved this turn, the quote appears in one of
   the cited passages, and every figure in the statement appears in the quote or in the
@@ -364,6 +366,7 @@ def verify_analyst_report(
     payload_tickers = {str(r.get("ticker", "")).upper() for r in variance_reports}
 
     trimmed = AnalystReport(
+        intent=report.intent,
         headline=_trim_words(report.headline, MAX_HEADLINE_CHARS),
         key_metrics=report.key_metrics[:MAX_KEY_METRICS],
         findings=[
@@ -558,16 +561,11 @@ def render_analyst_report_markdown(
     lines = [f"### {headline}", ""]
     lines.extend(_render_coverage_notices(coverage_notices))
 
-    metric_refs = list(report.key_metrics)
-    if not metric_refs:
-        metric_refs = [
-            AnalystMetricReference(ticker=t, metric=m)
-            for t in list(reps)[:2]
-            for m in ("revenue", "operating_income", "net_income")
-        ]
+    # Key Metrics render ONLY when the agent explicitly selected them for this question; there
+    # is no revenue / operating income / net income fallback for qualitative answers.
     metric_lines = [
         rendered
-        for ref in metric_refs
+        for ref in report.key_metrics
         if (rep := reps.get(ref.ticker.upper())) is not None
         and (rendered := _render_metric_line(ref, rep)) is not None
     ]

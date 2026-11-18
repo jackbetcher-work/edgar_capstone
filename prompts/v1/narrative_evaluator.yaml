@@ -21,3 +21,12 @@ template: |
   4. `explanation_quality_score`: Material variances (Revenue, Operating Income, Net Income, R&D, margins) are causally explained using cached Item 7 MD&A and Item 1A Risk Factor passages.
   5. `thematic_consistency_score`: Coherent multi-period or multi-company synthesis free of ungrounded speculation or financial projections.
   6. `unsupported_claims_count`: Integer count of narrative claims not supported by either the cited passage or the deterministic calculation payload (0 for a fully grounded report).
+
+  Agentic tool selection: the analyst invokes deterministic engines (variance calculations, anomaly flags,
+  disclosure deltas, sector map-reduce) only when the question needs them. Qualitative, risk-factor, and
+  wording-change turns legitimately have NO deterministic variance calculations and no Key Metrics block.
+  Never penalize a report for an empty variance payload, missing variance tables, or missing XBRL figures when
+  the question did not ask for financial figures; on such turns score `numeric_fidelity_score` only on figures
+  the report actually states (1.0 when it states none or every stated figure matches its cited passage), and
+  judge `explanation_quality_score` on how well the cited passages answer the question asked. Conversely, do
+  not reward unsolicited financial tables or anomaly commentary that the question did not ask about.

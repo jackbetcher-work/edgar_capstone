@@ -34,6 +34,7 @@ from edgar_capstone.agents.structured_report import (
     render_analyst_report_markdown,
     verify_analyst_report,
 )
+from edgar_capstone.agents.tool_runtime import current_tool_turn_context, emit_tool_progress
 from edgar_capstone.common.domain import RETRIEVAL_TOOL_NAMES, sha256_text
 from edgar_capstone.common.env import env_positive_int
 from edgar_capstone.security.agent_identity import (
@@ -145,6 +146,66 @@ def retrieval_budget_before_tool_callback(
             ),
         }
     state[_RETRIEVAL_CALLS_STATE_KEY] = used + 1
+    return None
+
+
+_AGENT_TOOL_PROGRESS_LABELS: dict[str, str] = {
+    "calculate_period_variances": "Computing deterministic period-over-period variances",
+    "flag_material_variances": "Flagging material variances and attaching MD&A explanations",
+    "compare_disclosures_across_years": "Comparing 10-K disclosure wording across fiscal years",
+    "sector_thematic_map_reduce": "Running full-sector thematic map-reduce",
+    "query_looker_financial_explore": "Querying the Looker financial explore",
+    "fetch_financial_metrics": "Fetching structured XBRL financial metrics",
+    "search_10k_chunks_rag": "Searching 10-K passages",
+    "query_cached_10k_context": "Reading cached 10-K section passages",
+}
+
+
+def agent_tool_progress_before_tool_callback(
+    tool: BaseTool,
+    args: dict[str, Any],
+    tool_context: ToolContext | Any,
+) -> dict[str, Any] | None:
+    """Stream an SSE `agent_tool` progress event whenever the analyst invokes a tool.
+
+    Runs last in the before-tool chain, so it only fires for calls that passed the identity and
+    retrieval-budget checks. Never short-circuits the tool.
+    """
+    _ = tool_context
+    name = str(getattr(tool, "name", "") or "")
+    label = _AGENT_TOOL_PROGRESS_LABELS.get(name, f"Running {name}")
+    scope_bits = [
+        str(args.get(k))
+        for k in ("tickers", "gics_sector", "explore_name")
+        if isinstance(args, dict) and args.get(k) not in (None, "", "ALL")
+    ]
+    suffix = f" ({', '.join(scope_bits)})" if scope_bits else ""
+    emit_tool_progress("agent_tool", f"{label}{suffix}...", {"tool": name})
+    turn_ctx = current_tool_turn_context()
+    if turn_ctx is not None:
+        call_id = str(getattr(tool_context, "function_call_id", "") or name)
+        turn_ctx.tool_started_at[call_id] = time.perf_counter()
+    return None
+
+
+def agent_tool_timing_after_tool_callback(
+    tool: BaseTool,
+    args: dict[str, Any],
+    tool_context: ToolContext | Any,
+    tool_response: Any,
+) -> dict[str, Any] | None:
+    """Record wall-clock duration of each agent-invoked tool on the active turn context."""
+    _ = args, tool_response
+    turn_ctx = current_tool_turn_context()
+    if turn_ctx is None:
+        return None
+    name = str(getattr(tool, "name", "") or "")
+    call_id = str(getattr(tool_context, "function_call_id", "") or name)
+    started = turn_ctx.tool_started_at.pop(call_id, None)
+    if started is not None:
+        turn_ctx.tool_durations_ms.append(
+            (name, round((time.perf_counter() - started) * 1000.0, 2))
+        )
     return None
 
 

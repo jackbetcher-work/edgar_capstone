@@ -25,8 +25,10 @@ from edgar_capstone.observability import (
 )
 from edgar_capstone.security.auth import (
     AuthenticatedUser,
+    bind_audit_principal,
     record_security_audit_event,
     require_permissions,
+    reset_audit_principal,
 )
 from edgar_capstone.security.rbac import Permission
 
@@ -87,12 +89,17 @@ def _execute_and_enrich_chat_turn(
         turn_kwargs["on_progress"] = on_progress
 
     runner = _resolve_chat_turn_runner()
+    # Attribute guardrail block audit events (Model Armor / SDP / projection filter), which are
+    # raised deep inside the ADK turn without an `AuthenticatedUser`, to this request principal.
+    principal_token = bind_audit_principal(user)
     try:
         turn_result = runner(**turn_kwargs)
     except LiveRuntimeUnavailableError:
         raise
     except RuntimeError as exc:
         raise LiveRuntimeUnavailableError(str(exc)) from exc
+    finally:
+        reset_audit_principal(principal_token)
 
     resolved_tickers = turn_result.get("resolved_scope", {}).get("tickers") or req.tickers
     record_security_audit_event(

@@ -1008,6 +1008,53 @@ def _sector_coverage_notice(sector_coverage: dict[str, Any]) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
+def _profile_coverage_rows(
+    profiles: list[Any],
+    *,
+    tickers: list[str],
+    start_year: int,
+    end_year: int,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Variance-report-shaped coverage rows built from the cached BigQuery profile catalog.
+
+    Lets missing-fiscal-year and fiscal-calendar notices be computed for every ticker-scoped
+    turn whether or not the agent invoked `calculate_period_variances`.
+    """
+    lo, hi = sorted((int(start_year), int(end_year)))
+    wanted = {normalize_edgar_ticker(t): t for t in tickers}
+    by_ticker: dict[str, dict[int, Any]] = {}
+    for p in profiles:
+        tk = normalize_edgar_ticker(str(getattr(p, "ticker", "") or ""))
+        fy = int(getattr(p, "fiscal_year", 0) or 0)
+        if tk in wanted and lo <= fy <= hi:
+            by_ticker.setdefault(tk, {})[fy] = p
+    rows: list[dict[str, Any]] = []
+    missing_tickers: list[str] = []
+    for norm_tk, display_tk in wanted.items():
+        fy_map = by_ticker.get(norm_tk) or {}
+        avail = sorted(fy_map)
+        if not avail:
+            missing_tickers.append(display_tk)
+            continue
+        latest = fy_map[avail[-1]]
+        rows.append(
+            {
+                "ticker": str(getattr(latest, "ticker", display_tk) or display_tk),
+                "company_name": str(getattr(latest, "company_name", "") or display_tk),
+                "start_year": avail[0],
+                "end_year": avail[-1],
+                "available_fiscal_years": avail,
+                "missing_fiscal_years": [fy for fy in range(lo, hi + 1) if fy not in fy_map],
+                "period_end_dates": {
+                    fy: str(getattr(p, "period_of_report", "") or "")
+                    for fy, p in fy_map.items()
+                    if getattr(p, "period_of_report", None)
+                },
+            }
+        )
+    return rows, missing_tickers
+
+
 def build_coverage_notices(
     *,
     variance_reports: list[dict[str, Any]],
@@ -1015,34 +1062,78 @@ def build_coverage_notices(
     query: str = "",
     sector_coverage: dict[str, Any] | None = None,
     pre_notices: list[dict[str, Any]] | None = None,
+    profiles: list[Any] | None = None,
+    tickers: list[str] | None = None,
+    start_year: int | None = None,
+    end_year: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Deterministically build user-facing coverage & fiscal calendar notices."""
+    """Deterministically build user-facing coverage & fiscal calendar notices.
+
+    When the cached BigQuery `profiles` catalog and the resolved scope (`tickers`, `start_year`,
+    `end_year`) are supplied, `missing_ticker`, `missing_fiscal_year`, and
+    `fiscal_calendar_misalignment` notices are computed from the catalog, independently of
+    whether the agent produced `variance_reports` this turn. Without a catalog (e.g. BigQuery
+    unavailable) they fall back to the variance reports.
+    """
     notices: list[dict[str, Any]] = list(pre_notices or [])
 
-    if missing_tickers:
+    coverage_rows: list[dict[str, Any]] = list(variance_reports)
+    eff_missing = list(missing_tickers or [])
+    if profiles and tickers and start_year is not None and end_year is not None:
+        coverage_rows, catalog_missing = _profile_coverage_rows(
+            profiles, tickers=list(tickers), start_year=start_year, end_year=end_year
+        )
+        eff_missing = list(dict.fromkeys([*catalog_missing, *eff_missing]))
+
+    if eff_missing:
         notices.append(
             CoverageNotice(
                 code="missing_ticker",
                 severity="warning",
                 message=(
                     "No financial metric filings were found in the requested fiscal window for: "
-                    f"{', '.join(missing_tickers)}."
+                    f"{', '.join(eff_missing)}."
                 ),
-                tickers=list(missing_tickers),
+                tickers=list(eff_missing),
             ).model_dump(mode="json")
         )
 
-    notices.extend(_missing_year_notices(variance_reports))
+    notices.extend(_missing_year_notices(coverage_rows))
 
-    cal_notice = _calendar_misalignment_notice(variance_reports)
+    cal_notice = _calendar_misalignment_notice(coverage_rows)
     if cal_notice is not None:
         notices.append(cal_notice)
 
-    rd_notice = _missing_rd_notice(query, variance_reports)
-    if rd_notice is not None:
-        notices.append(rd_notice)
-
-    if sector_coverage:
-        notices.append(_sector_coverage_notice(sector_coverage))
-
+    notices.extend(
+        extend_coverage_notices(
+            [], query=query, variance_reports=variance_reports, sector_coverage=sector_coverage
+        )
+    )
     return notices
+
+
+def extend_coverage_notices(
+    notices: list[dict[str, Any]],
+    *,
+    query: str = "",
+    variance_reports: list[dict[str, Any]] | None = None,
+    sector_coverage: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Append notices that depend on agent-invoked tool outputs (R&D gaps, sector coverage).
+
+    Called after tool outputs are hydrated from `session_state`; never duplicates a code.
+    """
+    out = list(notices)
+    codes = {str(n.get("code")) for n in out}
+    rd_notice = _missing_rd_notice(query, list(variance_reports or []))
+    if rd_notice is not None and "missing_metric" not in codes:
+        out.append(rd_notice)
+    if sector_coverage and "sector_coverage_summary" not in codes:
+        out.append(_sector_coverage_notice(sector_coverage))
+    return out
+
+
+def is_broad_corpus_query(query: str) -> bool:
+    """True for corpus-wide phrasing ("across all", "chunk health", ...) that must not inherit
+    remembered tickers from session memory (scope resolution gate, not intent classification)."""
+    return bool(_BROAD_CORPUS_PHRASE_RE.search(query or ""))

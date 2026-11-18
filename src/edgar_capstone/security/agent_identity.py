@@ -105,13 +105,15 @@ class AgentIdentitySpec:
 
 # Logical backing service boundaries for ADK tools & internal S2S hops
 TOOL_TARGET_SERVICE_MAP: dict[str, str] = {
-    "classify_query_intent": "intent-router-service",
+    # Scope / entity resolution routing hop (intent itself is emitted by FinancialAnalystAgent).
+    "resolve_query_scope": "intent-router-service",
     "fetch_financial_metrics": "bigquery-metrics-service",
     "query_looker_financial_explore": "looker-semantic-service",
     "calculate_period_variances": "variance-calculation-service",
     "flag_material_variances": "variance-calculation-service",
     "search_10k_chunks_rag": "hybrid-rag-search-service",
     "compare_disclosures_across_years": "hybrid-rag-search-service",
+    "sector_thematic_map_reduce": "hybrid-rag-search-service",
     "load_cached_10k_section": "context-cache-service",
     "query_cached_10k_context": "context-cache-service",
 }
@@ -131,7 +133,7 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
         agent_name="RootOrchestrator",
         service_account_id="root-orchestrator-agent-sa",
         description=(
-            "Central ADK supervisor for intent classification, structured metric routing, "
+            "Central ADK supervisor for scope resolution, structured metric routing, "
             "and delegating deep 10-K analysis and context caching to specialist sub-agents."
         ),
         allowed_callers=frozenset({CUSTOM_RUNTIME_SA_ACCOUNT_ID}),
@@ -149,7 +151,7 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
         ),
         allowed_tools=frozenset(
             {
-                "classify_query_intent",
+                "resolve_query_scope",
                 "fetch_financial_metrics",
                 "query_looker_financial_explore",
                 "calculate_period_variances",
@@ -203,6 +205,7 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
                 "search_10k_chunks_rag",
                 "flag_material_variances",
                 "compare_disclosures_across_years",
+                "sector_thematic_map_reduce",
                 "load_cached_10k_section",
                 "query_cached_10k_context",
             }

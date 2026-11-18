@@ -37,6 +37,12 @@ from edgar_capstone.agents.schemas import (
     DisclosureYearPair,
     GroundedCitation,
 )
+from edgar_capstone.agents.tool_runtime import (
+    STATE_DISCLOSURE_DELTA_SUMMARY,
+    STATE_DISCLOSURE_DELTAS,
+    STATE_RETRIEVED_CITATIONS,
+    merge_disclosure_deltas,
+)
 from edgar_capstone.agents.tools import (
     _gcp_adapters,
     _parse_ticker_list,
@@ -984,18 +990,7 @@ def compare_disclosures_across_years(
 
     summary["companies_analyzed"] = len(companies)
     citations = list(all_citations.values())
-    if tool_context is not None and hasattr(tool_context, "state"):
-        existing = list(tool_context.state.get("retrieved_citations", []))
-        tool_context.state["retrieved_citations"] = merge_citations(existing, citations)
-        tool_context.state["disclosure_delta_summary"] = summary
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="compare_disclosures_across_years",
-        data_source="gcp",
-        services_hit=["vertex_ai_search", "bigquery", "gcs"],
-    )
-
-    return {
+    result: dict[str, Any] = {
         "status": "success",
         "theme": theme.strip(),
         "theme_terms": theme_terms,
@@ -1008,6 +1003,21 @@ def compare_disclosures_across_years(
         "companies": companies,
         "citations": citations,
     }
+    if tool_context is not None and hasattr(tool_context, "state"):
+        existing = list(tool_context.state.get(STATE_RETRIEVED_CITATIONS) or [])
+        tool_context.state[STATE_RETRIEVED_CITATIONS] = merge_citations(existing, citations)
+        # Full payload (not just the summary) so the turn's DisclosureDeltaCard is hydrated
+        # from session_state; repeated calls in one turn merge by ticker.
+        merged = merge_disclosure_deltas(tool_context.state.get(STATE_DISCLOSURE_DELTAS), result)
+        tool_context.state[STATE_DISCLOSURE_DELTAS] = merged
+        tool_context.state[STATE_DISCLOSURE_DELTA_SUMMARY] = (merged or result)["summary"]
+    _record_gcp_backend_invocation(
+        tool_context,
+        tool_name="compare_disclosures_across_years",
+        data_source="gcp",
+        services_hit=["vertex_ai_search", "bigquery", "gcs"],
+    )
+    return result
 
 
 def disclosure_delta_citations(result: dict[str, Any] | None) -> list[dict[str, Any]]:

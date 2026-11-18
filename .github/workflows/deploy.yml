@@ -217,6 +217,16 @@ jobs:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
 
+      # TTFT delta (agentic tool selection refactor)
+      #   p95_ttft_ms target unchanged at 3000 ms (evals/thresholds.yaml); a TTFT-only regression
+      #   stays an advisory warning below. TTFT = react_execution.observed_ttft_ms (first streamed
+      #   token / function call of the FIRST analyst model call, from ADK stream start). The
+      #   pre-synthesis pre-pass is now RAG-only (variance / flag / delta / sector map-reduce
+      #   pre-computation removed), so TTFT is expected unchanged-to-lower; total turn latency
+      #   grows by one or more model/tool round-trips (measured +6 to +17 s) on turns where the agent calls a
+      #   deterministic tool (quantitative, anomaly, sector-wide), unchanged-to-lower on
+      #   qualitative turns. Measured 2026-11-18: mean TTFT delta -99 ms (n=4 live turns); see the
+      #   "TTFT delta" block in evals/thresholds.yaml for per-query TTFT / total latency.
       - name: Run live golden evaluation regression gates
         env:
           EDGAR_TEST_PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
@@ -241,7 +251,7 @@ jobs:
               val = (report.get("metrics") or {}).get("p95_ttft_ms")
               print(
                   f"::warning::Advisory latency notice: p95_ttft_ms={val} ms exceeded 3000 ms "
-                  "(non-blocking while iterating on latency; all 16 quality, grounding, and safety gates passed)."
+                  "(non-blocking while iterating on latency; all 17 quality, grounding, and safety gates passed)."
               )
               sys.exit(0)
           print(f"::error::Blocking eval gate regression(s): {regs}")
@@ -291,6 +301,15 @@ jobs:
           project_id: ${{ env.GCP_PROJECT_ID }}
           region: ${{ env.GCP_REGION }}
           image: ${{ env.IMAGE_URI }}:${{ github.sha }}
+          # Underscore label keys only. deploy-cloudrun@v2 adds `managed-by=github-actions`
+          # and `commit-sha=<sha>` by default; Cloud Logging copies Cloud Run labels onto
+          # every LogEntry and the BigQuery log sink normalizes '-' to '_', so `managed-by`
+          # collides with Terraform's `managed_by` (table_invalid_schema). Skip the defaults,
+          # set equivalent underscore labels, and strip any legacy hyphenated keys (flags).
+          skip_default_labels: true
+          labels: |-
+            commit_sha=${{ github.sha }}
+            deployed_by=github-actions
           env_vars: |-
             GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}
             GOOGLE_CLOUD_PROJECT=${{ env.GCP_PROJECT_ID }}
@@ -332,6 +351,7 @@ jobs:
             --min-instances=1
             --max-instances=10
             --timeout=300
+            --remove-labels=managed-by,commit-sha
             --startup-probe=httpGet.path=/health,initialDelaySeconds=0,periodSeconds=10,timeoutSeconds=5,failureThreshold=24
 
       # The service is not reachable from GitHub's runners: in load_balancer mode its

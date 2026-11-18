@@ -7,6 +7,7 @@ import type {
 } from '../types/edgar'
 import type { ParsedInlineCitationToken } from '../utils/formatters'
 import { citationToken } from '../utils/citationTokens'
+import { isRenderableDisclosureDeltas } from '../utils/deterministicEvidence'
 
 interface DisclosureDeltaCardProps {
   turnId: string
@@ -30,10 +31,10 @@ export function DisclosureDeltaCard({
   onSelectCitation,
 }: DisclosureDeltaCardProps) {
   const [expanded, setExpanded] = useState<string | null>(null)
-  if (result.status !== 'success' || !result.companies || result.companies.length === 0) {
+  if (!isRenderableDisclosureDeltas(result)) {
     return null
   }
-  const byId = new Map(citations.map((c) => [c.chunk_id, c]))
+  const byId = new Map((citations ?? []).map((c) => [c.chunk_id, c]))
   const summary = result.summary
 
   const citeButton = (chunkId: string | null, label: string) => {
@@ -85,14 +86,16 @@ export function DisclosureDeltaCard({
                 .sort(([a], [b]) => Number(a) - Number(b))
                 .map(([fy, n]) => `FY${fy.slice(-2)}:${n}`)
                 .join(' → ')
-              const pairs = comp.year_pairs.length > 0 ? comp.year_pairs : [null]
+              const yearPairs = comp.year_pairs ?? []
+              const missingYears = comp.missing_fiscal_years ?? []
+              const pairs = yearPairs.length > 0 ? yearPairs : [null]
               return pairs.map((pair, idx) => {
                 const key = pair
                   ? `${comp.ticker}-${pair.prior_fiscal_year}-${pair.current_fiscal_year}`
                   : `${comp.ticker}-none`
                 const isOpen = expanded === key
                 const changes = pair
-                  ? pair.deltas.filter((d) => d.change_type !== 'unchanged')
+                  ? (pair.deltas ?? []).filter((d) => d.change_type !== 'unchanged')
                   : []
                 return (
                   <Fragment key={key}>
@@ -101,13 +104,13 @@ export function DisclosureDeltaCard({
                         {idx === 0 && (
                           <span title={comp.company_name}>
                             <span className="font-bold text-bb-yellow">{comp.ticker}</span>
-                            {comp.missing_fiscal_years.length > 0 && (
+                            {missingYears.length > 0 && (
                               <span
                                 className="ml-1.5 text-[9.5px] text-ink-muted"
                                 title="No 10-K in corpus for these fiscal years"
                               >
                                 (no FY
-                                {comp.missing_fiscal_years
+                                {missingYears
                                   .map((y) => String(y).slice(-2))
                                   .join('/')}
                                 )
@@ -142,21 +145,21 @@ export function DisclosureDeltaCard({
                         )}
                       </td>
                       <td className="py-1.5 px-2.5 text-right text-bb-pos">
-                        {pair?.counts.added ?? '—'}
+                        {pair?.counts?.added ?? '—'}
                       </td>
                       <td className="py-1.5 px-2.5 text-right text-bb-amber">
-                        {pair?.counts.modified ?? '—'}
+                        {pair?.counts?.modified ?? '—'}
                       </td>
                       <td className="py-1.5 px-2.5 text-right text-bb-neg">
-                        {pair?.counts.removed ?? '—'}
+                        {pair?.counts?.removed ?? '—'}
                       </td>
                     </tr>
                     {isOpen &&
                       changes.map((d) => {
-                        const style = CHANGE_STYLES[d.change_type]
+                        const style = CHANGE_STYLES[d.change_type] ?? CHANGE_STYLES.modified
                         const phrases = [
-                          ...d.added_phrases.slice(0, 2).map((p) => `+ “${p}”`),
-                          ...d.removed_phrases.slice(0, 2).map((p) => `− “${p}”`),
+                          ...(d.added_phrases ?? []).slice(0, 2).map((p) => `+ “${p}”`),
+                          ...(d.removed_phrases ?? []).slice(0, 2).map((p) => `− “${p}”`),
                         ]
                         return (
                           <tr

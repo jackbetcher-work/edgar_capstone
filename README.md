@@ -40,11 +40,11 @@ make check
 > **Local Authentication Note:** Outside Cloud Run (`IAP_STRICT_MODE=false`), the UI can mint a local ES256 Workspace/Okta developer JWT via `POST /api/v1/auth/sso/dev-token` so all RBAC-protected `/api/v1/*` routes work locally without external IdP setup.
 
 ### Live Data & Gemini Configuration
-Every request reads live GCP data (BigQuery `financial_metrics` / `filing_chunks` via `VECTOR_SEARCH`, Vertex AI Search, Vertex AI `text-embedding-005`, Cloud Firestore `analyst_sessions` / `analyst_feedback`, and the GCS corpus bucket), and every answer is written by live Gemini through the Google ADK `Runner` (SSE streaming over a persistent background `asyncio` event loop that caches `Gemini` clients for HTTP/2 keepalive reuse and executes sync tools via `ToolThreadPoolConfig`). Active ADK agents are `FinancialAnalystAgent` (primary orchestrator) and `NarrativeEvaluatorAgent` — the legacy unused supervisor hierarchy (`RootOrchestrator` / `agent.py`, `ContextCacheAgent`, and `CodingAssistantAgent`) has been retired, while granular SPIFFE S2S per-agent workload identities remain enforced in `security/agent_identity.py`.
+Every request reads live GCP data (BigQuery `financial_metrics` / `filing_chunks` via `VECTOR_SEARCH`, Vertex AI Search, Vertex AI `text-embedding-005`, Cloud Firestore `analyst_sessions` / `analyst_feedback`, and the GCS corpus bucket), and every answer is written by live Gemini through the Google ADK `Runner` (SSE streaming over a persistent background `asyncio` event loop that caches `Gemini` clients for HTTP/2 keepalive reuse and executes sync tools via `ToolThreadPoolConfig`). `FinancialAnalystAgent` decides which deterministic engines each question needs — `calculate_period_variances`, `flag_material_variances` (with MD&A explanations), `compare_disclosures_across_years`, `sector_thematic_map_reduce`, and `query_looker_financial_explore` are agent-invoked ADK tools, never pre-computed — and emits the canonical intent in its structured `AnalystReport`; tool outputs are hydrated from ADK `session_state` before claim verification, so qualitative answers carry no unsolicited variance tables, anomaly flags, or Key Metrics. Active ADK agents are `FinancialAnalystAgent` (primary orchestrator) and `NarrativeEvaluatorAgent` — the legacy unused supervisor hierarchy (`RootOrchestrator` / `agent.py`, `ContextCacheAgent`, and `CodingAssistantAgent`) has been retired, while granular SPIFFE S2S per-agent workload identities remain enforced in `security/agent_identity.py`.
 
 There is no local corpus, no synthesized filing text, and no template-synthesis fallback. If all findings in a live Gemini report fail claim-level verification on the first pass, one verification-guided regeneration attempt runs with exact rejection reasons; if still unverifiable, the answer is withheld (`answer_verified: false`, shown as **Answer Withheld** in the UI) rather than replaced. Upstream failures return HTTP `503`.
 
-On interactive turns, the Gemini 3.5 Flash LLM-as-a-Judge runs asynchronously off the request path: initial turn telemetry records `evaluation_grade="pending"` and `evaluation_score=NULL` (never a fabricated placeholder score so BigQuery/Looker `AVG(evaluation_score)` stays accurate), and once the background judge completes it records the real grade and score via `BigQueryTelemetrySink.record_async_evaluation_result(...)` (updating the local turn in place and streaming a schema-valid row to `session_telemetry_events`; pending evaluations are drained cleanly on shutdown via `flush_pending_evaluations`).
+On interactive turns, the Gemini 3.5 Flash LLM-as-a-Judge runs asynchronously off the request path: initial turn telemetry records `evaluation_grade="pending"` and `evaluation_score=NULL` (never a fabricated placeholder score so BigQuery `AVG(evaluation_score)` in `v_session_analytics_summary` stays accurate), and once the background judge completes it records the real grade and score via `BigQueryTelemetrySink.record_async_evaluation_result(...)` (updating the local turn in place and streaming a schema-valid row to `session_telemetry_events`; pending evaluations are drained cleanly on shutdown via `flush_pending_evaluations`).
 
 The Makefile targets (`dev`, `backend`, `start`, `test`, `eval-all`, `smoke`) set the GCP environment explicitly, because developer shells often export an unrelated `GCP_PROJECT_ID`. `test` and `eval-all` keep telemetry, session persistence, and feedback in memory so they don't write to the production telemetry tables.
 
@@ -60,7 +60,7 @@ CORPUS_PROJECT_ID=<other-project> make dev        # point at another project
 ```
 
 ### Container Packaging & Smoke Tests
-The image installs only the lean runtime package (`pip install .` — no `edgartools`, `pandas`, `google-cloud-storage`, `pytest`, or `ruff`), the built UI, `prompts/`, and `looker/`; no corpus data is baked in. At runtime every data read goes to BigQuery, Vertex AI Search, and GCS.
+The image installs only the lean runtime package (`pip install .` — no `edgartools`, `pandas`, `google-cloud-storage`, `pytest`, or `ruff`), the built UI, and `prompts/`; no corpus data is baked in (the un-deployed LookML layer was removed — see [Observability](#observability-cloud-console-native-tracing-logs-metrics--bigquery)). At runtime every data read goes to BigQuery, Vertex AI Search, and GCS.
 
 ```bash
 make smoke                          # In-process: GET /health (data_backend block) + UI served from /
@@ -99,7 +99,7 @@ FastAPI routes are organized into modular routers under `src/edgar_capstone/api/
 
 > **Pruned Redundant / Test-Only Routes:** The following legacy endpoints have been removed and now return HTTP `404` or `405` (with `GET /healthz` returning `404` even when `frontend/dist` is built): `GET /healthz`, `POST /api/v1/section`, `GET /api/v1/auth/rbac`, `GET /api/v1/explore/yoy_variances`, `GET /api/v1/explore/audit_trail`, `GET /api/v1/looker/catalog`, `GET /api/v1/telemetry/context-latency`, `POST /api/v1/intent`, `POST /api/v1/evaluate`, `POST /api/v1/coding-assist`, `POST /api/v1/variances`, `POST /api/v1/search`, and `GET /api/v1/metrics`.
 
-### Observability: Latency Tracing & Structured Logs
+### Observability: Cloud Console-Native Tracing, Logs, Metrics & BigQuery
 Each API request is one OpenTelemetry trace, exported to **Cloud Trace**. Every log line is structured JSON carrying the same trace ID and goes to **Cloud Logging**. On Cloud Run (`K_SERVICE` set) both turn on automatically, so Cloud Build and GitHub Actions don't need extra env vars. Locally, spans stay in-process unless you choose an exporter, and logs are readable text that still includes `[trace=… span=…]`. Full details are in [`docs/observability.md`](docs/observability.md).
 
 ```bash
@@ -127,6 +127,15 @@ curl -si localhost:8000/api/v1/companies -H "Authorization: Bearer $TOKEN" | gre
 
 `GET /health` includes an `observability` block showing the active exporter, sampling ratio, instrumentation state, and log format.
 
+Operations run entirely in the Google Cloud Console:
+
+- **Cloud Monitoring dashboards** (Terraform): *SEC EDGAR RAG Vector Database — Chunk Health & Ingestion Monitoring* and *SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit*. The second covers API rate, status, and latency; LLM TTFT, latency, calls, cache hits, tokens, and approximate USD; turns by intent and fact-check; judge scores; security audit events; and logs panels for errors, audit, and LLM telemetry. `terraform output llm_observability_dashboard_url` prints the link.
+- **Low-cardinality log-based metrics** `sec_edgar/*` (`api_request_latencies`, `llm_ttft_ms`, `llm_model_latency_ms`, `llm_calls`, `llm_input_tokens`, `llm_output_tokens`, `llm_cost_usd`, `llm_cache_savings_usd`, `session_turns`, `evaluation_scores`, `security_audit_events`). They never use `session_id`, `user_email`, `trace_id`, `call_id`, or tickers as labels.
+- **Alert policies:** API p95 latency, HTTP 5xx errors, and elevated 401/403 denials or guardrail blocks, all notifying `monitoring_notification_channels`.
+- **BigQuery:** the app streams `llm_telemetry_events`, `session_telemetry_events`, and `security_audit_logs` (each with `trace_id`). The SQL views `v_telemetry_cost_and_latency` (exact USD), `v_session_analytics_summary`, and `v_security_audit_summary` are queried from BigQuery Studio. Cloud Logging also exports the raw telemetry LogEntries to the dedicated `sec_edgar_ops_logs` dataset.
+
+> **Intentional divergence — no Looker/LookML:** the reference spec's "BI dashboards exported to Looker" item is deliberately replaced by Cloud Monitoring dashboards plus version-controlled BigQuery SQL views. No Looker instance was ever deployed, so `looker/` and `lookml.py` were removed and `/health` no longer reports a LookML catalog. If executive reporting is needed later, attach Looker Studio to the BigQuery views (*Explore with Looker Studio*). The ADK tool `query_looker_financial_explore` already queries BigQuery directly and keeps its name until a follow-up rename PR.
+
 ### Golden Evals (`make eval-all`)
 `make eval-all` runs the golden query–variance–explanation set in [`evals/golden_dataset.jsonl`](evals/golden_dataset.jsonl) through the chat pipeline and exits non-zero when any gate in [`evals/thresholds.yaml`](evals/thresholds.yaml) regresses. See [`evals/README.md`](evals/README.md) for the record schema and how to add items.
 
@@ -143,7 +152,7 @@ make refresh-golden-expectations             # Recompute golden variance numbers
 
 ```text
 ├── docs/project_reference.md        # Target architecture and product specification
-├── docs/observability.md            # Tracing, structured logging, correlation surfaces & GCP lookup guide
+├── docs/observability.md            # Cloud Trace, Cloud Logging, log-based metrics, alerts, dashboards, BigQuery views & correlation guide
 ├── prompts/                         # Versioned agent prompts: registry.yaml (`latest` -> v5), v1/ (financial_analyst, narrative_evaluator, model_armor_policy), v5/financial_analyst.yaml
 ├── evals/                           # 63-item golden eval dataset (golden_dataset.jsonl across 6 categories), 17 regression gates (thresholds.yaml), schema guide
 ├── src/edgar_capstone/
@@ -168,7 +177,6 @@ make refresh-golden-expectations             # Recompute golden variance numbers
 │   │   ├── lro.py                   # `poll_operation`: per-poll token refresh, transient 429/5xx retries, immediate fail-fast on 403/404
 │   │   ├── discovery_engine.py      # Discovery Engine / Vertex AI Search host & datastore path builders
 │   │   └── paths.py                 # Repository/container asset & repo root resolution
-│   ├── lookml.py                    # Mtime-cached LookML project catalog introspection over `looker/`
 │   ├── telemetry.py                 # Async BigQuery telemetry/audit sinks (w/ `trace_id`, LRU session cap, `record_async_evaluation_result`), Firestore feedback/session stores
 │   ├── observability/               # OpenTelemetry -> Cloud Trace, trace-correlated JSON logs -> Cloud Logging
 │   │   ├── tracing.py               # TracerProvider + CloudTraceSpanExporter, strict `traceparent`/`X-Cloud-Trace-Context` parsers, FastAPI/httpx instrumentation, `@traced`
@@ -177,11 +185,13 @@ make refresh-golden-expectations             # Recompute golden variance numbers
 │   ├── agents/                      # PEP 562 lazy-loaded Google ADK agents, live Runner SSE engine, ReAct, map-reduce & scope validation
 │   │   ├── adapters/                # Modular GCP tool adapters: `bigquery.py`, `vertex_search.py`, `gcs.py`, `registry.py`
 │   │   ├── factories.py             # ADK agent factories (`build_edgar_agent`, `create_financial_analyst_agent` w/ `BuiltInPlanner` default thinking & `output_schema=AnalystReport`, `create_narrative_evaluator_agent`)
-│   │   ├── intent.py                # Deterministic query intent classification (`classify_query_intent`)
+│   │   ├── intent.py                # Canonical intents; agent-emitted intent + tool-trace fallback (`resolve_turn_intent`)
+│   │   ├── tool_runtime.py          # Turn-scoped session_state seeding/hydration of agent-invoked deterministic tool outputs + SSE tool context
+│   │   ├── sector_tool.py           # Agent-invocable `sector_thematic_map_reduce` ADK tool (full-sector map-reduce + SSE progress)
 │   │   ├── prompt_builders.py       # Compact prompt assembly, boundary-balanced evidence leads, judge citation selection
 │   │   ├── evaluation.py            # Flash LLM-as-a-Judge evaluator (`evaluate_variance_explanation`, `citation_precision_score`)
 │   │   ├── live_runtime.py          # Persistent background asyncio loop, cached ADK Gemini clients, SSE runner w/ `ToolThreadPoolConfig`
-│   │   ├── chat_engine.py           # Conversational RAG turn: guardrails, scope validation, balanced retrieval, map-reduce, ReAct, telemetry
+│   │   ├── chat_engine.py           # Conversational RAG turn: guardrails, scope validation, RAG evidence pre-pass, ReAct, tool-output hydration, telemetry
 │   │   ├── scope_validation.py      # Dynamic 501-issuer `EntityCatalog` (dual-class CIK dedup, guarded `V`/Visa detection), all 11 GICS sectors, clarification & coverage notices
 │   │   ├── sector_map_reduce.py     # Full-sector batched map-reduce (single BQ `ML.DISTANCE` + `QUALIFY` query, parallel Flash batches + quote verifier, SSE progress)
 │   │   ├── react_loop.py            # Structured ReAct loop, single verification-guided live retry, async off-path Flash judge pool (`pending`/`None` -> `record_async_evaluation_result`) + clean atexit shutdown
@@ -214,10 +224,9 @@ make refresh-golden-expectations             # Recompute golden variance numbers
 │       ├── agent_identity.py        # Retained granular SPIFFE S2S per-agent identities & attestation broker (`RootOrchestrator`, `FinancialAnalystAgent`, `ContextCacheManager`, `ModelArmorGuardrail`)
 │       ├── secrets.py               # Secret Manager REST client, constant-time `RedactedSecret`, repo secret scanner
 │       └── model_armor/             # Modular Model Armor v1 + Cloud SDP/DLP package (zero `import re`): `config.py`, `projection_filter.py`, `emulator.py`, `client.py`, `service.py`, `adk_plugin.py`
-├── looker/                          # LookML semantic layer (manifest, model, 6 views, 2 LookML dashboards)
 ├── frontend/                        # React 19 + TypeScript + Tailwind v4 split-pane terminal UI w/ SSE streaming & modular inspector (`services/httpClient.ts`, `components/inspector/{CitationsTab,FilingReaderTab,XbrlFactTab}.tsx`; 14 Vitest tests)
 ├── scripts/                         # CLI entrypoints sharing `scripts/_cli.py`: dataset build, vector DB build (+ `--upload-only`), R&D backfill, BigQuery / Vertex AI Search publishing, container smoke test, secret scanner, golden evals
-├── terraform/                       # GCP IaC: BigQuery (native views, `golden_eval_set`, `eval_results`), Firestore, Discovery Engine, Model Armor/SDP exclusion, Cloud Run, IAM/CI live access, IAP, Cloud Monitoring p95 latency alert & dashboard, opt-in VPC-SC & Cloud Build triggers
+├── terraform/                       # GCP IaC: BigQuery (native views, `golden_eval_set`, `eval_results`), Firestore, Discovery Engine, Model Armor/SDP exclusion, Cloud Run, IAM/CI live access, IAP, Cloud Monitoring log-based metrics, alerts & 2 dashboards, ops-log BigQuery sink, opt-in VPC-SC & Cloud Build triggers
 ├── tests/                           # Live GCP + live Gemini pytest suite (`>=80%` coverage gate) plus fast offline `test_refactor_regressions.py`
 ├── requirements.txt                 # Lean runtime dependencies only (excludes dev and `[ingest]` extras; `uv.lock` removed)
 ├── Dockerfile                       # Multi-stage non-root build (Node 22 UI + lean Python 3.11 runtime); no corpus data in the image
@@ -267,7 +276,7 @@ Outstanding items remaining against [`docs/project_reference.md`](docs/project_r
 **Current state:**
 - Interactive SSE streaming (`POST /api/v1/chat/stream`) emits its first status event in `< 50 ms`, and warm end-to-end turns complete in `~12–22 s` (`1,853–1,921 ms` warm raw TTFT) while preserving default native thinking (`include_thoughts=True`, no forced low thinking level) on `FinancialAnalystAgent`.
 - Raw model-only `p95_ttft_ms` on the unprovisioned Vertex AI `global` endpoint still exceeds `3,000 ms` due to intermittent backend tail jitter (`evals/thresholds.yaml` keeps `p95_ttft_ms: 3000` strictly as the target metric).
-- In `.github/workflows/deploy.yml`, a regression solely on `p95_ttft_ms` emits a non-blocking `::warning::` while all 16 quality, grounding, citation, and safety gates remain hard-blocking deploy gates.
+- In `.github/workflows/deploy.yml`, a regression solely on `p95_ttft_ms` emits a non-blocking `::warning::` while all 17 quality, grounding, citation, selective-display, and safety gates remain hard-blocking deploy gates.
 
 **Done when:** `p95_ttft_ms <= 3,000 ms` passes consistently with default analytical thinking (e.g., via Provisioned Throughput, regional model availability, or further retrieval/prefill optimization).
 

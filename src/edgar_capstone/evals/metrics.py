@@ -34,6 +34,7 @@ _XBRL_TAG_RE = re.compile(
     r"\[([A-Z][A-Z0-9.\-]{0,6})\s+FY(\d{4})\s*\|\s*XBRL\s+([^|\]]+?)\s*\|\s*acc:([^\]]+?)\]"
 )
 _NOTES_SECTION_MARKER = "#### Notes (not source-verified)"
+_KEY_METRICS_MARKER = "#### Key Metrics"
 
 PCT_ENGINE_TOLERANCE = 0.01
 VALUE_REL_TOLERANCE = 1e-6
@@ -259,11 +260,19 @@ def _section_hit(sec: ExpectedSection, sources: list[tuple[str, int, str]]) -> b
 
 
 def score_routing(item: GoldenEvalItem, response: dict[str, Any]) -> tuple[bool, list[str]]:
-    """Intent, tickers, and fiscal window resolved as the golden item expects."""
+    """Intent, tickers, and fiscal window resolved as the golden item expects.
+
+    Intent is emitted by the agent (`intent_source='agent'`) or inferred from its tool trace
+    (`'tool_inference'`); the source is included in the failure reason for triage."""
     reasons: list[str] = []
     scope = response.get("resolved_scope") or {}
     if item.expected_intent and response.get("intent") != item.expected_intent:
-        reasons.append(f"intent={response.get('intent')} expected {item.expected_intent}")
+        source = response.get("intent_source")
+        reasons.append(
+            f"intent={response.get('intent')}"
+            + (f" (source={source})" if source else "")
+            + f" expected {item.expected_intent}"
+        )
     resolved = sorted(_norm_ticker(t) for t in scope.get("tickers") or [])
     if item.tickers and resolved != sorted(item.tickers):
         reasons.append(f"tickers={resolved} expected {sorted(item.tickers)}")
@@ -457,6 +466,49 @@ def score_anomaly_flags(
         else:
             missing.append(ef.label)
     return matched, len(item.expected_flags), missing
+
+
+def score_selective_display(
+    item: GoldenEvalItem, response: dict[str, Any]
+) -> tuple[bool | None, list[str]]:
+    """Deterministic engine output is shown only when the golden item expects it.
+
+    `FinancialAnalystAgent` decides which deterministic engines to call, and the turn surfaces
+    `variance_reports` / `material_variance_flags` / `#### Key Metrics` only when the matching
+    tool ran. For a scored item:
+    (a) no `expected_variances` -> `variance_reports` must be empty and no Key Metrics section;
+    (b) no `expected_flags` (and not tagged `flags_optional`) -> `material_variance_flags` must
+        be empty.
+    Returns `None` when neither check applies (the item expects both variances and flags or
+    tags flags optional); numeric_agreement / anomaly_flag_recall cover the positive side.
+    """
+    check_variances = not item.expected_variances
+    check_flags = not item.expected_flags and not item.flags_optional
+    if not (check_variances or check_flags):
+        return None, []
+
+    reasons: list[str] = []
+    if check_variances:
+        reports = response.get("variance_reports") or []
+        if reports:
+            tickers = sorted({_norm_ticker(r.get("ticker", "")) for r in reports})
+            reasons.append(
+                f"selective_display: {len(reports)} variance_reports returned {tickers} "
+                "but the item expects none"
+            )
+        if _KEY_METRICS_MARKER in (response.get("answer_markdown") or ""):
+            reasons.append("selective_display: Key Metrics rendered but the item expects none")
+    if check_flags:
+        flags = response.get("material_variance_flags") or []
+        if flags:
+            ids = sorted(
+                str(f.get("flag_id") or f"{f.get('ticker')}_{f.get('metric')}") for f in flags
+            )
+            reasons.append(
+                f"selective_display: {len(flags)} material_variance_flags returned {ids[:5]} "
+                "but the item expects none"
+            )
+    return not reasons, reasons
 
 
 def score_unsupported_claims(response: dict[str, Any]) -> tuple[int, list[str]]:

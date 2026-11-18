@@ -10,6 +10,15 @@ from pydantic import BaseModel, Field
 from edgar_capstone.common.domain import SECTION_TITLES, MetricName, SectionId
 from edgar_capstone.common.models import FilingMetadataBase
 
+# Canonical routing intents (API schemas, Looker telemetry, golden evals, UI badges). Emitted by
+# FinancialAnalystAgent in `AnalystReport.intent`; see `agents.intent.resolve_turn_intent`.
+QueryIntentType = Literal[
+    "longitudinal_single_company",
+    "multi_company_peer_comparison",
+    "thematic_trend_tracking",
+    "chunk_health_monitoring",
+]
+
 
 class AgentReportTelemetryMixin(BaseModel):
     """Shared context/latency telemetry fields attached to agent evaluation & report outputs."""
@@ -763,13 +772,29 @@ class AnalystReport(BaseModel):
     notices are rendered deterministically outside the LLM schema.
     """
 
+    intent: QueryIntentType | None = Field(
+        default=None,
+        description=(
+            "Canonical intent of the analyst's question: 'thematic_trend_tracking' (how 10-K "
+            "disclosure wording or a theme changed across fiscal years or spread across a "
+            "sector, for one or several companies; takes precedence whenever the question is "
+            "about wording / disclosure change), 'multi_company_peer_comparison' (two or more "
+            "companies or sector benchmarks compared on figures or risks at a point in time or "
+            "over a window), 'longitudinal_single_company' (one company's figures or drivers "
+            "over time), or 'chunk_health_monitoring' (vector index / corpus health)."
+        ),
+    )
     headline: str = Field(
         ...,
         description="One-sentence direct answer to the analyst's question (at most 35 words).",
     )
     key_metrics: list[AnalystMetricReference] = Field(
         default_factory=list,
-        description="Up to 6 metrics to display, most relevant first.",
+        description=(
+            "Only the deterministic metrics the question actually asks about (e.g. only "
+            "'research_and_development' for an R&D question), most relevant first, at most 6. "
+            "Leave EMPTY for qualitative, risk-factor, or wording-change questions."
+        ),
     )
     findings: list[AnalystFinding] = Field(
         default_factory=list,

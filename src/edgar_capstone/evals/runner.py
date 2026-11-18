@@ -43,6 +43,7 @@ from edgar_capstone.evals.metrics import (
     score_routing,
     score_safety,
     score_scope_or_coverage,
+    score_selective_display,
     score_unsupported_claims,
     score_wording_delta_accuracy,
 )
@@ -62,6 +63,7 @@ class EvalThresholds:
     retrieval_precision_at_10: float = 0.85
     wording_delta_accuracy: float = 0.90
     anomaly_flag_recall: float = 1.0
+    selective_display_accuracy: float = 0.9
     scope_and_coverage_accuracy: float = 1.0
     routing_accuracy: float = 1.0
     judge_faithfulness: float = 0.85
@@ -109,6 +111,7 @@ class ItemResult:
     passed: bool = False
     status: str = ""
     intent: str | None = None
+    intent_source: str | None = None
     execution_mode: str | None = None
     numeric_agreement: bool | None = None
     citation_coverage: bool | None = None
@@ -123,6 +126,7 @@ class ItemResult:
     delta_expected: int = 0
     flag_matched: int = 0
     flag_expected: int = 0
+    selective_display_ok: bool | None = None
     scope_check_ok: bool | None = None
     is_scope_early_exit: bool = False
     unsupported_claims_count: int = 0
@@ -253,6 +257,7 @@ class EvalRunReport:
                     "retrieval_precision_at_10": r.retrieval_precision_at_10,
                     "delta_accuracy": r.delta_accuracy,
                     "flag_recall": r.flag_recall,
+                    "selective_display_ok": r.selective_display_ok,
                     "scope_check_ok": r.scope_check_ok,
                     "unsupported_claims_count": r.unsupported_claims_count,
                     "faithfulness_score": r.faithfulness_score,
@@ -396,6 +401,9 @@ def _score_deterministic_checks(
     if missing_flags:
         res.failure_reasons.append(f"anomaly flags missed: {missing_flags}")
 
+    res.selective_display_ok, reasons = score_selective_display(item, response)
+    res.failure_reasons.extend(reasons)
+
     if item.category == SCOPE_CATEGORY or item.expected_coverage_notice_codes:
         ok, reasons = score_scope_or_coverage(item, response)
         res.scope_check_ok = ok
@@ -489,6 +497,7 @@ def evaluate_item(
 
     res.status = str(response.get("status"))
     res.intent = response.get("intent")
+    res.intent_source = response.get("intent_source")
     res.execution_mode = response.get("execution_mode")
     res.total_latency_ms = response.get("total_latency_ms")
     res.citations_count = len(response.get("citations") or [])
@@ -532,6 +541,7 @@ def evaluate_item(
         and res.grounding_matched == res.grounding_expected
         and res.delta_matched == res.delta_expected
         and res.flag_matched == res.flag_expected
+        and res.selective_display_ok is not False
         and res.scope_check_ok is not False
         and res.unsupported_claims_count == 0
         and res.faithfulness_score is not None
@@ -588,6 +598,10 @@ def aggregate_metrics(results: list[ItemResult]) -> dict[str, float | int | None
         "retrieval_precision_at_10": _mean(p10_vals) if p10_vals else None,
         "wording_delta_accuracy": round(d_matched / d_expected, 4) if d_expected else None,
         "anomaly_flag_recall": round(f_matched / f_expected, 4) if f_expected else None,
+        # Only successful scored turns contribute (errored / non-success items stay None).
+        "selective_display_accuracy": _ratio(
+            [bool(r.selective_display_ok) for r in scored if r.selective_display_ok is not None]
+        ),
         "scope_and_coverage_accuracy": _ratio([bool(r.scope_check_ok) for r in scope_checks]),
         "routing_accuracy": _ratio([bool(r.routing_ok) for r in scored]),
         "judge_faithfulness": _judge("faithfulness_score"),
@@ -615,6 +629,7 @@ def evaluate_gates(
         "retrieval_precision_at_10",
         "wording_delta_accuracy",
         "anomaly_flag_recall",
+        "selective_display_accuracy",
         "scope_and_coverage_accuracy",
         "routing_accuracy",
         "judge_faithfulness",

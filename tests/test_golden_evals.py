@@ -18,6 +18,7 @@ import pytest
 from edgar_capstone.evals.bigquery_io import EvalBigQueryClient, load_schema_fields
 from edgar_capstone.evals.golden import (
     CORE_CATEGORIES,
+    FLAGS_OPTIONAL_TAG,
     ExpectedDelta,
     ExpectedFlag,
     ExpectedSection,
@@ -45,6 +46,7 @@ from edgar_capstone.evals.metrics import (
     score_routing,
     score_safety,
     score_scope_or_coverage,
+    score_selective_display,
     score_unsupported_claims,
     score_wording_delta_accuracy,
 )
@@ -228,6 +230,41 @@ def test_golden_dataset_meets_coverage_requirements(golden_items: list[GoldenEva
     assert any("ai" in i.tags or "generative_ai" in i.tags or "AI" in i.query for i in golden_items)
 
 
+def test_golden_dataset_matches_agentic_tool_selection(golden_items: list[GoldenEvalItem]) -> None:
+    """Qualitative thematic items expect no variances; flags only where the query asks for them."""
+    by_id = {i.id: i for i in golden_items}
+    for item in golden_items:
+        if item.category == "thematic_shift":
+            assert not item.expected_variances, f"{item.id}: qualitative item expects variances"
+            assert not item.expected_flags, f"{item.id}: qualitative item expects flags"
+        if item.expected_flags and item.category != "anomaly_explanation":
+            # Only queries that explicitly ask about losses / inflections may keep flags.
+            assert "Agentic tool selection reconciliation: KEPT expected_flags" in item.notes, (
+                item.id
+            )
+        assert not (item.expected_flags and item.flags_optional), item.id
+    assert [
+        i.id for i in golden_items if i.expected_flags and i.category != "anomaly_explanation"
+    ] == ["rcl_cumulative_loss_recovery_fy20_fy23"]
+    for item_id in (
+        "nvda_export_control_risk_fy24_fy26",
+        "msft_ai_capex_disclosure_fy24_fy26",
+        "meta_ai_regulation_privacy_risk_fy23_fy25",
+        "aapl_china_supply_chain_risk_fy24_fy26",
+        "lly_incretin_mdna_trend_fy23_fy25",
+        "jpm_rate_credit_risk_fy23_fy25",
+        "unh_cybersecurity_risk_fy23_fy25",
+        "mrk_pfe_rd_peer_fy22_fy24",
+        "ge_revenue_spinoff_comparability_fy22_fy24",
+    ):
+        assert "Agentic tool selection reconciliation" in by_id[item_id].notes, item_id
+    assert by_id["mrk_pfe_rd_peer_fy22_fy24"].expected_variances
+    assert by_id["ge_revenue_spinoff_comparability_fy22_fy24"].flags_optional
+    assert (
+        by_id["regional_banks_deposit_risk_fy22_fy23"].expected_intent == "thematic_trend_tracking"
+    )
+
+
 def test_golden_expected_variances_are_fully_populated(golden_items: list[GoldenEvalItem]) -> None:
     for item in golden_items:
         if item.is_safety:
@@ -272,6 +309,13 @@ def test_dataset_validation_rejects_bad_records() -> None:
         validate_golden_dataset([item, item], min_scored_items=0)
     with pytest.raises(GoldenDatasetError, match="need at least 20"):
         validate_golden_dataset([item])
+    with pytest.raises(ValueError, match="contradicts declared expected_flags"):
+        _scored_item(
+            tags=[FLAGS_OPTIONAL_TAG],
+            expected_flags=[
+                {"ticker": "NVDA", "fiscal_year": 2025, "metric": "revenue", "rule": "yoy_change"}
+            ],
+        )
 
 
 def test_dataset_fingerprint_is_order_independent(golden_items: list[GoldenEvalItem]) -> None:
@@ -565,6 +609,121 @@ def test_new_phase6_scorers_numeric_xbrl_filters_precision_deltas_flags_scope() 
     assert score_scope_or_coverage(scope_item, {"status": "success"})[0] is False
 
 
+def _qualitative_item(**overrides: Any) -> GoldenEvalItem:
+    return _scored_item(
+        **{
+            "id": "nvda_thematic_unit",
+            "category": "thematic_shift",
+            "query": "How has NVIDIA's export control risk wording changed from 2024 to 2026?",
+            "expected_intent": "thematic_trend_tracking",
+            "expected_variances": [],
+            **overrides,
+        }
+    )
+
+
+def _qualitative_response(**overrides: Any) -> dict[str, Any]:
+    answer = (
+        "### NVIDIA's export-control risk wording moved from potential to realized impacts.\n\n"
+        "#### Findings\n"
+        "- Export restrictions persisted. "
+        f"[NVDA FY2024 | Item 1A. Risk Factors | NVDA_2024_item_1a_0003]({_SEC_URL})\n"
+        "- Data Center demand drove growth. "
+        f"[NVDA FY2026 | Item 7. MD&A | NVDA_2026_item_7_0001]({_SEC_URL})"
+    )
+    return _response(
+        **{
+            "intent": "thematic_trend_tracking",
+            "intent_source": "agent",
+            "answer_markdown": answer,
+            "variance_reports": [],
+            "material_variance_flags": [],
+            **overrides,
+        }
+    )
+
+
+def test_selective_display_scoring_follows_tool_selection() -> None:
+    qual = _qualitative_item()
+    assert score_selective_display(qual, _qualitative_response()) == (True, [])
+    # Numeric metrics simply skip items without expected variances (no false failures).
+    assert score_numeric_agreement(qual, _qualitative_response(), narrative_pct_tolerance=0.1) == (
+        None,
+        [],
+    )
+    assert score_numeric_citation_coverage(qual, _qualitative_response()) == (None, [])
+    assert score_anomaly_flags(qual, _qualitative_response()) == (0, 0, [])
+
+    # Pre-computed variances / Key Metrics leaking into a qualitative answer fail.
+    leaked = _response(intent="thematic_trend_tracking", material_variance_flags=[])
+    ok, reasons = score_selective_display(qual, leaked)
+    assert ok is False
+    assert any("variance_reports returned ['NVDA']" in r for r in reasons)
+    assert any("Key Metrics rendered" in r for r in reasons)
+
+    flag = {
+        "flag_id": "NVDA_2025_operating_income_yoy_change",
+        "ticker": "NVDA",
+        "fiscal_year": 2025,
+        "metric": "operating_income",
+        "rule": "yoy_change",
+    }
+    ok, reasons = score_selective_display(
+        qual, _qualitative_response(material_variance_flags=[flag])
+    )
+    assert ok is False and "NVDA_2025_operating_income_yoy_change" in reasons[0]
+
+    # Quantitative item: variances expected, flags must stay empty unless tagged optional.
+    quant = _scored_item()
+    assert score_selective_display(quant, _response()) == (True, [])
+    ok, _ = score_selective_display(quant, _response(material_variance_flags=[flag]))
+    assert ok is False
+    optional = _scored_item(tags=[FLAGS_OPTIONAL_TAG])
+    assert optional.flags_optional is True
+    assert score_selective_display(optional, _response(material_variance_flags=[flag])) == (
+        None,
+        [],
+    )
+
+    # Anomaly item expecting both variances and flags is not scored by this metric.
+    anomaly = _scored_item(category="anomaly_explanation", expected_flags=[flag])
+    assert score_selective_display(anomaly, _response(material_variance_flags=[flag])) == (
+        None,
+        [],
+    )
+
+
+def test_runner_scores_selective_display_accuracy() -> None:
+    items = [_qualitative_item(), _qualitative_item(id="nvda_thematic_leak"), _scored_item()]
+
+    def turn(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["session_id"].endswith("nvda_thematic_leak"):
+            return _response(intent="thematic_trend_tracking", intent_source="tool_inference")
+        if kwargs["session_id"].endswith("nvda_thematic_unit"):
+            return _qualitative_response()
+        return _response()
+
+    report = run_golden_evals(items, turn_fn=turn, judge_fn=_perfect_judge)
+    by_id = {r.item_id: r for r in report.item_results}
+    assert by_id["nvda_thematic_unit"].selective_display_ok is True
+    assert by_id["nvda_thematic_unit"].numeric_agreement is None
+    assert by_id["nvda_thematic_unit"].intent_source == "agent"
+    assert by_id["nvda_thematic_unit"].passed is True
+    leak = by_id["nvda_thematic_leak"]
+    assert leak.selective_display_ok is False and leak.passed is False
+    assert leak.intent_source == "tool_inference"
+    assert by_id["nvda_test_item"].selective_display_ok is True
+    assert report.metrics["selective_display_accuracy"] == pytest.approx(0.6667)
+    assert "selective_display_accuracy" in report.regressions
+    row = report.to_bigquery_row()
+    assert row["selective_display_accuracy"] == pytest.approx(0.6667)
+    assert {r["item_id"]: r["selective_display_ok"] for r in row["item_results"]} == {
+        "nvda_thematic_unit": True,
+        "nvda_thematic_leak": False,
+        "nvda_test_item": True,
+    }
+
+
 def test_gates_fail_below_threshold_and_always_gate_ttft() -> None:
     thresholds = EvalThresholds()
     metrics = {
@@ -576,6 +735,7 @@ def test_gates_fail_below_threshold_and_always_gate_ttft() -> None:
         "retrieval_precision_at_10": 0.95,
         "wording_delta_accuracy": 0.95,
         "anomaly_flag_recall": 1.0,
+        "selective_display_accuracy": 0.95,
         "scope_and_coverage_accuracy": 1.0,
         "routing_accuracy": 1.0,
         "judge_faithfulness": 0.9,
@@ -589,6 +749,13 @@ def test_gates_fail_below_threshold_and_always_gate_ttft() -> None:
     gates = {g.name: g for g in evaluate_gates(metrics, thresholds)}
     assert gates["grounding_recall"].passed is False
     assert gates["numeric_agreement"].passed is True
+    assert gates["selective_display_accuracy"].passed is True
+    assert gates["selective_display_accuracy"].threshold == pytest.approx(0.9)
+    low = {
+        g.name: g
+        for g in evaluate_gates(metrics | {"selective_display_accuracy": 0.85}, thresholds)
+    }
+    assert low["selective_display_accuracy"].passed is False
     assert gates["unsupported_claims_total"].passed is True
     assert gates["unsupported_claims_total"].comparator == "<="
     assert not any(g.skipped for g in gates.values())
@@ -615,6 +782,7 @@ def test_thresholds_file_loads_and_rejects_unknown_keys(tmp_path: Path) -> None:
     loaded = EvalThresholds.load(REPO_ROOT / "evals" / "thresholds.yaml")
     assert loaded.grounding_recall == pytest.approx(0.92)
     assert loaded.p95_ttft_ms == pytest.approx(3000.0)
+    assert loaded.selective_display_accuracy == pytest.approx(0.9)
     bad = tmp_path / "t.yaml"
     bad.write_text("gates:\n  not_a_gate: 1\n", encoding="utf-8")
     with pytest.raises(ValueError, match="not_a_gate"):

@@ -65,6 +65,7 @@ from edgar_capstone.agents.schemas import (
     ModelTaskCategory,
     NarrativeEvaluationReport,
 )
+from edgar_capstone.agents.tool_runtime import ToolOutputs, turn_scoped_state_seed
 from edgar_capstone.common.domain import sha256_text
 from edgar_capstone.common.env import TRUTHY_ENV_VALUES
 from edgar_capstone.common.formatting import parse_model_output
@@ -658,10 +659,6 @@ async def run_live_adk_financial_reasoning_async(
         model=analyst_llm,
     )
 
-    calc_map = {
-        f"{r.get('ticker', 'UNK')}_{r.get('start_year', 0)}_{r.get('end_year', 0)}": r
-        for r in variance_reports
-    }
     cache_hits = sum(1 for c in cached_explanations if c.get("cache_hit"))
     cache_misses = max(0, len(cached_explanations) - cache_hits)
     cached_tokens = sum(
@@ -685,11 +682,20 @@ async def run_live_adk_financial_reasoning_async(
         verification_feedback=verification_feedback,
     )
 
+    # Every tool-output key is reset for this run (chat sessions persist across turns) and
+    # carries only outputs the agent already produced this turn (the regeneration pass).
+    prior_outputs = ToolOutputs(
+        variance_reports=list(variance_reports),
+        material_variance_flags=list(material_variance_flags or []),
+        disclosure_deltas=disclosure_deltas,
+        sector_coverage=(sector_map_summaries or {}).get("sector_coverage"),
+        sector_map_summaries=sector_map_summaries,
+        sector_benchmarks=list(sector_benchmarks),
+        chunk_health=chunk_health,
+    )
     state_seed: dict[str, Any] = {
-        "calculated_variances": calc_map,
-        "retrieved_citations": list(citations),
+        **turn_scoped_state_seed(citations=list(citations), prior=prior_outputs),
         "memory_context": dict(memory_context or {}),
-        "material_variance_flags": list(material_variance_flags or []),
         "context_cache_stats": {
             "hits": cache_hits,
             "misses": cache_misses,

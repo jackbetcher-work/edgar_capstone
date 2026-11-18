@@ -234,7 +234,7 @@ class TestLazyImportAndPackagingHygiene:
 
 
 # ===========================================================================
-# 2. Wave 1 Shared Foundations (`common/`, `gcp/`, `lookml.py`)
+# 2. Wave 1 Shared Foundations (`common/`, `gcp/`)
 # ===========================================================================
 
 
@@ -527,7 +527,7 @@ class TestCommonFoundations:
         assert parse_10k_cache_key("invalid_key") is None
 
 
-class TestGcpAndLookmlFoundations:
+class TestGcpFoundations:
     def test_gcp_defaults_precedence(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from edgar_capstone.gcp.defaults import (
             DEFAULT_BIGQUERY_DATASET_ID,
@@ -1025,60 +1025,6 @@ class TestGcpAndLookmlFoundations:
         ]
         mock_http.close()
 
-    def test_lookml_catalog_mtime_cache_invalidation_and_missing_dir(self, tmp_path: Path) -> None:
-        from edgar_capstone.lookml import clear_lookml_catalog_cache, load_lookml_project_catalog
-
-        clear_lookml_catalog_cache()
-        try:
-            missing = load_lookml_project_catalog(tmp_path / "does-not-exist")
-            assert missing["status"] == "missing"
-            assert missing["models"] == []
-
-            looker_dir = tmp_path / "looker"
-            (looker_dir / "models").mkdir(parents=True)
-            (looker_dir / "views").mkdir(parents=True)
-            (looker_dir / "dashboards").mkdir(parents=True)
-            (looker_dir / "manifest.lkml").write_text('project_name: "sec"\n', encoding="utf-8")
-            (looker_dir / "models" / "sec.model.lkml").write_text(
-                'connection: "bq"\nexplore: metrics {}\n', encoding="utf-8"
-            )
-            view_path = looker_dir / "views" / "metrics.view.lkml"
-            view_path.write_text(
-                "view: metrics {\n  dimension: ticker {}\n  measure: rev {}\n}\n", encoding="utf-8"
-            )
-            (looker_dir / "dashboards" / "exec.dashboard.lookml").write_text(
-                "- dashboard: exec_overview\n  title: Executive Overview\n  elements:\n  - name: rev_tile\n",
-                encoding="utf-8",
-            )
-
-            first = load_lookml_project_catalog(looker_dir)
-            second = load_lookml_project_catalog(looker_dir)
-            assert first is second
-            assert first["status"] == "ok"
-            assert first["views"][0]["dimensions"] == ["ticker"]
-            assert first["dashboard_count"] == 1
-            assert first["dashboards"][0]["dashboard_id"] == "exec_overview"
-            assert first["dashboards"][0]["elements"] == ["rev_tile"]
-
-            # Real repository looker/ directory resolves and loads cleanly
-            repo_cat = load_lookml_project_catalog()
-            assert repo_cat["status"] == "ok"
-            assert repo_cat["model_count"] >= 1
-
-            # Update file content and bump mtime_ns explicitly so cache invalidates deterministically
-            old_stat = view_path.stat()
-            view_path.write_text(
-                "view: metrics {\n  dimension: ticker {}\n  dimension: sector {}\n  measure: rev {}\n}\n",
-                encoding="utf-8",
-            )
-            os.utime(view_path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 5_000_000_000))
-
-            third = load_lookml_project_catalog(looker_dir)
-            assert third is not first
-            assert third["views"][0]["dimensions"] == ["ticker", "sector"]
-        finally:
-            clear_lookml_catalog_cache()
-
 
 # ===========================================================================
 # 3. Security & Observability P0/P1 Regression Tests
@@ -1555,9 +1501,9 @@ class TestPromptStoreDomainEnginesAndEvals:
             registry_loader=local_reg,
         )
         _, uri, ver = gcs_backend.fetch("financial_analyst", "latest")
-        assert ver == "v5"
-        assert "v5/financial_analyst.yaml" in uri
-        assert "v5%2Ffinancial_analyst.yaml" in gcs_urls[0]
+        assert ver == "v6"
+        assert "v6/financial_analyst.yaml" in uri
+        assert "v6%2Ffinancial_analyst.yaml" in gcs_urls[0]
         gcs_http.close()
 
         vertex_urls: list[str] = []
@@ -1578,9 +1524,9 @@ class TestPromptStoreDomainEnginesAndEvals:
             registry_loader=local_reg,
         )
         _, v_uri, v_ver = vertex_backend.fetch("financial_analyst", "latest")
-        assert v_ver == "v5"
-        assert v_uri.endswith("@v5")
-        assert "version=v5" in vertex_urls[0]
+        assert v_ver == "v6"
+        assert v_uri.endswith("@v6")
+        assert "version=v6" in vertex_urls[0]
         vertex_http.close()
 
     def test_prompt_store_gcs_404_and_500_fallback_to_local(
@@ -1610,8 +1556,8 @@ class TestPromptStoreDomainEnginesAndEvals:
             artifact = store.load_prompt_artifact("financial_analyst", version="latest")
             assert calls[0] == expected_attempts
             assert artifact.source_backend == "local"
-            assert artifact.release_tag == "v5"
-            assert artifact.version == "5.0.0"
+            assert artifact.release_tag == "v6"
+            assert artifact.version == "6.0.0"
             http_client.close()
 
     def test_deleted_legacy_prompts_absent(self) -> None:

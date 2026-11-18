@@ -50,7 +50,9 @@ export function clean10kDocumentBlock(raw: string): string {
   return raw.replace(/\\([.\-(),&*_[\]])/g, '$1').trim()
 }
 
-export function getIntentDisplayMeta(intent: QueryIntentType): {
+export function getIntentDisplayMeta(
+  intent: QueryIntentType | null | undefined
+): {
   label: string
   shortCode: string
   tone: 'accent' | 'positive' | 'amber' | 'negative'

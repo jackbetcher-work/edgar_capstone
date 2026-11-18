@@ -30,12 +30,18 @@ from typing import Any, Literal
 
 from google.adk.tools import FunctionTool, ToolContext
 
-from edgar_capstone.agents.citations import clean_excerpt
+from edgar_capstone.agents.citations import clean_excerpt, merge_citations
 from edgar_capstone.agents.resilience import with_tool_resilience
 from edgar_capstone.agents.schemas import (
     MaterialFlagExplanation,
     MaterialFlagSource,
     MaterialVarianceFlag,
+)
+from edgar_capstone.agents.tool_runtime import (
+    STATE_MATERIAL_FLAG_SUMMARY,
+    STATE_MATERIAL_FLAGS,
+    STATE_RETRIEVED_CITATIONS,
+    cached_turn_profiles,
 )
 from edgar_capstone.agents.tools import (
     _gcp_adapters,
@@ -600,14 +606,69 @@ def flag_material_variances_from_cached_profiles(
     )
 
 
+def build_material_flag_summary(
+    flag_res: dict[str, Any], *, explained_flags: int
+) -> dict[str, Any] | None:
+    """UI/telemetry summary for a `flag_material_variances` result (None when it failed)."""
+    if flag_res.get("status") != "success":
+        return None
+    return {
+        "total_flags": flag_res.get("total_flags", 0),
+        "returned_flags": flag_res.get("returned_flags", 0),
+        "high_severity_count": flag_res.get("high_severity_count", 0),
+        "explained_flags": explained_flags,
+        "thresholds": flag_res.get("thresholds"),
+    }
+
+
+def _store_flags_in_state(
+    tool_context: ToolContext | None,
+    *,
+    flags: list[dict[str, Any]],
+    summary: dict[str, Any] | None,
+    explanation_citations: list[dict[str, Any]],
+) -> None:
+    """Merge flags, summary, and MD&A explanation citations into ADK `session_state`."""
+    if tool_context is None or not hasattr(tool_context, "state"):
+        return
+    state = tool_context.state
+    merged: dict[str, dict[str, Any]] = {}
+    for f in [*(state.get(STATE_MATERIAL_FLAGS) or []), *flags]:
+        if isinstance(f, dict):
+            merged[str(f.get("flag_id") or id(f))] = f
+    state[STATE_MATERIAL_FLAGS] = list(merged.values())
+    if summary is not None:
+        prior = state.get(STATE_MATERIAL_FLAG_SUMMARY)
+        if isinstance(prior, dict):
+            summary = {
+                **summary,
+                "total_flags": int(prior.get("total_flags", 0) or 0)
+                + int(summary.get("total_flags", 0) or 0),
+                "returned_flags": len(merged),
+                "high_severity_count": sum(
+                    1 for f in merged.values() if f.get("severity") == "high"
+                ),
+                "explained_flags": sum(1 for f in merged.values() if f.get("explanation")),
+            }
+        state[STATE_MATERIAL_FLAG_SUMMARY] = summary
+    if explanation_citations:
+        existing = list(state.get(STATE_RETRIEVED_CITATIONS) or [])
+        state[STATE_RETRIEVED_CITATIONS] = merge_citations(existing, explanation_citations)
+
+
 @with_tool_resilience(tool_name="flag_material_variances")
 def flag_material_variances(
     tickers: str,
     start_year: int,
     end_year: int,
+    explain_top_flags: bool = True,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
     """Deterministically flags material financial variances (anomalies) that need a 10-K explanation.
+
+    Call this ONLY when the question asks about anomalies: unusual swings, inflections, profit
+    or loss sign reversals (e.g. net income turning negative), margin shifts, or why a figure
+    spiked or collapsed. Do not call it for plain metric lookups or qualitative questions.
 
     Rules: large YoY changes in Revenue, Operating Income, Net Income, or R&D; operating or net
     income sign reversals; large operating-margin, net-margin, or R&D-intensity shifts (bps);
@@ -619,25 +680,56 @@ def flag_material_variances(
         tickers: Comma-separated ticker symbols (e.g., 'NVDA' or 'NVDA,AAPL').
         start_year: First fiscal year of the window (e.g., 2024).
         end_year: Last fiscal year of the window (e.g., 2026).
+        explain_top_flags: When true (default), attach a retrieved MD&A passage (with chunk_id)
+            explaining each of the top 3 flags.
 
     Returns:
-        Dictionary with 'status', 'total_flags', 'thresholds', and ranked 'flags'.
+        Dictionary with 'status', 'total_flags', 'thresholds', ranked 'flags' (with optional
+        'explanation' passages), and 'explanation_citations'.
     """
     validated = _validate_flag_request(tickers, start_year, end_year)
     if isinstance(validated, dict):
         return validated
     ticker_filter, eff_start, eff_end = validated
 
-    profiles, sector_profiles = _load_profiles(ticker_filter, eff_start, eff_end, tool_context)
-    result = _compute_and_annotate_missing(
-        profiles,
-        sector_profiles,
-        ticker_filter=ticker_filter,
-        start_year=eff_start,
-        end_year=eff_end,
+    cached = cached_turn_profiles()
+    if cached:
+        # Inside a chat turn: reuse the cached BigQuery profile catalog (0 BigQuery RPCs).
+        result = flag_material_variances_from_cached_profiles(
+            cached, tickers=tickers, start_year=eff_start, end_year=eff_end
+        )
+        _record_gcp_backend_invocation(
+            tool_context,
+            tool_name="flag_material_variances",
+            data_source="gcp",
+            services_hit=["bigquery"],
+        )
+    else:
+        profiles, sector_profiles = _load_profiles(ticker_filter, eff_start, eff_end, tool_context)
+        result = _compute_and_annotate_missing(
+            profiles,
+            sector_profiles,
+            ticker_filter=ticker_filter,
+            start_year=eff_start,
+            end_year=eff_end,
+        )
+
+    explanation_citations: list[dict[str, Any]] = []
+    if result.get("status") == "success" and explain_top_flags and result.get("flags"):
+        flags_with_exp, explanation_citations = attach_flag_explanations(
+            list(result["flags"]), max_flags=3
+        )
+        result["flags"] = flags_with_exp
+    result["explanation_citations"] = explanation_citations
+    summary = build_material_flag_summary(result, explained_flags=len(explanation_citations))
+    if summary is not None:
+        result["summary"] = summary
+    _store_flags_in_state(
+        tool_context,
+        flags=list(result.get("flags") or []),
+        summary=summary,
+        explanation_citations=explanation_citations,
     )
-    if tool_context is not None and hasattr(tool_context, "state"):
-        tool_context.state["material_variance_flags"] = result["flags"]
     return result
 
 

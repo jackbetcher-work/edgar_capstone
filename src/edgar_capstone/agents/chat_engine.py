@@ -15,24 +15,18 @@ from typing import Any
 from google.adk.models.base_llm import BaseLlm
 
 from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
-from edgar_capstone.agents.citations import merge_citations
 from edgar_capstone.agents.context_memory import (
     get_context_latency_tracker,
     get_conversation_memory_manager,
     get_model_strategy_metadata,
     resolve_model_for_task,
 )
-from edgar_capstone.agents.disclosure_deltas import (
-    compare_disclosures_across_years,
-    disclosure_delta_citations,
+from edgar_capstone.agents.intent import (
+    infer_intent_from_tool_calls,
+    is_sector_wide_scope,
+    resolve_turn_intent,
 )
-from edgar_capstone.agents.intent import CHUNK_HEALTH_RE, classify_query_intent
 from edgar_capstone.agents.live_runtime import get_live_runtime_status_metadata
-from edgar_capstone.agents.material_variances import (
-    attach_flag_explanations,
-    flag_material_variances,
-    flag_material_variances_from_cached_profiles,
-)
 from edgar_capstone.agents.prompt_store import get_prompt_store_status_metadata
 from edgar_capstone.agents.react_loop import StructuredReActExecutor
 from edgar_capstone.agents.scope_validation import (
@@ -43,16 +37,20 @@ from edgar_capstone.agents.scope_validation import (
     build_coverage_notices,
     extract_removed_tickers,
     is_additive_followup,
+    is_broad_corpus_query,
     validate_query_scope_and_coverage,
 )
-from edgar_capstone.agents.sector_map_reduce import run_sector_thematic_map_reduce
+from edgar_capstone.agents.tool_runtime import (
+    DETERMINISTIC_TOOL_NAMES,
+    ToolOutputs,
+    ToolTurnContext,
+    tool_turn_context,
+)
 from edgar_capstone.agents.tools import (
     _parse_ticker_list,
     _profile_to_metric_record,
-    calculate_period_variances,
     get_active_gcp_tool_adapters,
     get_context_cache_runtime_stats,
-    query_looker_financial_explore,
     search_10k_chunks_rag,
 )
 from edgar_capstone.common.concurrency import run_parallel_with_context
@@ -81,12 +79,13 @@ ACTIVE_AGENT_NAMES: tuple[str, ...] = ("FinancialAnalystAgent", "NarrativeEvalua
 _S2S_ROUTER_IDENTITY_NAME: str = "RootOrchestrator"
 
 _CORPUS_YEARS_GROUP = "|".join(str(y) for y in range(MIN_CORPUS_YEAR, MAX_CORPUS_YEAR + 1))
+# Scope / metadata-filter resolution only (fiscal-year window and 10-K section filter). These are
+# not intent classification: intent is emitted by FinancialAnalystAgent (`AnalystReport.intent`).
 _YEAR_MENTION_RE = re.compile(rf"\b(?:FY\s*)?({_CORPUS_YEARS_GROUP})\b", re.IGNORECASE)
 _SINCE_YEAR_RE = re.compile(rf"\bsince\s+(?:FY\s*)?(?:{_CORPUS_YEARS_GROUP})\b", re.IGNORECASE)
 _ONLY_YEAR_RE = re.compile(
     rf"\b(?:just|only)\s+(?:FY\s*)?(?:{_CORPUS_YEARS_GROUP})\b", re.IGNORECASE
 )
-_ACROSS_ALL_RE = re.compile(r"\bacross\s+all\b", re.IGNORECASE)
 _ITEM_1A_ONLY_RE = re.compile(r"\b(?:item\s*1a|risk\s+factors?)\b", re.IGNORECASE)
 _ITEM_7_ONLY_RE = re.compile(r"\b(?:item\s*7|md&a|management'?s\s+discussion)\b", re.IGNORECASE)
 
@@ -358,7 +357,7 @@ def resolve_query_scope(
                     effective_sector = sec_name
                     break
 
-    broad_corpus_query = bool(CHUNK_HEALTH_RE.search(query) or _ACROSS_ALL_RE.search(query))
+    broad_corpus_query = is_broad_corpus_query(query)
     if (
         not effective_tickers
         and effective_sector == "ALL"
@@ -598,8 +597,14 @@ def _build_turn_response(
     candidates_searched: int = 0,
     context_cache: dict[str, Any] | None = None,
     evaluation: dict[str, Any] | None = None,
+    intent_source: str = "scope_gate",
 ) -> dict[str, Any]:
-    """Canonical response builder shared across ALL 4 return paths (always nested `model_armor`)."""
+    """Canonical response builder shared across ALL 4 return paths (always nested `model_armor`).
+
+    `variance_reports`, `material_variance_flags`, `material_variance_summary`, and
+    `disclosure_deltas` are populated only when FinancialAnalystAgent invoked the matching
+    deterministic tool this turn (empty / None otherwise).
+    """
     return {
         "status": status,
         "model_armor_blocked": model_armor_blocked,
@@ -615,6 +620,7 @@ def _build_turn_response(
         "report_verification": report_verification,
         "prompt_store": get_prompt_store_status_metadata(),
         "intent": intent,
+        "intent_source": intent_source,
         "orchestrator": PRIMARY_ORCHESTRATOR_NAME,
         "resolved_scope": resolved_scope,
         "answer_markdown": answer_markdown,
@@ -876,6 +882,8 @@ def _run_prompt_guardrail(
 
 @dataclass
 class _RetrievalBundle:
+    """Per-turn payloads: RAG pre-pass evidence + deterministic outputs the agent invoked."""
+
     variance_reports: list[dict[str, Any]] = field(default_factory=list)
     missing_tickers: list[str] = field(default_factory=list)
     sector_benchmarks: list[dict[str, Any]] = field(default_factory=list)
@@ -890,394 +898,24 @@ class _RetrievalBundle:
     sector_map_summaries: dict[str, Any] | None = None
 
 
-def _run_sector_wide_retrieval(
+def _run_rag_prepass(
     *,
     query: str,
-    public_scope: dict[str, Any],
-    all_profiles: list[Any],
-    map_llm: BaseLlm | None,
-    on_progress: ProgressCallback | None,
-    agent_trace: list[dict[str, Any]],
-    identities_used_by_agent: dict[str, dict[str, str]],
-) -> _RetrievalBundle:
-    """Execute full-sector batched map-reduce + sector benchmarks in parallel."""
-    t_sec = time.perf_counter()
-    bench_claims = authorize_agent_tool_invocation(
-        agent_name="FinancialAnalystAgent",
-        tool_name="query_looker_financial_explore",
-        caller=_S2S_ROUTER_IDENTITY_NAME,
-    )
-    _track_identity(identities_used_by_agent, bench_claims)
-    delta_claims = authorize_agent_tool_invocation(
-        agent_name="FinancialAnalystAgent",
-        tool_name="compare_disclosures_across_years",
-        caller=_S2S_ROUTER_IDENTITY_NAME,
-    )
-    _track_identity(identities_used_by_agent, delta_claims)
-
-    def _run_bench() -> dict[str, Any]:
-        return query_looker_financial_explore(
-            explore_name="sector_benchmarks",
-            tickers="ALL",
-            gics_sector=public_scope["gics_sector"],
-            start_year=public_scope["start_year"],
-            end_year=public_scope["end_year"],
-        )
-
-    def _run_mr() -> dict[str, Any]:
-        return run_sector_thematic_map_reduce(
-            theme=query,
-            gics_sector=public_scope["gics_sector"],
-            section_id=public_scope["section_id"],
-            start_year=public_scope["start_year"],
-            end_year=public_scope["end_year"],
-            sector_profiles=all_profiles or None,
-            map_llm=map_llm,
-            on_progress=on_progress,
-        )
-
-    bench_res, mr_res = run_parallel_with_context(
-        [_run_bench, _run_mr],
-        lambda fn: fn(),
-        max_workers=2,
-    )
-
-    sec_ms = round((time.perf_counter() - t_sec) * 1000.0, 2)
-    bundle = _RetrievalBundle()
-    if bench_res.get("status") == "success":
-        bundle.sector_benchmarks = list(bench_res.get("rows") or [])
-    bundle.sector_coverage = mr_res.get("sector_coverage")
-    bundle.sector_map_summaries = mr_res.get("sector_map_summaries")
-    bundle.disclosure_deltas = mr_res.get("disclosure_deltas")
-    bundle.citations = list(mr_res.get("citations") or [])
-    bundle.candidates_searched = int(
-        (bundle.sector_coverage or {}).get("total_chunks_evaluated") or len(bundle.citations)
-    )
-
-    _append_trace_step(
-        agent_trace,
-        agent="FinancialAnalystAgent",
-        claims=bench_claims,
-        tool="query_looker_financial_explore(sector_benchmarks)",
-        status="completed",
-        duration_ms=sec_ms,
-        summary=(
-            f"Retrieved {len(bundle.sector_benchmarks)} structured sector benchmark row(s) "
-            f"for {public_scope['gics_sector']}."
-        ),
-    )
-    cov = bundle.sector_coverage or {}
-    _append_trace_step(
-        agent_trace,
-        agent="FinancialAnalystAgent",
-        claims=delta_claims,
-        tool="sector_thematic_map_reduce",
-        status="completed",
-        duration_ms=sec_ms,
-        summary=(
-            f"Full-sector batched map-reduce analyzed {cov.get('issuers_analyzed', 0)}/"
-            f"{cov.get('issuers_in_sector', 0)} {public_scope['gics_sector']} issuers "
-            f"({cov.get('total_chunks_evaluated', 0):,} passages in "
-            f"{cov.get('batches_processed', 0)} parallel Flash batches) → "
-            f"{len(bundle.citations)} traceable citations."
-        ),
-    )
-    return bundle
-
-
-def _apply_structured_retrieval_result(
-    bundle: _RetrievalBundle,
-    *,
-    struct_kind: str,
-    struct_res: dict[str, Any],
-    calc_ms: float,
-    calc_claims: VerifiedAgentS2SClaims,
-    public_scope: dict[str, Any],
-    agent_trace: list[dict[str, Any]],
-) -> None:
-    if struct_kind == "chunk_health":
-        if struct_res.get("status") == "success":
-            bundle.chunk_health = struct_res
-        _append_trace_step(
-            agent_trace,
-            agent="FinancialAnalystAgent",
-            claims=calc_claims,
-            tool="query_looker_financial_explore(chunk_health)",
-            status="completed",
-            duration_ms=calc_ms,
-            summary=(
-                f"Verified vector index health: {struct_res.get('health_status', 'UNKNOWN')} "
-                f"({struct_res.get('total_chunks', 0):,} chunks)."
-            ),
-        )
-        return
-
-    if struct_kind == "variances":
-        if struct_res.get("status") == "success":
-            bundle.variance_reports = list(struct_res.get("variance_reports") or [])
-            bundle.missing_tickers = list(struct_res.get("missing_tickers") or [])
-            for rep in bundle.variance_reports:
-                bundle.calculated_variances_map[
-                    f"{rep['ticker']}_{rep['start_year']}_{rep['end_year']}"
-                ] = rep
-        _append_trace_step(
-            agent_trace,
-            agent="FinancialAnalystAgent",
-            claims=calc_claims,
-            tool="calculate_period_variances",
-            status="completed",
-            duration_ms=calc_ms,
-            summary=(
-                "Computed deterministic Revenue, Operating Income, Net Income, R&D, XBRL "
-                f"provenance, and margin bps variances for {len(bundle.variance_reports)} issuer(s) "
-                f"({public_scope['tickers_csv']})."
-            ),
-        )
-        return
-
-    if struct_res.get("status") == "success":
-        bundle.sector_benchmarks = list(struct_res.get("rows") or [])
-    _append_trace_step(
-        agent_trace,
-        agent="FinancialAnalystAgent",
-        claims=calc_claims,
-        tool="query_looker_financial_explore(sector_benchmarks)",
-        status="completed",
-        duration_ms=calc_ms,
-        summary=(
-            f"Retrieved {len(bundle.sector_benchmarks)} structured sector benchmark row(s) "
-            f"for {public_scope['gics_sector']}."
-        ),
-    )
-
-
-def _apply_optional_retrieval_outputs(
-    bundle: _RetrievalBundle,
-    *,
-    flags_out: Any,
-    flag_claims: VerifiedAgentS2SClaims | None,
-    deltas_out: Any,
-    delta_claims_opt: VerifiedAgentS2SClaims | None,
-    agent_trace: list[dict[str, Any]],
-) -> None:
-    if flags_out is not None and flag_claims is not None and bundle.variance_reports:
-        flag_res, material_flags, explanation_cits, flag_ms = flags_out
-        bundle.material_flags = material_flags
-        explained_count = len(explanation_cits)
-        merge_citations(bundle.citations, explanation_cits)
-        if flag_res.get("status") == "success":
-            bundle.material_flags_summary = {
-                "total_flags": flag_res.get("total_flags", 0),
-                "returned_flags": flag_res.get("returned_flags", 0),
-                "high_severity_count": flag_res.get("high_severity_count", 0),
-                "explained_flags": explained_count,
-                "thresholds": flag_res.get("thresholds"),
-            }
-        _append_trace_step(
-            agent_trace,
-            agent="FinancialAnalystAgent",
-            claims=flag_claims,
-            tool="flag_material_variances",
-            status="completed" if flag_res.get("status") == "success" else "warning",
-            duration_ms=flag_ms,
-            summary=(
-                f"Flagged {flag_res.get('total_flags', 0)} material variance(s) "
-                f"({flag_res.get('high_severity_count', 0)} high severity); attached MD&A "
-                f"explanations to {explained_count}."
-            ),
-        )
-
-    if deltas_out is not None and delta_claims_opt is not None:
-        disclosure_deltas, delta_ms = deltas_out
-        bundle.disclosure_deltas = disclosure_deltas
-        merge_citations(bundle.citations, disclosure_delta_citations(disclosure_deltas))
-        delta_summary = (disclosure_deltas or {}).get("summary") or {}
-        _append_trace_step(
-            agent_trace,
-            agent="FinancialAnalystAgent",
-            claims=delta_claims_opt,
-            tool="compare_disclosures_across_years",
-            status=(
-                "completed" if (disclosure_deltas or {}).get("status") == "success" else "warning"
-            ),
-            duration_ms=delta_ms,
-            summary=(
-                f"Compared theme disclosures for {delta_summary.get('companies_analyzed', 0)} "
-                f"company(ies) across {delta_summary.get('year_pairs', 0)} year pair(s): "
-                f"{delta_summary.get('added', 0)} added, {delta_summary.get('modified', 0)} "
-                f"modified, {delta_summary.get('removed', 0)} removed."
-            ),
-        )
-
-
-def _authorize_parallel_retrieval_claims(
-    *,
-    intent: str,
-    public_scope: dict[str, Any],
-    run_deltas: bool,
-    identities_used_by_agent: dict[str, dict[str, str]],
-) -> tuple[
-    VerifiedAgentS2SClaims,
-    VerifiedAgentS2SClaims | None,
-    VerifiedAgentS2SClaims | None,
-]:
-    flag_claims: VerifiedAgentS2SClaims | None = None
-    delta_claims_opt: VerifiedAgentS2SClaims | None = None
-
-    if intent == "chunk_health_monitoring" or not public_scope["tickers"]:
-        calc_tool = "query_looker_financial_explore"
-    else:
-        calc_tool = "calculate_period_variances"
-        flag_claims = authorize_agent_tool_invocation(
-            agent_name="FinancialAnalystAgent",
-            tool_name="flag_material_variances",
-            caller=_S2S_ROUTER_IDENTITY_NAME,
-        )
-        _track_identity(identities_used_by_agent, flag_claims)
-
-    calc_claims = authorize_agent_tool_invocation(
-        agent_name="FinancialAnalystAgent",
-        tool_name=calc_tool,
-        caller=_S2S_ROUTER_IDENTITY_NAME,
-    )
-    _track_identity(identities_used_by_agent, calc_claims)
-
-    if run_deltas:
-        delta_claims_opt = authorize_agent_tool_invocation(
-            agent_name="FinancialAnalystAgent",
-            tool_name="compare_disclosures_across_years",
-            caller=_S2S_ROUTER_IDENTITY_NAME,
-        )
-        _track_identity(identities_used_by_agent, delta_claims_opt)
-
-    return calc_claims, flag_claims, delta_claims_opt
-
-
-def _run_parallel_retrieval(
-    *,
-    query: str,
-    intent: str,
     public_scope: dict[str, Any],
     top_k: int,
-    all_profiles: list[Any],
     rag_claims: VerifiedAgentS2SClaims,
     agent_trace: list[dict[str, Any]],
-    identities_used_by_agent: dict[str, dict[str, str]],
-) -> _RetrievalBundle:
-    """Run structured metrics/variances, hybrid RAG, anomaly flags, and disclosure deltas in parallel."""
-    run_flags = bool(public_scope["tickers"] and intent != "chunk_health_monitoring")
-    run_deltas = (
-        intent == "thematic_trend_tracking"
-        and public_scope["end_year"] > public_scope["start_year"]
-    )
-    calc_claims, flag_claims, delta_claims_opt = _authorize_parallel_retrieval_claims(
-        intent=intent,
-        public_scope=public_scope,
-        run_deltas=run_deltas,
-        identities_used_by_agent=identities_used_by_agent,
-    )
-
-    def _run_structured_step() -> tuple[str, dict[str, Any], float]:
-        ts = time.perf_counter()
-        if intent == "chunk_health_monitoring":
-            res = query_looker_financial_explore(
-                explore_name="chunk_health",
-                tickers=public_scope["tickers_csv"],
-                gics_sector=public_scope["gics_sector"],
-                start_year=public_scope["start_year"],
-                end_year=public_scope["end_year"],
-            )
-            return "chunk_health", res, round((time.perf_counter() - ts) * 1000.0, 2)
-        if public_scope["tickers"]:
-            res = calculate_period_variances(
-                tickers=public_scope["tickers_csv"],
-                start_year=public_scope["start_year"],
-                end_year=public_scope["end_year"],
-            )
-            return "variances", res, round((time.perf_counter() - ts) * 1000.0, 2)
-        res = query_looker_financial_explore(
-            explore_name="sector_benchmarks",
-            tickers="ALL",
-            gics_sector=public_scope["gics_sector"],
-            start_year=public_scope["start_year"],
-            end_year=public_scope["end_year"],
-        )
-        return "benchmarks", res, round((time.perf_counter() - ts) * 1000.0, 2)
-
-    def _run_rag_step() -> tuple[list[dict[str, Any]], int, float]:
-        ts = time.perf_counter()
-        cits, cand = _retrieve_balanced_citations(
-            query=query,
-            tickers=public_scope["tickers"],
-            gics_sector=public_scope["gics_sector"],
-            section_id=public_scope["section_id"],
-            start_year=public_scope["start_year"],
-            end_year=public_scope["end_year"],
-            top_k=top_k,
-        )
-        return cits, cand, round((time.perf_counter() - ts) * 1000.0, 2)
-
-    def _run_flags_step() -> tuple[
-        dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], float
-    ]:
-        ts = time.perf_counter()
-        if all_profiles:
-            flag_res = flag_material_variances_from_cached_profiles(
-                all_profiles,
-                tickers=public_scope["tickers_csv"],
-                start_year=public_scope["start_year"],
-                end_year=public_scope["end_year"],
-            )
-        else:
-            flag_res = flag_material_variances(
-                tickers=public_scope["tickers_csv"],
-                start_year=public_scope["start_year"],
-                end_year=public_scope["end_year"],
-            )
-        exp_flags: list[dict[str, Any]] = []
-        exp_cits: list[dict[str, Any]] = []
-        if flag_res.get("status") == "success":
-            exp_flags, exp_cits = attach_flag_explanations(
-                list(flag_res.get("flags") or []), max_flags=3
-            )
-        return flag_res, exp_flags, exp_cits, round((time.perf_counter() - ts) * 1000.0, 2)
-
-    def _run_deltas_step() -> tuple[dict[str, Any], float]:
-        ts = time.perf_counter()
-        res = compare_disclosures_across_years(
-            theme=query,
-            tickers=public_scope["tickers_csv"],
-            gics_sector=public_scope["gics_sector"],
-            section_id=public_scope["section_id"],
-            start_year=public_scope["start_year"],
-            end_year=public_scope["end_year"],
-        )
-        return res, round((time.perf_counter() - ts) * 1000.0, 2)
-
-    jobs: list[tuple[str, Callable[[], Any]]] = [
-        ("struct", _run_structured_step),
-        ("rag", _run_rag_step),
-    ]
-    if run_flags:
-        jobs.append(("flags", _run_flags_step))
-    if run_deltas:
-        jobs.append(("deltas", _run_deltas_step))
-
-    results = dict(
-        run_parallel_with_context(jobs, lambda item: (item[0], item[1]()), max_workers=4)
-    )
-    struct_kind, struct_res, calc_ms = results["struct"]
-    citations, candidates_searched, rag_ms = results["rag"]
-
-    bundle = _RetrievalBundle(citations=citations, candidates_searched=candidates_searched)
-    _apply_structured_retrieval_result(
-        bundle,
-        struct_kind=struct_kind,
-        struct_res=struct_res,
-        calc_ms=calc_ms,
-        calc_claims=calc_claims,
-        public_scope=public_scope,
-        agent_trace=agent_trace,
+) -> tuple[list[dict[str, Any]], int]:
+    """Balanced hybrid-RAG evidence leads (the only pre-pass; deterministic engines are tools)."""
+    ts = time.perf_counter()
+    citations, candidates_searched = _retrieve_balanced_citations(
+        query=query,
+        tickers=public_scope["tickers"],
+        gics_sector=public_scope["gics_sector"],
+        section_id=public_scope["section_id"],
+        start_year=public_scope["start_year"],
+        end_year=public_scope["end_year"],
+        top_k=top_k,
     )
     _append_trace_step(
         agent_trace,
@@ -1285,21 +923,120 @@ def _run_parallel_retrieval(
         claims=rag_claims,
         tool="search_10k_chunks_rag",
         status="completed",
-        duration_ms=rag_ms,
+        duration_ms=round((time.perf_counter() - ts) * 1000.0, 2),
         summary=(
             f"Ranked {candidates_searched:,} metadata-filtered 10-K chunks (BigQuery VECTOR_SEARCH + "
-            f"Vertex AI Search) → top {len(bundle.citations)} grounded citations."
+            f"Vertex AI Search) → top {len(citations)} grounded citations."
         ),
     )
-    _apply_optional_retrieval_outputs(
-        bundle,
-        flags_out=results.get("flags"),
-        flag_claims=flag_claims,
-        deltas_out=results.get("deltas"),
-        delta_claims_opt=delta_claims_opt,
-        agent_trace=agent_trace,
+    return citations, candidates_searched
+
+
+def _bundle_from_tool_outputs(
+    outputs: ToolOutputs,
+    *,
+    citations: list[dict[str, Any]],
+    candidates_searched: int,
+) -> _RetrievalBundle:
+    """Build the turn bundle from deterministic tool outputs hydrated from ADK session_state."""
+    sector_cov = outputs.sector_coverage
+    return _RetrievalBundle(
+        variance_reports=list(outputs.variance_reports),
+        missing_tickers=list(outputs.missing_tickers),
+        sector_benchmarks=list(outputs.sector_benchmarks),
+        chunk_health=outputs.chunk_health,
+        calculated_variances_map=outputs.calculated_variances_map,
+        citations=list(citations),
+        candidates_searched=(
+            int((sector_cov or {}).get("total_chunks_evaluated") or 0) or candidates_searched
+        ),
+        material_flags=list(outputs.material_variance_flags),
+        material_flags_summary=outputs.material_variance_summary,
+        disclosure_deltas=outputs.disclosure_deltas,
+        sector_coverage=sector_cov,
+        sector_map_summaries=outputs.sector_map_summaries,
     )
-    return bundle
+
+
+def _agent_tool_summary(tool: str, bundle: _RetrievalBundle, calls: list[dict[str, Any]]) -> str:
+    if tool == "calculate_period_variances":
+        tickers = ", ".join(r["ticker"] for r in bundle.variance_reports if r.get("ticker"))
+        return (
+            "Agent-invoked deterministic Revenue, Operating Income, Net Income, R&D, XBRL "
+            f"provenance, and margin bps variances for {len(bundle.variance_reports)} issuer(s)"
+            f"{f' ({tickers})' if tickers else ''}."
+        )
+    if tool == "flag_material_variances":
+        summ = bundle.material_flags_summary or {}
+        return (
+            f"Agent-invoked anomaly detection flagged {summ.get('total_flags', len(bundle.material_flags))} "
+            f"material variance(s) ({summ.get('high_severity_count', 0)} high severity); attached "
+            f"MD&A explanations to {summ.get('explained_flags', 0)}."
+        )
+    if tool == "compare_disclosures_across_years":
+        d_sum = (bundle.disclosure_deltas or {}).get("summary") or {}
+        return (
+            f"Agent-invoked theme disclosure comparison for {d_sum.get('companies_analyzed', 0)} "
+            f"company(ies) across {d_sum.get('year_pairs', 0)} year pair(s): "
+            f"{d_sum.get('added', 0)} added, {d_sum.get('modified', 0)} modified, "
+            f"{d_sum.get('removed', 0)} removed."
+        )
+    if tool == "sector_thematic_map_reduce":
+        cov = bundle.sector_coverage or {}
+        return (
+            f"Agent-invoked full-sector batched map-reduce analyzed {cov.get('issuers_analyzed', 0)}/"
+            f"{cov.get('issuers_in_sector', 0)} {cov.get('gics_sector', '')} issuers "
+            f"({int(cov.get('total_chunks_evaluated', 0) or 0):,} passages in "
+            f"{cov.get('batches_processed', 0)} parallel Flash batches)."
+        )
+    if tool == "query_looker_financial_explore":
+        explores = sorted(
+            {str((c.get("args") or {}).get("explore_name") or "") for c in calls} - {""}
+        )
+        return (
+            f"Agent-invoked Looker explore(s) {explores}: {len(bundle.sector_benchmarks)} sector "
+            f"benchmark row(s); chunk health "
+            f"{(bundle.chunk_health or {}).get('health_status', 'not requested')}."
+        )
+    return f"Agent-invoked {tool} ({len(calls)} call(s))."
+
+
+def _append_agent_tool_trace_steps(
+    *,
+    agent_trace: list[dict[str, Any]],
+    identities_used_by_agent: dict[str, dict[str, str]],
+    tool_calls: list[dict[str, Any]],
+    bundle: _RetrievalBundle,
+    turn_ctx: ToolTurnContext,
+) -> list[str]:
+    """S2S-attested trace steps for every deterministic tool the agent chose to invoke."""
+    invoked: dict[str, list[dict[str, Any]]] = {}
+    for call in tool_calls:
+        name = str(call.get("name") or "")
+        if name in DETERMINISTIC_TOOL_NAMES:
+            invoked.setdefault(name, []).append(call)
+    for name, calls in invoked.items():
+        claims = authorize_agent_tool_invocation(
+            agent_name="FinancialAnalystAgent",
+            tool_name=name,
+            caller=_S2S_ROUTER_IDENTITY_NAME,
+        )
+        _track_identity(identities_used_by_agent, claims)
+        trace_tool = (
+            f"query_looker_financial_explore({','.join(sorted({str((c.get('args') or {}).get('explore_name') or '') for c in calls}))})"
+            if name == "query_looker_financial_explore"
+            else name
+        )
+        _append_trace_step(
+            agent_trace,
+            agent="FinancialAnalystAgent",
+            claims=claims,
+            tool=trace_tool,
+            status="completed",
+            duration_ms=turn_ctx.tool_duration_ms(name),
+            summary=_agent_tool_summary(name, bundle, calls),
+        )
+    return sorted(invoked)
 
 
 def _inspect_response_guardrail(
@@ -1541,7 +1278,7 @@ def run_conversational_rag_turn(
     t1 = time.perf_counter()
     route_claims = authorize_agent_tool_invocation(
         agent_name=_S2S_ROUTER_IDENTITY_NAME,
-        tool_name="classify_query_intent",
+        tool_name="resolve_query_scope",
         caller=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
     )
     _track_identity(identities_used_by_agent, route_claims)
@@ -1611,7 +1348,10 @@ def run_conversational_rag_turn(
             reason=validation.get("reason"),
         )
 
-    intent = classify_query_intent(query, tickers=public_scope["tickers"] or None)
+    # Intent is emitted by FinancialAnalystAgent (`AnalystReport.intent`); the router only
+    # resolves scope. `provisional_intent` is a structural (non-lexical) routing hint.
+    provisional_intent = infer_intent_from_tool_calls(public_scope, [])
+    sector_wide_scope = is_sector_wide_scope(public_scope)
     orchestrator_model = resolve_model_for_task("orchestration")
     route_ms = round((time.perf_counter() - t1) * 1000.0, 2)
     mem_suffix = " (recalled from session memory)" if public_scope.get("memory_inherited") else ""
@@ -1620,37 +1360,34 @@ def run_conversational_rag_turn(
         agent=_S2S_ROUTER_IDENTITY_NAME,
         claims=route_claims,
         model_used=orchestrator_model,
-        tool="classify_query_intent",
+        tool="resolve_query_scope",
         status="completed",
         duration_ms=route_ms,
         summary=(
-            f"Routed to '{intent}' ({orchestrator_model}) · Tickers: {public_scope['tickers_csv']}{mem_suffix} · "
+            f"Resolved scope ({orchestrator_model}) · Tickers: {public_scope['tickers_csv']}{mem_suffix} · "
             f"Sector: {public_scope['gics_sector']} · Section: {public_scope['section_id']} · "
-            f"FY{public_scope['start_year']}–FY{public_scope['end_year']}"
+            f"FY{public_scope['start_year']}–FY{public_scope['end_year']} · intent and "
+            "deterministic tools are selected by FinancialAnalystAgent"
         ),
     )
 
-    is_sector_wide_thematic = (
-        intent == "thematic_trend_tracking"
-        and not public_scope["tickers"]
-        and public_scope["gics_sector"] not in ("ALL", "", None)
-    )
     _emit(
         "scope_resolved",
         (
             f"Scoped to {public_scope['gics_sector']} sector (FY{public_scope['start_year']}–FY{public_scope['end_year']})"
-            if is_sector_wide_thematic
+            if sector_wide_scope
             else f"Scoped to {public_scope['tickers_csv']} (FY{public_scope['start_year']}–FY{public_scope['end_year']})"
         ),
         {
-            "intent": intent,
+            "intent": None,
+            "provisional_intent": provisional_intent,
             "tickers": public_scope["tickers"],
             "gics_sector": public_scope["gics_sector"],
-            "sector_map_reduce": is_sector_wide_thematic,
+            "sector_wide_scope": sector_wide_scope,
         },
     )
 
-    # Step 2 & Step 3: Parallel Retrieval (Variances / Benchmarks + Hybrid RAG / Sector Map-Reduce)
+    # Step 2: Hybrid RAG evidence-lead pre-pass (deterministic engines are agent-invoked tools)
     authorize_agent_s2s_hop(
         caller_agent=_S2S_ROUTER_IDENTITY_NAME,
         callee_agent="FinancialAnalystAgent",
@@ -1661,39 +1398,28 @@ def run_conversational_rag_turn(
         caller=_S2S_ROUTER_IDENTITY_NAME,
     )
     _track_identity(identities_used_by_agent, rag_claims)
-
-    if is_sector_wide_thematic:
-        bundle = _run_sector_wide_retrieval(
-            query=query,
-            public_scope=public_scope,
-            all_profiles=all_profiles,
-            map_llm=map_llm,
-            on_progress=on_progress,
-            agent_trace=agent_trace,
-            identities_used_by_agent=identities_used_by_agent,
-        )
-    else:
-        _emit("retrieving", "Fetching financial metrics and 10-K evidence in parallel...", None)
-        bundle = _run_parallel_retrieval(
-            query=query,
-            intent=intent,
-            public_scope=public_scope,
-            top_k=top_k,
-            all_profiles=all_profiles,
-            rag_claims=rag_claims,
-            agent_trace=agent_trace,
-            identities_used_by_agent=identities_used_by_agent,
-        )
-
-    coverage_notices = build_coverage_notices(
-        variance_reports=bundle.variance_reports,
-        missing_tickers=bundle.missing_tickers,
+    _emit("retrieving", "Retrieving 10-K evidence leads...", None)
+    prepass_citations, prepass_candidates = _run_rag_prepass(
         query=query,
-        sector_coverage=bundle.sector_coverage,
-        pre_notices=pre_notices,
+        public_scope=public_scope,
+        top_k=top_k,
+        rag_claims=rag_claims,
+        agent_trace=agent_trace,
     )
 
-    # Step 4 & Step 5: Structured ReAct Execution Loop
+    # Missing-fiscal-year / fiscal-calendar / missing-ticker notices come from the cached
+    # BigQuery profile catalog, independent of whether the agent computes variance reports.
+    base_coverage_notices = build_coverage_notices(
+        variance_reports=[],
+        query=query,
+        pre_notices=pre_notices,
+        profiles=all_profiles,
+        tickers=list(public_scope["tickers"]),
+        start_year=int(public_scope["start_year"]),
+        end_year=int(public_scope["end_year"]),
+    )
+
+    # Step 3 & Step 4: Structured ReAct loop; the agent invokes deterministic tools as needed
     last_cache_claims: VerifiedAgentS2SClaims | None = None
 
     def _on_cache_s2s_call(_ticker: str, _fy: int, _sec: str) -> None:
@@ -1710,33 +1436,38 @@ def run_conversational_rag_turn(
         _track_identity(identities_used_by_agent, c_claims)
         last_cache_claims = c_claims
 
-    react_result = StructuredReActExecutor(
-        reasoning_llm=reasoning_llm,
-        judge_llm=judge_llm,
-    ).execute_post_retrieval_reasoning(
-        query=query,
-        intent=intent,
-        scope=public_scope,
-        variance_reports=bundle.variance_reports,
-        citations=bundle.citations,
-        sector_benchmarks=bundle.sector_benchmarks,
-        chunk_health=bundle.chunk_health,
-        memory_tokens=int(memory_ctx.get("memory_tokens", 0) or 0),
-        memory_prep_latency_ms=float(memory_ctx.get("memory_lookup_latency_ms", 0.0) or 0.0),
-        memory_context=memory_ctx,
-        session_id=session_id,
-        telemetry_session_id=telemetry_session_id,
-        user_id=user_id,
-        on_cache_s2s_call=_on_cache_s2s_call,
-        material_variance_flags=bundle.material_flags,
-        disclosure_deltas=bundle.disclosure_deltas,
-        coverage_notices=coverage_notices,
-        sector_map_summaries=bundle.sector_map_summaries,
-        prompt_already_verified=True,
-        run_judge_sync=run_judge_sync,
-        skip_background_judge=skip_background_judge,
+    with tool_turn_context(
         on_progress=on_progress,
-    )
+        map_llm=map_llm,
+        cached_profiles=all_profiles,
+    ) as turn_ctx:
+        react_result = StructuredReActExecutor(
+            reasoning_llm=reasoning_llm,
+            judge_llm=judge_llm,
+        ).execute_post_retrieval_reasoning(
+            query=query,
+            intent=provisional_intent,
+            scope=public_scope,
+            variance_reports=[],
+            citations=prepass_citations,
+            sector_benchmarks=[],
+            chunk_health=None,
+            memory_tokens=int(memory_ctx.get("memory_tokens", 0) or 0),
+            memory_prep_latency_ms=float(memory_ctx.get("memory_lookup_latency_ms", 0.0) or 0.0),
+            memory_context=memory_ctx,
+            session_id=session_id,
+            telemetry_session_id=telemetry_session_id,
+            user_id=user_id,
+            on_cache_s2s_call=_on_cache_s2s_call,
+            material_variance_flags=[],
+            disclosure_deltas=None,
+            coverage_notices=base_coverage_notices,
+            sector_map_summaries=None,
+            prompt_already_verified=True,
+            run_judge_sync=run_judge_sync,
+            skip_background_judge=skip_background_judge,
+            on_progress=on_progress,
+        )
 
     answer_markdown: str = react_result["answer_markdown"]
     citations: list[dict[str, Any]] = react_result["citations"]
@@ -1750,6 +1481,22 @@ def run_conversational_rag_turn(
     evaluation_model: str = react_result["evaluation_model"]
     active_execution_mode: str = react_result["execution_mode"]
     adk_runtime_meta: dict[str, Any] = react_result["adk_runtime"]
+    agent_tool_calls: list[dict[str, Any]] = list(react_result.get("agent_tool_calls") or [])
+
+    # Deterministic tool outputs hydrated from ADK session_state (before verification ran)
+    bundle = _bundle_from_tool_outputs(
+        react_result.get("tool_outputs") or ToolOutputs(),
+        citations=citations,
+        candidates_searched=prepass_candidates,
+    )
+    coverage_notices: list[dict[str, Any]] = list(
+        react_result.get("coverage_notices") or base_coverage_notices
+    )
+    intent, intent_source = resolve_turn_intent(
+        agent_intent=react_result.get("agent_intent"),
+        scope=public_scope,
+        tool_calls=agent_tool_calls,
+    )
 
     eval_var_step = react_steps[0]
     _append_trace_step(
@@ -1764,6 +1511,18 @@ def run_conversational_rag_turn(
             f"ReAct [Thought→Action]: Evaluated {len(variance_evaluations)} variance report(s) "
             f"using `{reasoning_model}` (context_latency={eval_var_step.context_latency_ms:.2f}ms)."
         ),
+    )
+    invoked_tools = _append_agent_tool_trace_steps(
+        agent_trace=agent_trace,
+        identities_used_by_agent=identities_used_by_agent,
+        tool_calls=agent_tool_calls,
+        bundle=bundle,
+        turn_ctx=turn_ctx,
+    )
+    _emit(
+        "intent_resolved",
+        f"Intent: {intent} ({intent_source}); deterministic tools: {', '.join(invoked_tools) or 'none'}",
+        {"intent": intent, "intent_source": intent_source, "agent_invoked_tools": invoked_tools},
     )
 
     context_cache_info: dict[str, Any] | None = None
@@ -1926,6 +1685,7 @@ def run_conversational_rag_turn(
         structured_report=adk_runtime_meta.get("structured_report"),
         report_verification=adk_runtime_meta.get("report_verification"),
         intent=intent,
+        intent_source=intent_source,
         resolved_scope=public_scope,
         answer_markdown=answer_markdown,
         answer_verified=bool(react_result.get("answer_verified")),

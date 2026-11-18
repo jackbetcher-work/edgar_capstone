@@ -8,6 +8,7 @@ audit logging.
 
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import threading
@@ -452,6 +453,30 @@ def is_bearer_token_revoked(raw_jwt: str) -> bool:
         return True
 
 
+# Request-scoped authenticated principal for audit attribution of events raised deep inside a
+# turn (Model Armor / SDP / projection-filter guardrail blocks) where no `AuthenticatedUser` is
+# threaded through. Bound by the chat router for the duration of a turn; `contextvars` carries it
+# across the SSE worker thread, the background ADK asyncio loop, and parallel tool workers.
+_AUDIT_PRINCIPAL: contextvars.ContextVar[AuthenticatedUser | None] = contextvars.ContextVar(
+    "edgar_audit_principal", default=None
+)
+
+
+def bind_audit_principal(user: AuthenticatedUser | None) -> contextvars.Token:
+    """Bind the authenticated request principal for guardrail audit attribution."""
+    return _AUDIT_PRINCIPAL.set(user)
+
+
+def reset_audit_principal(token: contextvars.Token) -> None:
+    """Restore the previously bound audit principal (call in a `finally`)."""
+    _AUDIT_PRINCIPAL.reset(token)
+
+
+def current_audit_principal() -> AuthenticatedUser | None:
+    """Return the authenticated principal bound to the current request context, if any."""
+    return _AUDIT_PRINCIPAL.get()
+
+
 def record_security_audit_event(
     *,
     event_type: str,
@@ -460,8 +485,17 @@ def record_security_audit_event(
     status_outcome: str = "allowed",
     tickers: list[str] | str | None = None,
     detail: str = "",
+    inherit_request_principal: bool = False,
 ) -> dict[str, Any]:
-    """Append a structured authentication or 10-K data access event to the audit trail."""
+    """Append a structured authentication or 10-K data access event to the audit trail.
+
+    With ``inherit_request_principal=True`` and ``user=None``, the principal bound via
+    `bind_audit_principal` for the active request is attributed (guardrail blocks raised inside an
+    authenticated chat turn). Without a bound principal the event stays ``unauthenticated``.
+    The active Cloud Trace ID is always attached by the telemetry sink.
+    """
+    if user is None and inherit_request_principal:
+        user = _AUDIT_PRINCIPAL.get()
     if isinstance(tickers, str):
         ticker_list = [t.strip().upper() for t in tickers.split(",") if t.strip()]
     elif tickers is not None:
@@ -1394,6 +1428,9 @@ def issue_local_dev_workspace_sso_token(
 
 
 __all__ = [
+    "bind_audit_principal",
+    "current_audit_principal",
+    "reset_audit_principal",
     "ALLOWED_JWS_ALGORITHMS",
     "DEFAULT_LOCAL_IAP_AUDIENCE",
     "GOOGLE_IAP_ISSUER",

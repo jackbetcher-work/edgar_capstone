@@ -158,15 +158,35 @@ def test_findings_are_kept_only_when_quote_chunk_and_figures_verify(
     )
     assert tag in md
     assert f'*Evidence:* "{amount_quote}"' in md
-    # Key metrics default to the deterministic figures with period_of_report and XBRL provenance
-    assert f"{rev_pct:+.2f}%" in md
-    assert "XBRL" in md and "acc:" in md
-    assert "2024-01-" in md or "2026-01-" in md
+    # No forced Key Metrics fallback: the agent selected none, so none are rendered even though
+    # the deterministic payload is available.
+    assert "#### Key Metrics" not in md
+    assert f"{rev_pct:+.2f}%" not in md
     calc_map = {f"{r['ticker']}_{r['start_year']}_{r['end_year']}": r for r in reports}
     check = verify_narrative_against_calculations(
         response_text=md, calculated_variances=calc_map, retrieved_citations=citations
     )
     assert check.passed, check.discrepancies
+
+    # Explicitly selected key metrics render the deterministic figures with period_of_report
+    # and XBRL provenance (and only the selected metric).
+    selected = verify_analyst_report(
+        report.model_copy(update={"key_metrics": [{"ticker": "NVDA", "metric": "revenue"}]}),
+        variance_reports=reports,
+        citations=citations,
+    )
+    md_metrics = render_analyst_report_markdown(
+        selected, variance_reports=reports, citations=citations, scope={"tickers_csv": "NVDA"}
+    )
+    assert "#### Key Metrics (deterministic engine)" in md_metrics
+    assert f"{rev_pct:+.2f}%" in md_metrics
+    assert "XBRL" in md_metrics and "acc:" in md_metrics
+    assert "2024-01-" in md_metrics or "2026-01-" in md_metrics
+    assert "Net Income:" not in md_metrics and "Operating Income:" not in md_metrics
+    check_metrics = verify_narrative_against_calculations(
+        response_text=md_metrics, calculated_variances=calc_map, retrieved_citations=citations
+    )
+    assert check_metrics.passed, check_metrics.discrepancies
 
 
 def test_unverifiable_headline_is_replaced_and_all_rejected_findings_mark_unusable(

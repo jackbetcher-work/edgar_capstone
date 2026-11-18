@@ -182,16 +182,29 @@ class CloudLoggingJsonFormatter(logging.Formatter):
         if request_ctx:
             payload["request"] = request_ctx
 
-        if record.exc_info and record.levelno >= logging.ERROR:
-            payload["@type"] = ERROR_REPORTING_TYPE
+        if record.levelno >= logging.ERROR:
+            # `serviceContext` on every ERROR+ line lets Logs Explorer / Error Reporting group
+            # by service + revision. Only records carrying a traceback are tagged with the
+            # Error Reporting `@type` (plus `context.reportLocation`), so plain error lines such
+            # as 5xx access logs don't open one Error Reporting group per path/latency message.
             service_ctx = {"service": self.service_name}
             if self.service_version:
                 service_ctx["version"] = self.service_version
             payload["serviceContext"] = service_ctx
+            if record.exc_info:
+                payload["@type"] = ERROR_REPORTING_TYPE
+                payload["context"] = {
+                    "reportLocation": {
+                        "filePath": record.pathname,
+                        "lineNumber": record.lineno,
+                        "functionName": record.funcName,
+                    }
+                }
 
         for key, value in _record_extras(record).items():
-            if key not in _RESERVED_PAYLOAD_KEYS:
-                payload[key] = value
+            if key in _RESERVED_PAYLOAD_KEYS or (key == "context" and "context" in payload):
+                continue
+            payload[key] = value
 
         return json.dumps(payload, default=str, ensure_ascii=False, separators=(",", ":"))
 

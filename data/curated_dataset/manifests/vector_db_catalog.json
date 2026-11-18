@@ -4,23 +4,21 @@
   "dataset_id": "sec_edgar",
   "table_id": "filing_chunks",
   "location": "us-central1",
-  "generated_at": "2026-11-16T22:14:54Z",
+  "generated_at": "2026-11-18T16:51:02Z",
   "embedding_model": "text-embedding-005",
   "embedding_backend": "vertex_ai",
   "embedding_dimensions": 768,
   "total_profiles_processed": 3022,
-  "total_chunks_generated": 342945,
-  "item_1a_chunks": 154383,
-  "item_7_chunks": 188562,
+  "total_chunks_generated": 346219,
+  "item_1a_chunks": 154454,
+  "item_7_chunks": 191765,
   "bigquery_manifest_path": "/Users/jackbetcher/agy-cli-projects/edgar_capstone/data/curated_dataset/manifests/bigquery_filing_chunks.jsonl",
   "vertex_vector_manifest_path": "/Users/jackbetcher/agy-cli-projects/edgar_capstone/data/curated_dataset/vector_search/embeddings/chunks_embeddings.json",
   "health_report_path": "/Users/jackbetcher/agy-cli-projects/edgar_capstone/data/curated_dataset/manifests/chunk_health_report.json",
   "uploaded_to_gcs": true,
   "loaded_to_bigquery": true,
   "published_monitoring_metrics": true,
-  "health_score": 99.76,
+  "health_score": 100.0,
   "health_status": "HEALTHY",
-  "warnings": [
-    "[FDX_2020] Produced 0 chunks from /Users/jackbetcher/agy-cli-projects/edgar_capstone/data/curated_dataset/unstructured/FDX/2020_10k.md"
-  ]
+  "warnings": []
 }

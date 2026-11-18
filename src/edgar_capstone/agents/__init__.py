@@ -69,10 +69,10 @@ if TYPE_CHECKING:
     )
     from edgar_capstone.agents.financial_analyst import DEFAULT_ANALYST_MODEL
     from edgar_capstone.agents.intent import (
-        CHUNK_HEALTH_RE,
         QueryIntentType,
         TurnIntentType,
-        classify_query_intent,
+        infer_intent_from_tool_calls,
+        resolve_turn_intent,
     )
     from edgar_capstone.agents.live_runtime import (
         AdkStreamResult,
@@ -151,6 +151,15 @@ if TYPE_CHECKING:
         VarianceEvaluationItem,
     )
     from edgar_capstone.agents.sector_map_reduce import run_sector_thematic_map_reduce
+    from edgar_capstone.agents.sector_tool import (
+        SectorThematicMapReduceTool,
+        sector_thematic_map_reduce,
+    )
+    from edgar_capstone.agents.tool_runtime import (
+        ToolOutputs,
+        hydrate_tool_outputs,
+        tool_turn_context,
+    )
     from edgar_capstone.agents.tools import (
         BigQueryAdapter,
         ContextCacheTool,
@@ -322,10 +331,13 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     # financial_analyst
     "DEFAULT_ANALYST_MODEL": ("edgar_capstone.agents.financial_analyst", "DEFAULT_ANALYST_MODEL"),
     # intent
-    "CHUNK_HEALTH_RE": ("edgar_capstone.agents.intent", "CHUNK_HEALTH_RE"),
     "QueryIntentType": ("edgar_capstone.agents.intent", "QueryIntentType"),
     "TurnIntentType": ("edgar_capstone.agents.intent", "TurnIntentType"),
-    "classify_query_intent": ("edgar_capstone.agents.intent", "classify_query_intent"),
+    "infer_intent_from_tool_calls": (
+        "edgar_capstone.agents.intent",
+        "infer_intent_from_tool_calls",
+    ),
+    "resolve_turn_intent": ("edgar_capstone.agents.intent", "resolve_turn_intent"),
     # live_runtime
     "AdkStreamResult": ("edgar_capstone.agents.live_runtime", "AdkStreamResult"),
     "LiveBackendType": ("edgar_capstone.agents.live_runtime", "LiveBackendType"),
@@ -455,6 +467,18 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "ReActPhaseType": ("edgar_capstone.agents.schemas", "ReActPhaseType"),
     "ReActStep": ("edgar_capstone.agents.schemas", "ReActStep"),
     "VarianceEvaluationItem": ("edgar_capstone.agents.schemas", "VarianceEvaluationItem"),
+    # sector_tool & tool_runtime
+    "SectorThematicMapReduceTool": (
+        "edgar_capstone.agents.sector_tool",
+        "SectorThematicMapReduceTool",
+    ),
+    "sector_thematic_map_reduce": (
+        "edgar_capstone.agents.sector_tool",
+        "sector_thematic_map_reduce",
+    ),
+    "ToolOutputs": ("edgar_capstone.agents.tool_runtime", "ToolOutputs"),
+    "hydrate_tool_outputs": ("edgar_capstone.agents.tool_runtime", "hydrate_tool_outputs"),
+    "tool_turn_context": ("edgar_capstone.agents.tool_runtime", "tool_turn_context"),
     # sector_map_reduce
     "run_sector_thematic_map_reduce": (
         "edgar_capstone.agents.sector_map_reduce",
@@ -507,7 +531,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
 
 __all__ = [
     "ACTIVE_AGENT_NAMES",
-    "CHUNK_HEALTH_RE",
     "DEFAULT_ANALYST_MODEL",
     "DEFAULT_ANALYST_PROMPT_VERSION",
     "DEFAULT_FLASH_MODEL",
@@ -586,7 +609,7 @@ __all__ = [
     "build_financial_reasoning_prompt",
     "build_narrative_evaluation_prompt",
     "calculate_period_variances",
-    "classify_query_intent",
+    "infer_intent_from_tool_calls",
     "compare_disclosures_across_years",
     "compute_material_variance_flags",
     "configure_gcp_tool_adapters",
@@ -637,7 +660,13 @@ __all__ = [
     "run_live_adk_financial_reasoning_async",
     "run_live_adk_narrative_evaluation",
     "run_live_adk_narrative_evaluation_async",
+    "resolve_turn_intent",
     "run_sector_thematic_map_reduce",
+    "sector_thematic_map_reduce",
+    "SectorThematicMapReduceTool",
+    "ToolOutputs",
+    "hydrate_tool_outputs",
+    "tool_turn_context",
     "search_10k_chunks_rag",
     "select_citations_for_judge",
     "verify_narrative_against_calculations",

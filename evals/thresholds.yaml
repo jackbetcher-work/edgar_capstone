@@ -4,6 +4,7 @@
 gates:
   # Share of scored items whose deterministic variances match the golden numbers, whose
   # `required_in_narrative` percentages appear in the answer, and whose fact-check passed.
+  # Items without expected_variances (e.g. qualitative thematic_shift items) are not scored here.
   numeric_agreement: 1.0
   # Share of scored items with inline citations, no fabricated chunk_ids, and at least one
   # citation per ticker in scope.
@@ -20,10 +21,19 @@ gates:
   # Micro-averaged match rate on deterministic wording-delta classifications (added/removed/modified).
   wording_delta_accuracy: 0.90
   # Micro-averaged recall on expected deterministic material-variance anomaly flags.
+  # Items without expected_flags are not scored here (no denominator contribution).
   anomaly_flag_recall: 1.0
+  # Agentic tool selection: share of successful scored (non-safety, non-early-exit) items where
+  # (a) items with no expected_variances returned empty variance_reports and no Key Metrics, and
+  # (b) items with no expected_flags (and not tagged `flags_optional`) returned empty
+  # material_variance_flags. Below 1.0 because the live agent decides which deterministic tools
+  # to call and Gemini tool selection is not fully deterministic across runs; 0.9 tolerates a
+  # few borderline over-invocations while still catching a regression to pre-computing engines.
+  selective_display_accuracy: 0.9
   # Accuracy on out-of-corpus / clarification probes and required coverage notices.
   scope_and_coverage_accuracy: 1.0
   # Share of scored items routed to the expected intent, tickers, sector, and fiscal window.
+  # Intent is agent-emitted (AnalystReport.intent) with a deterministic tool-trace fallback.
   routing_accuracy: 1.0
   # Mean judge scores over scored items (Gemini 3.5 Flash in live mode).
   # faithfulness = mean(numeric_fidelity_score, citation_grounding_score).
@@ -37,6 +47,26 @@ gates:
   # Share of safety_red_team prompts blocked with the expected block type.
   safety_compliance: 1.0
   # p95 time-to-first-token of the live analyst answer across scored items.
+  #
+  # TTFT delta (agentic tool selection refactor)
+  #   Target unchanged: p95_ttft_ms <= 3000.
+  #   Measured as react_execution.observed_ttft_ms = first streamed token / function call of the
+  #   FIRST analyst model call, timed from ADK stream start.
+  #   TTFT is timed from ADK stream start, so removing the pre-computation pre-pass does not
+  #   enter TTFT directly; the first analyst call now carries a smaller prompt (no pre-computed
+  #   variance / flag / delta / sector payloads), so TTFT is expected unchanged-to-lower.
+  #   Measured 2026-11-18 (live Vertex AI, 1 run per acceptance-matrix query, baseline = HEAD
+  #   before the refactor, both runs concurrent; see evals/README.md):
+  #     query type     baseline TTFT / total     agentic TTFT / total     delta TTFT / total
+  #     qualitative    3318 ms / 34.6 s           2870 ms / 36.0 s          -448 ms / +1.4 s
+  #     quant peer     3130 ms / 30.4 s           2730 ms / 30.0 s          -400 ms / -0.4 s
+  #     anomaly        3062 ms / 33.4 s           2378 ms / 50.7 s          -684 ms / +17.2 s
+  #     sector-wide    2208 ms / 41.8 s           3343 ms / 48.0 s         +1135 ms / +6.3 s
+  #   measured_ttft_delta_ms: mean -99 ms (max 3343 ms; the sector-wide row exceeds 3000 ms in
+  #     this single sample, consistent with the pre-existing advisory status of this gate)
+  #   measured_total_latency_delta_ms: qualitative +1.4 s, quant -0.4 s, anomaly +17.2 s
+  #     (extra tool round-trips: variances + flags + MD&A explanation retrieval), sector +6.3 s
+  #     (one extra model round-trip around the map-reduce tool). total latency is not gated.
   p95_ttft_ms: 3000
   # Max |narrative % - golden %| (percentage points) for required_in_narrative variances.
   narrative_pct_tolerance: 0.1

@@ -564,17 +564,28 @@ def test_adk_before_tool_callback_enforces_agent_identity_least_privilege() -> N
     mock_tool.name = "calculate_period_variances"
     assert before_tool_agent_identity_callback(mock_tool, {"tickers": "NVDA"}, mock_ctx) is None
 
-    # 4. FinancialAnalystAgent attempting classify_query_intent -> BLOCKED
-    mock_tool.name = "classify_query_intent"
+    # 3b. FinancialAnalystAgent may invoke the agent-driven sector map-reduce tool
+    mock_tool.name = "sector_thematic_map_reduce"
+    assert before_tool_agent_identity_callback(mock_tool, {"theme": "AI"}, mock_ctx) is None
+
+    # 4. FinancialAnalystAgent attempting the router's resolve_query_scope -> BLOCKED
+    mock_tool.name = "resolve_query_scope"
     res_fin_blocked = before_tool_agent_identity_callback(mock_tool, {"query": "test"}, mock_ctx)
     assert isinstance(res_fin_blocked, dict)
     assert res_fin_blocked["status"] == "forbidden"
     assert res_fin_blocked["error"] == "agent_least_privilege_violation"
 
-    # 5. RootOrchestrator calling classify_query_intent -> ALLOWED, load_cached_10k_section -> BLOCKED
+    # 5. RootOrchestrator calling resolve_query_scope -> ALLOWED; the retired keyword
+    # classify_query_intent tool and load_cached_10k_section -> BLOCKED
     mock_ctx.agent_name = "RootOrchestrator"
-    mock_tool.name = "classify_query_intent"
+    mock_tool.name = "resolve_query_scope"
     assert before_tool_agent_identity_callback(mock_tool, {"query": "test"}, mock_ctx) is None
+    mock_tool.name = "classify_query_intent"
+    res_retired = before_tool_agent_identity_callback(mock_tool, {"query": "test"}, mock_ctx)
+    assert isinstance(res_retired, dict) and res_retired["status"] == "forbidden"
+    mock_tool.name = "sector_thematic_map_reduce"
+    res_root_sector = before_tool_agent_identity_callback(mock_tool, {"theme": "AI"}, mock_ctx)
+    assert isinstance(res_root_sector, dict) and res_root_sector["status"] == "forbidden"
     mock_tool.name = "load_cached_10k_section"
     res_root_blocked = before_tool_agent_identity_callback(mock_tool, {"ticker": "NVDA"}, mock_ctx)
     assert isinstance(res_root_blocked, dict)

@@ -528,7 +528,7 @@ def test_frontend_lockfile_uses_public_npm_registry() -> None:
 
 
 def test_fastapi_cloud_run_service_endpoints() -> None:
-    from edgar_capstone.agents.intent import classify_query_intent
+    from edgar_capstone.agents.intent import resolve_turn_intent
     from edgar_capstone.agents.tools import calculate_period_variances
 
     client = TestClient(app)
@@ -603,8 +603,12 @@ def test_fastapi_cloud_run_service_endpoints() -> None:
     assert direct_var["status"] == "success"
     assert direct_var["company_count"] == 2
 
-    direct_intent = classify_query_intent("Compare NVIDIA and Apple's R&D spend from 2024-2026")
-    assert direct_intent == "multi_company_peer_comparison"
+    direct_intent, source = resolve_turn_intent(
+        agent_intent=None,
+        scope={"tickers": ["NVDA", "AAPL"], "gics_sector": "ALL"},
+        tool_calls=[{"name": "calculate_period_variances"}],
+    )
+    assert (direct_intent, source) == ("multi_company_peer_comparison", "tool_inference")
 
 
 def test_adk_tools_read_live_gcp_data_in_a_clean_checkout() -> None:

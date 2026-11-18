@@ -12,11 +12,7 @@ def resolve_repo_root() -> Path:
     if (source_root / "pyproject.toml").is_file():
         return source_root
     cwd = Path.cwd().resolve()
-    if (
-        (cwd / "pyproject.toml").is_file()
-        or (cwd / "prompts").is_dir()
-        or (cwd / "looker").is_dir()
-    ):
+    if (cwd / "pyproject.toml").is_file() or (cwd / "prompts").is_dir():
         return cwd
     app_dir = Path("/app")
     if app_dir.is_dir():
@@ -25,7 +21,7 @@ def resolve_repo_root() -> Path:
 
 
 def resolve_asset_dir(name: str, *, env_var: str | None = None) -> Path:
-    """Resolve a runtime asset directory (``prompts``, ``looker``, ``terraform/schemas``, etc.)."""
+    """Resolve a runtime asset directory (``prompts``, ``terraform/schemas``, etc.)."""
     if env_var:
         override = os.environ.get(env_var, "").strip()
         if override:
