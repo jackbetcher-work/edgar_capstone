@@ -139,7 +139,7 @@ locals {
   # Bounded-enum label descriptions (shared by every telemetry metric). Booleans are
   # STRING labels holding "true" / "false" ("" when the payload field is null).
   telemetry_label_descriptions = {
-    model_name        = "Gemini model ID (e.g. gemini-3.8-flash, gemini-3.5-flash)"
+    model_name        = "Gemini model ID (e.g. gemini-3.8-flash, gemini-3.5-flash-lite)"
     agent_name        = "ADK agent name (FinancialAnalystAgent, NarrativeEvaluatorAgent)"
     task_category     = "Workload category (financial_reasoning, evaluation, ...)"
     within_ttft_slo   = "Whether TTFT met the configured SLO (true/false)"

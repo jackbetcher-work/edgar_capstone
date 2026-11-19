@@ -46,6 +46,7 @@ locals {
     _SEC_CORPUS_BUCKET = local.sec_corpus_bucket_name
     _ANALYST_MODEL     = var.financial_reasoning_model
     _FLASH_MODEL       = var.coding_and_evaluation_model
+    _LITE_MODEL        = var.compaction_and_mapping_model
     _GEMINI_LOCATION   = var.gemini_location
   }
 

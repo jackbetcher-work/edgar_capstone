@@ -57,7 +57,7 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `chunk_health_dashboard` (`google_monitoring_dashboard`): 12-column Cloud Monitoring dashboard with KPI scorecards, GICS sector/section chunk distribution charts, anomaly breakdown bars, token length trends, BigQuery query execution telemetry, and a structured logs panel (`jsonPayload.event_type="sec_edgar_chunk_health_evaluation"`).
 - **BigQuery Cloud Resource Connection (`vertex-ai-rag-conn`):** Granted `roles/aiplatform.user` and `roles/storage.objectViewer` on the SEC corpus bucket.
 - **Gemini models & APIs (`terraform/variables.tf`, `terraform/apis.tf`):**
-  - `financial_reasoning_model` (default `gemini-3.8-flash`), `coding_and_evaluation_model` (`gemini-3.5-flash`), and `gemini_location` (`global`) become Cloud Run's `EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`, and `EDGAR_GEMINI_LOCATION`. The Cloud Build triggers pass the same values.
+  - `financial_reasoning_model` (default `gemini-3.8-flash`), `coding_and_evaluation_model` (`gemini-3.8-flash`, `ThinkingLevel.LOW`), `compaction_and_mapping_model` (`gemini-3.5-flash-lite`), and `gemini_location` (`global`) become Cloud Run's `EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`, `EDGAR_LITE_MODEL`, and `EDGAR_GEMINI_LOCATION`. The Cloud Build triggers pass the same values.
   - The project can't reach `gemini-2.5-pro`, and both Flash models are served only from the `global` endpoint. BigQuery, GCS, Model Armor, and embeddings stay in `var.region`.
   - `serviceconsumermanagement.googleapis.com` is enabled because Vertex AI context caching needs it to provision its tenant project.
 - **Observability (`terraform/observability.tf`, `terraform/monitoring.tf`):**

@@ -31,6 +31,7 @@ from typing import Any, Literal
 from google.adk.tools import FunctionTool, ToolContext
 
 from edgar_capstone.agents.citations import clean_excerpt, merge_citations
+from edgar_capstone.agents.prompt_builders import compact_material_flags_for_tool
 from edgar_capstone.agents.resilience import with_tool_resilience
 from edgar_capstone.agents.schemas import (
     MaterialFlagExplanation,
@@ -730,6 +731,8 @@ def flag_material_variances(
         summary=summary,
         explanation_citations=explanation_citations,
     )
+    if tool_context is not None and hasattr(tool_context, "state"):
+        return compact_material_flags_for_tool(result)
     return result
 
 

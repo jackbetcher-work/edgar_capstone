@@ -233,11 +233,13 @@ def build_tool_selection_policy(scope: dict[str, Any], *, has_prior_outputs: boo
             "Usually pair it with `calculate_period_variances`. Keep `explain_top_flags=true` so "
             "the top flags arrive with MD&A passages (`explanation.chunk_id`).",
             "- `compare_disclosures_across_years(theme, tickers, gics_sector, section_id, "
-            "start_year, end_year)`: call when the question asks how specific companies' 10-K "
-            "wording on a theme changed across fiscal years.",
-            "- `sector_thematic_map_reduce(theme, gics_sector, section_id, start_year, end_year)`: "
-            "call for sector-wide thematic questions (no companies named, a GICS sector in scope); "
-            "it scans every issuer in the sector. Do not also call "
+            "start_year, end_year, theme_terms)`: call when the question asks how specific "
+            "companies' 10-K wording on a theme changed across fiscal years. Populate "
+            "`theme_terms` with comma-separated key phrases and domain synonyms to count.",
+            "- `sector_thematic_map_reduce(theme, gics_sector, section_id, start_year, end_year, "
+            "theme_terms)`: call for sector-wide thematic questions (no companies named, a GICS "
+            "sector in scope); it scans every issuer in the sector. Populate `theme_terms` with "
+            "comma-separated key phrases and synonyms. Do not also call "
             "`compare_disclosures_across_years` for the same sector theme.",
             "- `query_looker_financial_explore(explore_name, ...)`: `sector_benchmarks` / "
             "`peer_comparison` for sector-level financial benchmarks, `chunk_health` for vector "
@@ -315,37 +317,97 @@ def build_retrieval_instructions(
     return "\n".join(lines)
 
 
+def _compact_material_flag_entries(flags: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compact material variance flags to lean LLM-ready dicts (full payloads stay in session_state)."""
+    compact: list[dict[str, Any]] = []
+    for f in flags[:_MAX_PROMPT_FLAGS]:
+        src = f.get("source") or {}
+        exp = f.get("explanation") or {}
+        entry: dict[str, Any] = {
+            "flag_id": f.get("flag_id"),
+            "ticker": f.get("ticker"),
+            "fiscal_year": f.get("fiscal_year"),
+            "prior_fiscal_year": f.get("prior_fiscal_year"),
+            "metric": f.get("metric"),
+            "rule": f.get("rule"),
+            "severity": f.get("severity"),
+            "value": f.get("value"),
+            "unit": f.get("unit"),
+            "description": f.get("description"),
+            "period_of_report": src.get("period_of_report"),
+            "prior_period_of_report": src.get("prior_period_of_report"),
+            "accession_number": src.get("accession_number"),
+            "xbrl_concept": src.get("xbrl_concept"),
+            "explanation_query": f.get("explanation_query"),
+            "explanation_chunk_id": exp.get("chunk_id"),
+            "explanation_excerpt": " ".join(str(exp.get("excerpt") or "").split())[:600]
+            if exp.get("excerpt")
+            else None,
+        }
+        compact.append({k: v for k, v in entry.items() if v is not None})
+    return compact
+
+
+def compact_material_flags_for_tool(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a token-lean `flag_material_variances` tool digest for the LLM context.
+
+    The full flags list, thresholds, and `explanation_citations` remain in ADK `session_state`
+    for UI cards, claim verification, and citation rendering.
+    """
+    if result.get("status") != "success":
+        return result
+    compact_flags: list[dict[str, Any]] = []
+    for f in list(result.get("flags") or [])[:_MAX_PROMPT_FLAGS]:
+        src = f.get("source") or {}
+        exp = f.get("explanation") or {}
+        entry: dict[str, Any] = {
+            "flag_id": f.get("flag_id"),
+            "ticker": f.get("ticker"),
+            "fiscal_year": f.get("fiscal_year"),
+            "prior_fiscal_year": f.get("prior_fiscal_year"),
+            "metric": f.get("metric"),
+            "rule": f.get("rule"),
+            "severity": f.get("severity"),
+            "value": f.get("value"),
+            "unit": f.get("unit"),
+            "description": f.get("description"),
+            "period_of_report": src.get("period_of_report"),
+            "prior_period_of_report": src.get("prior_period_of_report"),
+            "accession_number": src.get("accession_number"),
+            "xbrl_concept": src.get("xbrl_concept"),
+            "explanation_query": f.get("explanation_query"),
+        }
+        if exp:
+            entry["explanation"] = {
+                k: v
+                for k, v in {
+                    "chunk_id": exp.get("chunk_id"),
+                    "section_id": exp.get("section_id"),
+                    "excerpt": " ".join(str(exp.get("excerpt") or "").split())[:600] or None,
+                }.items()
+                if v is not None
+            }
+        compact_flags.append({k: v for k, v in entry.items() if v is not None})
+    payload: dict[str, Any] = {
+        "status": "success",
+        "total_flags": result.get("total_flags", len(compact_flags)),
+        "returned_flags": len(compact_flags),
+        "high_severity_count": result.get("high_severity_count", 0),
+        "missing_tickers": list(result.get("missing_tickers") or []),
+        "flags": compact_flags,
+    }
+    if result.get("summary") is not None:
+        payload["summary"] = {
+            k: v for k, v in result["summary"].items() if k != "thresholds" and v is not None
+        }
+    return payload
+
+
 def build_material_flags_prompt_section(flags: list[dict[str, Any]] | None) -> str:
     """Compact, authoritative anomaly flags for the analyst (including XBRL provenance & excerpt)."""
     if not flags:
         return ""
-    compact = []
-    for f in flags[:_MAX_PROMPT_FLAGS]:
-        src = f.get("source") or {}
-        exp = f.get("explanation") or {}
-        compact.append(
-            {
-                "flag_id": f.get("flag_id"),
-                "ticker": f.get("ticker"),
-                "fiscal_year": f.get("fiscal_year"),
-                "prior_fiscal_year": f.get("prior_fiscal_year"),
-                "metric": f.get("metric"),
-                "rule": f.get("rule"),
-                "severity": f.get("severity"),
-                "value": f.get("value"),
-                "unit": f.get("unit"),
-                "description": f.get("description"),
-                "period_of_report": src.get("period_of_report"),
-                "prior_period_of_report": src.get("prior_period_of_report"),
-                "accession_number": src.get("accession_number"),
-                "xbrl_concept": src.get("xbrl_concept"),
-                "explanation_query": f.get("explanation_query"),
-                "explanation_chunk_id": exp.get("chunk_id"),
-                "explanation_excerpt": " ".join(str(exp.get("excerpt") or "").split())[:600]
-                if exp.get("excerpt")
-                else None,
-            }
-        )
+    compact = _compact_material_flag_entries(flags)
     return (
         "## Authoritative Material Variance Flags (deterministic anomaly detection)\n"
         "(These anomalies were detected by fixed rules; never recompute or re-threshold them. "
@@ -356,34 +418,38 @@ def build_material_flags_prompt_section(flags: list[dict[str, Any]] | None) -> s
     )
 
 
-def build_disclosure_deltas_prompt_section(result: dict[str, Any] | None) -> str:
-    """Compact year-over-year disclosure deltas (theme wording changes) for the analyst."""
-    if not result or result.get("status") != "success" or not result.get("companies"):
-        return ""
+def _compact_disclosure_delta_companies(
+    companies: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     compact_companies: list[dict[str, Any]] = []
-    for comp in result["companies"]:
+    for comp in companies:
         pairs = []
         for pair in comp.get("year_pairs") or []:
+            compact_deltas = []
+            for d in pair.get("deltas") or []:
+                if d.get("change_type") == "unchanged":
+                    continue
+                delta_entry: dict[str, Any] = {
+                    "change_type": d["change_type"],
+                    "section_id": d.get("section_id"),
+                    "prior_chunk_id": d.get("prior_chunk_id"),
+                    "current_chunk_id": d.get("current_chunk_id"),
+                    "added_phrases": d.get("added_phrases") or [],
+                    "removed_phrases": d.get("removed_phrases") or [],
+                    "excerpt": " ".join(
+                        str(d.get("current_excerpt") or d.get("prior_excerpt") or "").split()
+                    )[:_EVIDENCE_LEAD_EXCERPT_CHARS],
+                }
+                if d["change_type"] == "modified" and d.get("prior_excerpt"):
+                    delta_entry["prior_excerpt"] = " ".join(str(d["prior_excerpt"]).split())[:350]
+                compact_deltas.append(delta_entry)
+                if len(compact_deltas) >= _MAX_PROMPT_DELTAS_PER_PAIR:
+                    break
             pairs.append(
                 {
                     "years": f"FY{pair['prior_fiscal_year']}->FY{pair['current_fiscal_year']}",
                     "counts": pair.get("counts"),
-                    "deltas": [
-                        {
-                            "change_type": d["change_type"],
-                            "prior_chunk_id": d.get("prior_chunk_id"),
-                            "current_chunk_id": d.get("current_chunk_id"),
-                            "added_phrases": d.get("added_phrases") or [],
-                            "removed_phrases": d.get("removed_phrases") or [],
-                            "excerpt": " ".join(
-                                str(
-                                    d.get("current_excerpt") or d.get("prior_excerpt") or ""
-                                ).split()
-                            )[:_EVIDENCE_LEAD_EXCERPT_CHARS],
-                        }
-                        for d in pair.get("deltas") or []
-                        if d["change_type"] != "unchanged"
-                    ][:_MAX_PROMPT_DELTAS_PER_PAIR],
+                    "deltas": compact_deltas,
                 }
             )
         compact_companies.append(
@@ -394,10 +460,39 @@ def build_disclosure_deltas_prompt_section(result: dict[str, Any] | None) -> str
                 "year_pairs": pairs,
             }
         )
+    return compact_companies
+
+
+def compact_disclosure_deltas_for_tool(result: dict[str, Any]) -> dict[str, Any]:
+    """Return a token-lean `compare_disclosures_across_years` tool digest for the LLM context.
+
+    The full disclosure delta payload and `citations` remain in ADK `session_state` for UI
+    rendering, claim verification, and citation tables.
+    """
+    if result.get("status") != "success":
+        return result
+    return {
+        "status": "success",
+        "theme": result.get("theme"),
+        "theme_terms": result.get("theme_terms") or [],
+        "section_id": result.get("section_id"),
+        "start_year": result.get("start_year"),
+        "end_year": result.get("end_year"),
+        "companies_selected_by": result.get("companies_selected_by"),
+        "missing_tickers": list(result.get("missing_tickers") or []),
+        "summary": result.get("summary") or {},
+        "companies": _compact_disclosure_delta_companies(list(result.get("companies") or [])),
+    }
+
+
+def build_disclosure_deltas_prompt_section(result: dict[str, Any] | None) -> str:
+    """Compact year-over-year disclosure deltas (theme wording changes) for the analyst."""
+    if not result or result.get("status") != "success" or not result.get("companies"):
+        return ""
     payload = {
         "theme": result.get("theme"),
         "summary": result.get("summary"),
-        "companies": compact_companies,
+        "companies": _compact_disclosure_delta_companies(list(result["companies"])),
     }
     return (
         "## Authoritative Year-over-Year Disclosure Deltas (deterministic wording comparison)\n"
@@ -535,29 +630,31 @@ def build_financial_reasoning_prompt(
             "## 10-K Evidence Leads (pre-retrieved passages — cite directly or extend with tools)\n"
             f"```json\n{_compact_json(leads)}\n```"
         )
-    sections.append(
-        build_tool_selection_policy(
-            scope,
-            has_prior_outputs=bool(
-                variance_reports
-                or material_variance_flags
-                or disclosure_deltas
-                or sector_map_summaries
-                or sector_benchmarks
-                or chunk_health
-            ),
-        )
-    )
-    sections.append(build_retrieval_instructions(scope, variance_evaluations))
     if verification_feedback:
         sections.append(
             "## Verification Correction Required (Prior Draft Rejected)\n"
             f"{verification_feedback.strip()}\n"
-            "Fix every finding so each `evidence_quote` is copied verbatim from its cited "
-            "`chunk_id`, and every dollar/percentage figure in `statement` matches the exact "
-            "figure in `evidence_quote` or the deterministic variance payload above (avoid scaling "
-            "or rewriting table numbers if units are ambiguous)."
+            "Tools are disabled for this repair pass — all deterministic outputs and 10-K evidence "
+            "are already included above. Fix every finding so each `evidence_quote` is copied "
+            "verbatim from its cited `chunk_id`, and every dollar/percentage figure in `statement` "
+            "matches the exact figure in `evidence_quote` or the deterministic variance payload "
+            "above (avoid scaling or rewriting table numbers if units are ambiguous)."
         )
+    else:
+        sections.append(
+            build_tool_selection_policy(
+                scope,
+                has_prior_outputs=bool(
+                    variance_reports
+                    or material_variance_flags
+                    or disclosure_deltas
+                    or sector_map_summaries
+                    or sector_benchmarks
+                    or chunk_health
+                ),
+            )
+        )
+        sections.append(build_retrieval_instructions(scope, variance_evaluations))
     sections.append(
         "## Answer Format\n"
         "Answer with a concise `AnalystReport` JSON (`intent`, `headline`, `key_metrics`, "
@@ -626,7 +723,7 @@ def build_narrative_evaluation_prompt(
     cached_explanations_count: int = 0,
     reference_explanation: str | None = None,
 ) -> str:
-    """Assemble the evaluation prompt for `NarrativeEvaluatorAgent` (Gemini 3.5 Flash)."""
+    """Assemble the evaluation prompt for `NarrativeEvaluatorAgent` (Gemini 3.8 Flash, low thinking)."""
     if variance_reports:
         variance_block = (
             "### Deterministic Variance Calculations\n"
@@ -682,7 +779,9 @@ __all__ = [
     "build_narrative_evaluation_prompt",
     "build_retrieval_instructions",
     "build_tool_selection_policy",
+    "compact_disclosure_deltas_for_tool",
     "compact_evidence_leads",
+    "compact_material_flags_for_tool",
     "compact_variance_reports_for_prompt",
     "select_citations_for_judge",
 ]

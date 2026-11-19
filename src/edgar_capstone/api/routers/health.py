@@ -52,6 +52,7 @@ def health(
         "models": {
             "financial_reasoning": model_meta["financial_reasoning_model"],
             "coding_and_evaluation": model_meta["coding_and_evaluation_model"],
+            "compaction_and_mapping": model_meta["compaction_and_mapping_model"],
         },
         "adk_runtime": get_live_runtime_status_metadata(),
         "model_armor": get_model_armor_status_metadata(),

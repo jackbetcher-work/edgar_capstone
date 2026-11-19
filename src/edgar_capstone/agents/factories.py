@@ -119,32 +119,27 @@ def create_financial_analyst_agent(
     name: str = "FinancialAnalystAgent",
     model: str | BaseLlm | None = None,
     prompt_version: str | None = None,
+    enable_tools: bool = True,
+    low_thinking: bool = False,
 ) -> Agent:
     """Create the specialized `FinancialAnalystAgent` ADK `LlmAgent`.
 
     Uses default native thinking (`BuiltInPlanner(ThinkingConfig(include_thoughts=True))`) rather
     than forced low thinking so complex SEC 10-K reasoning quality is preserved, and resolves the
     model dynamically at call time via `resolve_model_for_task("financial_reasoning")` when
-    `model` is omitted.
+    `model` is omitted. Verification-guided repair retries pass `enable_tools=False,
+    low_thinking=True` to execute a single fast JSON repair call over already-retrieved evidence.
     """
-    thinking_cfg = genai_types.ThinkingConfig(include_thoughts=True)
-    return build_edgar_agent(
-        name=name,
-        model=model,
-        task_category="financial_reasoning",
-        prompt_id="financial_analyst",
-        prompt_version=prompt_version or DEFAULT_ANALYST_PROMPT_VERSION,
-        planner=BuiltInPlanner(thinking_config=thinking_cfg),
-        description=(
-            "Gemini SEC 10-K financial reasoning agent employing a structured ReAct "
-            "loop to evaluate deterministic period-over-period variances, retrieve only the 10-K "
-            "evidence each question needs (Item 1A Risk Factors & Item 7 MD&A passages), and "
-            "format strictly cited reports."
-        ),
-        # Deterministic engines are invoked by the agent ONLY when the question needs them
-        # (nothing is pre-computed); each writes its full output to session_state, which the
-        # chat pipeline hydrates before claim verification and rendering.
-        tools=[
+    resolved_model: str | BaseLlm = (
+        model if model is not None else resolve_model_for_task("financial_reasoning")
+    )
+    thinking_cfg = (
+        low_thinking_config_for_model(resolved_model, include_thoughts=True)
+        if low_thinking
+        else None
+    ) or genai_types.ThinkingConfig(include_thoughts=True)
+    tools: Sequence[Any] = (
+        [
             VarianceCalculationTool,
             AnomalyFlagTool,
             MetricFetchTool,
@@ -158,7 +153,27 @@ def create_financial_analyst_agent(
             DisclosureDeltaTool,
             # Full-sector batched map-reduce for sector-wide thematic questions (SSE progress).
             SectorThematicMapReduceTool,
-        ],
+        ]
+        if enable_tools
+        else ()
+    )
+    return build_edgar_agent(
+        name=name,
+        model=resolved_model,
+        task_category="financial_reasoning",
+        prompt_id="financial_analyst",
+        prompt_version=prompt_version or DEFAULT_ANALYST_PROMPT_VERSION,
+        planner=BuiltInPlanner(thinking_config=thinking_cfg),
+        description=(
+            "Gemini SEC 10-K financial reasoning agent employing a structured ReAct "
+            "loop to evaluate deterministic period-over-period variances, retrieve only the 10-K "
+            "evidence each question needs (Item 1A Risk Factors & Item 7 MD&A passages), and "
+            "format strictly cited reports."
+        ),
+        # Deterministic engines are invoked by the agent ONLY when the question needs them
+        # (nothing is pre-computed); each writes its full output to session_state, which the
+        # chat pipeline hydrates before claim verification and rendering.
+        tools=tools,
         generate_content_config=genai_types.GenerateContentConfig(
             temperature=0.1,
             # Includes thinking tokens on Gemini 3.x; a 4096 cap truncated full reports.
@@ -168,12 +183,16 @@ def create_financial_analyst_agent(
         # verified claim by claim in `structured_report.py` before rendering.
         output_schema=AnalystReport,
         output_key="financial_analyst_report",
-        before_tool_callback=[
-            before_tool_agent_identity_callback,
-            retrieval_budget_before_tool_callback,
-            agent_tool_progress_before_tool_callback,
-        ],
-        after_tool_callback=agent_tool_timing_after_tool_callback,
+        before_tool_callback=(
+            [
+                before_tool_agent_identity_callback,
+                retrieval_budget_before_tool_callback,
+                agent_tool_progress_before_tool_callback,
+            ]
+            if enable_tools
+            else None
+        ),
+        after_tool_callback=agent_tool_timing_after_tool_callback if enable_tools else None,
         include_fact_check_callback=True,
     )
 
@@ -184,7 +203,7 @@ def create_narrative_evaluator_agent(
     model: str | BaseLlm | None = None,
     prompt_version: str | None = None,
 ) -> Agent:
-    """Create the `NarrativeEvaluatorAgent` ADK `LlmAgent` pinned to `gemini-3.5-flash`.
+    """Create the `NarrativeEvaluatorAgent` ADK `LlmAgent` (`gemini-3.8-flash`, `ThinkingLevel.LOW`).
 
     Wired with telemetry-only model callbacks (`include_fact_check_callback=False`) so judge
     calls record exact TTFT, tokens, and USD cost in `ContextLatencyTracker` without firing
@@ -200,8 +219,8 @@ def create_narrative_evaluator_agent(
         prompt_id="narrative_evaluator",
         prompt_version=prompt_version,
         description=(
-            "Gemini 3.5 Flash LLM-as-a-Judge evaluation specialist scoring numeric fidelity, "
-            "10-K citation grounding, variance explanation quality, and thematic coherence."
+            "Gemini 3.8 Flash (low-thinking) LLM-as-a-Judge evaluation specialist scoring numeric "
+            "fidelity, 10-K citation grounding, variance explanation quality, and thematic coherence."
         ),
         output_schema=NarrativeEvaluationReport,
         output_key="narrative_evaluation_report",

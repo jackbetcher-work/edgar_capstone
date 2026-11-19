@@ -1,4 +1,4 @@
-"""Live Google ADK `Runner` & Gemini (`gemini-3.8-flash` / `gemini-3.5-flash`) Streaming Execution Engine.
+"""Live Google ADK `Runner` & Gemini (`gemini-3.8-flash` / `gemini-3.5-flash-lite`) Streaming Execution Engine.
 
 Bridges the active ADK specialist agents (`FinancialAnalystAgent` and `NarrativeEvaluatorAgent`)
 to live Vertex AI / Gemini execution via `google.adk.runners.Runner` with Server-Sent Events
@@ -641,6 +641,9 @@ async def run_live_adk_financial_reasoning_async(
     verification_feedback: str | None = None,
     defer_callback_fact_check: bool = False,
     ephemeral: bool = False,
+    enable_tools: bool = True,
+    low_thinking: bool = False,
+    max_llm_calls: int | None = None,
 ) -> AdkStreamResult:
     """Execute `FinancialAnalystAgent` (`EDGAR_ANALYST_MODEL`) via ADK `Runner` with SSE streaming TTFT."""
     resolved = resolution or resolve_live_adk_runtime(custom_llm=custom_llm)
@@ -657,6 +660,8 @@ async def run_live_adk_financial_reasoning_async(
     analyst_agent = create_financial_analyst_agent(
         name="FinancialAnalystAgent",
         model=analyst_llm,
+        enable_tools=enable_tools,
+        low_thinking=low_thinking,
     )
 
     cache_hits = sum(1 for c in cached_explanations if c.get("cache_hit"))
@@ -714,6 +719,9 @@ async def run_live_adk_financial_reasoning_async(
             ModelArmorSafetyPlugin(pre_verified_prompt_hashes={prompt_hash}),
         ]
 
+    eff_max_llm_calls = (
+        max_llm_calls if max_llm_calls is not None else (2 if not enable_tools else 10)
+    )
     return await run_adk_agent_stream_async(
         agent=analyst_agent,
         prompt_text=prompt_text,
@@ -726,7 +734,7 @@ async def run_live_adk_financial_reasoning_async(
         backend=resolved.backend,
         # Retrieval is capped at 6 tool calls (retrieval_budget_before_tool_callback); the
         # remaining calls leave room for parallel tool rounds plus the final AnalystReport.
-        max_llm_calls=10,
+        max_llm_calls=eff_max_llm_calls,
         plugins=plugins_override,
         ephemeral=ephemeral,
     )
@@ -757,6 +765,9 @@ def run_live_adk_financial_reasoning(
     verification_feedback: str | None = None,
     defer_callback_fact_check: bool = False,
     ephemeral: bool = False,
+    enable_tools: bool = True,
+    low_thinking: bool = False,
+    max_llm_calls: int | None = None,
 ) -> AdkStreamResult:
     """Synchronous wrapper around `run_live_adk_financial_reasoning_async`."""
     return _run_coro_sync(
@@ -784,6 +795,9 @@ def run_live_adk_financial_reasoning(
             verification_feedback=verification_feedback,
             defer_callback_fact_check=defer_callback_fact_check,
             ephemeral=ephemeral,
+            enable_tools=enable_tools,
+            low_thinking=low_thinking,
+            max_llm_calls=max_llm_calls,
         )
     )
 
@@ -799,7 +813,7 @@ async def run_live_adk_narrative_evaluation_async(
     custom_llm: BaseLlm | None = None,
     reference_explanation: str | None = None,
 ) -> tuple[dict[str, Any], AdkStreamResult]:
-    """Execute `NarrativeEvaluatorAgent` (`gemini-3.5-flash`) via ADK `Runner` with SSE streaming.
+    """Execute `NarrativeEvaluatorAgent` (`gemini-3.8-flash`, `ThinkingLevel.LOW`) via ADK `Runner` with SSE streaming.
 
     When `reference_explanation` is supplied (golden eval runs), it is appended as an
     analyst-authored reference so the judge can score thematic consistency and explanation

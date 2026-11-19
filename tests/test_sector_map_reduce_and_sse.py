@@ -36,7 +36,7 @@ class _FakeCreds:
 class _ScriptedMapFlashLlm(ScriptedBaseLlm):
     """Returns one verified quote + one hallucinated/fabricated chunk_id per map batch."""
 
-    model: str = "gemini-3.5-flash"
+    model: str = "gemini-3.5-flash-lite"
 
     async def generate_content_async(
         self,
@@ -450,3 +450,53 @@ def test_chat_stream_sanitizes_internal_exception_secret(monkeypatch: pytest.Mon
     assert len(err_events) == 1
     assert err_events[0]["error"] == "internal_server_error"
     assert "SECRET_PASSWORD" not in err_events[0]["message"]
+
+
+def test_sector_map_agent_defaults_to_flash_lite(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SectorMapSummarizerAgent resolves `gemini-3.5-flash-lite` via `context_compaction`."""
+    from google.genai import types as genai_types
+
+    from edgar_capstone.agents import sector_map_reduce as smr
+    from edgar_capstone.agents.live_runtime import AdkStreamResult
+
+    monkeypatch.delenv("EDGAR_LITE_MODEL", raising=False)
+    captured: dict[str, Any] = {}
+
+    def _fake_stream(**kwargs: Any) -> AdkStreamResult:
+        captured["agent"] = kwargs["agent"]
+        return AdkStreamResult(
+            agent_name=kwargs["agent"].name,
+            app_name=kwargs["app_name"],
+            session_id=kwargs["session_id"],
+            backend="vertex_ai",
+            final_text="",
+            session_state={
+                "sector_batch_summary": {
+                    "batch_index": 0,
+                    "tickers_covered": ["NVDA"],
+                    "dominant_themes": ["AI risk"],
+                    "wording_shifts": [],
+                    "evidence": [],
+                }
+            },
+        )
+
+    monkeypatch.setattr(smr, "run_adk_agent_stream", _fake_stream)
+    out = smr._summarize_batch_via_flash(
+        batch_index=0,
+        total_batches=1,
+        gics_sector="Information Technology",
+        theme="AI risk",
+        start_year=2024,
+        end_year=2026,
+        company_payloads=[{"ticker": "NVDA", "passages": []}],
+        chunk_lookup={},
+    )
+    assert out["model_used"] == "gemini-3.5-flash-lite"
+    agent = captured["agent"]
+    assert agent.name == "SectorMapSummarizerAgent"
+    assert agent.model.model == "gemini-3.5-flash-lite"
+    assert (
+        agent.generate_content_config.thinking_config.thinking_level
+        == genai_types.ThinkingLevel.LOW
+    )

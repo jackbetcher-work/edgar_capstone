@@ -66,7 +66,7 @@ There is no offline mode or local corpus. Every request reads live GCP data and 
 | Component | Role |
 | :--- | :--- |
 | `FinancialAnalystAgent` | Primary ADK agent (`gemini-3.8-flash`, native thinking). Output is constrained to the `AnalystReport` schema. |
-| `NarrativeEvaluatorAgent` | LLM-as-a-Judge (`gemini-3.5-flash`). Scores faithfulness, citation precision, and explanation quality. |
+| `NarrativeEvaluatorAgent` | LLM-as-a-Judge (`gemini-3.8-flash`, `ThinkingLevel.LOW`). Scores faithfulness, citation precision, and explanation quality. |
 | `calculate_period_variances` / `fetch_financial_metrics` | Deterministic multi-period and YoY variance engine over BigQuery `financial_metrics`. |
 | `flag_material_variances` | Rule-based anomaly flags with MD&A explanations and XBRL provenance. |
 | `compare_disclosures_across_years` | YoY wording deltas (added, removed, or modified) with citations from both years. |
@@ -115,7 +115,8 @@ CORPUS_PROJECT_ID=<other-project> make dev   # point at another project
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
 | `EDGAR_ANALYST_MODEL` | `gemini-3.8-flash` | Reasoning model for `FinancialAnalystAgent` |
-| `EDGAR_FLASH_MODEL` | `gemini-3.5-flash` | Judge and lightweight tasks |
+| `EDGAR_FLASH_MODEL` | `gemini-3.8-flash` | LLM-as-a-Judge (`NarrativeEvaluatorAgent`, `ThinkingLevel.LOW`) |
+| `EDGAR_LITE_MODEL` | `gemini-3.5-flash-lite` | Sector map-reduce (`SectorMapSummarizerAgent`) and event compaction (`LlmEventSummarizer`) |
 | `EDGAR_GEMINI_LOCATION` | `global` | Vertex AI endpoint for Gemini. BigQuery, GCS, and embeddings use `GOOGLE_CLOUD_LOCATION`. |
 | `GEMINI_API_KEY` | unset | Uses the Gemini API instead of Vertex AI when `GOOGLE_GENAI_USE_VERTEXAI` is unset |
 | `IAP_STRICT_MODE` | `false` | When `false` (local), the UI can mint an ES256 dev JWT via `POST /api/v1/auth/sso/dev-token`. Always disabled on Cloud Run. |

@@ -9,7 +9,7 @@ principled, verifiable batched map-reduce:
    (`ML.DISTANCE(embedding, @query_embedding, 'COSINE')` + `QUALIFY ROW_NUMBER()`).
 3. **Deterministic per-company alignment & mention counts**: Uses the word-trigram algorithm from
    `disclosure_deltas.py` across every issuer's retrieved passages.
-4. **Parallel batched map (`gemini-3.5-flash`)**: Groups matching companies into batches of ~14
+4. **Parallel batched map (`gemini-3.5-flash-lite`)**: Groups matching companies into batches of ~14
    issuers and summarizes each batch concurrently with constrained JSON (`SectorBatchSummary`),
    verifying every cited `chunk_id` and verbatim quote against the real batch chunks.
 5. **Reduce-ready output**: Returns verified batch digests, deterministic sector coverage metadata,
@@ -23,7 +23,7 @@ import logging
 import threading
 import uuid
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from google.adk.agents import Agent
@@ -40,7 +40,7 @@ from edgar_capstone.agents.disclosure_deltas import (
     build_company_evolution,
     chunk_row_to_citation,
     count_theme_mentions,
-    extract_theme_terms,
+    resolve_theme_terms,
 )
 from edgar_capstone.agents.live_runtime import (
     resolve_live_adk_runtime,
@@ -198,7 +198,7 @@ def _summarize_batch_via_flash(
     chunk_lookup: dict[str, dict[str, Any]],
     map_llm: BaseLlm | None = None,
 ) -> dict[str, Any]:
-    """Run one map batch through Gemini 3.5 Flash and filter out any unverifiable citations."""
+    """Run one map batch through Gemini 3.5 Flash-Lite and filter out any unverifiable citations."""
     tickers_in_batch = [str(c["ticker"]) for c in company_payloads]
     prompt = _build_batch_prompt(
         batch_index=batch_index,
@@ -512,6 +512,7 @@ def run_sector_thematic_map_reduce(
     section_id: str,
     start_year: int,
     end_year: int,
+    theme_terms: str | Sequence[str] | None = None,
     sector_profiles: list[FinancialDataProfile] | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     per_company_year: int = DEFAULT_PER_COMPANY_YEAR,
@@ -567,7 +568,7 @@ def run_sector_thematic_map_reduce(
         per_company_year=per_company_year,
     )
 
-    theme_terms = extract_theme_terms(theme)
+    resolved_theme_terms = resolve_theme_terms(theme, theme_terms)
     rows_by_ticker_fy: dict[str, dict[int, list[dict[str, Any]]]] = defaultdict(
         lambda: defaultdict(list)
     )
@@ -599,7 +600,7 @@ def run_sector_thematic_map_reduce(
         issuer_names=issuer_names,
         gics_sector=gics_sector,
         window=window,
-        theme_terms=theme_terms,
+        theme_terms=resolved_theme_terms,
         issuers_in_sector=issuers_in_sector,
     )
 
@@ -674,7 +675,7 @@ def run_sector_thematic_map_reduce(
     disclosure_deltas_payload = {
         "status": "success",
         "theme": theme.strip(),
-        "theme_terms": theme_terms,
+        "theme_terms": resolved_theme_terms,
         "section_id": sec_filter or "ALL",
         "start_year": start_year,
         "end_year": end_year,

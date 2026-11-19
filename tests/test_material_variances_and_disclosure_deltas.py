@@ -11,6 +11,7 @@ import pytest
 from edgar_capstone.agents import create_financial_analyst_agent
 from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.agents.disclosure_deltas import (
+    DisclosureDeltaTool,
     SectionMaterial,
     _resolve_target_tickers,
     align_year_pair,
@@ -18,6 +19,8 @@ from edgar_capstone.agents.disclosure_deltas import (
     compare_disclosures_across_years,
     count_theme_mentions,
     extract_theme_terms,
+    parse_theme_terms,
+    resolve_theme_terms,
     strip_chunk_header,
     wording_changes,
 )
@@ -268,12 +271,28 @@ _OLD_ONLY = (
 
 
 def test_theme_terms_and_mentions() -> None:
-    terms = extract_theme_terms("How has the wording on AI risk changed across all tech companies?")
-    assert terms[:2] == ["ai", "artificial intelligence"]
-    assert "risk" not in terms and "wording" not in terms and "companies" not in terms
+    # Primary hybrid path: LLM-supplied comma-separated phrases & domain synonyms
+    llm_terms = resolve_theme_terms(
+        "AI risk", "AI, Artificial Intelligence, generative AI, ai,  GenAI "
+    )
+    assert llm_terms == ["ai", "artificial intelligence", "generative ai", "genai"]
     text = "Artificial intelligence and AI models; generative AI. Maintain trail."
     # 'artificial intelligence', 'AI', 'generative AI' (longest match wins); 'maintain' is not 'ai'
-    assert count_theme_mentions(text, terms) == 3
+    assert count_theme_mentions(text, llm_terms) == 3
+
+    # Arbitrary non-hardcoded domain synonyms (e.g., pharma GLP-1) work without static tables
+    glp_terms = parse_theme_terms("GLP-1, semaglutide, weight-loss drugs")
+    assert glp_terms == ["glp-1", "semaglutide", "weight-loss drugs"]
+    assert (
+        count_theme_mentions("GLP-1s and semaglutide compete with weight-loss drugs.", glp_terms)
+        == 3
+    )
+
+    # Lightweight fallback when the caller omits theme_terms
+    fallback_terms = resolve_theme_terms("How has the wording on AI risk changed across companies?")
+    assert fallback_terms == ["ai"]
+    assert "risk" not in fallback_terms and "wording" not in fallback_terms
+    assert extract_theme_terms("export controls China") == ["export", "controls", "china"]
 
 
 def test_wording_changes_ignore_boundary_runs() -> None:
@@ -501,7 +520,7 @@ def _assert_citations_resolve(resp: dict[str, Any]) -> None:
 
 def test_disclosure_deltas_theme_mentions_when_full_text_empty() -> None:
     """When GCS full_text is unavailable, theme mention counts fall back to chunk excerpts."""
-    terms = extract_theme_terms("AI risk disclosures")
+    terms = resolve_theme_terms("AI risk disclosures", "AI, artificial intelligence, generative AI")
     mat_2025 = SectionMaterial(
         ticker="NVDA",
         company_name="NVIDIA Corporation",
@@ -618,6 +637,26 @@ def test_resolve_target_tickers_and_multi_section_evolution_merge(
     assert len(evo.year_pairs) == 1
     assert sum(evo.year_pairs[0].counts.values()) >= 2
     assert {c["section_id"] for c in cited} == {"item_1a", "item_7"}
+
+
+def test_compare_disclosures_uses_llm_supplied_theme_terms(fake_gcp_adapters: Any) -> None:
+    """Tool accepts optional `theme_terms` from the LLM without extra LLM calls or static tables."""
+    decl = DisclosureDeltaTool._get_declaration()
+    schema = decl.parameters_json_schema or {}
+    assert "theme_terms" in (schema.get("properties") or {})
+    assert "theme_terms" not in (schema.get("required") or [])
+
+    res = compare_disclosures_across_years(
+        theme="export controls",
+        tickers="NVDA",
+        gics_sector="ALL",
+        section_id="item_1a",
+        start_year=2024,
+        end_year=2025,
+        theme_terms="export controls, BIS, license requirements",
+    )
+    assert res["status"] == "success"
+    assert res["theme_terms"] == ["export controls", "bis", "license requirements"]
 
 
 def test_chat_turn_runs_disclosure_delta_pipeline_for_thematic_queries(

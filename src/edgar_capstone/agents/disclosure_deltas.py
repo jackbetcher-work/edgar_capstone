@@ -10,8 +10,9 @@ Turns "how has the wording on <theme> changed?" into deterministic, citable grou
 3. **Classification:** coverage >= ``UNCHANGED_MIN`` -> *unchanged*; a counterpart chunk that
    shares >= ``MODIFIED_MIN`` of the passage's trigrams -> *modified* (with word-level added /
    removed phrases); otherwise *added* (current-year passage) or *removed* (prior-year passage).
-4. **Theme mentions:** occurrences of the theme's key terms (with simple synonyms, e.g. "AI" ->
-   "artificial intelligence", "generative AI") per fiscal year across the compared sections.
+4. **Theme mentions:** occurrences of the theme's key terms and domain synonyms (supplied by the
+   calling LLM via ``theme_terms`` in the same tool call, with a lightweight token fallback when
+   omitted) per fiscal year across the compared sections.
 
 Every delta cites the prior-year and/or current-year chunk it was computed from, so Gemini
 summarizes changes it did not have to detect itself, and the analyst can open both passages.
@@ -23,6 +24,7 @@ import difflib
 import functools
 import itertools
 import re
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -30,6 +32,7 @@ from typing import Any, Literal
 from google.adk.tools import FunctionTool, ToolContext
 
 from edgar_capstone.agents.citations import clean_excerpt, merge_citations
+from edgar_capstone.agents.prompt_builders import compact_disclosure_deltas_for_tool
 from edgar_capstone.agents.resilience import with_tool_resilience
 from edgar_capstone.agents.schemas import (
     CompanyDisclosureEvolution,
@@ -41,6 +44,7 @@ from edgar_capstone.agents.tool_runtime import (
     STATE_DISCLOSURE_DELTA_SUMMARY,
     STATE_DISCLOSURE_DELTAS,
     STATE_RETRIEVED_CITATIONS,
+    cached_turn_profiles,
     merge_disclosure_deltas,
 )
 from edgar_capstone.agents.tools import (
@@ -76,212 +80,59 @@ _CHANGE_ORDER: dict[ChangeType, int] = {"modified": 0, "added": 1, "removed": 2,
 _TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
 _MD_ESCAPE_RE = re.compile(r"\\([^\w\s])")
 _NON_WORD_RE = re.compile(r"[^\w]")
+_TERM_SPLIT_RE = re.compile(r"[,;\n]+")
+_MAX_THEME_TERMS = 20
+_MAX_TERM_CHARS = 80
 
-_STOPWORDS: frozenset[str] = frozenset(
+# Minimal stopword filter used only as a fallback when the caller omits explicit `theme_terms`.
+_FALLBACK_STOPWORDS: frozenset[str] = frozenset(
     {
+        "10k",
         "a",
-        "about",
-        "above",
         "across",
-        "after",
-        "again",
-        "against",
         "all",
-        "also",
-        "am",
         "an",
         "and",
-        "any",
         "are",
         "as",
         "at",
         "be",
-        "been",
-        "before",
-        "being",
-        "below",
         "between",
-        "both",
-        "but",
         "by",
-        "can",
-        "could",
-        "did",
-        "do",
-        "does",
-        "doing",
-        "down",
-        "during",
-        "each",
-        "few",
-        "for",
-        "from",
-        "further",
-        "fy",
-        "had",
-        "has",
-        "have",
-        "having",
-        "he",
-        "her",
-        "here",
-        "hers",
-        "how",
-        "i",
-        "if",
-        "in",
-        "into",
-        "is",
-        "it",
-        "its",
-        "itself",
-        "just",
-        "last",
-        "me",
-        "more",
-        "most",
-        "my",
-        "no",
-        "nor",
-        "not",
-        "now",
-        "of",
-        "off",
-        "on",
-        "once",
-        "only",
-        "or",
-        "other",
-        "our",
-        "ours",
-        "out",
-        "over",
-        "own",
-        "past",
-        "same",
-        "she",
-        "should",
-        "since",
-        "so",
-        "some",
-        "such",
-        "than",
-        "that",
-        "the",
-        "their",
-        "theirs",
-        "them",
-        "then",
-        "there",
-        "these",
-        "they",
-        "this",
-        "those",
-        "through",
-        "to",
-        "too",
-        "under",
-        "until",
-        "up",
-        "very",
-        "was",
-        "we",
-        "were",
-        "what",
-        "when",
-        "where",
-        "which",
-        "while",
-        "who",
-        "whom",
-        "why",
-        "will",
-        "with",
-        "would",
-        "year",
-        "years",
-        "you",
-        "your",
-        "fiscal",
-    }
-)
-# Words that describe the question rather than the theme being tracked.
-_GENERIC_THEME_TERMS: frozenset[str] = frozenset(
-    {
-        "10-k",
-        "10k",
-        "1a",
-        "500",
-        "across",
-        "between",
         "change",
         "changed",
         "changes",
-        "changing",
         "companies",
         "company",
-        "compare",
-        "compared",
-        "comparison",
-        "describe",
-        "described",
         "disclosure",
         "disclosures",
-        "discuss",
-        "discussed",
-        "evolution",
-        "evolve",
-        "evolved",
-        "factor",
-        "factors",
         "filing",
         "filings",
-        "firm",
-        "firms",
+        "fiscal",
+        "for",
+        "from",
+        "fy",
+        "has",
+        "have",
         "how",
-        "industry",
-        "issuer",
-        "issuers",
+        "in",
+        "is",
         "item",
-        "language",
-        "md&a",
-        "mda",
-        "mention",
-        "mentioned",
-        "mentions",
+        "of",
+        "on",
+        "or",
         "risk",
         "risks",
-        "s&p",
-        "section",
-        "sections",
-        "sector",
-        "sectors",
-        "shift",
-        "shifted",
-        "sp",
-        "talk",
-        "talked",
-        "tech",
-        "technology",
-        "track",
-        "tracking",
-        "trend",
-        "trends",
-        "word",
+        "the",
+        "to",
+        "was",
+        "were",
+        "with",
         "wording",
-        "words",
+        "year",
+        "years",
     }
 )
-_THEME_SYNONYMS: dict[str, tuple[str, ...]] = {
-    "ai": ("ai", "artificial intelligence", "generative ai", "genai"),
-    "genai": ("generative ai", "genai", "artificial intelligence"),
-    "artificial": ("artificial intelligence", "ai", "generative ai"),
-    "cyber": ("cybersecurity", "cyber", "cyberattack", "cyber-attack"),
-    "cybersecurity": ("cybersecurity", "cyber", "cyberattack", "cyber-attack"),
-    "tariff": ("tariff",),
-    "tariffs": ("tariff",),
-    "climate": ("climate",),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -370,18 +221,46 @@ def wording_changes(prior_text: str, current_text: str) -> tuple[list[str], list
     return added, removed
 
 
-def extract_theme_terms(theme: str) -> list[str]:
-    """Key theme phrases to count (stopwords and question words removed, synonyms expanded)."""
+def parse_theme_terms(raw_terms: str | Sequence[str] | None) -> list[str]:
+    """Normalize LLM-supplied theme phrases/synonyms (comma-separated string or sequence)."""
+    if not raw_terms:
+        return []
+    items = _TERM_SPLIT_RE.split(raw_terms) if isinstance(raw_terms, str) else list(raw_terms)
     terms: list[str] = []
-    for tok in word_tokens(theme):
-        if tok in _STOPWORDS or tok in _GENERIC_THEME_TERMS or tok.isdigit():
+    seen: set[str] = set()
+    for item in items:
+        cleaned = " ".join(_clean_text(str(item)).strip(" \"'").split()).lower()
+        if len(cleaned) < 2 or len(cleaned) > _MAX_TERM_CHARS or cleaned.isdigit():
             continue
-        if len(tok) < 2:
+        if not any(ch.isalnum() for ch in cleaned):
             continue
-        for term in _THEME_SYNONYMS.get(tok, (tok,)):
-            if term not in terms:
-                terms.append(term)
+        if cleaned not in seen:
+            seen.add(cleaned)
+            terms.append(cleaned)
+            if len(terms) >= _MAX_THEME_TERMS:
+                break
     return terms
+
+
+def extract_theme_terms(theme: str) -> list[str]:
+    """Lightweight fallback tokenization when the caller omits explicit ``theme_terms``."""
+    terms: list[str] = []
+    seen: set[str] = set()
+    for tok in word_tokens(theme):
+        if tok in _FALLBACK_STOPWORDS or tok.isdigit() or len(tok) < 2:
+            continue
+        if tok not in seen:
+            seen.add(tok)
+            terms.append(tok)
+            if len(terms) >= _MAX_THEME_TERMS:
+                break
+    return terms
+
+
+def resolve_theme_terms(theme: str, theme_terms: str | Sequence[str] | None = None) -> list[str]:
+    """Prefer LLM-supplied ``theme_terms`` (phrases + synonyms); fall back to ``theme`` tokens."""
+    parsed = parse_theme_terms(theme_terms)
+    return parsed if parsed else extract_theme_terms(theme)
 
 
 @functools.lru_cache(maxsize=256)
@@ -391,7 +270,7 @@ def _terms_regex_cached(terms: tuple[str, ...]) -> re.Pattern[str] | None:
     alternation = "|".join(
         re.escape(t).replace(r"\ ", r"\s+") for t in sorted(terms, key=len, reverse=True)
     )
-    return re.compile(rf"\b(?:{alternation})(?:s|es)?\b", re.IGNORECASE)
+    return re.compile(rf"(?<!\w)(?:{alternation})(?:s|es)?(?!\w)", re.IGNORECASE)
 
 
 def _terms_regex(terms: Sequence[str]) -> re.Pattern[str] | None:
@@ -799,9 +678,18 @@ def _company_years(
 ) -> dict[str, tuple[str, str, list[int]]]:
     """ticker -> (company_name, gics_sector, fiscal years with a filing in the window)."""
     wanted = {normalize_edgar_ticker(t) for t in tickers}
-    profiles = _gcp_adapters().bigquery.fetch_profiles(
-        tickers=wanted, start_year=start_year, end_year=end_year
-    )
+    cached = cached_turn_profiles()
+    if cached:
+        profiles = [
+            p
+            for p in cached
+            if normalize_edgar_ticker(p.ticker) in wanted
+            and start_year <= int(p.fiscal_year) <= end_year
+        ]
+    else:
+        profiles = _gcp_adapters().bigquery.fetch_profiles(
+            tickers=wanted, start_year=start_year, end_year=end_year
+        )
     out: dict[str, tuple[str, str, list[int]]] = {}
     for p in profiles:
         norm = normalize_edgar_ticker(p.ticker)
@@ -853,25 +741,62 @@ def _retrieve_passages_and_materials(
     sec_filter: str,
     per_year_k: int,
 ) -> tuple[
-    dict[tuple[str, int], list[dict[str, Any]]], dict[tuple[str, int, str], SectionMaterial | None]
+    dict[tuple[str, int], list[dict[str, Any]]],
+    dict[tuple[str, int, str], SectionMaterial | None],
+    bool,
 ]:
+    """Retrieve theme passages and section chunks in parallel with a single batched BQ section query.
+
+    Replaces the prior per-section `get_full_10k_section` (BQ + GCS) + per-section BQ chunk fan-out
+    with one batched `fetch_sections_chunks_batch` RPC running concurrently alongside passage search.
+    Falls back to `get_full_10k_section` only for a slice with zero BigQuery chunks.
+    """
     retrieval_keys = [(t, fy) for t in selected for fy in company_meta.get(t, ("", "", []))[2]]
+    all_years = [fy for _, fy in retrieval_keys]
+    batch_tickers = {normalize_edgar_ticker(t) for t in selected}
+    batch_section = sec_filter if sec_filter in _SECTIONS else None
 
-    def _search(item: tuple[str, int]) -> list[dict[str, Any]]:
-        tk, fy = item
-        res = search_10k_chunks_rag(
-            query=theme,
-            tickers=tk,
-            gics_sector="ALL",
-            section_id=sec_filter,
-            start_year=fy,
-            end_year=fy,
-            top_k=per_year_k,
+    tasks: list[tuple[str, Any]] = [("search", key) for key in retrieval_keys]
+    if batch_tickers and all_years:
+        tasks.append(("batch_sections", (batch_tickers, min(all_years), max(all_years))))
+
+    def _run_task(task: tuple[str, Any]) -> tuple[str, Any, Any]:
+        kind, payload = task
+        if kind == "search":
+            tk, fy = payload
+            res = search_10k_chunks_rag(
+                query=theme,
+                tickers=tk,
+                gics_sector="ALL",
+                section_id=sec_filter,
+                start_year=fy,
+                end_year=fy,
+                top_k=per_year_k,
+            )
+            return kind, payload, list(res.get("citations") or [])
+        tks, min_y, max_y = payload
+        rows = _gcp_adapters().bigquery.fetch_sections_chunks_batch(
+            tickers=tks,
+            start_year=min_y,
+            end_year=max_y,
+            section_id=batch_section,
+            include_embedding=False,
         )
-        return list(res.get("citations") or [])
+        return kind, payload, rows
 
-    passages_list = run_parallel_with_context(retrieval_keys, _search, max_workers=8)
-    passages = dict(zip(retrieval_keys, passages_list, strict=True))
+    completed = run_parallel_with_context(tasks, _run_task, max_workers=8)
+    passages: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    chunks_by_slice: dict[tuple[str, int, str], list[dict[str, Any]]] = defaultdict(list)
+    for kind, payload, value in completed:
+        if kind == "search":
+            passages[payload] = value
+        else:
+            for row in value:
+                row_tk = normalize_edgar_ticker(str(row.get("ticker") or ""))
+                row_fy = int(row["fiscal_year"])
+                row_sec = str(row.get("section_id") or "").strip().lower()
+                if row_tk and row_sec in _SECTIONS:
+                    chunks_by_slice[(row_tk, row_fy, row_sec)].append(row)
 
     section_keys = sorted(
         {
@@ -887,13 +812,40 @@ def _retrieve_passages_and_materials(
             expanded.add((t, y, sec))
     material_keys = sorted(expanded)
 
-    def _load(item: tuple[str, int, str]) -> SectionMaterial | None:
-        tk, fy, sec = item
-        return _load_section_material(tk, company_meta.get(tk, (tk, "", []))[0], fy, sec)
+    materials: dict[tuple[str, int, str], SectionMaterial | None] = {}
+    missing_keys: list[tuple[str, int, str]] = []
+    for tk, fy, sec in material_keys:
+        norm_tk = normalize_edgar_ticker(tk)
+        sec_chunks = chunks_by_slice.get((norm_tk, int(fy), sec.lower()), [])
+        if sec_chunks:
+            company_name = str(
+                sec_chunks[0].get("company_name") or company_meta.get(tk, (tk, "", []))[0]
+            )
+            materials[(tk, fy, sec)] = SectionMaterial(
+                ticker=norm_tk,
+                company_name=company_name,
+                fiscal_year=int(fy),
+                section_id=sec,
+                full_text="",
+                chunks=sec_chunks,
+            )
+        else:
+            missing_keys.append((tk, fy, sec))
 
-    materials_list = run_parallel_with_context(material_keys, _load, max_workers=8)
-    materials = dict(zip(material_keys, materials_list, strict=True))
-    return passages, materials
+    used_gcs_fallback = False
+    if missing_keys:
+
+        def _load_fallback(item: tuple[str, int, str]) -> SectionMaterial | None:
+            tk, fy, sec = item
+            return _load_section_material(tk, company_meta.get(tk, (tk, "", []))[0], fy, sec)
+
+        fallback_list = run_parallel_with_context(missing_keys, _load_fallback, max_workers=8)
+        for key, mat in zip(missing_keys, fallback_list, strict=True):
+            materials[key] = mat
+            if mat is not None and mat.full_text:
+                used_gcs_fallback = True
+
+    return passages, materials, used_gcs_fallback
 
 
 @with_tool_resilience(tool_name="compare_disclosures_across_years")
@@ -904,6 +856,7 @@ def compare_disclosures_across_years(
     section_id: str,
     start_year: int,
     end_year: int,
+    theme_terms: str = "",
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
     """Compares how companies' 10-K wording on a theme changed between consecutive fiscal years.
@@ -921,6 +874,9 @@ def compare_disclosures_across_years(
         section_id: 'item_1a' (Risk Factors), 'item_7' (MD&A), or 'ALL'.
         start_year: First fiscal year to compare (e.g., 2024).
         end_year: Last fiscal year to compare (e.g., 2026).
+        theme_terms: Optional comma-separated key phrases and domain synonyms to count across the
+            compared filings (e.g., 'AI, artificial intelligence, generative AI, GenAI' or
+            'export controls, BIS, Entity List'). Omit to fall back to tokens from `theme`.
 
     Returns:
         Dictionary with 'status', 'companies' (year pairs with deltas and counts, theme mentions,
@@ -953,8 +909,8 @@ def compare_disclosures_across_years(
 
     window = list(range(start_year, end_year + 1))
     company_meta = _company_years(selected, start_year, end_year)
-    theme_terms = extract_theme_terms(theme)
-    passages, materials = _retrieve_passages_and_materials(
+    resolved_terms = resolve_theme_terms(theme, theme_terms)
+    passages, materials, used_gcs_fallback = _retrieve_passages_and_materials(
         theme=theme,
         selected=selected,
         company_meta=company_meta,
@@ -976,7 +932,7 @@ def compare_disclosures_across_years(
             gics_sector=sector,
             window_years=window,
             available_years=years,
-            theme_terms=theme_terms,
+            theme_terms=resolved_terms,
             sections=sections,
             theme_passages={fy: passages.get((t, fy), []) for fy in years},
         )
@@ -993,7 +949,7 @@ def compare_disclosures_across_years(
     result: dict[str, Any] = {
         "status": "success",
         "theme": theme.strip(),
-        "theme_terms": theme_terms,
+        "theme_terms": resolved_terms,
         "section_id": sec_filter,
         "start_year": start_year,
         "end_year": end_year,
@@ -1011,12 +967,17 @@ def compare_disclosures_across_years(
         merged = merge_disclosure_deltas(tool_context.state.get(STATE_DISCLOSURE_DELTAS), result)
         tool_context.state[STATE_DISCLOSURE_DELTAS] = merged
         tool_context.state[STATE_DISCLOSURE_DELTA_SUMMARY] = (merged or result)["summary"]
+    services_hit = ["vertex_ai_search", "bigquery"]
+    if used_gcs_fallback:
+        services_hit.append("gcs")
     _record_gcp_backend_invocation(
         tool_context,
         tool_name="compare_disclosures_across_years",
         data_source="gcp",
-        services_hit=["vertex_ai_search", "bigquery", "gcs"],
+        services_hit=services_hit,
     )
+    if tool_context is not None and hasattr(tool_context, "state"):
+        return compact_disclosure_deltas_for_tool(result)
     return result
 
 

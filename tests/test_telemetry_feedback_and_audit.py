@@ -159,15 +159,21 @@ def auth_client_env(session_idp_keys: dict[str, Any]):
 
 
 def test_pro_and_flash_token_cost_and_cached_savings_math() -> None:
-    """Verify exact USD token cost and 75% cached-context discount math for Pro and Flash."""
+    """Verify exact USD token cost and cached-context discount math across model tiers."""
     meta = get_model_strategy_metadata()
     pricing = meta["pricing_per_1m_tokens_usd"]
     assert pricing["gemini-2.5-pro"]["uncached_input_usd_per_1m"] == pytest.approx(1.25)
     assert pricing["gemini-2.5-pro"]["cached_input_usd_per_1m"] == pytest.approx(0.3125)
     assert pricing["gemini-2.5-pro"]["output_usd_per_1m"] == pytest.approx(10.0)
-    assert pricing["gemini-3.5-flash"]["uncached_input_usd_per_1m"] == pytest.approx(0.30)
-    assert pricing["gemini-3.5-flash"]["cached_input_usd_per_1m"] == pytest.approx(0.075)
-    assert pricing["gemini-3.5-flash"]["output_usd_per_1m"] == pytest.approx(2.50)
+    assert pricing["gemini-3.8-flash"]["uncached_input_usd_per_1m"] == pytest.approx(0.75)
+    assert pricing["gemini-3.8-flash"]["cached_input_usd_per_1m"] == pytest.approx(0.075)
+    assert pricing["gemini-3.8-flash"]["output_usd_per_1m"] == pytest.approx(3.75)
+    assert pricing["gemini-3.5-flash-lite"]["uncached_input_usd_per_1m"] == pytest.approx(0.30)
+    assert pricing["gemini-3.5-flash-lite"]["cached_input_usd_per_1m"] == pytest.approx(0.03)
+    assert pricing["gemini-3.5-flash-lite"]["output_usd_per_1m"] == pytest.approx(2.50)
+    assert pricing["gemini-3.5-flash"]["uncached_input_usd_per_1m"] == pytest.approx(1.50)
+    assert pricing["gemini-3.5-flash"]["cached_input_usd_per_1m"] == pytest.approx(0.15)
+    assert pricing["gemini-3.5-flash"]["output_usd_per_1m"] == pytest.approx(9.00)
 
     # 100k cached 10-K tokens + 20k uncached prompt/variance tokens + 2k output tokens on Gemini 2.5 Pro
     pro_breakdown = ContextBreakdown(
@@ -206,7 +212,7 @@ def test_pro_and_flash_token_cost_and_cached_savings_math() -> None:
     assert pro_rec.session_id == "sess-cost-01"
     assert pro_rec.user_id == "analyst@fde-workspace.corp"
 
-    # 40k cached + 10k uncached + 1k output on Gemini 3.5 Flash
+    # 40k cached + 10k uncached + 1k output on Gemini 3.5 Flash-Lite
     flash_breakdown = ContextBreakdown(
         system_instruction_tokens=2_000,
         cached_10k_tokens=40_000,
@@ -229,31 +235,33 @@ def test_pro_and_flash_token_cost_and_cached_savings_math() -> None:
         user_id="analyst@fde-workspace.corp",
     )
     r2 = tracker.record_call(
-        agent_name="NarrativeEvaluatorAgent",
-        model_name="gemini-3.5-flash",
-        task_category="evaluation",
+        agent_name="SectorMapSummarizerAgent",
+        model_name="gemini-3.5-flash-lite",
+        task_category="context_compaction",
         context_breakdown=flash_breakdown,
         output_tokens=1_000,
         raw_inference_latency_ms=420.0,
         session_id="sess-cost-01",
         user_id="analyst@fde-workspace.corp",
     )
-    # Expected Flash input: (10k/1M)*0.30 + (40k/1M)*0.075 = 0.003 + 0.003 = 0.006
-    # Flash baseline input: (50k/1M)*0.30 = 0.015 -> savings = 0.009; output = (1k/1M)*2.5 = 0.0025
-    assert r2.total_cost_usd == pytest.approx(0.0085)
-    assert r2.cached_token_savings_usd == pytest.approx(0.009)
+    # Expected Flash-Lite input: (10k/1M)*0.30 + (40k/1M)*0.03 = 0.003 + 0.0012 = 0.0042
+    # Baseline input: (50k/1M)*0.30 = 0.015 -> savings = 0.0108; output = (1k/1M)*2.50 = 0.0025
+    assert r2.total_cost_usd == pytest.approx(0.0067)
+    assert r2.cached_token_savings_usd == pytest.approx(0.0108)
 
     summary = tracker.summarize()
     assert summary.total_calls == 2
     assert summary.total_output_tokens == 2_500
     assert summary.total_thoughts_tokens == 500
     assert summary.total_cost_usd == pytest.approx(r1.total_cost_usd + r2.total_cost_usd)
-    assert summary.total_cached_token_savings_usd == pytest.approx(0.09375 + 0.009)
+    assert summary.total_cached_token_savings_usd == pytest.approx(0.09375 + 0.0108)
     assert summary.total_uncached_baseline_cost_usd == pytest.approx(0.17 + 0.0175)
-    expected_pct = round(((0.09375 + 0.009) / (0.17 + 0.0175)) * 100.0, 2)
+    expected_pct = round(((0.09375 + 0.0108) / (0.17 + 0.0175)) * 100.0, 2)
     assert summary.cache_cost_savings_pct == pytest.approx(expected_pct)
     assert summary.by_model["gemini-2.5-pro"]["total_cost_usd"] == pytest.approx(0.07625)
-    assert summary.by_model["gemini-3.5-flash"]["cached_token_savings_usd"] == pytest.approx(0.009)
+    assert summary.by_model["gemini-3.5-flash-lite"]["cached_token_savings_usd"] == pytest.approx(
+        0.0108
+    )
 
 
 # ---------------------------------------------------------------------------

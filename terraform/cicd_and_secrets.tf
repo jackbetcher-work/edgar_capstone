@@ -282,6 +282,11 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "EDGAR_LITE_MODEL"
+        value = var.compaction_and_mapping_model
+      }
+
+      env {
         name  = "EDGAR_GEMINI_LOCATION"
         value = var.gemini_location
       }

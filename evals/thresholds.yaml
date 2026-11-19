@@ -35,7 +35,7 @@ gates:
   # Share of scored items routed to the expected intent, tickers, sector, and fiscal window.
   # Intent is agent-emitted (AnalystReport.intent) with a deterministic tool-trace fallback.
   routing_accuracy: 1.0
-  # Mean judge scores over scored items (Gemini 3.5 Flash in live mode).
+  # Mean judge scores over scored items (Gemini 3.8 Flash, ThinkingLevel.LOW in live mode).
   # faithfulness = mean(numeric_fidelity_score, citation_grounding_score).
   judge_faithfulness: 0.85
   # Mean Flash judge citation_precision_score across scored items (§5 target: >= 95%).

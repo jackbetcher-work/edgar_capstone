@@ -658,12 +658,176 @@ def test_flag_tool_attaches_optional_explanations_and_summary_to_state(explain: 
         tool_context=ctx,
     )
     assert res["status"] == "success" and res["flags"]
+    # LLM-facing return is compacted (no thresholds or redundant explanation_citations),
+    # while session_state retains the full flags, summary, and explanation citations.
+    assert "thresholds" not in res
+    assert "explanation_citations" not in res
+    assert "thresholds" not in res["summary"]
     out = hydrate_tool_outputs(ctx.state)
-    assert out.material_variance_flags == res["flags"]
-    assert out.material_variance_summary == res["summary"]
-    explained = [f for f in res["flags"] if f.get("explanation")]
-    assert res["summary"]["explained_flags"] == len(res["explanation_citations"])
+    assert out.material_variance_flags
+    assert [f["flag_id"] for f in res["flags"]] == [
+        f["flag_id"] for f in out.material_variance_flags[: len(res["flags"])]
+    ]
+    assert out.material_variance_summary is not None
+    assert out.material_variance_summary["total_flags"] == res["summary"]["total_flags"]
+    assert out.material_variance_summary["explained_flags"] == res["summary"]["explained_flags"]
+    explained_in_return = [f for f in res["flags"] if f.get("explanation")]
+    explained_in_state = [f for f in out.material_variance_flags if f.get("explanation")]
     if explain:
-        assert explained and out.citations
+        assert explained_in_return and explained_in_state and out.citations
+        assert explained_in_return[0]["explanation"]["chunk_id"]
     else:
-        assert not explained and res["explanation_citations"] == []
+        assert not explained_in_return and not explained_in_state and not out.citations
+
+
+def test_compact_tool_returns_shrink_llm_payloads_while_keeping_full_session_state() -> None:
+    """Variance, anomaly, and disclosure-delta tools return compact digests when tool_context is set."""
+    import json
+
+    from edgar_capstone.agents.disclosure_deltas import compare_disclosures_across_years
+    from edgar_capstone.agents.material_variances import flag_material_variances
+
+    # 1. calculate_period_variances
+    full_var = calculate_period_variances(tickers="NVDA", start_year=2024, end_year=2026)
+    ctx_var = SimpleNamespace(state={})
+    compact_var = calculate_period_variances(
+        tickers="NVDA", start_year=2024, end_year=2026, tool_context=ctx_var
+    )
+    assert len(json.dumps(compact_var, default=str)) < len(json.dumps(full_var, default=str))
+    assert "metric_provenance" not in compact_var["variance_reports"][0]
+    assert "source_urls" not in compact_var["variance_reports"][0]
+    hydrated_var = hydrate_tool_outputs(ctx_var.state)
+    assert hydrated_var.variance_reports == full_var["variance_reports"]
+
+    # 2. flag_material_variances
+    full_flags = flag_material_variances(
+        tickers="INTC", start_year=2023, end_year=2025, explain_top_flags=True
+    )
+    ctx_flags = SimpleNamespace(state={})
+    compact_flags = flag_material_variances(
+        tickers="INTC",
+        start_year=2023,
+        end_year=2025,
+        explain_top_flags=True,
+        tool_context=ctx_flags,
+    )
+    assert len(json.dumps(compact_flags, default=str)) < len(json.dumps(full_flags, default=str))
+    assert hydrate_tool_outputs(ctx_flags.state).material_variance_flags == full_flags["flags"]
+
+    # 3. compare_disclosures_across_years
+    full_delta = compare_disclosures_across_years(
+        theme="export controls AI",
+        tickers="NVDA",
+        gics_sector="ALL",
+        section_id="item_1a",
+        start_year=2024,
+        end_year=2026,
+    )
+    ctx_delta = SimpleNamespace(state={})
+    compact_delta = compare_disclosures_across_years(
+        theme="export controls AI",
+        tickers="NVDA",
+        gics_sector="ALL",
+        section_id="item_1a",
+        start_year=2024,
+        end_year=2026,
+        tool_context=ctx_delta,
+    )
+    assert "citations" not in compact_delta
+    assert len(json.dumps(compact_delta, default=str)) <= len(json.dumps(full_delta, default=str))
+    hydrated_delta = hydrate_tool_outputs(ctx_delta.state)
+    assert hydrated_delta.disclosure_deltas is not None
+    assert hydrated_delta.disclosure_deltas["summary"] == full_delta["summary"]
+
+
+def test_compare_disclosures_reuses_cached_profiles_and_batches_chunks_without_gcs() -> None:
+    """Disclosure deltas use cached profiles + 1 batched BQ chunk query with 0 GCS downloads."""
+    from edgar_capstone.agents.disclosure_deltas import compare_disclosures_across_years
+    from edgar_capstone.agents.tools import get_active_gcp_tool_adapters
+
+    _, profiles = _get_entity_catalog(allow_fetch=True)
+    adapters = get_active_gcp_tool_adapters()
+    batch_calls: list[dict[str, Any]] = []
+    orig_batch = adapters.bigquery.fetch_sections_chunks_batch
+
+    def _spy_batch(**kwargs: Any) -> list[dict[str, Any]]:
+        batch_calls.append(kwargs)
+        return orig_batch(**kwargs)
+
+    with (
+        tool_turn_context(cached_profiles=profiles),
+        patch.object(
+            adapters.bigquery,
+            "fetch_profiles",
+            side_effect=AssertionError("disclosure deltas must reuse cached turn profiles"),
+        ),
+        patch.object(
+            adapters.gcs_corpus,
+            "fetch_markdown",
+            side_effect=AssertionError("disclosure deltas must not hit GCS when BQ chunks exist"),
+        ),
+        patch.object(
+            adapters.bigquery,
+            "fetch_section_chunks",
+            side_effect=AssertionError("disclosure deltas must use batched chunk fetch"),
+        ),
+        patch.object(adapters.bigquery, "fetch_sections_chunks_batch", side_effect=_spy_batch),
+    ):
+        res = compare_disclosures_across_years(
+            theme="export controls AI",
+            tickers="NVDA,AAPL",
+            gics_sector="ALL",
+            section_id="item_1a",
+            start_year=2024,
+            end_year=2026,
+        )
+
+    assert res["status"] == "success"
+    assert len(batch_calls) == 1
+    assert batch_calls[0]["tickers"] == {"NVDA", "AAPL"}
+    assert batch_calls[0]["include_embedding"] is False
+
+
+def test_chat_prepass_overlaps_memory_guardrail_and_catalog_in_parallel() -> None:
+    """Memory recall, Model Armor prompt check, and entity catalog fetch run concurrently."""
+    import threading
+
+    from edgar_capstone.agents import chat_engine
+    from edgar_capstone.security.model_armor import get_model_armor_guardrail
+
+    _reset()
+    barrier = threading.Barrier(3, timeout=5.0)
+    memory_mgr = get_conversation_memory_manager()
+    guardrail = get_model_armor_guardrail()
+    orig_recall = memory_mgr.recall_session_context
+    orig_inspect = guardrail.inspect_user_prompt
+    orig_catalog = chat_engine._get_entity_catalog
+
+    def _sync_recall(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        barrier.wait()
+        return orig_recall(*args, **kwargs)
+
+    def _sync_inspect(*args: Any, **kwargs: Any) -> Any:
+        barrier.wait()
+        return orig_inspect(*args, **kwargs)
+
+    def _sync_catalog(*args: Any, **kwargs: Any) -> Any:
+        barrier.wait()
+        return orig_catalog(*args, **kwargs)
+
+    llm = _ScriptedAnalystLlm(tool_calls=[], intent="thematic_trend_tracking", requests=[])
+    with (
+        patch.object(memory_mgr, "recall_session_context", side_effect=_sync_recall),
+        patch.object(guardrail, "inspect_user_prompt", side_effect=_sync_inspect),
+        patch.object(chat_engine, "_get_entity_catalog", side_effect=_sync_catalog),
+    ):
+        turn = run_conversational_rag_turn(
+            query="How has NVIDIA's export control risk wording changed from FY2024 to FY2026?",
+            tickers="NVDA",
+            start_year=2024,
+            end_year=2026,
+            user_id=_USER,
+            reasoning_llm=llm,
+            skip_background_judge=True,
+        )
+    assert turn["status"] == "success"

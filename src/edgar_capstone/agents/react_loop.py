@@ -13,7 +13,7 @@ Implements the structured ReAct loop (`Thought -> Action -> Observation -> ... -
    pre-computed. Their outputs are hydrated from ADK `session_state` BEFORE the structured report
    is verified claim by claim (numeric and citation fact-checks), rendered, and fact-checked;
    answers that fail verification are withheld, never replaced by template text. Output quality is scored
-   by the live `gemini-3.5-flash` judge (synchronously in evals or asynchronously with real
+   by the live `gemini-3.8-flash` (low-thinking) judge (synchronously in evals or asynchronously with real
    telemetry callback via `record_async_evaluation_result` on interactive turns — never emitting
    fabricated `1.0` placeholder scores).
 """
@@ -74,8 +74,7 @@ from edgar_capstone.agents.tool_runtime import (
     ToolOutputs,
     hydrate_tool_outputs,
 )
-from edgar_capstone.agents.tools import calculate_period_variances, query_cached_10k_context
-from edgar_capstone.common.concurrency import run_parallel_with_context
+from edgar_capstone.agents.tools import calculate_period_variances
 from edgar_capstone.common.domain import RETRIEVAL_TOOL_NAMES, MetricName
 from edgar_capstone.common.formatting import fmt_bps, fmt_pct, fmt_usd
 from edgar_capstone.observability.tracing import current_trace_correlation, traced
@@ -402,91 +401,6 @@ def evaluate_calculated_variances(
     return evaluations
 
 
-@traced("react.query_cached_10k")
-def query_cached_10k_for_explanations(
-    *,
-    variance_evaluations: list[VarianceEvaluationItem],
-    citations: list[dict[str, Any]],
-    query: str,
-    section_filter: str = "ALL",
-    max_queries: int = 6,
-    on_cache_call: Callable[[str, int, str], None] | None = None,
-) -> tuple[list[Cached10KExplanation], list[dict[str, Any]]]:
-    """Step 2 of ReAct reasoning: query cached 10-K sections for causal explanations of variances."""
-    planned_requests: list[dict[str, Any]] = []
-    seen_keys: set[tuple[str, int, str]] = set()
-
-    for ev in variance_evaluations:
-        for tq in ev.targeted_10k_queries:
-            key = (str(tq["ticker"]), int(tq["fiscal_year"]), str(tq["section_id"]))
-            if key not in seen_keys:
-                seen_keys.add(key)
-                planned_requests.append(tq)
-
-    # Fallback when query is thematic / cross-sector without pre-evaluated company variances
-    if not planned_requests and citations:
-        sec_norm = (section_filter or "ALL").strip().lower()
-        for cit in citations[:4]:
-            sec_id = sec_norm if sec_norm in ("item_1a", "item_7") else str(cit["section_id"])
-            key = (str(cit["ticker"]), int(cit["fiscal_year"]), sec_id)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                planned_requests.append(
-                    {
-                        "ticker": str(cit["ticker"]),
-                        "fiscal_year": int(cit["fiscal_year"]),
-                        "section_id": sec_id,
-                        "variance_query": query,
-                        "driver_focus": f"Thematic 10-K disclosure context ({cit['ticker']} FY{cit['fiscal_year']})",
-                    }
-                )
-
-    explanations: list[Cached10KExplanation] = []
-    linked_citations: list[dict[str, Any]] = []
-    batch = planned_requests[:max_queries]
-
-    for req in batch:
-        if on_cache_call is not None:
-            on_cache_call(req["ticker"], int(req["fiscal_year"]), req["section_id"])
-
-    def _query_one(req: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-        res = query_cached_10k_context(
-            ticker=req["ticker"],
-            fiscal_year=int(req["fiscal_year"]),
-            section_id=req["section_id"],
-            variance_query=req["variance_query"],
-            max_passages=2,
-        )
-        return req, res
-
-    ordered_results = run_parallel_with_context(batch, _query_one, max_workers=6)
-
-    for req, res in ordered_results:
-        if res.get("status") != "success":
-            continue
-
-        explanations.append(
-            Cached10KExplanation(
-                cache_key=str(res["cache_key"]),
-                cache_hit=bool(res["cache_hit"]),
-                ticker=str(res["ticker"]),
-                company_name=str(res["company_name"]),
-                fiscal_year=int(res["fiscal_year"]),
-                section_id=res["section_id"],
-                section_title=str(res["section_title"]),
-                variance_driver_focus=str(req["driver_focus"]),
-                extracted_explanations=list(res.get("explanations") or []),
-                matched_chunk_ids=list(res.get("matched_chunk_ids") or []),
-                token_estimate=int(res.get("token_estimate") or 0),
-                lookup_latency_ms=float(res.get("lookup_latency_ms") or 0.0),
-                sec_filing_url=str(res.get("sec_filing_url") or ""),
-            )
-        )
-        linked_citations.extend(res.get("matched_citations") or [])
-
-    return explanations, linked_citations
-
-
 def _output_schema_error(exc: BaseException) -> str | None:
     """Short message when `exc` (or its cause chain) is an output-schema validation failure."""
     seen: set[int] = set()
@@ -693,113 +607,6 @@ class StructuredReActExecutor:
         )
         return variance_evaluations, step
 
-    def _run_cached_10k_pass(
-        self,
-        *,
-        query: str,
-        intent: str,
-        scope: dict[str, Any],
-        variance_evaluations: list[VarianceEvaluationItem],
-        citations: list[dict[str, Any]],
-        current_step_count: int,
-        on_cache_s2s_call: Callable[[str, int, str], None] | None,
-    ) -> tuple[list[Cached10KExplanation], list[dict[str, Any]], list[ReActStep]]:
-        t_cache = time.perf_counter()
-        cached_explanations: list[Cached10KExplanation] = []
-        extra_citations: list[dict[str, Any]] = []
-        steps: list[ReActStep] = []
-
-        if intent != "chunk_health_monitoring":
-            cached_explanations, extra_citations = query_cached_10k_for_explanations(
-                variance_evaluations=variance_evaluations,
-                citations=citations,
-                query=query,
-                section_filter=scope.get("section_id", "ALL"),
-                max_queries=6,
-                on_cache_call=on_cache_s2s_call,
-            )
-        cache_query_ms = (time.perf_counter() - t_cache) * 1000.0
-
-        merged_citations = merge_citations(list(citations), extra_citations)
-        cached_hits = sum(1 for e in cached_explanations if e.cache_hit)
-        cached_toks_hit = sum(e.token_estimate for e in cached_explanations if e.cache_hit)
-        uncached_toks_miss = sum(e.token_estimate for e in cached_explanations if not e.cache_hit)
-
-        steps.append(
-            ReActStep(
-                iteration=current_step_count + 1,
-                phase="query_cached_10k_context",
-                thought=(
-                    "Using the evaluated variance drivers, query cached 10-K Item 7 (MD&A) and "
-                    "Item 1A (Risk Factors) sections via ContextCacheManager to extract grounded explanations."
-                ),
-                action="query_cached_10k_context",
-                action_input={
-                    "sections_queried": [e.cache_key for e in cached_explanations],
-                    "section_filter": scope.get("section_id", "ALL"),
-                },
-                observation=(
-                    f"Retrieved {len(cached_explanations)} cached 10-K section explanation(s) "
-                    f"(cache_hits={cached_hits}/{len(cached_explanations)}, "
-                    f"resident_tokens={cached_toks_hit + uncached_toks_miss:,})."
-                ),
-                agent="ContextCacheManager",
-                model_used=None,
-                context_tokens=cached_toks_hit + uncached_toks_miss,
-                cached_context_tokens=cached_toks_hit,
-                context_latency_ms=round(cache_query_ms, 3),
-                duration_ms=round(cache_query_ms, 3),
-            )
-        )
-
-        # Adaptive peer-gap check if multi-company comparison has a ticker missing cached explanation
-        covered_tickers = {e.ticker for e in cached_explanations}
-        missing_eval_tickers = [
-            ev.ticker for ev in variance_evaluations if ev.ticker not in covered_tickers
-        ]
-        if (
-            missing_eval_tickers
-            and (current_step_count + len(steps)) < self.max_iterations - 1
-            and intent != "chunk_health_monitoring"
-        ):
-            t_adapt = time.perf_counter()
-            followup_evals = [
-                ev for ev in variance_evaluations if ev.ticker in missing_eval_tickers
-            ]
-            more_exps, more_cits = query_cached_10k_for_explanations(
-                variance_evaluations=followup_evals,
-                citations=merged_citations,
-                query=query,
-                section_filter=scope.get("section_id", "ALL"),
-                max_queries=4,
-                on_cache_call=on_cache_s2s_call,
-            )
-            adapt_ms = (time.perf_counter() - t_adapt) * 1000.0
-            cached_explanations.extend(more_exps)
-            merge_citations(merged_citations, more_cits)
-            add_cached_toks = sum(e.token_estimate for e in more_exps if e.cache_hit)
-            steps.append(
-                ReActStep(
-                    iteration=current_step_count + len(steps) + 1,
-                    phase="query_cached_10k_context",
-                    thought=(
-                        f"Observation showed peer ticker(s) {missing_eval_tickers} lacked cached 10-K explanations; "
-                        "executing follow-up cached 10-K lookup before synthesis."
-                    ),
-                    action="query_cached_10k_context(adaptive_peer_fill)",
-                    action_input={"missing_tickers": missing_eval_tickers},
-                    observation=f"Added {len(more_exps)} cached 10-K explanation(s) for {missing_eval_tickers}.",
-                    agent="ContextCacheManager",
-                    model_used=None,
-                    context_tokens=sum(e.token_estimate for e in more_exps),
-                    cached_context_tokens=add_cached_toks,
-                    context_latency_ms=round(adapt_ms, 3),
-                    duration_ms=round(adapt_ms, 3),
-                )
-            )
-
-        return cached_explanations, merged_citations, steps
-
     def _invoke_financial_reasoning(
         self,
         *,
@@ -824,6 +631,8 @@ class StructuredReActExecutor:
         custom_llm: BaseLlm | None,
         verification_feedback: str | None = None,
         ephemeral: bool = False,
+        enable_tools: bool = True,
+        low_thinking: bool = False,
     ) -> AdkStreamResult:
         """Single unified invocation helper for initial synthesis and regeneration retry."""
         return run_live_adk_financial_reasoning(
@@ -850,6 +659,8 @@ class StructuredReActExecutor:
             verification_feedback=verification_feedback,
             defer_callback_fact_check=True,
             ephemeral=ephemeral,
+            enable_tools=enable_tools,
+            low_thinking=low_thinking,
         )
 
     def _maybe_regenerate_structured_report(
@@ -873,7 +684,7 @@ class StructuredReActExecutor:
         latency_records: list[ModelContextLatencyRecord],
         agent_retrieved_citations: list[dict[str, Any]],
     ) -> tuple[Any, AdkStreamResult, ToolOutputs, str | None]:
-        """One verification-guided retry; returns `(verified, stream, tool_outputs, intent)`."""
+        """One fast, tool-less, low-thinking verification repair pass."""
         if verified.verification.usable or self.reasoning_llm is not None:
             return verified, live_stream_result, tool_outputs, None
         feedback_lines = [
@@ -883,12 +694,12 @@ class StructuredReActExecutor:
         ]
         logger.info(
             "All %d live AnalystReport findings failed verification; running one "
-            "verification-guided regeneration pass.",
+            "tool-less low-thinking regeneration pass.",
             verified.verification.findings_total,
         )
         try:
-            # The retry is seeded with every deterministic output the agent already produced
-            # this turn, so it does not need to re-invoke the tools.
+            # The retry is seeded with every deterministic output and citation already retrieved
+            # this turn, so it runs tool-less with low thinking as a single JSON repair call.
             retry_res = self._invoke_financial_reasoning(
                 query=query,
                 intent=intent,
@@ -911,6 +722,8 @@ class StructuredReActExecutor:
                 custom_llm=None,
                 verification_feedback="\n".join(feedback_lines),
                 ephemeral=True,
+                enable_tools=False,
+                low_thinking=True,
             )
             latency_records.extend(live_stream_result.latency_records)
             tool_outputs = tool_outputs.merge(hydrate_tool_outputs(retry_res.session_state))
@@ -1336,19 +1149,13 @@ class StructuredReActExecutor:
         )
         react_steps: list[ReActStep] = [step_1]
 
-        # Iteration 2 (+ optional adaptive peer fill): Query Cached 10-K Context
-        cached_explanations, merged_citations, cache_steps = self._run_cached_10k_pass(
-            query=query,
-            intent=intent,
-            scope=scope,
-            variance_evaluations=variance_evaluations,
-            citations=citations,
-            current_step_count=len(react_steps),
-            on_cache_s2s_call=on_cache_s2s_call,
-        )
-        react_steps.extend(cache_steps)
+        # Pre-pass citations are already coverage-balanced by hybrid RAG; cached 10-K sections
+        # are queried on demand by the agent via QueryCached10KTool instead of a redundant pre-pass.
+        _ = on_cache_s2s_call
+        cached_explanations: list[Cached10KExplanation] = []
+        merged_citations = list(citations)
 
-        # Iteration 3: Live synthesis & claim verification (with optional regeneration pass)
+        # Iteration 2: Live synthesis & claim verification (with optional tool-less repair pass)
         outcome = self._synthesize_and_verify_with_retry(
             query=query,
             intent=intent,

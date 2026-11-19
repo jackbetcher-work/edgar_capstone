@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from edgar_capstone.agents.context_memory import (
         FINANCIAL_REASONING_MODEL,
         FLASH_CODING_AND_EVAL_MODEL,
+        FLASH_LITE_MODEL,
         TTFT_SLO_TARGET_MS,
         BoundedInMemoryMemoryService,
         ContextLatencyTracker,
@@ -119,7 +120,6 @@ if TYPE_CHECKING:
         StructuredReActExecutor,
         evaluate_calculated_variances,
         flush_pending_evaluations,
-        query_cached_10k_for_explanations,
     )
     from edgar_capstone.agents.resilience import (
         RateLimitExceededError,
@@ -243,6 +243,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "FLASH_CODING_AND_EVAL_MODEL": (
         "edgar_capstone.agents.context_memory",
         "FLASH_CODING_AND_EVAL_MODEL",
+    ),
+    "FLASH_LITE_MODEL": (
+        "edgar_capstone.agents.context_memory",
+        "FLASH_LITE_MODEL",
     ),
     "TTFT_SLO_TARGET_MS": ("edgar_capstone.agents.context_memory", "TTFT_SLO_TARGET_MS"),
     "BoundedInMemoryMemoryService": (
@@ -436,10 +440,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "edgar_capstone.agents.react_loop",
         "flush_pending_evaluations",
     ),
-    "query_cached_10k_for_explanations": (
-        "edgar_capstone.agents.react_loop",
-        "query_cached_10k_for_explanations",
-    ),
     # resilience
     "RateLimitExceededError": ("edgar_capstone.agents.resilience", "RateLimitExceededError"),
     "ToolExecutionError": ("edgar_capstone.agents.resilience", "ToolExecutionError"),
@@ -537,6 +537,7 @@ __all__ = [
     "DEFAULT_PROMPT_VERSION",
     "FINANCIAL_REASONING_MODEL",
     "FLASH_CODING_AND_EVAL_MODEL",
+    "FLASH_LITE_MODEL",
     "PRIMARY_ORCHESTRATOR_NAME",
     "TTFT_SLO_TARGET_MS",
     "AdkStreamResult",
@@ -642,7 +643,6 @@ __all__ = [
     "low_thinking_config_for_model",
     "make_adk_instruction_provider",
     "query_cached_10k_context",
-    "query_cached_10k_for_explanations",
     "query_looker_financial_explore",
     "reconcile_breakdown_with_usage_metadata",
     "reset_gcp_tool_adapters",

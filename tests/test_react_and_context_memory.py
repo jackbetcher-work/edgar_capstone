@@ -28,6 +28,7 @@ from google.genai import types as genai_types
 from edgar_capstone.agents import (
     FINANCIAL_REASONING_MODEL,
     FLASH_CODING_AND_EVAL_MODEL,
+    FLASH_LITE_MODEL,
     ContextBreakdown,
     ContextLatencyTracker,
     ConversationMemoryManager,
@@ -230,9 +231,10 @@ class _DeterministicReActProLlm(BaseLlm):
 
 
 def test_dual_model_specialization_and_adk_app_configuration() -> None:
-    """Verify Gemini 3.8 Flash handles complex financial reasoning while Gemini 3.5 Flash handles coding, eval, & compaction."""
+    """Verify Gemini 3.8 Flash handles reasoning & low-thinking eval while Gemini 3.5 Flash-Lite handles compaction & mapping."""
     assert FINANCIAL_REASONING_MODEL == "gemini-3.8-flash"
-    assert FLASH_CODING_AND_EVAL_MODEL == "gemini-3.5-flash"
+    assert FLASH_CODING_AND_EVAL_MODEL == "gemini-3.8-flash"
+    assert FLASH_LITE_MODEL == "gemini-3.5-flash-lite"
 
     # Task routing assertions
     for pro_task in (
@@ -244,14 +246,18 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     ):
         assert resolve_model_for_task(pro_task) == "gemini-3.8-flash"  # type: ignore[arg-type]
 
-    for flash_task in (
+    for eval_task in (
         "evaluation",
         "llm_as_judge",
         "coding_assistance",
+    ):
+        assert resolve_model_for_task(eval_task) == "gemini-3.8-flash"  # type: ignore[arg-type]
+
+    for lite_task in (
         "context_compaction",
         "context_cache_warmup",
     ):
-        assert resolve_model_for_task(flash_task) == "gemini-3.5-flash"  # type: ignore[arg-type]
+        assert resolve_model_for_task(lite_task) == "gemini-3.5-flash-lite"  # type: ignore[arg-type]
 
     # ADK Agent model assignments, planners & callbacks via lazy factories
     analyst = create_financial_analyst_agent()
@@ -264,7 +270,13 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     assert analyst.before_model_callback is before_model_safety_and_latency_callback
     assert analyst.after_model_callback is after_model_fact_check_callback
 
-    assert evaluator.model == "gemini-3.5-flash"
+    assert evaluator.model == "gemini-3.8-flash"
+    assert evaluator.generate_content_config is not None
+    assert evaluator.generate_content_config.thinking_config is not None
+    assert (
+        evaluator.generate_content_config.thinking_config.thinking_level
+        == genai_types.ThinkingLevel.LOW
+    )
     assert evaluator.before_model_callback is before_model_telemetry_callback
     assert evaluator.after_model_callback is after_model_telemetry_callback
 
@@ -272,7 +284,7 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     assert QueryCached10KTool.name == "query_cached_10k_context"
     assert "query_cached_10k_context" in analyst_tool_names
 
-    # ADK App ContextCacheConfig + EventsCompactionConfig (summarized via Gemini 3.5 Flash)
+    # ADK App ContextCacheConfig + EventsCompactionConfig (summarized via Gemini 3.5 Flash-Lite)
     custom_app = create_edgar_adk_app(analyst, app_name="edgar_test_app")
     assert isinstance(custom_app, App)
     assert custom_app.context_cache_config is not None
@@ -281,11 +293,13 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     assert custom_app.events_compaction_config is not None
     assert custom_app.events_compaction_config.token_threshold == 32000
     assert custom_app.events_compaction_config.summarizer is not None
-    assert custom_app.events_compaction_config.summarizer._llm.model == "gemini-3.5-flash"  # type: ignore[attr-defined]
+    assert custom_app.events_compaction_config.summarizer._llm.model == "gemini-3.5-flash-lite"  # type: ignore[attr-defined]
 
     meta = get_model_strategy_metadata()
     assert meta["financial_reasoning_model"] == "gemini-3.8-flash"
-    assert meta["coding_and_evaluation_model"] == "gemini-3.5-flash"
+    assert meta["coding_and_evaluation_model"] == "gemini-3.8-flash"
+    assert meta["compaction_and_mapping_model"] == "gemini-3.5-flash-lite"
+    assert meta["events_compaction_config"]["adk_app_summarizer_model"] == "gemini-3.5-flash-lite"
     assert meta["events_compaction_config"]["compaction_method"] == "deterministic_digest"
 
 
@@ -527,7 +541,9 @@ def _is_model(name: str, family: str) -> bool:
 def test_structured_react_executor_peer_comparison_with_sync_judge(
     fake_gcp_adapters: Any,
 ) -> None:
-    """Variance pre-pass, cached 10-K querying with peer fill, scripted synthesis + sync judge."""
+    """Variance evaluation, pre-retrieved citations (no legacy cached-10K pre-pass), synthesis + sync judge."""
+    from edgar_capstone.agents.tools import search_10k_chunks_rag
+
     var_res = calculate_period_variances(tickers="NVDA,AAPL", start_year=2024, end_year=2026)
     reports = var_res["variance_reports"]
     assert {r["ticker"] for r in reports} == {"AAPL", "NVDA"}
@@ -540,6 +556,18 @@ def test_structured_react_executor_peer_comparison_with_sync_judge(
         assert ev.targeted_10k_queries
         assert {q["section_id"] for q in ev.targeted_10k_queries} <= {"item_7", "item_1a"}
         assert all(q["ticker"] == ev.ticker for q in ev.targeted_10k_queries)
+
+    rag_res = search_10k_chunks_rag(
+        query="Compare NVIDIA and Apple revenue and margin drivers from 2024 to 2026",
+        tickers="NVDA,AAPL",
+        gics_sector="Information Technology",
+        section_id="ALL",
+        start_year=2024,
+        end_year=2026,
+        top_k=8,
+    )
+    prepass_citations = list(rag_res["citations"])
+    assert {c["ticker"] for c in prepass_citations} >= {"AAPL", "NVDA"}
 
     executor = StructuredReActExecutor(
         reasoning_llm=ScriptedAnalystLlm(
@@ -561,7 +589,7 @@ def test_structured_react_executor_peer_comparison_with_sync_judge(
             "end_year": 2026,
         },
         variance_reports=reports,
-        citations=[],
+        citations=prepass_citations,
         sector_benchmarks=[],
         chunk_health=None,
         memory_tokens=48,
@@ -570,27 +598,21 @@ def test_structured_react_executor_peer_comparison_with_sync_judge(
     )
     assert out["execution_mode"] == "live_adk"
     assert out["reasoning_model"] == "gemini-3.8-flash"
-    assert _is_model(out["evaluation_model"], "gemini-3.5-flash")
+    assert _is_model(out["evaluation_model"], "gemini-3.8-flash")
     assert out["adk_runtime"]["executed_via_adk_runner"] is True
     assert out["answer_verified"] is True
     assert out["adk_runtime"]["answer_withheld_reason"] is None
 
-    # Both peers got cached 10-K explanations linked to retrieved citations
-    assert {e.ticker for e in out["cached_explanations"]} == {"AAPL", "NVDA"}
+    # No legacy pre-synthesis cached-10K pass; pre-retrieved citations cover both peers directly.
+    assert out["cached_explanations"] == []
     assert len(out["citations"]) >= 2
     assert {c["ticker"] for c in out["citations"]} >= {"AAPL", "NVDA"}
-    for exp in out["cached_explanations"]:
-        assert exp.extracted_explanations
-        assert all(cid.startswith(f"{exp.ticker}_") for cid in exp.matched_chunk_ids)
 
     step_phases = [s.phase for s in out["react_steps"]]
-    assert step_phases[0] == "evaluate_variances"
-    assert "query_cached_10k_context" in step_phases
-    assert "format_grounded_output" in step_phases
-    assert step_phases[-1] == "fact_check_and_eval"
+    assert step_phases == ["evaluate_variances", "format_grounded_output", "fact_check_and_eval"]
 
     eval_report = out["evaluation_report"]
-    assert _is_model(eval_report.evaluator_model, "gemini-3.5-flash")
+    assert _is_model(eval_report.evaluator_model, "gemini-3.8-flash")
     assert eval_report.grade == "pass"
     assert eval_report.overall_score is not None and 0.90 <= eval_report.overall_score <= 1.0
     assert eval_report.context_tokens > 0
@@ -685,9 +707,9 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     assert turn1["resolved_scope"]["memory_inherited"] is False
     assert turn1["context_and_memory"]["session_memory"]["persistence"]["persisted"] is True
     assert turn1["react_execution"]["strategy"] == "structured_react_loop"
-    assert turn1["react_execution"]["iterations"] >= 4
-    assert len(turn1["react_execution"]["cached_10k_explanations"]) >= 1
-    assert _is_model(turn1["evaluation"]["evaluator_model"], "gemini-3.5-flash")
+    assert turn1["react_execution"]["iterations"] >= 3
+    assert turn1["react_execution"]["cached_10k_explanations"] == []
+    assert _is_model(turn1["evaluation"]["evaluator_model"], "gemini-3.8-flash")
     assert turn1["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
     assert turn1["context_and_memory"]["turn_context_latency"]["total_calls"] >= 1
     assert turn1["react_execution"]["judge_mode"] == "async_background"
@@ -730,7 +752,6 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     assert tracker_summary.total_calls >= 4
     by_model = list(tracker_summary.by_model)
     assert any(_is_model(m, "gemini-3.8-flash") for m in by_model), by_model
-    assert any(_is_model(m, "gemini-3.5-flash") for m in by_model), by_model
 
 
 def test_react_async_judge_pending_and_background_telemetry_callback(
@@ -778,7 +799,6 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
         observed_ttft_ms=112.5,
         session_state={"financial_analyst_report": report_payload},
     )
-    monkeypatch.setattr(react_loop, "query_cached_10k_for_explanations", lambda **_kw: ([], []))
     monkeypatch.setattr(
         react_loop.StructuredReActExecutor,
         "_invoke_financial_reasoning",
@@ -788,7 +808,7 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
         react_loop,
         "evaluate_variance_explanation",
         lambda **_kw: NarrativeEvaluationReport(
-            evaluator_model="gemini-3.5-flash",
+            evaluator_model="gemini-3.8-flash",
             grade="pass",
             overall_score=0.93,
             numeric_fidelity_score=1.0,
@@ -909,14 +929,12 @@ def test_react_guided_regeneration_retry_recovers_and_handles_exception(
             }
         ],
     }
-    monkeypatch.setattr(react_loop, "query_cached_10k_for_explanations", lambda **_kw: ([], []))
-
-    # Case 1: Retry recovers a verified answer and receives verification_feedback
-    captured_feedback: list[str | None] = []
+    # Case 1: Retry recovers a verified answer, receives verification_feedback, and runs tool-less + low-thinking
+    captured_calls: list[dict[str, Any]] = []
 
     def _invoke_recover(self, **kwargs: Any) -> AdkStreamResult:
-        captured_feedback.append(kwargs.get("verification_feedback"))
-        payload = bad_payload if len(captured_feedback) == 1 else good_payload
+        captured_calls.append(dict(kwargs))
+        payload = bad_payload if len(captured_calls) == 1 else good_payload
         return AdkStreamResult(
             agent_name="FinancialAnalystAgent",
             app_name="edgar_chat_app",
@@ -946,11 +964,53 @@ def test_react_guided_regeneration_retry_recovers_and_handles_exception(
         chunk_health=None,
         skip_background_judge=True,
     )
-    assert len(captured_feedback) == 2
-    assert captured_feedback[0] is None
-    assert captured_feedback[1] is not None and "99.99%" in captured_feedback[1]
+    assert len(captured_calls) == 2
+    assert captured_calls[0].get("verification_feedback") is None
+    assert captured_calls[0].get("enable_tools", True) is True
+    assert captured_calls[0].get("low_thinking", False) is False
+    assert (
+        captured_calls[1].get("verification_feedback") is not None
+        and "99.99%" in captured_calls[1]["verification_feedback"]
+    )
+    assert captured_calls[1].get("enable_tools") is False
+    assert captured_calls[1].get("low_thinking") is True
     assert recovered["answer_verified"] is True
     assert "Blackwell" in recovered["answer_markdown"]
+
+    # Verify create_financial_analyst_agent honors enable_tools=False, low_thinking=True
+    from edgar_capstone.agents.factories import create_financial_analyst_agent
+    from edgar_capstone.agents.prompt_builders import build_financial_reasoning_prompt
+
+    repair_agent = create_financial_analyst_agent(enable_tools=False, low_thinking=True)
+    assert list(repair_agent.tools or []) == []
+    assert repair_agent.before_tool_callback is None
+    assert repair_agent.after_tool_callback is None
+    assert repair_agent.planner is not None
+    assert repair_agent.planner.thinking_config.thinking_level == genai_types.ThinkingLevel.LOW
+    assert repair_agent.planner.thinking_config.include_thoughts is True
+
+    repair_prompt = build_financial_reasoning_prompt(
+        query="Why did NVDA revenue expand?",
+        intent="longitudinal_single_company",
+        scope={
+            "tickers": ["NVDA"],
+            "tickers_csv": "NVDA",
+            "gics_sector": "ALL",
+            "section_id": "item_7",
+            "start_year": 2025,
+            "end_year": 2026,
+        },
+        variance_reports=[],
+        variance_evaluations=[],
+        cached_explanations=[],
+        citations=[citation],
+        sector_benchmarks=[],
+        chunk_health=None,
+        verification_feedback="- Finding 0: figure mismatch",
+    )
+    assert "## Verification Correction Required" in repair_prompt
+    assert "## Deterministic Tool Selection" not in repair_prompt
+    assert "## 10-K Retrieval Guidance" not in repair_prompt
 
     # Case 2: Retry raises an upstream error -> safely withholds response without crashing
     calls = [0]
@@ -1031,6 +1091,13 @@ def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
     assert (prof.uncached_input_usd_per_1m, prof.cached_input_usd_per_1m) == (0.75, 0.075)
     assert prof.output_usd_per_1m == 3.75
     assert _get_profile_for_model("publishers/google/models/gemini-3.8-flash-001") is prof
+    lite_prof = _get_profile_for_model("gemini-3.5-flash-lite")
+    assert lite_prof.model_name == "gemini-3.5-flash-lite"
+    assert lite_prof.tier == "fast_compaction_and_mapping"
+    assert (lite_prof.uncached_input_usd_per_1m, lite_prof.cached_input_usd_per_1m) == (0.30, 0.03)
+    assert lite_prof.output_usd_per_1m == 2.50
+    # Longest-prefix match ensures versioned flash-lite never collides with gemini-3.5-flash.
+    assert _get_profile_for_model("publishers/google/models/gemini-3.5-flash-lite-001") is lite_prof
     assert _get_profile_for_model("gemini-3.5-flash").model_name == "gemini-3.5-flash"
     assert _get_profile_for_model("gemini-2.5-pro").model_name == "gemini-2.5-pro"
     # No silent pricing fallback for unlisted models (previously defaulted to Gemini 2.5 Pro).
@@ -1046,7 +1113,7 @@ def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
 
     eval_text = make_adk_instruction_provider("narrative_evaluator")(ctx)
     assert "NarrativeEvaluatorAgent" in eval_text
-    assert "(`gemini-3.5-flash`)" in eval_text
+    assert "(`gemini-3.8-flash`)" in eval_text
 
     monkeypatch.setenv("EDGAR_ANALYST_MODEL", "gemini-next-pro")
     assert "FinancialAnalystAgent (`gemini-next-pro`)" in make_adk_instruction_provider(
@@ -1054,3 +1121,5 @@ def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
     )(ctx)
     monkeypatch.setenv("EDGAR_FLASH_MODEL", "gemini-next-flash")
     assert "(`gemini-next-flash`)" in make_adk_instruction_provider("narrative_evaluator")(ctx)
+    monkeypatch.setenv("EDGAR_LITE_MODEL", "gemini-next-lite")
+    assert resolve_model_for_task("context_compaction") == "gemini-next-lite"

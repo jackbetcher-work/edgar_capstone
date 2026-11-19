@@ -41,6 +41,7 @@ from edgar_capstone.agents.adapters import (
 )
 from edgar_capstone.agents.citations import merge_citations
 from edgar_capstone.agents.hybrid_rag import _execute_live_gcp_hybrid_rag
+from edgar_capstone.agents.prompt_builders import compact_variance_reports_for_prompt
 from edgar_capstone.agents.resilience import with_tool_resilience
 from edgar_capstone.agents.schemas import GroundedCitation
 from edgar_capstone.agents.tool_runtime import (
@@ -568,6 +569,14 @@ def calculate_period_variances(
         tool_context.state[STATE_VARIANCE_MISSING_TICKERS] = sorted(
             prior_missing | set(missing_tickers)
         )
+        # Full XBRL provenance reports live in session_state for claim verification and rendering;
+        # return a token-lean digest to the LLM to cut Call 2+ prefill latency (~18 KB/company).
+        return {
+            "status": "success",
+            "company_count": len(reports),
+            "missing_tickers": missing_tickers,
+            "variance_reports": compact_variance_reports_for_prompt(reports),
+        }
 
     return {
         "status": "success",

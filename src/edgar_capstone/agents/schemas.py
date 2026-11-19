@@ -389,7 +389,8 @@ class ModelContextLatencyRecord(BaseModel):
     timestamp: str = Field(..., description="ISO-8601 UTC timestamp")
     agent_name: str = Field(..., description="ADK agent executing the model call")
     model_name: str = Field(
-        ..., description="Gemini model identifier (e.g., gemini-3.8-flash or gemini-3.5-flash)"
+        ...,
+        description="Gemini model identifier (e.g., gemini-3.8-flash or gemini-3.5-flash-lite)",
     )
     task_category: ModelTaskCategory = Field(
         default="financial_reasoning",
@@ -697,9 +698,9 @@ class ReActStep(BaseModel):
 
 
 class NarrativeEvaluationReport(AgentReportTelemetryMixin):
-    """LLM-as-a-Judge / rubric evaluation output powered by Gemini 3.5 Flash."""
+    """LLM-as-a-Judge / rubric evaluation output powered by Gemini 3.8 Flash (low thinking)."""
 
-    evaluator_model: str = "gemini-3.5-flash"
+    evaluator_model: str = "gemini-3.8-flash"
     task_category: Literal["evaluation", "llm_as_judge"] = "evaluation"
     grade: Literal["pass", "needs_revision", "fail", "pending"] = "pass"
     overall_score: float | None = Field(default=None, ge=0.0, le=1.0)

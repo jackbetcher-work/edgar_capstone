@@ -352,7 +352,8 @@ jobs:
             GOOGLE_GENAI_USE_VERTEXAI=true
             EDGAR_ANALYST_MODEL=gemini-3.8-flash
             EDGAR_GEMINI_LOCATION=global
-            EDGAR_FLASH_MODEL=gemini-3.5-flash
+            EDGAR_FLASH_MODEL=gemini-3.8-flash
+            EDGAR_LITE_MODEL=gemini-3.5-flash-lite
             EDGAR_MODEL_ARMOR_MODE=gcp
             MODEL_ARMOR_TEMPLATE_ID=sec-edgar-analyst-armor
             SDP_INSPECT_TEMPLATE_ID=sec-edgar-sdp-inspect

@@ -1,9 +1,11 @@
-"""Gemini 3.5 Flash LLM-as-a-Judge evaluation specialist for SEC 10-K narratives.
+"""Gemini 3.8 Flash (low-thinking) LLM-as-a-Judge evaluation specialist for SEC 10-K narratives.
 
 Model Strategy:
-- `gemini-3.5-flash` (`DEFAULT_FLASH_MODEL`): Dedicated to LLM-as-a-Judge evaluation tasks
-  (`NarrativeEvaluatorAgent`, `evaluate_variance_explanation`), while the financial reasoning
-  model (`gemini-3.8-flash`) handles complex financial reasoning in `FinancialAnalystAgent`.
+- `gemini-3.8-flash` with `ThinkingLevel.LOW` (`DEFAULT_FLASH_MODEL` / `EDGAR_FLASH_MODEL`):
+  Dedicated to LLM-as-a-Judge evaluation tasks (`NarrativeEvaluatorAgent`,
+  `evaluate_variance_explanation`), while `FinancialAnalystAgent` runs `gemini-3.8-flash` with
+  default native thinking and `SectorMapSummarizerAgent` / `LlmEventSummarizer` run
+  `gemini-3.5-flash-lite` (`EDGAR_LITE_MODEL`).
 """
 
 from __future__ import annotations
@@ -145,7 +147,7 @@ def evaluate_variance_explanation(
     reference_explanation: str | None = None,
     fact_check: FactCheckVerification | None = None,
 ) -> NarrativeEvaluationReport:
-    """Score a synthesized report with the live `NarrativeEvaluatorAgent` (`gemini-3.5-flash`).
+    """Score a synthesized report with the live `NarrativeEvaluatorAgent` (`gemini-3.8-flash`, low thinking).
 
     The deterministic numeric and citation fact-check caps the judge's scores, so a report with
     mismatched figures or missing citations can't pass on the judge's opinion alone.

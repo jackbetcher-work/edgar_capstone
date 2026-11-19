@@ -1,7 +1,7 @@
 """Google ADK `Runner` SSE execution, runtime wiring, and the flagship live Gemini E2E smoke test.
 
 - `test_conversational_rag_turn_executes_live_gemini_end_to_end` (`@pytest.mark.live`): the single
-  flagship end-to-end live Gemini `gemini-3.8-flash` + async `gemini-3.5-flash` judge + live
+  flagship end-to-end live Gemini `gemini-3.8-flash` + async `gemini-3.8-flash` (low-thinking) judge + live
   Model Armor + live BigQuery / Vertex AI Search / GCS turn.
 - All other tests in this module are fast, deterministic unit/integration tests using scripted
   ADK `BaseLlm`s and `fake_gcp_adapters`.
@@ -151,6 +151,7 @@ def test_live_runtime_resolution_and_gemini_client_wiring(
         "EDGAR_GEMINI_LOCATION",
         "EDGAR_ANALYST_MODEL",
         "EDGAR_FLASH_MODEL",
+        "EDGAR_LITE_MODEL",
         "GCP_PROJECT_ID",
     ):
         monkeypatch.delenv(env_key, raising=False)
@@ -170,10 +171,13 @@ def test_live_runtime_resolution_and_gemini_client_wiring(
 
     pro_gemini = build_adk_llm_for_task("financial_reasoning", resolution=vertex_res)
     flash_gemini = build_adk_llm_for_task("evaluation", resolution=vertex_res)
+    lite_gemini = build_adk_llm_for_task("context_compaction", resolution=vertex_res)
     assert isinstance(pro_gemini, Gemini)
     assert isinstance(flash_gemini, Gemini)
+    assert isinstance(lite_gemini, Gemini)
     assert pro_gemini.model == "gemini-3.8-flash"
-    assert flash_gemini.model == "gemini-3.5-flash"
+    assert flash_gemini.model == "gemini-3.8-flash"
+    assert lite_gemini.model == "gemini-3.5-flash-lite"
     assert pro_gemini.client_kwargs == {
         "vertexai": True,
         "project": TEST_PROJECT_ID,
@@ -363,7 +367,7 @@ def test_conversational_rag_turn_executes_live_gemini_end_to_end(
         assert "#### Key Metrics (deterministic engine)" in turn["answer_markdown"]
 
         evaluation = turn["evaluation"]
-        assert _is_model(evaluation["evaluator_model"], "gemini-3.5-flash")
+        assert _is_model(evaluation["evaluator_model"], "gemini-3.8-flash")
         assert evaluation["grade"] == "pending"
         assert evaluation["overall_score"] is None
         assert evaluation["numeric_fidelity_score"] is None
@@ -373,13 +377,17 @@ def test_conversational_rag_turn_executes_live_gemini_end_to_end(
         assert any(_is_model(m, "gemini-3.8-flash") for m in models_called), models_called
         assert runtime["judge_mode"] == "async_background"
         flush_pending_evaluations(timeout=30.0)
-        all_models_called = [r.model_name for r in tracker.recent_records(limit=20)]
-        assert any(_is_model(m, "gemini-3.5-flash") for m in all_models_called), all_models_called
+        all_records = tracker.recent_records(limit=20)
+        assert any(
+            r.agent_name == "NarrativeEvaluatorAgent"
+            and _is_model(r.model_name, "gemini-3.8-flash")
+            for r in all_records
+        ), [(r.agent_name, r.model_name) for r in all_records]
 
         async_evals = get_telemetry_sink().recent_async_evaluations(session_id="live-chat-sess-01")
         assert len(async_evals) >= 1
         assert any(
-            _is_model(ev.get("evaluator_model", ""), "gemini-3.5-flash")
+            _is_model(ev.get("evaluator_model", ""), "gemini-3.8-flash")
             and ev.get("evaluation_grade") in {"pass", "needs_revision", "fail"}
             and ev.get("evaluation_score") is not None
             and 0.0 <= float(ev["evaluation_score"]) <= 1.0
@@ -474,7 +482,7 @@ def test_narrative_evaluator_deterministic_cap_overrides_generous_judge(
         citations=[cit],
         llm=overly_generous_judge,
     )
-    assert _is_model(grounded.evaluator_model, "gemini-3.5-flash")
+    assert _is_model(grounded.evaluator_model, "gemini-3.8-flash")
     assert grounded.grade == "pass"
     assert grounded.overall_score is not None and 0.95 <= grounded.overall_score <= 1.0
     assert grounded.context_tokens > 0

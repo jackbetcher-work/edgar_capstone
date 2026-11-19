@@ -37,7 +37,7 @@ prompts:
 
   narrative_evaluator:
     agent_name: "NarrativeEvaluatorAgent"
-    model: "gemini-3.5-flash"
+    model: "gemini-3.8-flash"
     latest: "v1"
     versions:
       v1:

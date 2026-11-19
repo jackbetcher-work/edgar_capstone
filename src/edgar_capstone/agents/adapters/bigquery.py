@@ -622,3 +622,38 @@ class BigQueryAdapter(GcpAdapterErrorTranslationMixin, BigQueryRestClient):
             bq_scalar_param("section_id", "STRING", section_id.lower()),
         ]
         return self.run_query(sql, params)
+
+    def fetch_sections_chunks_batch(
+        self,
+        *,
+        tickers: set[str],
+        start_year: int,
+        end_year: int,
+        section_id: str | None = None,
+        include_embedding: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Fetch canonical chunks across multiple `(ticker, fiscal_year, section_id)` slices in one RPC."""
+        if not tickers:
+            return []
+        eff_sec = (
+            section_id.strip().lower()
+            if section_id and section_id.strip().lower() in ("item_1a", "item_7")
+            else None
+        )
+        clauses, params = _build_scope_where_clauses(
+            start_year=start_year,
+            end_year=end_year,
+            tickers=tickers,
+            section_id=eff_sec,
+        )
+        emb_col = ", embedding" if include_embedding else ""
+        sql = (
+            "SELECT chunk_id, profile_id, ticker, company_name, gics_sector, "
+            "fiscal_year, period_of_report, filing_date, accession_number, "
+            f"section_id, section_title, chunk_index, chunk_text{emb_col}, "
+            "sec_filing_url, unstructured_gcs_uri "
+            f"FROM {self._table_ref(self.filing_chunks_table)} "
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY ticker ASC, fiscal_year ASC, section_id ASC, chunk_index ASC"
+        )
+        return self.run_query(sql, params)

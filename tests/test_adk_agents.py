@@ -58,6 +58,13 @@ def test_adk_agent_factories_and_tool_registration() -> None:
     evaluator = create_narrative_evaluator_agent()
     assert isinstance(evaluator, Agent)
     assert evaluator.name == "NarrativeEvaluatorAgent"
+    assert evaluator.model == "gemini-3.8-flash"
+    assert evaluator.generate_content_config is not None
+    assert evaluator.generate_content_config.thinking_config is not None
+    assert (
+        evaluator.generate_content_config.thinking_config.thinking_level
+        == genai_types.ThinkingLevel.LOW
+    )
     assert callable(evaluator.instruction)
     # Judge uses telemetry-only callbacks (never Model Armor HTTP or AnalystReport parsing)
     assert evaluator.before_model_callback is before_model_telemetry_callback

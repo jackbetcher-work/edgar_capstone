@@ -55,6 +55,7 @@ from edgar_capstone.agents.tools import (
     get_context_cache_runtime_stats,
     search_10k_chunks_rag,
 )
+from edgar_capstone.common.concurrency import run_parallel_with_context
 from edgar_capstone.observability.tracing import traced
 from edgar_capstone.security.agent_identity import (
     VerifiedAgentS2SClaims,
@@ -734,14 +735,25 @@ def _run_prompt_guardrail(
     turn_start: float,
     telemetry_session_id: str,
     user_id: str,
+    precomputed_decision: GuardrailDecision | None = None,
+    precomputed_guard_ms: float | None = None,
 ) -> tuple[str, GuardrailDecision, dict[str, Any] | None]:
     """Inspect user prompt with Model Armor / SDP; return `(sanitized_query, decision, blocked_response)`."""
     t0 = time.perf_counter()
-    guardrail_svc = get_model_armor_guardrail()
-    prompt_decision = guardrail_svc.inspect_user_prompt(
-        query,
-        caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-    )
+    if precomputed_decision is not None:
+        prompt_decision = precomputed_decision
+        elapsed_guard_ms = (
+            round(float(precomputed_guard_ms), 2)
+            if precomputed_guard_ms is not None
+            else round(float(prompt_decision.latency_ms), 2)
+        )
+    else:
+        guardrail_svc = get_model_armor_guardrail()
+        prompt_decision = guardrail_svc.inspect_user_prompt(
+            query,
+            caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+        )
+        elapsed_guard_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
     if prompt_decision.blocked:
         guard_claims = authorize_agent_s2s_hop(
@@ -749,7 +761,7 @@ def _run_prompt_guardrail(
             callee_agent="ModelArmorGuardrail",
         )
         _track_identity(identities_used_by_agent, guard_claims)
-        guard_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        guard_ms = elapsed_guard_ms
         cats_str = ", ".join(prompt_decision.matched_categories) or "policy_violation"
         _append_trace_step(
             agent_trace,
@@ -853,7 +865,7 @@ def _run_prompt_guardrail(
             claims=guard_claims,
             tool="cloud_sdp_deidentify_content",
             status="sanitized",
-            duration_ms=round((time.perf_counter() - t0) * 1000.0, 2),
+            duration_ms=elapsed_guard_ms,
             summary=(
                 "De-identified sensitive PII in user prompt via SDP "
                 f"(info_types={list(prompt_decision.sdp_info_types)})."
@@ -992,12 +1004,15 @@ def _append_agent_tool_trace_steps(
     bundle: _RetrievalBundle,
     turn_ctx: ToolTurnContext,
 ) -> list[str]:
-    """S2S-attested trace steps for every deterministic tool the agent chose to invoke."""
+    """S2S-attested trace steps for every deterministic tool and cached 10-K lookup the agent invoked."""
     invoked: dict[str, list[dict[str, Any]]] = {}
+    cache_calls: list[dict[str, Any]] = []
     for call in tool_calls:
         name = str(call.get("name") or "")
         if name in DETERMINISTIC_TOOL_NAMES:
             invoked.setdefault(name, []).append(call)
+        elif name == "query_cached_10k_context":
+            cache_calls.append(call)
     for name, calls in invoked.items():
         claims = authorize_agent_tool_invocation(
             agent_name="FinancialAnalystAgent",
@@ -1018,6 +1033,26 @@ def _append_agent_tool_trace_steps(
             status="completed",
             duration_ms=turn_ctx.tool_duration_ms(name),
             summary=_agent_tool_summary(name, bundle, calls),
+        )
+    if cache_calls:
+        authorize_agent_s2s_hop(
+            caller_agent="FinancialAnalystAgent",
+            callee_agent="ContextCacheManager",
+        )
+        c_claims = authorize_agent_tool_invocation(
+            agent_name="ContextCacheManager",
+            tool_name="query_cached_10k_context",
+            caller="FinancialAnalystAgent",
+        )
+        _track_identity(identities_used_by_agent, c_claims)
+        _append_trace_step(
+            agent_trace,
+            agent="ContextCacheManager",
+            claims=c_claims,
+            tool="query_cached_10k_context",
+            status="completed",
+            duration_ms=turn_ctx.tool_duration_ms("query_cached_10k_context"),
+            summary=(f"Agent-invoked cached 10-K section lookup ({len(cache_calls)} call(s))."),
         )
     return sorted(invoked)
 
@@ -1237,8 +1272,30 @@ def run_conversational_rag_turn(
 
     _emit("starting", "Checking safety guardrails and session memory...", None)
 
+    # Parallel pre-pass: overlap Firestore memory recall, Model Armor prompt check, and the
+    # read-only S&P 500 entity catalog fetch (all three are independent; if Model Armor blocks,
+    # the catalog result is discarded and the exact blocked payload is returned).
     memory_mgr = get_conversation_memory_manager()
-    memory_ctx = memory_mgr.recall_session_context(session_id, user_id=user_id)
+
+    def _run_prepass_branch(branch: str) -> Any:
+        if branch == "memory":
+            return memory_mgr.recall_session_context(session_id, user_id=user_id)
+        if branch == "guardrail":
+            t_g = time.perf_counter()
+            dec = get_model_armor_guardrail().inspect_user_prompt(
+                query,
+                caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+            )
+            return dec, (time.perf_counter() - t_g) * 1000.0
+        return _get_entity_catalog(allow_fetch=True)
+
+    memory_ctx, (raw_prompt_decision, raw_guard_ms), (catalog, all_profiles) = (
+        run_parallel_with_context(
+            ["memory", "guardrail", "catalog"],
+            _run_prepass_branch,
+            max_workers=3,
+        )
+    )
 
     # Step 0: Managed Google Cloud Model Armor, Cloud SDP/DLP & Financial Projection Guardrails
     query, prompt_decision, blocked_prompt_resp = _run_prompt_guardrail(
@@ -1253,6 +1310,8 @@ def run_conversational_rag_turn(
         turn_start=turn_start,
         telemetry_session_id=telemetry_session_id,
         user_id=user_id,
+        precomputed_decision=raw_prompt_decision,
+        precomputed_guard_ms=raw_guard_ms,
     )
     if blocked_prompt_resp is not None:
         return blocked_prompt_resp
@@ -1265,7 +1324,6 @@ def run_conversational_rag_turn(
         caller=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
     )
     _track_identity(identities_used_by_agent, route_claims)
-    catalog, all_profiles = _get_entity_catalog(allow_fetch=True)
     scope = resolve_query_scope(
         query=query,
         tickers=tickers,
@@ -1403,22 +1461,6 @@ def run_conversational_rag_turn(
     )
 
     # Step 3 & Step 4: Structured ReAct loop; the agent invokes deterministic tools as needed
-    last_cache_claims: VerifiedAgentS2SClaims | None = None
-
-    def _on_cache_s2s_call(_ticker: str, _fy: int, _sec: str) -> None:
-        nonlocal last_cache_claims
-        authorize_agent_s2s_hop(
-            caller_agent="FinancialAnalystAgent",
-            callee_agent="ContextCacheManager",
-        )
-        c_claims = authorize_agent_tool_invocation(
-            agent_name="ContextCacheManager",
-            tool_name="query_cached_10k_context",
-            caller="FinancialAnalystAgent",
-        )
-        _track_identity(identities_used_by_agent, c_claims)
-        last_cache_claims = c_claims
-
     with tool_turn_context(
         on_progress=on_progress,
         map_llm=map_llm,
@@ -1441,7 +1483,6 @@ def run_conversational_rag_turn(
             session_id=session_id,
             telemetry_session_id=telemetry_session_id,
             user_id=user_id,
-            on_cache_s2s_call=_on_cache_s2s_call,
             material_variance_flags=[],
             disclosure_deltas=None,
             coverage_notices=base_coverage_notices,
@@ -1509,36 +1550,6 @@ def run_conversational_rag_turn(
     )
 
     context_cache_info: dict[str, Any] | None = None
-    if cached_explanations and last_cache_claims is not None:
-        primary_exp = cached_explanations[0]
-        cache_hits_count = sum(1 for e in cached_explanations if e.cache_hit)
-        total_cached_tokens = sum(e.token_estimate for e in cached_explanations)
-        total_lookup_ms = round(sum(e.lookup_latency_ms for e in cached_explanations), 2)
-        context_cache_info = {
-            "cache_key": primary_exp.cache_key,
-            "cache_hit": primary_exp.cache_hit,
-            "ticker": primary_exp.ticker,
-            "fiscal_year": primary_exp.fiscal_year,
-            "section_id": primary_exp.section_id,
-            "token_estimate": primary_exp.token_estimate,
-            "sec_filing_url": primary_exp.sec_filing_url,
-            "sections_queried_count": len(cached_explanations),
-            "cache_hits_count": cache_hits_count,
-            "total_section_tokens": total_cached_tokens,
-            "lookup_latency_ms": total_lookup_ms,
-        }
-        _append_trace_step(
-            agent_trace,
-            agent="ContextCacheManager",
-            claims=last_cache_claims,
-            tool="query_cached_10k_context",
-            status="completed",
-            duration_ms=total_lookup_ms,
-            summary=(
-                f"ReAct [Query Cached 10-K]: Queried {len(cached_explanations)} cached 10-K section(s) "
-                f"(hits={cache_hits_count}/{len(cached_explanations)}, ~{total_cached_tokens:,} tokens)."
-            ),
-        )
 
     # Post-Generation Numeric Fact-Check S2S Attestation
     _emit("verifying", "Verifying citations, XBRL provenance, and compliance guardrails...", None)

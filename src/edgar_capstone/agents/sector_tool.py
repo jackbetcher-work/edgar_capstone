@@ -103,6 +103,7 @@ def sector_thematic_map_reduce(
     section_id: str,
     start_year: int,
     end_year: int,
+    theme_terms: str = "",
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
     """Runs full-sector batched map-reduce over EVERY issuer in a GICS sector for one theme.
@@ -119,6 +120,9 @@ def sector_thematic_map_reduce(
         section_id: 'item_1a' (Risk Factors), 'item_7' (MD&A), or 'ALL'.
         start_year: First fiscal year of the window (e.g., 2024).
         end_year: Last fiscal year of the window (e.g., 2026).
+        theme_terms: Optional comma-separated key phrases and domain synonyms to count across the
+            sector's filings (e.g., 'AI, artificial intelligence, generative AI, GenAI'). Omit to
+            fall back to tokens from `theme`.
 
     Returns:
         Dictionary with 'status', 'sector_coverage', 'delta_summary', verified 'batch_summaries'
@@ -144,6 +148,7 @@ def sector_thematic_map_reduce(
         section_id=section_id,
         start_year=start_year,
         end_year=end_year,
+        theme_terms=theme_terms,
         sector_profiles=cached_turn_profiles() or None,
         map_llm=turn_map_llm(),
         on_progress=turn_ctx.on_progress if turn_ctx is not None else None,

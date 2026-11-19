@@ -111,9 +111,15 @@ variable "gemini_location" {
 }
 
 variable "coding_and_evaluation_model" {
-  description = "Gemini Flash model used for LLM-as-a-Judge evaluation, coding assistance, and context compaction."
+  description = "Gemini Flash model used by NarrativeEvaluatorAgent for LLM-as-a-Judge evaluation (runs with ThinkingLevel.LOW)."
   type        = string
-  default     = "gemini-3.5-flash"
+  default     = "gemini-3.8-flash"
+}
+
+variable "compaction_and_mapping_model" {
+  description = "Lightweight Gemini Flash-Lite model used for SectorMapSummarizerAgent map-reduce batches and ADK LlmEventSummarizer compaction (EDGAR_LITE_MODEL)."
+  type        = string
+  default     = "gemini-3.5-flash-lite"
 }
 
 variable "embedding_dimensions" {
