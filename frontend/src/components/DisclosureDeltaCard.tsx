@@ -8,12 +8,14 @@ import type {
 import type { ParsedInlineCitationToken } from '../utils/formatters'
 import { citationToken } from '../utils/citationTokens'
 import { isRenderableDisclosureDeltas } from '../utils/deterministicEvidence'
+import { EvidencePanel } from './EvidencePanel'
 
 interface DisclosureDeltaCardProps {
   turnId: string
   result: DisclosureDeltaResult
   citations: GroundedCitation[]
   onSelectCitation: (token: ParsedInlineCitationToken) => void
+  defaultOpen?: boolean
 }
 
 const CHANGE_STYLES: Record<DisclosureDelta['change_type'], { label: string; cls: string }> = {
@@ -29,6 +31,7 @@ export function DisclosureDeltaCard({
   result,
   citations,
   onSelectCitation,
+  defaultOpen = true,
 }: DisclosureDeltaCardProps) {
   const [expanded, setExpanded] = useState<string | null>(null)
   if (!isRenderableDisclosureDeltas(result)) {
@@ -53,21 +56,17 @@ export function DisclosureDeltaCard({
   }
 
   return (
-    <section
-      aria-label="Year-over-Year Disclosure Deltas"
-      className="mb-3 border border-hairline surface-panel overflow-hidden"
+    <EvidencePanel
+      ariaLabel="Year-over-Year Disclosure Deltas"
+      title="Disclosure Changes YoY"
+      toggleId={`btn-toggle-deltas-${turnId}`}
+      defaultOpen={defaultOpen}
+      summary={
+        summary
+          ? `+${summary.added} added · ~${summary.modified} modified · −${summary.removed} removed · ${summary.companies_analyzed} issuer${summary.companies_analyzed === 1 ? '' : 's'}`
+          : undefined
+      }
     >
-      <div className="px-3 py-1.5 surface-header border-b border-hairline flex items-center justify-between gap-2 tabular-nums-mono">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-bb-amber">
-          Disclosure Delta Engine
-        </span>
-        {summary && (
-          <span className="text-[10px] text-ink-muted uppercase">
-            +{summary.added} · ~{summary.modified} · −{summary.removed} ·{' '}
-            {summary.companies_analyzed} ISSUER(S)
-          </span>
-        )}
-      </div>
       <div className="overflow-x-auto">
         <table className="w-full text-left border-collapse text-[11px] tabular-nums-mono">
           <thead>
@@ -195,6 +194,6 @@ export function DisclosureDeltaCard({
           </tbody>
         </table>
       </div>
-    </section>
+    </EvidencePanel>
   )
 }

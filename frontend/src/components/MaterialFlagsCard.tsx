@@ -6,6 +6,7 @@ import type {
 import type { ParsedInlineCitationToken } from '../utils/formatters'
 import { citationToken } from '../utils/citationTokens'
 import { buildXbrlFactFromFlag } from '../utils/xbrlFactSelection'
+import { EvidencePanel } from './EvidencePanel'
 
 interface MaterialFlagsCardProps {
   turnId: string
@@ -14,6 +15,7 @@ interface MaterialFlagsCardProps {
   citations: GroundedCitation[]
   onSelectCitation: (token: ParsedInlineCitationToken) => void
   onInspectXbrlFact?: (fact: XbrlFactSelection) => void
+  defaultOpen?: boolean
 }
 
 const RULE_LABELS: Record<MaterialVarianceFlag['rule'], string> = {
@@ -56,24 +58,23 @@ export function MaterialFlagsCard({
   citations,
   onSelectCitation,
   onInspectXbrlFact,
+  defaultOpen = true,
 }: MaterialFlagsCardProps) {
   if (!flags || flags.length === 0) return null
   const byId = new Map(citations.map((c) => [c.chunk_id, c]))
+  const highCount = flags.filter((f) => f.severity === 'high').length
+  const countLabel = `${flags.length}${
+    totalFlags && totalFlags > flags.length ? ` OF ${totalFlags}` : ''
+  } FLAGGED${highCount > 0 ? ` · ${highCount} HIGH` : ''}`
 
   return (
-    <section
-      aria-label="Material Variance Flags"
-      className="mb-3 border border-hairline surface-panel overflow-hidden"
+    <EvidencePanel
+      ariaLabel="Material Variance Flags"
+      title="Material Variance Flags"
+      toggleId={`btn-toggle-flags-${turnId}`}
+      defaultOpen={defaultOpen}
+      summary={countLabel}
     >
-      <div className="px-3 py-1.5 surface-header border-b border-hairline flex items-center justify-between gap-2 tabular-nums-mono">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-bb-amber">
-          Material Variance Flags
-        </span>
-        <span className="text-[10px] text-ink-muted uppercase">
-          {flags.length}
-          {totalFlags && totalFlags > flags.length ? ` OF ${totalFlags}` : ''} · RULE-BASED
-        </span>
-      </div>
       <div className="overflow-x-auto">
         <table className="w-full text-left border-collapse text-[11px] tabular-nums-mono">
           <thead>
@@ -198,6 +199,6 @@ export function MaterialFlagsCard({
           </tbody>
         </table>
       </div>
-    </section>
+    </EvidencePanel>
   )
 }

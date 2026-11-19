@@ -13,11 +13,14 @@ import {
 } from './inspector/CitationsTab'
 import { FilingReaderTab } from './inspector/FilingReaderTab'
 import { XbrlFactTab } from './inspector/XbrlFactTab'
+import { countDistinctCitations } from '../utils/citationDedup'
 
 interface SourceInspectorPaneProps {
   citations: GroundedCitation[]
   companies: CompanySummary[]
   activeChunkId: string | null
+  /** Incremented whenever an inline citation asks the pane to reveal a chunk. */
+  chunkFocusNonce?: number
   onSelectChunkId: (chunkId: string | null) => void
   activeTab: 'citations' | 'document' | 'xbrl'
   onChangeTab: (tab: 'citations' | 'document' | 'xbrl') => void
@@ -39,6 +42,7 @@ export function SourceInspectorPane({
   citations,
   companies,
   activeChunkId,
+  chunkFocusNonce = 0,
   onSelectChunkId,
   activeTab,
   onChangeTab,
@@ -53,6 +57,10 @@ export function SourceInspectorPane({
   const [citationSectionFilter, setCitationSectionFilter] =
     useState<CitationSectionFilter>('ALL')
   const [docKeyword, setDocKeyword] = useState('')
+  const distinctCitationCount = useMemo(
+    () => countDistinctCitations(citations),
+    [citations]
+  )
 
   const filingTargets = useMemo<FilingTarget[]>(() => {
     const map = new Map<string, FilingTarget>()
@@ -103,7 +111,7 @@ export function SourceInspectorPane({
             }`}
           >
             <span>Grounded Chunks</span>
-            <span className="text-[10px]">[{citations.length}]</span>
+            <span className="text-[10px]">[{distinctCitationCount}]</span>
           </button>
 
           <button
@@ -160,6 +168,7 @@ export function SourceInspectorPane({
         <CitationsTab
           citations={citations}
           activeChunkId={activeChunkId}
+          focusNonce={chunkFocusNonce}
           sectionFilter={citationSectionFilter}
           onChangeSectionFilter={setCitationSectionFilter}
           onSelectChunkId={onSelectChunkId}

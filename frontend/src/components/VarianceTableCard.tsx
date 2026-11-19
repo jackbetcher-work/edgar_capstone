@@ -12,6 +12,7 @@ import {
   buildXbrlFactFromAnnualStep,
   buildXbrlFactFromVariance,
 } from '../utils/xbrlFactSelection'
+import { EvidencePanel } from './EvidencePanel'
 
 interface VarianceTableCardProps {
   turnId: string
@@ -22,6 +23,8 @@ interface VarianceTableCardProps {
     sectionId: 'item_7' | 'item_1a'
   ) => void
   onInspectXbrlFact?: (fact: XbrlFactSelection) => void
+  /** Start expanded (standalone) or collapsed beneath an answer. */
+  defaultOpen?: boolean
 }
 
 function deltaTextClass(val: number | null | undefined): string {
@@ -40,6 +43,7 @@ export function VarianceTableCard({
   reports,
   onInspectFilingSection,
   onInspectXbrlFact,
+  defaultOpen = true,
 }: VarianceTableCardProps) {
   const [expandedTicker, setExpandedTicker] = useState<string | null>(
     reports.length === 1 ? reports[0].ticker : null
@@ -58,31 +62,34 @@ export function VarianceTableCard({
     if (month) fiscalMonths.add(month)
   })
   const hasFiscalMisalignment = reports.length > 1 && fiscalMonths.size > 1
+  const tickerList = reports.map((r) => r.ticker).join(', ')
+  const spanYears = Array.from(
+    new Set(
+      reports.map(
+        (r) => `FY${String(r.start_year).slice(-2)}→FY${String(r.end_year).slice(-2)}`
+      )
+    )
+  ).join(' / ')
 
   return (
-    <section
-      aria-label="Deterministic Financial Variance Engine Output"
-      className="mb-3 border border-hairline surface-panel overflow-hidden"
-    >
-      <div className="px-3 py-1.5 surface-header border-b border-hairline flex flex-wrap items-center justify-between gap-2 tabular-nums-mono">
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-bb-amber">
-          Deterministic Variance Calculation Engine
-        </span>
-        <div className="flex items-center gap-2">
-          {hasFiscalMisalignment && (
-            <span
-              className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[9.5px] font-semibold uppercase badge-amber"
-              title="Compared peers have different fiscal year-end months; verify period-end dates below."
-            >
-              <Calendar className="w-2.5 h-2.5" />
-              DIFFERING FY-END DATES
-            </span>
-          )}
-          <span className="text-[10px] text-ink-muted uppercase">
-            XBRL AUDITED · USD
+    <EvidencePanel
+      ariaLabel="Deterministic Financial Variance Engine Output"
+      title="Financial Variances"
+      toggleId={`btn-toggle-variance-${turnId}`}
+      defaultOpen={defaultOpen}
+      summary={`${tickerList} · ${spanYears} · XBRL · USD`}
+      badges={
+        hasFiscalMisalignment ? (
+          <span
+            className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[9.5px] font-semibold uppercase badge-amber"
+            title="Compared peers have different fiscal year-end months; verify period-end dates below."
+          >
+            <Calendar className="w-2.5 h-2.5" />
+            DIFFERING FY-END DATES
           </span>
-        </div>
-      </div>
+        ) : null
+      }
+    >
 
       <div className="overflow-x-auto">
         <table className="w-full text-left border-collapse text-[11px] tabular-nums-mono">
@@ -419,6 +426,6 @@ export function VarianceTableCard({
           </tbody>
         </table>
       </div>
-    </section>
+    </EvidencePanel>
   )
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AuthGatePanel } from './components/AuthGatePanel'
 import { HeaderBar } from './components/HeaderBar'
 import { HybridScopeBar } from './components/HybridScopeBar'
@@ -42,6 +42,8 @@ import type {
   ParsedInlineXbrlToken,
 } from './utils/formatters'
 import { getRenderableVarianceReports } from './utils/deterministicEvidence'
+import { countDistinctCitations } from './utils/citationDedup'
+import { filingHighlightAnchor } from './utils/filingMarkdown'
 import { buildXbrlFactFromInlineToken } from './utils/xbrlFactSelection'
 
 const DEFAULT_FILTERS: SearchScopeFilters = {
@@ -86,6 +88,9 @@ export function App() {
     useState<XbrlFactSelection | null>(null)
   const [activeCitations, setActiveCitations] = useState<GroundedCitation[]>([])
   const [activeChunkId, setActiveChunkId] = useState<string | null>(null)
+  // Bumped on each inline-citation click so the source pane reveals the chunk
+  // even when it is already the active one.
+  const [chunkFocusNonce, setChunkFocusNonce] = useState<number>(0)
   const [cachedSection, setCachedSection] =
     useState<CachedSectionResponse | null>(null)
   const [isLoadingSection, setIsLoadingSection] = useState<boolean>(false)
@@ -300,6 +305,11 @@ export function App() {
     setAuthErrorMessage(null)
   }
 
+  const distinctCitationCount = useMemo(
+    () => countDistinctCitations(activeCitations),
+    [activeCitations]
+  )
+
   const isAuthLocked = authRequired && !authenticatedUser
   const isAnyTurnLoading = turns.some((t) => t.isLoading)
 
@@ -370,7 +380,7 @@ export function App() {
       const respCitations = resp.citations ?? []
       if (respCitations.length > 0) {
         setActiveCitations(respCitations)
-        setActiveChunkId(respCitations[0].chunk_id)
+        setActiveChunkId(null)
         setSourceTab('citations')
         setIsSourcePaneOpen(true)
       }
@@ -435,6 +445,7 @@ export function App() {
       setActiveCitations(turnCitations)
     }
     setActiveChunkId(token.chunkId)
+    setChunkFocusNonce((n) => n + 1)
 
     const matchedCit = turnCitations.find((c) => c.chunk_id === token.chunkId)
     if (sourceTab === 'document' && matchedCit) {
@@ -442,7 +453,7 @@ export function App() {
         matchedCit.ticker,
         matchedCit.fiscal_year,
         matchedCit.section_id,
-        matchedCit.excerpt
+        filingHighlightAnchor(matchedCit.excerpt)
       )
     } else {
       setSourceTab('citations')
@@ -527,7 +538,7 @@ export function App() {
         onResetConversation={handleResetConversation}
         isSourcePaneOpen={isSourcePaneOpen}
         onToggleSourcePane={() => setIsSourcePaneOpen((prev) => !prev)}
-        citationCount={activeCitations.length}
+        citationCount={distinctCitationCount}
         authenticatedUser={authenticatedUser}
         isAuthLocked={isAuthLocked}
         onLogout={() => {
@@ -593,7 +604,7 @@ export function App() {
                         }}
                         onFocusTurnCitations={(cits) => {
                           setActiveCitations(cits)
-                          setActiveChunkId(cits[0]?.chunk_id ?? null)
+                          setActiveChunkId(null)
                           setSourceTab('citations')
                           setIsSourcePaneOpen(true)
                         }}
@@ -626,6 +637,7 @@ export function App() {
                   citations={activeCitations}
                   companies={companies}
                   activeChunkId={activeChunkId}
+                  chunkFocusNonce={chunkFocusNonce}
                   onSelectChunkId={setActiveChunkId}
                   activeTab={sourceTab}
                   onChangeTab={setSourceTab}

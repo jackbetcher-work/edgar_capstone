@@ -243,10 +243,10 @@ describe('ChatTurnItem — agent-invoked deterministic evidence', () => {
     expect(screen.getAllByTitle(/Inspect NVDA FY2026/i).length).toBeGreaterThan(0)
 
     expect(screen.queryByLabelText(VARIANCE_CARD_LABEL)).toBeNull()
-    expect(screen.queryByText(/Deterministic Variance Calculation Engine/i)).toBeNull()
+    expect(screen.queryByText(/Financial Variances/i)).toBeNull()
     expect(screen.queryByLabelText(FLAGS_CARD_LABEL)).toBeNull()
     expect(screen.queryByLabelText(DELTA_CARD_LABEL)).toBeNull()
-    expect(screen.queryByText(/Disclosure Delta Engine/i)).toBeNull()
+    expect(screen.queryByText(/Disclosure Changes YoY/i)).toBeNull()
     expect(document.getElementById('deterministic-evidence-turn-test')).toBeNull()
   })
 
@@ -326,7 +326,7 @@ describe('ChatTurnItem — agent-invoked deterministic evidence', () => {
 
     const narrative = screen.getByRole('region', { name: 'Grounded Answer' })
     const deltaCard = screen.getByLabelText(DELTA_CARD_LABEL)
-    expect(screen.getByText('Disclosure Delta Engine')).toBeTruthy()
+    expect(screen.getByText('Disclosure Changes YoY')).toBeTruthy()
     expect(isAfter(deltaCard, narrative)).toBe(true)
     expect(document.getElementById('deterministic-evidence-turn-test')).toBeTruthy()
   })
@@ -347,7 +347,7 @@ describe('ChatTurnItem — agent-invoked deterministic evidence', () => {
 
     expect(screen.getByText('Direct Answer')).toBeTruthy()
     expect(screen.queryByLabelText(DELTA_CARD_LABEL)).toBeNull()
-    expect(screen.queryByText('Disclosure Delta Engine')).toBeNull()
+    expect(screen.queryByText('Disclosure Changes YoY')).toBeNull()
     expect(document.getElementById('deterministic-evidence-turn-test')).toBeNull()
   })
 

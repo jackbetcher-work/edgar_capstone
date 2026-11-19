@@ -359,10 +359,12 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
     expect(await screen.findByText(/SEC XBRL NUMERIC PROVENANCE/i)).toBeTruthy()
     expect(screen.getByText('0001045810-26-000021')).toBeTruthy()
 
-    // Deterministic Variance Table rendered from the backend payload with period-end dates
-    expect(
-      screen.getByText(/Deterministic Variance Calculation Engine/i)
-    ).toBeTruthy()
+    // Deterministic Variance Table rendered from the backend payload, collapsed
+    // beneath the answer with a digest; expanding reveals period-end dates.
+    expect(screen.getByText('Financial Variances')).toBeTruthy()
+    expect(screen.getByText(/NVDA · FY24→FY26 · XBRL · USD/)).toBeTruthy()
+    expect(screen.queryByText(/Jan 2024 → Jan 2026/i)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Financial Variances/i }))
     expect(screen.getByText(/Jan 2024 → Jan 2026/i)).toBeTruthy()
     expect(screen.getAllByText(/\+254\.45%/i).length).toBeGreaterThan(0)
 
@@ -423,7 +425,7 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
 
     // Nothing synthesized: no answer, variance table, fact-check badge, or citations.
     expect(screen.queryByText(/Fact-Check Verified/i)).toBeNull()
-    expect(screen.queryByText(/Deterministic Variance Calculation Engine/i)).toBeNull()
+    expect(screen.queryByText(/Financial Variances/i)).toBeNull()
     expect(screen.queryByText(/\+254\.45%/)).toBeNull()
     expect(screen.queryAllByTitle(/Inspect NVDA FY2026/i)).toHaveLength(0)
     expect(screen.getByText(/NO 10-K PASSAGES LOADED/i)).toBeTruthy()
@@ -603,9 +605,9 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
 
     expect(await screen.findByText('Export-Control Risk')).toBeTruthy()
     expect(screen.getByText(/Fact-Check Verified/i)).toBeTruthy()
-    expect(screen.queryByText(/Deterministic Variance Calculation Engine/i)).toBeNull()
+    expect(screen.queryByText(/Financial Variances/i)).toBeNull()
     expect(screen.queryByLabelText('Material Variance Flags')).toBeNull()
-    expect(screen.queryByText(/Disclosure Delta Engine/i)).toBeNull()
+    expect(screen.queryByText(/Disclosure Changes YoY/i)).toBeNull()
     expect(document.querySelector('[id^="deterministic-evidence-"]')).toBeNull()
 
     // Inline XBRL chip with no variance report still opens the fact inspector

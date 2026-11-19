@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import {
   AlertTriangle,
   Check,
@@ -31,6 +31,7 @@ import {
   getRenderableVarianceReports,
   isRenderableDisclosureDeltas,
 } from '../utils/deterministicEvidence'
+import { dedupeCitations } from '../utils/citationDedup'
 
 interface ChatTurnItemProps {
   turn: ConversationTurn
@@ -122,6 +123,38 @@ export function ChatTurnItem({
   const showDisclosureCard = disclosureDeltas !== null
   const hasDeterministicEvidence =
     showVarianceCard || showFlagsCard || showDisclosureCard
+  const respCitations = resp?.citations
+  const { groups: sourceGroups, aliasOf } = useMemo(
+    () => dedupeCitations(respCitations ?? []),
+    [respCitations]
+  )
+  const distinctSourceCount = sourceGroups.length
+  const activePrimaryId = activeChunkId ? aliasOf[activeChunkId] ?? activeChunkId : null
+  const isChunkActive = (chunkId: string) =>
+    activePrimaryId !== null && (aliasOf[chunkId] ?? chunkId) === activePrimaryId
+  // The rendered report already embeds coverage notices as blockquotes; only
+  // show the standalone notice when the narrative does not repeat it.
+  const answerText = resp?.answer_markdown ?? ''
+  const standaloneNotices = (resp?.coverage_notices ?? []).filter(
+    (notice) => notice.message && !answerText.includes(notice.message)
+  )
+  // Pipeline telemetry is useful for engineers, noise for analysts: keep it in a tooltip.
+  const latency = resp?.context_and_memory?.turn_context_latency
+  const telemetryTitle = resp
+    ? [
+        intentMeta?.label,
+        `ReAct iterations: ${resp.react_execution?.iterations ?? resp.agent_trace.length}`,
+        latency
+          ? `Mean context latency: ${latency.mean_context_latency_ms.toFixed(1)}ms · Cached tokens: ${latency.total_cached_context_tokens}`
+          : null,
+        resp.context_and_memory?.models
+          ? `Reasoning: ${resp.context_and_memory.models.financial_reasoning_model} · Eval: ${resp.context_and_memory.models.coding_and_evaluation_model}`
+          : null,
+        `Total latency: ${(resp.total_latency_ms / 1000).toFixed(1)}s`,
+      ]
+        .filter(Boolean)
+        .join('\n')
+    : undefined
 
   return (
     <article
@@ -225,7 +258,7 @@ export function ChatTurnItem({
         <div className="p-3">
           {/* Status & Action Strip */}
           <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 mb-3 border-b border-hairline tabular-nums-mono text-[11px]">
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2" title={telemetryTitle}>
               <span
                 className={`px-1.5 py-0.2 text-[10px] font-bold uppercase badge-${intentMeta.tone}`}
               >
@@ -295,23 +328,15 @@ export function ChatTurnItem({
                   </span>
                 )}
 
-              {resp.context_and_memory?.turn_context_latency && (
-                <span
-                  className="px-1.5 py-0.2 text-[10px] uppercase text-ink-secondary border border-hairline"
-                  title={`Reasoning: ${resp.context_and_memory.models.financial_reasoning_model} | Eval/Coding: ${resp.context_and_memory.models.coding_and_evaluation_model} | Cached Tokens: ${resp.context_and_memory.turn_context_latency.total_cached_context_tokens}`}
-                >
-                  ReAct:{resp.react_execution?.iterations ?? resp.agent_trace.length} · CTX:{resp.context_and_memory.turn_context_latency.mean_context_latency_ms.toFixed(1)}ms
-                </span>
-              )}
-
               {citations.length > 0 && (
                 <button
                   id={`btn-focus-citations-${turn.id}`}
                   type="button"
                   onClick={() => onFocusTurnCitations(citations)}
                   className="px-1.5 py-0.2 text-[10px] uppercase btn-terminal-key cursor-pointer"
+                  title="Show the 10-K passages behind this answer"
                 >
-                  [{citations.length} SOURCES]
+                  [{distinctSourceCount} {distinctSourceCount === 1 ? 'SOURCE' : 'SOURCES'}]
                 </button>
               )}
 
@@ -372,13 +397,13 @@ export function ChatTurnItem({
           </div>
 
           {/* Deterministic Data Coverage Notices */}
-          {resp.coverage_notices && resp.coverage_notices.length > 0 && (
+          {standaloneNotices.length > 0 && (
             <div
               id={`coverage-notices-${turn.id}`}
               className="mb-3 space-y-1.5"
               aria-label="Filing Coverage Notices"
             >
-              {resp.coverage_notices.map((notice, idx) => (
+              {standaloneNotices.map((notice, idx) => (
                 <div
                   key={`${turn.id}-notice-${notice.code}-${idx}`}
                   className={`px-2.5 py-1.5 text-[11.5px] leading-snug border flex items-start gap-2 ${
@@ -404,6 +429,7 @@ export function ChatTurnItem({
               turnId={turn.id}
               markdown={resp.answer_markdown ?? ''}
               activeChunkId={activeChunkId}
+              isChunkActive={isChunkActive}
               onSelectCitation={(token) =>
                 onSelectInlineCitation(token, citations)
               }
@@ -419,10 +445,13 @@ export function ChatTurnItem({
           {hasDeterministicEvidence && (
             <div
               id={`deterministic-evidence-${turn.id}`}
-              className="mt-3"
+              className="mt-3 pt-2.5 border-t border-hairline"
               role="region"
               aria-label="Deterministic Evidence"
             >
+              <div className="mb-1.5 text-[10px] uppercase tracking-wider text-ink-muted tabular-nums-mono">
+                Supporting evidence
+              </div>
               {/* Deterministic Variance Table (calculate_period_variances) */}
               {showVarianceCard && (
                 <VarianceTableCard
@@ -430,6 +459,7 @@ export function ChatTurnItem({
                   reports={varianceReports}
                   onInspectFilingSection={onInspectFilingSection}
                   onInspectXbrlFact={onInspectXbrlFact}
+                  defaultOpen={false}
                 />
               )}
 
@@ -442,6 +472,7 @@ export function ChatTurnItem({
                   citations={citations}
                   onSelectCitation={(token) => onSelectInlineCitation(token, citations)}
                   onInspectXbrlFact={onInspectXbrlFact}
+                  defaultOpen={false}
                 />
               )}
 
@@ -452,6 +483,7 @@ export function ChatTurnItem({
                   result={disclosureDeltas}
                   citations={citations}
                   onSelectCitation={(token) => onSelectInlineCitation(token, citations)}
+                  defaultOpen={false}
                 />
               )}
             </div>

@@ -157,7 +157,7 @@ describe('Grounding fact cards', () => {
         onSelectCitation={onSelect}
       />
     )
-    expect(screen.getByText('Disclosure Delta Engine')).toBeTruthy()
+    expect(screen.getByText('Disclosure Changes YoY')).toBeTruthy()
     expect(screen.getByText('FY24:47 → FY25:64')).toBeTruthy()
     expect(screen.getByText(/no FY26/)).toBeTruthy()
     fireEvent.click(screen.getByText(/FY24→FY25/))

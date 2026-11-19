@@ -307,14 +307,15 @@ describe('GroundedMarkdown', () => {
     expect(container.querySelector('em')?.textContent).toBe('emphasis')
     expect(container.querySelector('code')?.textContent).toBe('us-gaap:Revenues')
 
-    const citBtn = screen.getByRole('button', { name: /\[NVDA FY26 · ITEM 7\]/i })
+    // Chips use analyst-readable labels: section topic / financial metric, not raw IDs.
+    const citBtn = screen.getByRole('button', { name: 'NVDA FY26 · MD&A' })
     expect(citBtn.className).toContain('citation-chip-active')
     fireEvent.click(citBtn)
     expect(onSelectCitation).toHaveBeenCalledWith(
       expect.objectContaining({ chunkId: 'NVDA_2026_item_7_0001', ticker: 'NVDA', fiscalYear: 2026 })
     )
 
-    const xbrlBtn = screen.getByRole('button', { name: /\[NVDA FY26 · XBRL Revenues\]/i })
+    const xbrlBtn = screen.getByRole('button', { name: 'NVDA FY26 · Revenue' })
     fireEvent.click(xbrlBtn)
     expect(onSelectXbrl).toHaveBeenCalledWith(
       expect.objectContaining({

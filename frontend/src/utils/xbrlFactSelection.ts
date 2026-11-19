@@ -11,6 +11,7 @@ import {
   formatUsdCompact,
   type ParsedInlineXbrlToken,
 } from './formatters'
+import { humanizeXbrlConcept } from './xbrlLabels'
 
 /**
  * Shared builders for `XbrlFactSelection` payloads passed to the XBRL Fact
@@ -134,12 +135,13 @@ export function buildXbrlFactFromInlineToken(
   matchedRep?: CompanyVarianceReport
 ): XbrlFactSelection {
   const fyKey = String(token.fiscalYear)
+  const metricLabel = humanizeXbrlConcept(token.xbrlConcept)
   return {
-    title: `${token.ticker} FY${token.fiscalYear} · ${token.xbrlConcept}`,
+    title: `${token.ticker} FY${token.fiscalYear} · ${metricLabel}`,
     ticker: token.ticker,
     companyName: matchedRep?.company_name,
     fiscalYear: token.fiscalYear,
-    metricLabel: token.xbrlConcept,
+    metricLabel,
     periodOfReport: matchedRep?.period_end_dates?.[fyKey] ?? null,
     filingDate: matchedRep?.filing_dates?.[fyKey] ?? null,
     accessionNumber: token.accessionNumber,
