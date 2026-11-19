@@ -320,8 +320,13 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
       await screen.findByText(/Query audited financials and grounded 10-K disclosures/i)
     ).toBeTruthy()
 
-    expect(screen.getByLabelText(/GICS Sector/i)).toBeTruthy()
-    expect(screen.getByLabelText(/Form 10-K Section/i)).toBeTruthy()
+    // No scope filter bar: companies, years and sections come from the question.
+    expect(screen.queryByLabelText(/GICS Sector/i)).toBeNull()
+    expect(screen.queryByLabelText(/Form 10-K Section/i)).toBeNull()
+    expect(screen.queryByRole('button', { name: /EQTY:/i })).toBeNull()
+    expect(
+      await screen.findByPlaceholderText(/Ask about S&P 500 10-Ks, FY2020–FY2026/)
+    ).toBeTruthy()
     expect(screen.getByText(/Grounded Chunks/i)).toBeTruthy()
 
     // Coverage monitor reflects exactly what /api/v1/companies returned.
@@ -345,9 +350,25 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
       expect(screen.getByText(/Fact-Check Verified/i)).toBeTruthy()
     })
 
-    expect(
-      fetchSpy.mock.calls.some(([input]) => String(input) === '/api/v1/chat/stream')
-    ).toBe(true)
+    const chatCall = fetchSpy.mock.calls.find(
+      ([input]) => String(input) === '/api/v1/chat/stream'
+    )
+    expect(chatCall).toBeTruthy()
+    // The UI pins no scope; the backend resolves it from the question text.
+    expect(JSON.parse(String(chatCall![1]?.body))).toMatchObject({
+      query: expect.stringContaining('NVIDIA and Apple'),
+      tickers: 'ALL',
+      gics_sector: 'ALL',
+      section_id: 'ALL',
+      start_year: 2024,
+      end_year: 2026,
+    })
+
+    // The turn header echoes the scope the agent resolved from the question.
+    const scope = screen.getByLabelText('Interpreted scope')
+    expect(scope.textContent).toContain('NVDA, AAPL')
+    expect(scope.textContent).toContain('FY2024–FY2026')
+    expect(scope.textContent).toContain('MD&A + Risk Factors')
 
     // Coverage notice & sector coverage pill rendered
     expect(screen.getByText(/Fiscal year-ends differ across peers/i)).toBeTruthy()
@@ -462,9 +483,6 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
     expect(screen.queryByText(/COVERAGE MONITOR/i)).toBeNull()
     expect(screen.queryByText('NVIDIA CORP')).toBeNull()
 
-    // Scope bar issuer picker shows the error rather than invented issuers.
-    fireEvent.click(screen.getByRole('button', { name: /EQTY:/i }))
-    expect(await screen.findByText(/COMPANY CATALOG UNAVAILABLE/i)).toBeTruthy()
     expect(document.querySelector('[id^="issuer-option-"]')).toBeNull()
   })
 

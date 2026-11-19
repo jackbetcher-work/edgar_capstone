@@ -247,6 +247,26 @@ def build_tool_selection_policy(scope: dict[str, Any], *, has_prior_outputs: boo
     )
 
 
+def _citation_coverage_line(scope: dict[str, Any]) -> str | None:
+    """Scope-specific citation-coverage requirement (no extra model call or re-prompt)."""
+    tickers = [str(t) for t in (scope.get("tickers") or []) if t]
+    years = _parse_scope_years(scope)
+    multi_company = len(tickers) > 1
+    multi_year = len(years) == 2 and years[0] != years[1]
+    if not (multi_company or multi_year):
+        return None
+    parts: list[str] = []
+    if multi_company:
+        parts.append(f"at least one cited finding for each of {', '.join(tickers)}")
+    if multi_year:
+        parts.append(f"findings citing both the FY{years[0]} and the FY{years[1]} filings")
+    return (
+        "- Citation coverage for this question: "
+        + " and ".join(parts)
+        + " (use the matching Evidence Leads; skip a company-year only if nothing covers it)."
+    )
+
+
 def build_retrieval_instructions(
     scope: dict[str, Any],
     variance_evaluations: list[dict[str, Any]],
@@ -284,6 +304,9 @@ def build_retrieval_instructions(
         "issue independent calls in parallel in one step, and never re-fetch evidence already "
         "present in the prompt (at most 6 retrieval calls).",
     ]
+    coverage_line = _citation_coverage_line(scope)
+    if coverage_line:
+        lines.append(coverage_line)
     if suggested:
         lines.append(
             "- Suggested retrieval targets from the variance evaluation:\n"

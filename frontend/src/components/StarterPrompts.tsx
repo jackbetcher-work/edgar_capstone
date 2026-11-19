@@ -1,9 +1,5 @@
 import { AlertTriangle, Loader2 } from 'lucide-react'
-import type {
-  CatalogLoadStatus,
-  CompanySummary,
-  SearchScopeFilters,
-} from '../types/edgar'
+import type { CatalogLoadStatus, CompanySummary } from '../types/edgar'
 import { formatUsdCompact } from '../utils/formatters'
 
 export interface StarterPromptPreset {
@@ -11,8 +7,8 @@ export interface StarterPromptPreset {
   mnemonic: string
   category: string
   title: string
+  /** Scope (companies, years, section) is expressed in the question itself. */
   query: string
-  scopePatch?: Partial<SearchScopeFilters>
 }
 
 const STARTER_PRESETS: StarterPromptPreset[] = [
@@ -23,13 +19,6 @@ const STARTER_PRESETS: StarterPromptPreset[] = [
     title: 'NVIDIA vs. Apple: FY2024–FY2026 Revenue, Margin & AI Drivers',
     query:
       "Compare NVIDIA and Apple's revenue, operating margin, and AI infrastructure & R&D commentary from 2024 to 2026.",
-    scopePatch: {
-      selectedTickers: ['NVDA', 'AAPL'],
-      gicsSector: 'ALL',
-      sectionId: 'ALL',
-      startYear: 2024,
-      endYear: 2026,
-    },
   },
   {
     id: 'longitudinal-msft',
@@ -38,13 +27,6 @@ const STARTER_PRESETS: StarterPromptPreset[] = [
     title: 'Microsoft FY2023–FY2025 Cloud Scale & Operating Leverage',
     query:
       "Analyze Microsoft's period-over-period revenue, operating income, and Azure AI CapEx drivers from 2023 to 2025.",
-    scopePatch: {
-      selectedTickers: ['MSFT'],
-      gicsSector: 'ALL',
-      sectionId: 'ALL',
-      startYear: 2023,
-      endYear: 2025,
-    },
   },
   {
     id: 'thematic-export-risk',
@@ -53,13 +35,6 @@ const STARTER_PRESETS: StarterPromptPreset[] = [
     title: 'Export Controls, China Licensing & AI Supply Chain Risk Evolution',
     query:
       'How has the wording on export controls, China trade restrictions, and AI supply chain risks evolved across Information Technology Item 1A filings from 2024 to 2026?',
-    scopePatch: {
-      selectedTickers: [],
-      gicsSector: 'Information Technology',
-      sectionId: 'item_1a',
-      startYear: 2024,
-      endYear: 2026,
-    },
   },
   {
     id: 'peer-healthcare-lly-unh',
@@ -67,14 +42,7 @@ const STARTER_PRESETS: StarterPromptPreset[] = [
     category: 'HEALTH CARE',
     title: 'Eli Lilly vs. UnitedHealth: Margin Trajectory & Regulatory Disclosures',
     query:
-      'Compare Eli Lilly and UnitedHealth financial variances, operating margins, and Item 1A regulatory risk factors from 2023 to 2025.',
-    scopePatch: {
-      selectedTickers: ['LLY', 'UNH'],
-      gicsSector: 'Health Care',
-      sectionId: 'ALL',
-      startYear: 2023,
-      endYear: 2025,
-    },
+      'Compare Eli Lilly and UnitedHealth financial variances, MD&A operating margin drivers, and Item 1A regulatory risk factors from 2023 to 2025.',
   },
 ]
 

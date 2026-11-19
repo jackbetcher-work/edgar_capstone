@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AuthGatePanel } from './components/AuthGatePanel'
 import { HeaderBar } from './components/HeaderBar'
-import { HybridScopeBar } from './components/HybridScopeBar'
 import { ChatTurnItem } from './components/ChatTurnItem'
 import { QueryComposer } from './components/QueryComposer'
 import { SourceInspectorPane } from './components/SourceInspectorPane'
@@ -34,7 +33,6 @@ import type {
   CompanySummary,
   ConversationTurn,
   GroundedCitation,
-  SearchScopeFilters,
   XbrlFactSelection,
 } from './types/edgar'
 import type {
@@ -45,15 +43,6 @@ import { getRenderableVarianceReports } from './utils/deterministicEvidence'
 import { countDistinctCitations } from './utils/citationDedup'
 import { filingHighlightAnchor } from './utils/filingMarkdown'
 import { buildXbrlFactFromInlineToken } from './utils/xbrlFactSelection'
-
-const DEFAULT_FILTERS: SearchScopeFilters = {
-  selectedTickers: [],
-  gicsSector: 'ALL',
-  sectionId: 'ALL',
-  startYear: 2024,
-  endYear: 2026,
-  topK: 8,
-}
 
 export function App() {
   // IAP + Google Workspace Okta/SSO Authentication State
@@ -66,7 +55,6 @@ export function App() {
   const [isIapSession, setIsIapSession] = useState<boolean>(false)
 
   const [companies, setCompanies] = useState<CompanySummary[]>([])
-  const [sectors, setSectors] = useState<string[]>([])
   const [totalProfiles, setTotalProfiles] = useState<number | null>(null)
   const [catalogStatus, setCatalogStatus] = useState<CatalogLoadStatus>('loading')
   const [catalogError, setCatalogError] = useState<string | null>(null)
@@ -75,7 +63,6 @@ export function App() {
     max: 2026,
   })
 
-  const [filters, setFilters] = useState<SearchScopeFilters>(DEFAULT_FILTERS)
   const [promptInput, setPromptInput] = useState<string>('')
   const [turns, setTurns] = useState<ConversationTurn[]>([])
 
@@ -115,13 +102,11 @@ export function App() {
     try {
       const catalog = await fetchCompaniesCatalog()
       setCompanies(catalog.companies)
-      setSectors(catalog.gics_sectors)
       setTotalProfiles(catalog.total_profiles)
       setYearBounds({ min: catalog.min_year, max: catalog.max_year })
       setCatalogStatus('ready')
     } catch (err) {
       setCompanies([])
-      setSectors([])
       setTotalProfiles(null)
       setCatalogStatus('error')
       if (err instanceof ApiAuthError) {
@@ -327,21 +312,18 @@ export function App() {
     }, 50)
   }
 
-  const runQuery = async (queryText: string, scopeToUse: SearchScopeFilters) => {
+  // Scope (companies, sector, section, fiscal years) is resolved by the backend
+  // from the question text and conversation memory; the UI sends no filters.
+  const runQuery = async (queryText: string) => {
     const trimmed = queryText.trim()
     if (!trimmed) return
 
     const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
-    const snapshotFilters: SearchScopeFilters = {
-      ...scopeToUse,
-      selectedTickers: [...scopeToUse.selectedTickers],
-    }
 
     const pendingTurn: ConversationTurn = {
       id: turnId,
       createdAt: new Date().toISOString(),
       userQuery: trimmed,
-      appliedFilters: snapshotFilters,
       response: null,
       isLoading: true,
     }
@@ -353,7 +335,6 @@ export function App() {
     try {
       const resp = await executeConversationalRagQueryStream(
         trimmed,
-        snapshotFilters,
         (progress) => {
           setTurns((prev) =>
             prev.map((t) =>
@@ -405,15 +386,7 @@ export function App() {
   }
 
   const handleSelectStarter = (preset: StarterPromptPreset) => {
-    const mergedScope: SearchScopeFilters = {
-      ...filters,
-      ...(preset.scopePatch ?? {}),
-      selectedTickers: preset.scopePatch?.selectedTickers
-        ? [...preset.scopePatch.selectedTickers]
-        : [...filters.selectedTickers],
-    }
-    setFilters(mergedScope)
-    void runQuery(preset.query, mergedScope)
+    void runQuery(preset.query)
   }
 
   const handleInspectXbrlFact = (fact: XbrlFactSelection) => {
@@ -556,17 +529,6 @@ export function App() {
         />
       ) : (
         <>
-          <HybridScopeBar
-            companies={companies}
-            catalogStatus={catalogStatus}
-            catalogError={catalogError}
-            sectors={sectors}
-            minYear={yearBounds.min}
-            maxYear={yearBounds.max}
-            filters={filters}
-            onChangeFilters={setFilters}
-          />
-
           {/* Split-Pane Main Terminal Workspace */}
           <div className="flex-1 flex min-h-0 relative overflow-hidden">
             {/* Left Blotter & Command Stream */}
@@ -596,11 +558,7 @@ export function App() {
                         onSelectXbrlCitation={handleSelectInlineXbrlCitation}
                         onInspectXbrlFact={handleInspectXbrlFact}
                         onSelectFollowup={(suggestedQuery) => {
-                          void runQuery(suggestedQuery, {
-                            ...filters,
-                            selectedTickers: [],
-                            gicsSector: 'ALL',
-                          })
+                          void runQuery(suggestedQuery)
                         }}
                         onFocusTurnCitations={(cits) => {
                           setActiveCitations(cits)
@@ -623,10 +581,11 @@ export function App() {
                 value={promptInput}
                 onChange={setPromptInput}
                 onSubmit={() => {
-                  void runQuery(promptInput, filters)
+                  void runQuery(promptInput)
                 }}
                 isSubmitting={isAnyTurnLoading}
-                filters={filters}
+                minYear={catalogStatus === 'ready' ? yearBounds.min : undefined}
+                maxYear={catalogStatus === 'ready' ? yearBounds.max : undefined}
               />
             </main>
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 import logging
 import re
 import threading
@@ -10,6 +11,7 @@ import uuid
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
@@ -53,7 +55,6 @@ from edgar_capstone.agents.tools import (
     get_context_cache_runtime_stats,
     search_10k_chunks_rag,
 )
-from edgar_capstone.common.concurrency import run_parallel_with_context
 from edgar_capstone.observability.tracing import traced
 from edgar_capstone.security.agent_identity import (
     VerifiedAgentS2SClaims,
@@ -85,6 +86,36 @@ _YEAR_MENTION_RE = re.compile(rf"\b(?:FY\s*)?({_CORPUS_YEARS_GROUP})\b", re.IGNO
 _SINCE_YEAR_RE = re.compile(rf"\bsince\s+(?:FY\s*)?(?:{_CORPUS_YEARS_GROUP})\b", re.IGNORECASE)
 _ONLY_YEAR_RE = re.compile(
     rf"\b(?:just|only)\s+(?:FY\s*)?(?:{_CORPUS_YEARS_GROUP})\b", re.IGNORECASE
+)
+# Calendar-dated events ("the July 2024 outage", "after March 10, 2023"). A month pins a date
+# that must be mapped onto each issuer's fiscal calendar; bare years are left as fiscal years.
+_MONTH_NUMBERS: dict[str, int] = {
+    name: idx
+    for idx, names in enumerate(
+        (
+            ("jan", "january"),
+            ("feb", "february"),
+            ("mar", "march"),
+            ("apr", "april"),
+            ("may",),
+            ("jun", "june"),
+            ("jul", "july"),
+            ("aug", "august"),
+            ("sep", "sept", "september"),
+            ("oct", "october"),
+            ("nov", "november"),
+            ("dec", "december"),
+        ),
+        start=1,
+    )
+    for name in names
+}
+_MONTH_GROUP = "|".join(sorted(_MONTH_NUMBERS, key=len, reverse=True))
+_EVENT_DATE_RE = re.compile(
+    rf"(?:\b(?P<after>after|following|since|post)[\s-]+(?:the\s+)?)?"
+    rf"\b(?P<month>{_MONTH_GROUP})\.?\s+(?:(?P<day>\d{{1,2}})(?:st|nd|rd|th)?,?\s+)?"
+    rf"(?P<year>{_CORPUS_YEARS_GROUP})\b",
+    re.IGNORECASE,
 )
 _ITEM_1A_ONLY_RE = re.compile(r"\b(?:item\s*1a|risk\s+factors?)\b", re.IGNORECASE)
 _ITEM_7_ONLY_RE = re.compile(r"\b(?:item\s*7|md&a|management'?s\s+discussion)\b", re.IGNORECASE)
@@ -264,6 +295,37 @@ def _resolve_section_filter(query: str, section_id: str) -> str:
     return "ALL"
 
 
+def _parse_event_date(query: str) -> tuple[date, bool] | None:
+    """Return `(event_date, is_after)` for the first calendar-dated event in the query.
+
+    `is_after` is True for "after / following / since / post-" phrasing, i.e. the user wants
+    the change from before the event through the latest filings. Missing days default to the
+    15th so the date falls inside the named month.
+    """
+    m = _EVENT_DATE_RE.search(query)
+    if not m:
+        return None
+    year = int(m.group("year"))
+    month = _MONTH_NUMBERS[m.group("month").lower()]
+    day = int(m.group("day")) if m.group("day") else 15
+    day = max(1, min(day, calendar.monthrange(year, month)[1]))
+    return date(year, month, day), bool(m.group("after"))
+
+
+def _event_fiscal_years(
+    event_date: date,
+    tickers: list[str],
+    catalog: EntityCatalog | None,
+) -> list[int]:
+    """Fiscal year containing `event_date` for each ticker (calendar year as fallback)."""
+    fys = [
+        fy
+        for tk in tickers
+        if catalog is not None and (fy := catalog.fiscal_year_for_date(tk, event_date)) is not None
+    ]
+    return fys or [event_date.year]
+
+
 def _resolve_year_window(
     query: str,
     start_year: int,
@@ -271,11 +333,23 @@ def _resolve_year_window(
     *,
     memory_inherited: bool,
     memory_context: dict[str, Any] | None,
+    tickers: list[str] | None = None,
+    catalog: EntityCatalog | None = None,
 ) -> tuple[int, int]:
     mentioned_years = sorted({int(y) for y in _YEAR_MENTION_RE.findall(query)})
     eff_start = start_year
     eff_end = end_year
-    if mentioned_years:
+    event = _parse_event_date(query) if len(mentioned_years) == 1 else None
+    is_default_window = start_year == 2024 and end_year == 2026
+    if event is not None and (event[1] or is_default_window):
+        # A dated event resolves on the issuer's fiscal calendar, always keeping the prior
+        # fiscal year as the pre-event baseline. "After / since" extends through the latest
+        # filings; a bare date ("the July 2024 outage") covers baseline + event year only.
+        event_date, is_after = event
+        event_fys = _event_fiscal_years(event_date, tickers or [], catalog)
+        eff_start = max(MIN_CORPUS_YEAR, min(event_fys) - 1)
+        eff_end = max(end_year, max(event_fys)) if is_after else max(event_fys)
+    elif mentioned_years:
         if len(mentioned_years) >= 2:
             eff_start = min(mentioned_years)
             eff_end = max(mentioned_years)
@@ -380,6 +454,8 @@ def resolve_query_scope(
         end_year,
         memory_inherited=memory_inherited,
         memory_context=memory_context,
+        tickers=valid_tickers,
+        catalog=catalog,
     )
 
     return {
@@ -395,27 +471,6 @@ def resolve_query_scope(
     }
 
 
-def _select_balanced_hits(
-    all_cits: list[dict[str, Any]],
-    buckets: list[list[dict[str, Any]]],
-    top_k: int,
-) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    used_ids: set[str] = set()
-    for bucket in buckets:
-        for hit in bucket[:2]:
-            cid = hit["chunk_id"]
-            if cid not in used_ids and len(selected) < top_k:
-                selected.append(hit)
-                used_ids.add(cid)
-    for hit in all_cits:
-        cid = hit["chunk_id"]
-        if cid not in used_ids and len(selected) < top_k:
-            selected.append(hit)
-            used_ids.add(cid)
-    return selected
-
-
 @traced("chat.retrieve_citations", record_args=("section_id", "top_k"))
 def _retrieve_balanced_citations(
     query: str,
@@ -426,95 +481,23 @@ def _retrieve_balanced_citations(
     end_year: int,
     top_k: int,
 ) -> tuple[list[dict[str, Any]], int]:
-    """Run hybrid RAG searches in parallel while guaranteeing multi-ticker AND boundary-year balance."""
-    tickers_csv = ",".join(tickers) if tickers else "ALL"
+    """Evidence-lead pre-pass: one coverage-aware hybrid RAG search over the resolved scope.
 
-    tasks: list[tuple[str, Callable[[], dict[str, Any]]]] = [
-        (
-            "primary",
-            lambda: search_10k_chunks_rag(
-                query=query,
-                tickers=tickers_csv,
-                gics_sector=gics_sector,
-                section_id=section_id,
-                start_year=start_year,
-                end_year=end_year,
-                top_k=max(top_k, 10),
-            ),
-        )
-    ]
-
-    if len(tickers) > 1:
-        per_ticker_k = max(2, top_k // len(tickers))
-        for sym in tickers[:4]:
-            tasks.append(
-                (
-                    f"ticker:{sym}",
-                    lambda s=sym, k=per_ticker_k: search_10k_chunks_rag(
-                        query=query,
-                        tickers=s,
-                        gics_sector="ALL",
-                        section_id=section_id,
-                        start_year=start_year,
-                        end_year=end_year,
-                        top_k=k,
-                    ),
-                )
-            )
-    elif end_year > start_year:
-        for boundary_year in (start_year, end_year):
-            tasks.append(
-                (
-                    f"year:{boundary_year}",
-                    lambda yr=boundary_year: search_10k_chunks_rag(
-                        query=query,
-                        tickers=tickers_csv,
-                        gics_sector=gics_sector,
-                        section_id=section_id,
-                        start_year=yr,
-                        end_year=yr,
-                        top_k=3,
-                    ),
-                )
-            )
-
-    pairs = run_parallel_with_context(
-        tasks,
-        lambda item: (item[0], item[1]()),
-        max_workers=5,
+    `search_10k_chunks_rag` guarantees at least one passage per `(ticker, fiscal_year)` in a
+    ticker-scoped window (see `hybrid_rag.coverage_slices`), which subsumes the old per-ticker
+    and boundary-year fan-out (up to 5 parallel full searches) with a single search whose
+    coverage query runs concurrently with `VECTOR_SEARCH`.
+    """
+    result = search_10k_chunks_rag(
+        query=query,
+        tickers=",".join(tickers) if tickers else "ALL",
+        gics_sector=gics_sector,
+        section_id=section_id,
+        start_year=start_year,
+        end_year=end_year,
+        top_k=top_k,
     )
-    results_by_tag = dict(pairs)
-
-    primary = results_by_tag["primary"]
-    merged_by_id: dict[str, dict[str, Any]] = {}
-    candidates_searched = int(primary.get("candidates_searched") or 0)
-    for cit in primary.get("citations") or []:
-        merged_by_id[cit["chunk_id"]] = cit
-
-    for tag, sub in results_by_tag.items():
-        if tag == "primary":
-            continue
-        for cit in sub.get("citations") or []:
-            merged_by_id.setdefault(cit["chunk_id"], cit)
-
-    all_cits = sorted(
-        merged_by_id.values(),
-        key=lambda c: float(c.get("score") or 0.0),
-        reverse=True,
-    )
-
-    if len(tickers) > 1 and len(all_cits) > top_k:
-        buckets = [[c for c in all_cits if c["ticker"] == sym] for sym in tickers]
-        return _select_balanced_hits(all_cits, buckets, top_k), candidates_searched
-
-    if len(tickers) <= 1 and end_year > start_year and len(all_cits) > top_k:
-        buckets = [
-            [c for c in all_cits if int(c.get("fiscal_year") or 0) == boundary_year]
-            for boundary_year in (start_year, end_year)
-        ]
-        return _select_balanced_hits(all_cits, buckets, top_k), candidates_searched
-
-    return all_cits[:top_k], candidates_searched
+    return list(result.get("citations") or []), int(result.get("candidates_searched") or 0)
 
 
 # ---------------------------------------------------------------------------

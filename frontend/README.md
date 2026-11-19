@@ -12,27 +12,28 @@ From the repo root, `make dev` starts FastAPI (`:8000`) and this UI (`:5173`) to
 | `npm run build` | `tsc -b` type check, then the production bundle in `dist/` (FastAPI serves it) |
 | `npm run preview` | Serve `dist/` on `:4173` with the same proxy |
 | `npm run lint` | ESLint (also a CI gate in `cloudbuild.yaml` and GitHub Actions) |
-| `npm test` | Vitest + Testing Library in jsdom (14 tests across `App.test.tsx`, `Auth.test.tsx`, `GroundingFactCards.test.tsx`) |
+| `npm test` | Vitest + Testing Library in jsdom (`src/__tests__/`) |
 
 ## Layout
 
 ```text
 src/
-├── App.tsx                      # Workspace state: auth/session bootstrap, scope, chat turns, feedback, source pane
+├── App.tsx                      # Workspace state: auth/session bootstrap, chat turns, feedback, source pane (no scope filters — the backend resolves scope from the question)
 ├── components/
 │   ├── AuthGatePanel.tsx        # Sign-in gate (IAP session, Workspace/Okta OIDC, local dev token)
 │   ├── HeaderBar.tsx            # Signed-in identity, role badge, sign-out
-│   ├── HybridScopeBar.tsx       # Ticker / GICS sector / 10-K section / fiscal-year filters
 │   ├── StarterPrompts.tsx       # Example longitudinal, peer-comparison, and thematic queries
-│   ├── QueryComposer.tsx        # EDGR> command line ("/" to focus, <GO> to run)
-│   ├── ChatTurnItem.tsx         # One answer: live SSE progress bar, coverage notices banner, sector coverage pill, suggested follow-up chips, rendered report, variance/flag/delta cards
+│   ├── QueryComposer.tsx        # EDGR> natural-language command line ("/" to focus, <GO> to run); placeholder shows corpus coverage
+│   ├── ChatTurnItem.tsx         # One answer: interpreted-scope echo (from `resolved_scope`), live SSE progress, coverage notices, follow-up chips, rendered report, collapsible variance/flag/delta cards
+│   ├── EvidencePanel.tsx        # Collapsible frame with digest header for the supporting-evidence cards
+│   ├── FilingMarkdown.tsx       # Structured rendering of 10-K corpus chunks (headings, bullets, repaired SEC tables)
 │   ├── DisclosureDeltaCard.tsx  # Deterministic YoY wording deltas (added / removed / modified passages)
 │   ├── GroundedMarkdown.tsx     # Markdown subset (###/#### headings, blockquotes, bullets, bold/code/italic) + clickable inline text & XBRL citation chips
 │   ├── MaterialFlagsCard.tsx    # Deterministic anomaly flags with period_of_report, xbrl_concept & clickable [XBRL] triggers
 │   ├── VarianceTableCard.tsx    # Deterministic variance table per company with period_of_report dates, DIFFERING FY-END DATES badge & [XBRL] triggers
 │   ├── SourceInspectorPane.tsx  # Right pane shell hosting the 3 modular tabs under `inspector/`
 │   └── inspector/
-│       ├── CitationsTab.tsx     # Cited chunk list with section filter and excerpt navigation
+│       ├── CitationsTab.tsx     # De-duplicated, collapsible cited passages with section filter, expand-all and per-filing variants
 │       ├── FilingReaderTab.tsx  # Full 10-K Markdown section viewer with keyword search & highlight
 │       └── XbrlFactTab.tsx      # XBRL provenance inspector (accession, concept, derived calculation inputs, MD&A jump)
 ├── services/
@@ -41,8 +42,12 @@ src/
 │   └── edgarApi.ts              # SSE streaming (/api/v1/chat/stream), /companies, /section, /feedback (live backend only; no offline fallback)
 ├── types/edgar.ts               # API response, SSE progress, NumericCitation, CoverageNotice & XBRL types
 └── utils/
+    ├── citationDedup.ts         # Collapses repeated / cross-year duplicate passages and maps aliases to the kept card
     ├── citationTokens.ts        # Builds canonical inline-citation tokens for the source pane
+    ├── filingMarkdown.ts        # Parses corpus chunk Markdown (strips header/escapes/footers, repairs SEC tables)
     ├── formatters.ts            # USD / percent / bps / period-end date formatting, combined text+XBRL citation parser & status badges
+    ├── resolvedScope.ts         # Formats the backend's `resolved_scope` for the per-answer scope echo
+    ├── xbrlLabels.ts            # Human labels for XBRL concepts and 10-K section breadcrumbs (citation chips)
     └── xbrlFactSelection.ts     # Maps variance rows, anomaly flags, and inline XBRL chips to `XbrlFactSelection` records
 ```
 

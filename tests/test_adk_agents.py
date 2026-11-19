@@ -423,7 +423,7 @@ def test_hybrid_rag_parallel_branch_partial_failure_and_rrf_filtering() -> None:
     adapters_bq_fail = MagicMock()
     adapters_bq_fail.embed_query.side_effect = RuntimeError("bq embeddings offline")
     adapters_bq_fail.vertex_ai_search.search_documents.return_value = [vais_row]
-    bq_hits, vais_hits, services = _run_parallel_branches(
+    bq_hits, vais_hits, _coverage, services = _run_parallel_branches(
         adapters_bq_fail,
         query="Blackwell",
         ticker_filter={"NVDA"},
@@ -441,7 +441,7 @@ def test_hybrid_rag_parallel_branch_partial_failure_and_rrf_filtering() -> None:
     adapters_vais_fail.embed_query.return_value = [0.1] * 8
     adapters_vais_fail.bigquery.vector_search_chunks.return_value = [bq_row]
     adapters_vais_fail.vertex_ai_search.search_documents.side_effect = ValueError("vais down")
-    bq_hits, vais_hits, services = _run_parallel_branches(
+    bq_hits, vais_hits, _coverage, services = _run_parallel_branches(
         adapters_vais_fail,
         query="Blackwell",
         ticker_filter={"NVDA"},
@@ -533,3 +533,133 @@ def test_hybrid_rag_parallel_branch_partial_failure_and_rrf_filtering() -> None:
     _reconcile_vais_hits(fused, [{"chunk_text": "   "}, vais_row], **kw)
     assert list(fused) == ["NVDA_2026_item_7_0001"]
     assert float(fused["NVDA_2026_item_7_0001"]["rrf_score"]) > prev_rrf
+
+
+def _chunk_row(ticker: str, fy: int, idx: int, text: str, similarity: float) -> dict[str, object]:
+    return {
+        "chunk_id": f"{ticker}_{fy}_item_7_{idx:04d}",
+        "profile_id": f"{ticker}_{fy}",
+        "ticker": ticker,
+        "company_name": ticker,
+        "gics_sector": "Health Care",
+        "fiscal_year": fy,
+        "section_id": "item_7",
+        "chunk_text": text,
+        "similarity": similarity,
+    }
+
+
+def test_coverage_slices_prioritize_boundary_years_and_respect_limits() -> None:
+    from edgar_capstone.agents.hybrid_rag import MAX_COVERAGE_SLICES, coverage_slices
+
+    assert coverage_slices({"PFE", "MRK"}, 2022, 2024) == [
+        ("MRK", 2022),
+        ("PFE", 2022),
+        ("MRK", 2024),
+        ("PFE", 2024),
+        ("MRK", 2023),
+        ("PFE", 2023),
+    ]
+    assert coverage_slices(set(), 2022, 2024) == []  # sector / corpus-wide scope
+    assert coverage_slices({"NVDA"}, 2026, 2026) == []  # single company-year
+    many = {f"T{i}" for i in range(MAX_COVERAGE_SLICES)}
+    assert coverage_slices(many, 2024, 2025) == []  # too broad to cover slice-by-slice
+
+
+def test_hybrid_rag_coverage_keeps_crowded_out_company_years() -> None:
+    """MRK/PFE FY2022-FY2024: VECTOR_SEARCH favors FY2022/FY2024; coverage restores FY2023."""
+    from edgar_capstone.agents.hybrid_rag import _execute_live_gcp_hybrid_rag
+
+    strong = [
+        _chunk_row(tk, fy, i, f"{tk} research and development expense {fy} pipeline", 0.9)
+        for tk in ("MRK", "PFE")
+        for fy in (2022, 2024)
+        for i in range(3)
+    ]
+    weak_2023 = [
+        _chunk_row("MRK", 2023, 29, "Merck acquired IPR&D charges for Prometheus", 0.5),
+        _chunk_row("PFE", 2023, 34, "Pfizer cost table and acquired in-process charges", 0.5),
+    ]
+    adapters = MagicMock()
+    adapters.embed_query.return_value = [0.1] * 8
+    adapters.bigquery.vector_search_chunks.return_value = strong
+    adapters.bigquery.vector_search_top_per_company_year.return_value = [
+        *weak_2023,
+        strong[0],  # duplicates of primary hits must not double count
+    ]
+    adapters.vertex_ai_search.search_documents.return_value = []
+
+    citations, _, services = _execute_live_gcp_hybrid_rag(
+        adapters,
+        query="Compare Merck and Pfizer research and development spending",
+        ticker_filter={"MRK", "PFE"},
+        sector_norm=None,
+        sec_norm=None,
+        start_year=2022,
+        end_year=2024,
+        effective_top_k=4,
+    )
+
+    slices = {(c["ticker"], c["fiscal_year"]) for c in citations}
+    assert slices == {(tk, fy) for tk in ("MRK", "PFE") for fy in (2022, 2023, 2024)}
+    # Budget grows from top_k=4 to the 6 company-years in scope, and output stays score-ordered.
+    assert len(citations) == 6
+    scores = [c["score"] for c in citations]
+    assert scores == sorted(scores, reverse=True)
+    assert "bigquery_vector_search" in services
+    kwargs = adapters.bigquery.vector_search_top_per_company_year.call_args.kwargs
+    assert kwargs["tickers"] == {"MRK", "PFE"}
+    assert (kwargs["start_year"], kwargs["end_year"]) == (2022, 2024)
+
+
+def test_hybrid_rag_coverage_is_best_effort_and_skipped_for_single_slices() -> None:
+    from edgar_capstone.agents.hybrid_rag import _execute_live_gcp_hybrid_rag
+
+    rows = [_chunk_row("MRK", 2024, i, "Merck research and development", 0.8) for i in range(3)]
+    adapters = MagicMock()
+    adapters.embed_query.return_value = [0.1] * 8
+    adapters.bigquery.vector_search_chunks.return_value = rows
+    adapters.bigquery.vector_search_top_per_company_year.side_effect = RuntimeError("bq slot")
+    adapters.vertex_ai_search.search_documents.return_value = []
+
+    # Coverage query failure degrades to plain top-k instead of failing retrieval.
+    citations, _, _ = _execute_live_gcp_hybrid_rag(
+        adapters,
+        query="Merck R&D",
+        ticker_filter={"MRK"},
+        sector_norm=None,
+        sec_norm=None,
+        start_year=2022,
+        end_year=2024,
+        effective_top_k=2,
+    )
+    assert [c["chunk_id"] for c in citations] == [r["chunk_id"] for r in rows[:2]]
+
+    # A single company-year never issues the coverage query.
+    adapters.bigquery.vector_search_top_per_company_year.reset_mock()
+    _execute_live_gcp_hybrid_rag(
+        adapters,
+        query="Merck R&D",
+        ticker_filter={"MRK"},
+        sector_norm=None,
+        sec_norm=None,
+        start_year=2024,
+        end_year=2024,
+        effective_top_k=2,
+    )
+    adapters.bigquery.vector_search_top_per_company_year.assert_not_called()
+
+
+def test_retrieval_instructions_state_citation_coverage_without_extra_calls() -> None:
+    from edgar_capstone.agents.prompt_builders import build_retrieval_instructions
+
+    peer = build_retrieval_instructions(
+        {"tickers": ["DAL", "UAL", "LUV"], "start_year": 2022, "end_year": 2024}, []
+    )
+    assert "at least one cited finding for each of DAL, UAL, LUV" in peer
+    assert "FY2022 and the FY2024 filings" in peer
+
+    single_year = build_retrieval_instructions(
+        {"tickers": ["NVDA"], "start_year": 2026, "end_year": 2026}, []
+    )
+    assert "Citation coverage" not in single_year

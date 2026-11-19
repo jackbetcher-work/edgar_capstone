@@ -395,3 +395,99 @@ def test_detect_tickers_explicit_prefix_dollar_unknown_and_dotted_tickers() -> N
     # Standalone 'V' after pre-context (`vs V`) with topic cue resolves to Visa
     found_pre, _ = catalog.detect_tickers_in_query("Revenue trends for NVDA vs V in FY2025")
     assert set(found_pre) == {"NVDA", "V"}
+
+
+def _fiscal_calendar_catalog() -> EntityCatalog:
+    """CRWD (FYE Jan 31), RF (FYE Dec 31) with period-end dates; MMM without them."""
+    profiles = [
+        SimpleNamespace(
+            ticker="CRWD",
+            company_name="CrowdStrike Holdings, Inc.",
+            gics_sector="Information Technology",
+            fiscal_year=fy,
+            period_of_report=f"{fy}-01-31",
+        )
+        for fy in range(2022, 2027)
+    ]
+    profiles += [
+        SimpleNamespace(
+            ticker="RF",
+            company_name="Regions Financial Corp",
+            gics_sector="Financials",
+            fiscal_year=fy,
+            period_of_report=f"{fy}-12-31",
+        )
+        for fy in range(2021, 2026)
+    ]
+    profiles.append(
+        SimpleNamespace(ticker="MMM", company_name="3M Company", gics_sector="Industrials")
+    )
+    return EntityCatalog(profiles)
+
+
+def test_fiscal_year_for_date_follows_each_issuer_calendar() -> None:
+    from datetime import date
+
+    catalog = _fiscal_calendar_catalog()
+    # CrowdStrike's fiscal year ends Jan 31: July 2024 falls in FY2025, Jan 31 2024 in FY2024.
+    assert catalog.fiscal_year_for_date("CRWD", date(2024, 7, 19)) == 2025
+    assert catalog.fiscal_year_for_date("CRWD", date(2024, 1, 31)) == 2024
+    # Calendar-year filer.
+    assert catalog.fiscal_year_for_date("RF", date(2023, 3, 10)) == 2023
+    # After the latest filed period -> the next, not-yet-filed fiscal year.
+    assert catalog.fiscal_year_for_date("RF", date(2026, 3, 1)) == 2026
+    # No period-end data -> unknown.
+    assert catalog.fiscal_year_for_date("MMM", date(2024, 7, 1)) is None
+
+
+def test_event_dates_resolve_on_the_issuer_fiscal_calendar() -> None:
+    catalog = _fiscal_calendar_catalog()
+
+    # "After <dated event>": prior fiscal year baseline through the latest filings.
+    s = resolve_query_scope(
+        query="How did CrowdStrike's risk factor disclosure change after the July 2024 "
+        "Falcon sensor outage?",
+        catalog=catalog,
+    )
+    assert (s["tickers"], s["start_year"], s["end_year"]) == (["CRWD"], 2024, 2026)
+
+    # Bare dated event: baseline + the fiscal year containing the event.
+    s = resolve_query_scope(
+        query="What did CrowdStrike disclose about the July 19, 2024 outage?", catalog=catalog
+    )
+    assert (s["start_year"], s["end_year"]) == (2024, 2025)
+
+    # Calendar-year filer with an explicit day.
+    s = resolve_query_scope(
+        query="How did Regions Financial's liquidity risk wording change following March 10, 2023?",
+        catalog=catalog,
+    )
+    assert (s["tickers"], s["start_year"], s["end_year"]) == (["RF"], 2022, 2026)
+
+    # No period-end data for the issuer -> calendar year is the fallback.
+    s = resolve_query_scope(
+        query="How did 3M (MMM) describe PFAS risk after the June 2023 settlement?",
+        catalog=catalog,
+    )
+    assert (s["start_year"], s["end_year"]) == (2022, 2026)
+
+
+def test_year_only_mentions_keep_existing_window_rules() -> None:
+    catalog = _fiscal_calendar_catalog()
+    # Bare years are fiscal years: the single-year default stays (yr-1, yr) ...
+    s = resolve_query_scope(
+        query="How did Regions Financial change its deposit risk wording after the 2023 "
+        "bank failures?",
+        catalog=catalog,
+    )
+    assert (s["start_year"], s["end_year"]) == (2022, 2023)
+    # ... explicit ranges and "since <year>" are unchanged ...
+    s = resolve_query_scope(
+        query="How did CrowdStrike's revenue change from 2023 to 2025?", catalog=catalog
+    )
+    assert (s["start_year"], s["end_year"]) == (2023, 2025)
+    s = resolve_query_scope(query="CrowdStrike risks since 2024", catalog=catalog)
+    assert (s["start_year"], s["end_year"]) == (2024, 2026)
+    # ... and "may" as a verb is not a month.
+    s = resolve_query_scope(query="What risks may affect CrowdStrike in 2025?", catalog=catalog)
+    assert (s["start_year"], s["end_year"]) == (2024, 2025)

@@ -505,11 +505,61 @@ class BigQueryAdapter(GcpAdapterErrorTranslationMixin, BigQueryRestClient):
             if section_id and section_id.strip().lower() in ("item_1a", "item_7")
             else None
         )
-        clauses, params = _build_scope_where_clauses(
+        return self._top_per_company_year(
+            query_embedding,
             start_year=start_year,
             end_year=end_year,
             gics_sector=gics_sector,
             section_id=eff_section,
+            per_company_year=per_company_year,
+            source_backend="bigquery_sector_vector_search",
+        )
+
+    def vector_search_top_per_company_year(
+        self,
+        query_embedding: list[float],
+        *,
+        tickers: set[str],
+        start_year: int,
+        end_year: int,
+        section_id: str | None = None,
+        per_company_year: int = 2,
+    ) -> list[dict[str, Any]]:
+        """Retrieve the top-N cosine-ranked chunks for each `(ticker, fiscal_year)` in scope.
+
+        Ticker-scoped counterpart of `vector_search_sector_top_per_ticker`, used by hybrid RAG to
+        guarantee every company-year in a multi-year / multi-company window has at least one
+        candidate passage. The prefiltered row set is small (a few companies x a few years), so
+        an exact `ML.DISTANCE` scan in one query costs about the same as `VECTOR_SEARCH`.
+        """
+        return self._top_per_company_year(
+            query_embedding,
+            start_year=start_year,
+            end_year=end_year,
+            tickers=tickers,
+            section_id=section_id,
+            per_company_year=per_company_year,
+            source_backend="bigquery_coverage_vector_search",
+        )
+
+    def _top_per_company_year(
+        self,
+        query_embedding: list[float],
+        *,
+        start_year: int,
+        end_year: int,
+        tickers: set[str] | None = None,
+        gics_sector: str | None = None,
+        section_id: str | None = None,
+        per_company_year: int,
+        source_backend: str,
+    ) -> list[dict[str, Any]]:
+        clauses, params = _build_scope_where_clauses(
+            start_year=start_year,
+            end_year=end_year,
+            tickers=tickers,
+            gics_sector=gics_sector,
+            section_id=section_id,
             extra_clauses=("ARRAY_LENGTH(embedding) = @embedding_dim",),
         )
         params.extend(
@@ -540,7 +590,7 @@ class BigQueryAdapter(GcpAdapterErrorTranslationMixin, BigQueryRestClient):
             {
                 **r,
                 "similarity": _distance_to_similarity(r.get("distance")),
-                "source_backend": "bigquery_sector_vector_search",
+                "source_backend": source_backend,
             }
             for r in rows
         ]

@@ -4,6 +4,7 @@ import {
   Check,
   Copy,
   HelpCircle,
+  History,
   Info,
   Layers,
   Loader2,
@@ -32,6 +33,7 @@ import {
   isRenderableDisclosureDeltas,
 } from '../utils/deterministicEvidence'
 import { dedupeCitations } from '../utils/citationDedup'
+import { summarizeResolvedScope } from '../utils/resolvedScope'
 
 interface ChatTurnItemProps {
   turn: ConversationTurn
@@ -109,6 +111,11 @@ export function ChatTurnItem({
 
   const resp = turn.response
   const intentMeta = resp ? getIntentDisplayMeta(resp.intent) : null
+  // Only answered turns have a meaningful scope; guardrail / clarification turns don't.
+  const scopeSummary =
+    resp && !turn.isLoading && resp.status === 'success'
+      ? summarizeResolvedScope(resp.resolved_scope)
+      : null
   const citations = resp?.citations ?? []
   // Deterministic engines are agent-invoked tools: only render a card when the
   // agent actually called the corresponding tool and it produced output.
@@ -172,30 +179,34 @@ export function ChatTurnItem({
           </span>
         </div>
 
-        <div className="flex items-center gap-1.5 text-[10px] text-ink-muted uppercase shrink-0">
-          <span>
-            FY{String(turn.appliedFilters.startYear).slice(-2)}–FY
-            {String(turn.appliedFilters.endYear).slice(-2)}
-          </span>
-          {turn.appliedFilters.selectedTickers.length > 0 && (
-            <>
-              <span>|</span>
-              <span className="text-bb-yellow font-semibold">
-                {turn.appliedFilters.selectedTickers.join(',')}
+        {scopeSummary && (
+          <div
+            id={`resolved-scope-${turn.id}`}
+            aria-label="Interpreted scope"
+            className="flex items-center gap-1.5 text-[10px] text-ink-muted uppercase shrink-0"
+            title={`Scope interpreted from your question: ${scopeSummary.issuersFull} · ${scopeSummary.years} · ${scopeSummary.sections}${
+              scopeSummary.carriedOver ? ' (companies/years carried over from earlier questions)' : ''
+            }. Rephrase the question to change it.`}
+          >
+            <span className="text-bb-yellow font-semibold normal-case">
+              {scopeSummary.issuers}
+            </span>
+            {scopeSummary.years && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span>{scopeSummary.years}</span>
+              </>
+            )}
+            <span aria-hidden="true">·</span>
+            <span>{scopeSummary.sections}</span>
+            {scopeSummary.carriedOver && (
+              <span className="inline-flex items-center gap-0.5 normal-case text-ink-secondary">
+                <History className="w-3 h-3" aria-hidden="true" />
+                carried over
               </span>
-            </>
-          )}
-          {turn.appliedFilters.sectionId !== 'ALL' && (
-            <>
-              <span>|</span>
-              <span>
-                {turn.appliedFilters.sectionId === 'item_1a'
-                  ? 'ITEM 1A'
-                  : 'ITEM 7'}
-              </span>
-            </>
-          )}
-        </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Loading State with Live SSE Stream Progress */}

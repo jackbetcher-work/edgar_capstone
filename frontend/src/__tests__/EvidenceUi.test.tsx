@@ -270,7 +270,6 @@ describe('ChatTurnItem decluttering', () => {
       id: 'turn-x',
       createdAt: '2026-11-18T00:00:00Z',
       userQuery: 'Why did Apple net income change?',
-      appliedFilters: { selectedTickers: ['AAPL'], gicsSector: 'ALL', sectionId: 'ALL', startYear: 2023, endYear: 2024, topK: 8 },
       response,
       isLoading: false,
     }

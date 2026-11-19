@@ -3,7 +3,7 @@ import type {
   ChatProgressEvent,
   ChatTurnResponse,
   CompaniesCatalogResponse,
-  SearchScopeFilters,
+  SectionFilterId,
 } from '../types/edgar'
 import { buildAuthorizedHeaders, clearStoredBearerToken } from './authService'
 import {
@@ -21,28 +21,34 @@ export interface ChatQueryPayload {
   query: string
   tickers: string
   gics_sector: string
-  section_id: SearchScopeFilters['sectionId']
+  section_id: SectionFilterId
   start_year: number
   end_year: number
   top_k: number
   session_id: string
 }
 
-export function buildChatQueryPayload(
-  query: string,
-  filters: SearchScopeFilters
-): ChatQueryPayload {
+/**
+ * Neutral scope sent with every chat turn. The UI has no scope filters: the
+ * backend resolves companies, sector, 10-K section and fiscal years from the
+ * analyst's natural-language question (plus conversation memory). These values
+ * match the API defaults, which the resolver treats as "nothing pinned" — in
+ * particular the 2024–2026 window is the sentinel that lets a single year
+ * mentioned in the question ("in 2022") reshape the window.
+ */
+export const NATURAL_LANGUAGE_SCOPE = {
+  tickers: 'ALL',
+  gics_sector: 'ALL',
+  section_id: 'ALL',
+  start_year: 2024,
+  end_year: 2026,
+  top_k: 8,
+} as const satisfies Omit<ChatQueryPayload, 'query' | 'session_id'>
+
+export function buildChatQueryPayload(query: string): ChatQueryPayload {
   return {
     query,
-    tickers:
-      filters.selectedTickers.length > 0
-        ? filters.selectedTickers.join(',')
-        : 'ALL',
-    gics_sector: filters.gicsSector,
-    section_id: filters.sectionId,
-    start_year: filters.startYear,
-    end_year: filters.endYear,
-    top_k: filters.topK,
+    ...NATURAL_LANGUAGE_SCOPE,
     session_id: CLIENT_SESSION_ID,
   }
 }
@@ -57,7 +63,6 @@ export async function fetchCompaniesCatalog(): Promise<CompaniesCatalogResponse>
 
 export async function executeConversationalRagQueryStream(
   query: string,
-  filters: SearchScopeFilters,
   onProgress?: (event: ChatProgressEvent) => void
 ): Promise<ChatTurnResponse> {
   const endpoint = '/api/v1/chat/stream'
@@ -69,7 +74,7 @@ export async function executeConversationalRagQueryStream(
         'Content-Type': 'application/json',
         Accept: 'text/event-stream',
       }),
-      body: JSON.stringify(buildChatQueryPayload(query, filters)),
+      body: JSON.stringify(buildChatQueryPayload(query)),
     },
     { onUnauthorized: clearStoredBearerToken }
   )

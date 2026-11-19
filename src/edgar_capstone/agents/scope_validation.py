@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import calendar
 import re
+from datetime import date
 from typing import Any
 
 from edgar_capstone.agents.schemas import CoverageNotice
@@ -435,6 +436,19 @@ _BROAD_CORPUS_PHRASE_RE = re.compile(
 )
 
 
+def _parse_iso_date(raw: Any) -> date | None:
+    """Parse a `YYYY-MM-DD` string (or pass through a `date`); None when absent or malformed."""
+    if isinstance(raw, date):
+        return raw
+    text = str(raw or "").strip()[:10]
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
 def _normalize_company_name(name: str) -> str:
     cleaned = _COMPANY_NAME_PUNCT_RE.sub(" ", (name or "").lower())
     cleaned = _LEGAL_SUFFIX_RE.sub(" ", cleaned)
@@ -475,6 +489,9 @@ class EntityCatalog:
         self.ticker_to_sector: dict[str, str] = {}
         self.ticker_to_cik: dict[str, str] = {}
         self.ticker_years: dict[str, set[int]] = {}
+        # ticker -> fiscal_year -> fiscal period end date, used to map calendar event dates
+        # ("the July 2024 outage") onto each issuer's own fiscal calendar.
+        self.ticker_period_ends: dict[str, dict[int, date]] = {}
         self._name_patterns: list[tuple[re.Pattern[str], str]] = []
 
         seen_norm_names: dict[str, str] = {}
@@ -493,6 +510,9 @@ class EntityCatalog:
                 self.ticker_to_cik[tk] = cik
             if fy is not None:
                 self.ticker_years.setdefault(tk, set()).add(int(fy))
+                period_end = _parse_iso_date(getattr(p, "period_of_report", None))
+                if period_end is not None:
+                    self.ticker_period_ends.setdefault(tk, {})[int(fy)] = period_end
             norm_name = _normalize_company_name(cname)
             if len(norm_name) >= 4:
                 existing = seen_norm_names.get(norm_name)
@@ -511,6 +531,22 @@ class EntityCatalog:
 
     def contains_ticker(self, ticker: str) -> bool:
         return normalize_edgar_ticker(ticker) in self.tickers
+
+    def fiscal_year_for_date(self, ticker: str, event_date: date) -> int | None:
+        """Return the issuer's fiscal year whose period contains `event_date`.
+
+        That is the earliest fiscal year whose `period_of_report` falls on or after the date
+        (e.g. CrowdStrike, FYE January 31: July 2024 -> FY2025). A date after the latest filed
+        period maps to the next, not-yet-filed fiscal year. Returns None when the catalog has no
+        period-end dates for the ticker.
+        """
+        ends = self.ticker_period_ends.get(normalize_edgar_ticker(ticker))
+        if not ends:
+            return None
+        for fy, period_end in sorted(ends.items(), key=lambda kv: kv[1]):
+            if period_end >= event_date:
+                return fy
+        return max(ends) + 1
 
     def detect_tickers_in_query(self, query: str) -> tuple[list[str], list[str]]:
         """Return `(detected_known_tickers, unknown_ticker_mentions)` from natural language."""

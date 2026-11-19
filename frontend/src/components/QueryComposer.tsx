@@ -1,13 +1,14 @@
 import { useEffect, useRef, type FormEvent, type KeyboardEvent } from 'react'
 import { Loader2 } from 'lucide-react'
-import type { SearchScopeFilters } from '../types/edgar'
 
 interface QueryComposerProps {
   value: string
   onChange: (val: string) => void
   onSubmit: () => void
   isSubmitting: boolean
-  filters: SearchScopeFilters
+  /** Corpus fiscal-year coverage, surfaced in the placeholder so analysts know what they can ask. */
+  minYear?: number
+  maxYear?: number
 }
 
 export function QueryComposer({
@@ -15,7 +16,8 @@ export function QueryComposer({
   onChange,
   onSubmit,
   isSubmitting,
-  filters,
+  minYear,
+  maxYear,
 }: QueryComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
@@ -60,19 +62,9 @@ export function QueryComposer({
     }
   }
 
-  const scopeSummary = [
-    filters.selectedTickers.length > 0
-      ? filters.selectedTickers.join(',')
-      : filters.gicsSector !== 'ALL'
-        ? filters.gicsSector.toUpperCase()
-        : 'AUTO EQTY',
-    `FY${String(filters.startYear).slice(-2)}–FY${String(filters.endYear).slice(-2)}`,
-    filters.sectionId === 'ALL'
-      ? '1A+7'
-      : filters.sectionId === 'item_1a'
-        ? '1A'
-        : '7',
-  ].join(' | ')
+  const coverage =
+    minYear && maxYear ? `S&P 500 10-Ks, FY${minYear}–FY${maxYear}` : 'S&P 500 10-Ks'
+  const placeholder = `Ask about ${coverage} — e.g. "AAPL vs MSFT operating margin, FY2022–FY2024" [/ to focus]`
 
   return (
     <div className="surface-header border-t border-hairline px-3 py-2 shrink-0">
@@ -99,13 +91,9 @@ export function QueryComposer({
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={handleKeyDown}
           disabled={isSubmitting}
-          placeholder="Enter variance query, peer comparison, or 10-K risk prompt... [Press / to focus]"
+          placeholder={placeholder}
           className="flex-1 resize-none bg-transparent py-0.5 text-xs text-ink-primary placeholder:text-[var(--text-muted)] focus:outline-none leading-relaxed max-h-32 tabular-nums-mono"
         />
-
-        <span className="hidden md:inline-block tabular-nums-mono text-[10px] text-ink-muted pb-1 shrink-0">
-          {scopeSummary}
-        </span>
 
         <button
           id="btn-submit-analyst-query"

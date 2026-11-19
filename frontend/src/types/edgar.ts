@@ -491,15 +491,6 @@ export interface CachedSectionResponse {
   gics_sub_industry?: string
 }
 
-export interface SearchScopeFilters {
-  selectedTickers: string[]
-  gicsSector: string
-  sectionId: SectionFilterId
-  startYear: number
-  endYear: number
-  topK: number
-}
-
 export interface XbrlFactSelection {
   title: string
   ticker: string
@@ -527,7 +518,6 @@ export interface ConversationTurn {
   id: string
   createdAt: string
   userQuery: string
-  appliedFilters: SearchScopeFilters
   response: ChatTurnResponse | null
   isLoading: boolean
   progressStage?: string

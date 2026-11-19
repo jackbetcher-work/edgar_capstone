@@ -13,6 +13,7 @@ import {
 import {
   BackendUnavailableError,
   buildChatQueryPayload,
+  NATURAL_LANGUAGE_SCOPE,
   executeConversationalRagQueryStream,
   fetchCached10kSection,
   postAnalystFeedback,
@@ -24,16 +25,8 @@ import {
   fetchWithAuthErrorHandling,
   requestJson,
 } from '../services/httpClient'
-import type { AuthDiscoveryConfig, ChatProgressEvent, SearchScopeFilters } from '../types/edgar'
+import type { AuthDiscoveryConfig, ChatProgressEvent } from '../types/edgar'
 
-const DEFAULT_FILTERS: SearchScopeFilters = {
-  selectedTickers: ['NVDA', 'AAPL'],
-  gicsSector: 'Information Technology',
-  sectionId: 'item_7',
-  startYear: 2024,
-  endYear: 2026,
-  topK: 8,
-}
 
 function makeChunkedSseResponse(chunks: string[], status = 200): Response {
   const encoder = new TextEncoder()
@@ -134,20 +127,19 @@ describe('edgarApi SSE parsing & payloads', () => {
     vi.restoreAllMocks()
   })
 
-  it('buildChatQueryPayload formats selected tickers or ALL fallback', () => {
-    const withTickers = buildChatQueryPayload('Compare NVDA and AAPL', DEFAULT_FILTERS)
-    expect(withTickers.tickers).toBe('NVDA,AAPL')
-    expect(withTickers.gics_sector).toBe('Information Technology')
-    expect(withTickers.section_id).toBe('item_7')
-    expect(withTickers.start_year).toBe(2024)
-    expect(withTickers.end_year).toBe(2026)
-    expect(withTickers.session_id).toMatch(/^edgar-session-/)
-
-    const allTickers = buildChatQueryPayload('All sector risks', {
-      ...DEFAULT_FILTERS,
-      selectedTickers: [],
+  it('buildChatQueryPayload sends only the question with neutral scope for NL resolution', () => {
+    const payload = buildChatQueryPayload('Compare NVDA and AAPL operating margin FY2022 to FY2024')
+    expect(payload).toEqual({
+      query: 'Compare NVDA and AAPL operating margin FY2022 to FY2024',
+      tickers: 'ALL',
+      gics_sector: 'ALL',
+      section_id: 'ALL',
+      start_year: 2024,
+      end_year: 2026,
+      top_k: 8,
+      session_id: expect.stringMatching(/^edgar-session-/),
     })
-    expect(allTickers.tickers).toBe('ALL')
+    expect(NATURAL_LANGUAGE_SCOPE).toMatchObject({ tickers: 'ALL', start_year: 2024, end_year: 2026 })
   })
 
   it('parses chunked SSE streams across arbitrary byte splits, comments, multi-line data, and ignores malformed JSON', async () => {
@@ -167,7 +159,6 @@ describe('edgarApi SSE parsing & payloads', () => {
 
     const res = await executeConversationalRagQueryStream(
       'Show NVDA revenue',
-      DEFAULT_FILTERS,
       (ev) => progressEvents.push(ev)
     )
     expect(progressEvents).toHaveLength(1)
@@ -183,7 +174,7 @@ describe('edgarApi SSE parsing & payloads', () => {
       ])
     )
     await expect(
-      executeConversationalRagQueryStream('q', DEFAULT_FILTERS)
+      executeConversationalRagQueryStream('q')
     ).rejects.toMatchObject({
       name: 'BackendUnavailableError',
       status: 503,
@@ -194,7 +185,7 @@ describe('edgarApi SSE parsing & payloads', () => {
       makeChunkedSseResponse(['event: progress\ndata: {"stage":"working","message":"..."}\n\n'])
     )
     await expect(
-      executeConversationalRagQueryStream('q', DEFAULT_FILTERS)
+      executeConversationalRagQueryStream('q')
     ).rejects.toThrow('stream ended before emitting a final grounded result')
   })
 
@@ -205,13 +196,13 @@ describe('edgarApi SSE parsing & payloads', () => {
         headers: { 'Content-Type': 'application/json' },
       })
     )
-    const ok = await executeConversationalRagQueryStream('q', DEFAULT_FILTERS)
+    const ok = await executeConversationalRagQueryStream('q')
     expect(ok.answer_markdown).toBe('json fallback')
 
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response('not-json', { status: 200, headers: { 'Content-Type': 'application/json' } })
     )
-    await expect(executeConversationalRagQueryStream('q', DEFAULT_FILTERS)).rejects.toBeInstanceOf(
+    await expect(executeConversationalRagQueryStream('q')).rejects.toBeInstanceOf(
       BackendUnavailableError
     )
   })
