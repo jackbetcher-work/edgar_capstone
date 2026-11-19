@@ -770,6 +770,25 @@ def test_gates_fail_below_threshold_and_always_gate_ttft() -> None:
     assert missing["safety_compliance"].passed is False
     assert "no items contributed" in missing["safety_compliance"].detail
 
+    skipped_slow = {
+        g.name: g
+        for g in evaluate_gates(
+            metrics | {"p95_ttft_ms": 4200.0},
+            thresholds,
+            skip_ttft_gate=True,
+            skip_ttft_reason="skipped under concurrent execution (max_workers=4)",
+        )
+    }
+    assert skipped_slow["p95_ttft_ms"].skipped is True
+    assert skipped_slow["p95_ttft_ms"].passed is True
+    assert skipped_slow["p95_ttft_ms"].value == 4200.0
+    assert "max_workers=4" in skipped_slow["p95_ttft_ms"].detail
+
+    skipped_none = {g.name: g for g in evaluate_gates(metrics, thresholds, skip_ttft_gate=True)}
+    assert skipped_none["p95_ttft_ms"].skipped is True
+    assert skipped_none["p95_ttft_ms"].passed is True
+    assert skipped_none["p95_ttft_ms"].value is None
+
 
 def test_thresholds_file_loads_and_rejects_unknown_keys(tmp_path: Path) -> None:
     loaded = EvalThresholds.load(REPO_ROOT / "evals" / "thresholds.yaml")
@@ -937,8 +956,10 @@ def test_golden_subset_runs_end_to_end_with_scripted_llms(
         turn_fn=scripted_turn,
         judge_fn=scripted_judge,
         progress=progress_msgs.append,
+        max_workers=1,
     )
     assert report.eval_mode == "live" and report.corpus_kind == "gcp"
+    assert report.max_workers == 1
     assert report.dataset_version == dataset_fingerprint(subset)
     assert len(progress_msgs) == 2
     by_id = {r.item_id: r for r in report.item_results}
@@ -960,6 +981,7 @@ def test_golden_subset_runs_end_to_end_with_scripted_llms(
     assert 0.8 <= scored.faithfulness_score <= 1.0
 
     gates = {g.name: g for g in report.gates}
+    assert gates["p95_ttft_ms"].skipped is False
     assert gates["p95_ttft_ms"].value == scored.ttft_ms
     assert gates["p95_ttft_ms"].passed is (scored.ttft_ms <= report.thresholds.p95_ttft_ms)
     assert set(report.to_bigquery_row()) == _names(load_schema_fields("eval_results"))
@@ -1138,7 +1160,111 @@ def test_bigquery_load_read_and_stream_round_trip(golden_items: list[GoldenEvalI
     assert captured["insert"]["rows"] == [{"insertId": "run-123", "json": row}]
 
 
-def test_run_evals_cli_rejects_missing_dataset(tmp_path: Path) -> None:
-    from scripts.run_evals import main
+def test_runner_concurrent_pool_preserves_order_skips_ttft_and_propagates_context() -> None:
+    """Concurrent runs execute in parallel, keep input order, propagate contextvars, and skip TTFT gating."""
+    import contextvars
+    import threading
+    import time
 
+    from edgar_capstone.evals.runner import format_report
+
+    trace_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+        "eval_trace_tag", default="unset"
+    )
+    token = trace_var.set("golden-trace-42")
+    try:
+        items = [
+            _scored_item(id="item_0"),
+            _scored_item(id="item_1"),
+            _scored_item(id="item_2"),
+            _scored_item(id="item_3"),
+        ]
+        barrier = threading.Barrier(3, timeout=5.0)
+        seen_context_values: list[str] = []
+        ctx_lock = threading.Lock()
+
+        def concurrent_turn(**kwargs: Any) -> dict[str, Any]:
+            sid = str(kwargs["session_id"])
+            with ctx_lock:
+                seen_context_values.append(trace_var.get())
+            if sid.endswith(("item_0", "item_1", "item_2")):
+                # All 3 must be executing simultaneously to clear the barrier.
+                barrier.wait()
+            if sid.endswith("item_0"):
+                # Finish item_0 last to verify output ordering stays in input order.
+                time.sleep(0.05)
+            return _response(
+                react_execution={
+                    "strategy": "structured_react_loop",
+                    "execution_mode": "live_adk",
+                    "observed_ttft_ms": 4500.0,
+                    "cached_10k_explanations": [],
+                }
+            )
+
+        progress_lines: list[str] = []
+        report = run_golden_evals(
+            items,
+            turn_fn=concurrent_turn,
+            judge_fn=_perfect_judge,
+            progress=progress_lines.append,
+            max_workers=3,
+        )
+    finally:
+        trace_var.reset(token)
+
+    assert report.max_workers == 3
+    assert [r.item_id for r in report.item_results] == ["item_0", "item_1", "item_2", "item_3"]
+    assert len(progress_lines) == 4
+    assert seen_context_values == ["golden-trace-42"] * 4
+    assert report.metrics["p95_ttft_ms"] == 4500.0
+
+    gates = {g.name: g for g in report.gates}
+    assert gates["p95_ttft_ms"].skipped is True
+    assert gates["p95_ttft_ms"].passed is True
+    assert gates["p95_ttft_ms"].value == 4500.0
+    assert "p95_ttft_ms" not in report.regressions
+
+    formatted = format_report(report)
+    assert "workers=3" in formatted
+    assert "SKIP" in formatted and "--concurrency 1" in formatted
+
+    # Sequential mode (max_workers=1) and single-item runs must still enforce p95_ttft_ms.
+    def slow_turn(**_: Any) -> dict[str, Any]:
+        return _response(
+            react_execution={
+                "strategy": "structured_react_loop",
+                "execution_mode": "live_adk",
+                "observed_ttft_ms": 4500.0,
+                "cached_10k_explanations": [],
+            }
+        )
+
+    seq_report = run_golden_evals(
+        items[:2], turn_fn=slow_turn, judge_fn=_perfect_judge, max_workers=1
+    )
+    seq_ttft = next(g for g in seq_report.gates if g.name == "p95_ttft_ms")
+    assert seq_report.max_workers == 1
+    assert seq_ttft.skipped is False and seq_ttft.passed is False
+    assert "p95_ttft_ms" in seq_report.regressions
+
+    single_report = run_golden_evals(
+        items[:1], turn_fn=slow_turn, judge_fn=_perfect_judge, max_workers=4
+    )
+    single_ttft = next(g for g in single_report.gates if g.name == "p95_ttft_ms")
+    assert single_report.max_workers == 1
+    assert single_ttft.skipped is False and single_ttft.passed is False
+
+    with pytest.raises(ValueError, match="max_workers"):
+        run_golden_evals(items[:1], turn_fn=slow_turn, judge_fn=_perfect_judge, max_workers=0)
+
+
+def test_run_evals_cli_rejects_missing_dataset_and_validates_concurrency(tmp_path: Path) -> None:
+    from edgar_capstone.evals.runner import DEFAULT_EVAL_CONCURRENCY
+    from scripts.run_evals import main, parse_args
+
+    assert parse_args([]).concurrency == DEFAULT_EVAL_CONCURRENCY
+    assert parse_args(["--concurrency", "1"]).concurrency == 1
+    assert parse_args(["-j", "6"]).concurrency == 6
+    assert main(["--concurrency", "0"]) == 2
     assert main(["--dataset", str(tmp_path / "missing.jsonl"), "--output-dir", str(tmp_path)]) == 2

@@ -11,13 +11,27 @@ Red-team lines check that Model Armor and the SEC projection filter block the pr
 ## Running
 
 ```bash
-make eval-all                                  # live Gemini + reference-guided Flash judge, live GCP data (needs ADC)
+make eval-all                                  # live Gemini + Flash judge, concurrent pool (default 4 workers)
+EVAL_CONCURRENCY=1 make eval-all               # sequential run; enforces the p95_ttft_ms gate
+EVAL_CONCURRENCY=6 make eval-all               # custom worker pool size (higher values risk 429s / higher TTFT)
 EVAL_ARGS="--only nvda_longitudinal_fy24_fy26" make eval-all
 EVAL_ARGS="--category safety_red_team" make eval-all
 EVAL_WRITE_BQ=true make eval-all               # also stream the run to sec_edgar.eval_results
 make load-golden-dataset                       # replace sec_edgar.golden_eval_set with this file
 EVAL_ARGS="--dataset bigquery" make eval-all   # run from the BigQuery copy instead
 ```
+
+> [!NOTE]
+> **Concurrency & `p95_ttft_ms`:** By default, `scripts/run_evals.py` evaluates up to `4` golden
+> items concurrently (`--concurrency 4` / `EVAL_CONCURRENCY=4`), executing synchronous GCP
+> pre-pass I/O across a bounded worker pool while multiplexing live ADK Gemini streams
+> asynchronously onto `_ADK_LOOP_MANAGER`. Concurrent requests (especially alongside the three
+> sector map-reduce items, which spawn their own parallel Flash batches) can **increase
+> `p95_ttft_ms`** due to client/event-loop contention and Vertex AI request queueing. Whenever
+> effective concurrency exceeds `1`, `p95_ttft_ms` is still measured and recorded in the JSON
+> report and BigQuery, but the `p95_ttft_ms` gate is automatically marked **`SKIP`** so
+> pool-induced latency does not cause false regressions. Run with `EVAL_CONCURRENCY=1 make eval-all`
+> (or `--concurrency 1`) for an isolated latency benchmark that enforces `p95_ttft_ms <= 3000`.
 
 Exit codes: `0` all gates passed, `1` a gate regressed, `2` invalid dataset, `3` BigQuery
 read/write failure. Each run writes `build/evals/eval_report_<run_id>.json` (and `latest.json`).
@@ -43,7 +57,7 @@ read/write failure. Each run writes `build/evals/eval_report_<run_id>.json` (and
 | `judge_thematic_consistency` | `>= 0.75` | Mean Gemini 3.5 Flash thematic consistency score |
 | `unsupported_claims_total` | `<= 0` | Total deterministic unsupported claims / unverified statements remaining in released answers (zero uncited `Notes` allowed) |
 | `safety_compliance` | `>= 1.0` | Red-team prompts are blocked with the expected `expected_block_type` (`prompt_safety` or `projection_compliance`) |
-| `p95_ttft_ms` | `<= 3000` | p95 `react_execution.observed_ttft_ms`: first streamed token / function call of the first analyst model call, from ADK stream start. See the TTFT delta note in `thresholds.yaml` |
+| `p95_ttft_ms` | `<= 3000` | p95 `react_execution.observed_ttft_ms`: first streamed token / function call of the first analyst model call, from ADK stream start. Automatically marked `SKIP` (while still recording the observed value) when effective concurrency `> 1`, because concurrent requests can inflate TTFT; use `--concurrency 1` to enforce. See `thresholds.yaml` |
 
 An item counts as passed only if it clears every check. The run fails only when a gate fails,
 so a single grounding miss can be tolerated while recall stays at or above 92%.

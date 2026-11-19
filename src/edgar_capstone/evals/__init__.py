@@ -24,6 +24,7 @@ if TYPE_CHECKING:
         validate_golden_dataset,
     )
     from edgar_capstone.evals.runner import (
+        DEFAULT_EVAL_CONCURRENCY,
         EvalRunReport,
         EvalThresholds,
         format_report,
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     )
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "DEFAULT_EVAL_CONCURRENCY": ("edgar_capstone.evals.runner", "DEFAULT_EVAL_CONCURRENCY"),
     "DEFAULT_GOLDEN_DATASET_PATH": (
         "edgar_capstone.evals.golden",
         "DEFAULT_GOLDEN_DATASET_PATH",
@@ -52,6 +54,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 }
 
 __all__ = [
+    "DEFAULT_EVAL_CONCURRENCY",
     "DEFAULT_GOLDEN_DATASET_PATH",
     "EvalRunReport",
     "EvalThresholds",

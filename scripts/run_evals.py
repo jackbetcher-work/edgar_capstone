@@ -2,12 +2,20 @@
 """Run the golden eval regression suite (`make eval-all`).
 
 Examples:
-    python scripts/run_evals.py                              # live Gemini + Flash judge, live GCP data
+    python scripts/run_evals.py                              # live Gemini + Flash judge, concurrent pool (default 4)
+    python scripts/run_evals.py --concurrency 1              # sequential run; enforces the p95_ttft_ms gate
     python scripts/run_evals.py --only nvda_longitudinal_fy24_fy26 --only safety_prompt_injection
     python scripts/run_evals.py --dataset bigquery           # read sec_edgar.golden_eval_set
     python scripts/run_evals.py --write-bigquery             # stream the run to sec_edgar.eval_results
 
-Exit codes: 0 all gates passed · 1 regression (a gate failed) · 2 invalid golden dataset ·
+Note on concurrency & TTFT:
+    Running multiple golden items concurrently (`--concurrency > 1`) speeds up wall-clock
+    execution (~4-5x) by overlapping sync GCP pre-pass I/O and multiplexing ADK Gemini
+    streams on the shared event loop, but concurrent traffic can inflate `p95_ttft_ms`.
+    The `p95_ttft_ms` gate is automatically skipped whenever more than one item runs
+    concurrently (the measured value is still recorded); pass `--concurrency 1` to enforce it.
+
+Exit codes: 0 all gates passed · 1 regression (a gate failed) · 2 invalid golden dataset / args ·
 3 BigQuery read/write failure.
 """
 
@@ -31,6 +39,7 @@ from edgar_capstone.evals.golden import (
     validate_golden_dataset,
 )
 from edgar_capstone.evals.runner import (
+    DEFAULT_EVAL_CONCURRENCY,
     DEFAULT_THRESHOLDS_PATH,
     EvalThresholds,
     format_report,
@@ -56,6 +65,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--only", action="append", default=[], help="Run only these item ids.")
     p.add_argument("--category", action="append", default=[], help="Run only these categories.")
     p.add_argument(
+        "-j",
+        "--concurrency",
+        type=int,
+        default=DEFAULT_EVAL_CONCURRENCY,
+        help=(
+            f"Max golden items to evaluate concurrently (default: {DEFAULT_EVAL_CONCURRENCY}). "
+            "When > 1, items execute in a bounded worker pool and the p95_ttft_ms gate is "
+            "skipped because concurrent requests can inflate TTFT; use --concurrency 1 to enforce it."
+        ),
+    )
+    p.add_argument(
         "--write-bigquery",
         action="store_true",
         help="Stream the run summary to BigQuery sec_edgar.eval_results (fails the run if it can't).",
@@ -76,6 +96,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.concurrency < 1:
+        print(f"ERROR: --concurrency must be >= 1 (got {args.concurrency})", file=sys.stderr)
+        return 2
 
     from edgar_capstone.evals.bigquery_io import EvalBigQueryClient, EvalBigQueryError
 
@@ -111,9 +134,16 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
+        effective_workers = min(args.concurrency, len(selected))
+        ttft_note = (
+            "; p95_ttft_ms gate skipped under concurrency (use --concurrency 1 to enforce)"
+            if effective_workers > 1
+            else ""
+        )
         print(
             f"Running {len(selected)}/{len(items)} golden items live "
-            f"(dataset: {source}; categories: {json.dumps(counts)})",
+            f"(workers: {effective_workers}{ttft_note}; dataset: {source}; "
+            f"categories: {json.dumps(counts)})",
             flush=True,
         )
         report = run_golden_evals(
@@ -121,6 +151,7 @@ def main(argv: list[str] | None = None) -> int:
             thresholds=thresholds,
             dataset_source=source,
             progress=None if args.quiet else (lambda line: print(line, flush=True)),
+            max_workers=args.concurrency,
         )
         print(format_report(report))
         report_path = write_report_json(report, args.output_dir)

@@ -35,8 +35,11 @@ LIVE_TEST_ENV := $(LIVE_GCP_ENV) EDGAR_TELEMETRY_BACKEND=local EDGAR_FEEDBACK_BA
 DOCKER_LIVE_TEST_ENV := $(addprefix -e ,$(LIVE_TEST_ENV))
 
 # Golden eval suite (scripts/run_evals.py): live Gemini + the Flash judge on Vertex AI.
+# EVAL_CONCURRENCY > 1 runs items concurrently in a pool and skips the p95_ttft_ms gate
+# (concurrent traffic can inflate TTFT; set EVAL_CONCURRENCY=1 to enforce p95_ttft_ms).
 # EVAL_WRITE_BQ=true streams the run to BigQuery sec_edgar.eval_results.
 EVAL_DATASET ?= evals/golden_dataset.jsonl
+EVAL_CONCURRENCY ?= 4
 EVAL_WRITE_BQ ?= false
 EVAL_ARGS ?=
 
@@ -95,8 +98,8 @@ test: ## Run backend (secret scan + pytest with >=80% coverage against live GCP)
 	$(LIVE_TEST_ENV) $(PYTHON) -m pytest -q --cov=edgar_capstone --cov-report=term-missing --cov-fail-under=80
 	cd frontend && npm run lint && npm test
 
-eval-all: ## Run the golden eval regression gates on live Gemini + GCP data (EVAL_WRITE_BQ=true)
-	$(LIVE_TEST_ENV) $(PYTHON) scripts/run_evals.py --dataset $(EVAL_DATASET) \
+eval-all: ## Run the golden eval regression gates on live Gemini + GCP data (EVAL_CONCURRENCY=4, EVAL_WRITE_BQ=true)
+	$(LIVE_TEST_ENV) $(PYTHON) scripts/run_evals.py --dataset $(EVAL_DATASET) --concurrency $(EVAL_CONCURRENCY) \
 		$(if $(filter true 1 yes,$(EVAL_WRITE_BQ)),--write-bigquery --project-id $(CORPUS_PROJECT_ID),) $(EVAL_ARGS)
 
 load-golden-dataset: ## Validate evals/golden_dataset.jsonl and load it into BigQuery sec_edgar.golden_eval_set

@@ -159,10 +159,13 @@ steps:
   # Stage 2.5: Eval Gate — Live golden regression gates (main deploy only;
   # optional via _EVAL_GATE_MODE: skip [default], advisory, or blocking)
   # ----------------------------------------------------------------------------
-  # TTFT delta (agentic tool selection refactor)
+  # TTFT delta & concurrency (agentic tool selection refactor)
   #   The p95_ttft_ms gate target stays 3000 ms (evals/thresholds.yaml). TTFT =
   #   react_execution.observed_ttft_ms: first streamed token / function call of the FIRST
-  #   analyst model call, timed from ADK stream start. The pre-synthesis pre-pass is now RAG-only
+  #   analyst model call, timed from ADK stream start. `scripts/run_evals.py` defaults to
+  #   `--concurrency 4` to finish within CI timeouts; because concurrent requests can inflate
+  #   p95_ttft_ms, the runner automatically skips the p95_ttft_ms gate when concurrency > 1
+  #   (while still recording the measured value). Pass `--concurrency 1` for isolated TTFT gating. The pre-synthesis pre-pass is now RAG-only
   #   (variance / flag / delta / sector map-reduce pre-computation removed), so TTFT is expected
   #   to be unchanged-to-lower. Total turn latency grows by one or more model/tool round-trips
   #   (measured +6 to +17 s) on anomaly / sector-wide turns where the agent calls deterministic

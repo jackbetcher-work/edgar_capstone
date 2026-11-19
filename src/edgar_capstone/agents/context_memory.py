@@ -974,9 +974,10 @@ class ConversationMemoryManager:
     def _get_store(self) -> SessionStoreProtocol:
         if self._explicit_store is not None:
             return self._explicit_store
-        if self._default_store is None:
-            self._default_store = FirestoreSessionStore()
-        return self._default_store
+        with self._lock:
+            if self._default_store is None:
+                self._default_store = FirestoreSessionStore()
+            return self._default_store
 
     @staticmethod
     def _session_key(session_id: str, user_id: str = "analyst") -> tuple[str, str]:

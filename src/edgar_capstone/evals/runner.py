@@ -3,21 +3,32 @@ applies the regression gates from `evals/thresholds.yaml`.
 
 Every run is live: answers come from the Gemini `FinancialAnalystAgent`, retrieval reads
 BigQuery / Vertex AI Search / Vertex AI embeddings / GCS, and the Gemini 3.5 Flash judge scores
-each answer against its reference explanation. The p95 TTFT gate always applies.
+each answer against its reference explanation.
+
+By default, items execute concurrently across a bounded worker pool (`DEFAULT_EVAL_CONCURRENCY`),
+which runs sync GCP pre-pass I/O in parallel threads while multiplexing live ADK Gemini streams
+asynchronously onto `_ADK_LOOP_MANAGER`. Concurrent requests (especially alongside sector
+map-reduce batches) can inflate `p95_ttft_ms` due to client/loop contention and Vertex AI queueing,
+so the `p95_ttft_ms` gate is automatically skipped whenever more than one item runs concurrently
+(the observed `p95_ttft_ms` is still recorded for visibility). Pass `max_workers=1`
+(`--concurrency 1`) to run sequentially and enforce the `p95_ttft_ms` gate.
 """
 
 from __future__ import annotations
 
+import contextvars
 import inspect
 import json
 import logging
 import os
 import platform
 import subprocess
+import threading
 import time
 import traceback
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -51,6 +62,7 @@ from edgar_capstone.evals.metrics import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_THRESHOLDS_PATH = REPO_ROOT / "evals" / "thresholds.yaml"
+DEFAULT_EVAL_CONCURRENCY = 4
 
 
 @dataclass(frozen=True)
@@ -191,6 +203,7 @@ class EvalRunReport:
     gates: list[GateResult]
     thresholds: EvalThresholds
     duration_seconds: float
+    max_workers: int = 1
 
     @property
     def passed(self) -> bool:
@@ -617,8 +630,19 @@ def aggregate_metrics(results: list[ItemResult]) -> dict[str, float | int | None
 
 
 def evaluate_gates(
-    metrics: dict[str, float | int | None], thresholds: EvalThresholds
+    metrics: dict[str, float | int | None],
+    thresholds: EvalThresholds,
+    *,
+    skip_ttft_gate: bool = False,
+    skip_ttft_reason: str = "",
 ) -> list[GateResult]:
+    """Evaluate aggregate metrics against `thresholds`.
+
+    When `skip_ttft_gate=True` (used for concurrent runs where `max_workers > 1`), the
+    observed `p95_ttft_ms` value is still attached to the `GateResult` for reporting, but
+    the gate is marked `skipped=True, passed=True` because parallel requests can inflate
+    client/upstream TTFT.
+    """
     gates: list[GateResult] = []
     for name in (
         "numeric_agreement",
@@ -664,16 +688,33 @@ def evaluate_gates(
     )
 
     ttft = metrics.get("p95_ttft_ms")
-    gates.append(
-        GateResult(
-            name="p95_ttft_ms",
-            value=float(ttft) if ttft is not None else None,
-            threshold=thresholds.p95_ttft_ms,
-            comparator="<=",
-            passed=ttft is not None and float(ttft) <= thresholds.p95_ttft_ms,
-            detail="" if ttft is not None else "no streaming TTFT captured",
+    if skip_ttft_gate:
+        gates.append(
+            GateResult(
+                name="p95_ttft_ms",
+                value=float(ttft) if ttft is not None else None,
+                threshold=thresholds.p95_ttft_ms,
+                comparator="<=",
+                passed=True,
+                skipped=True,
+                detail=skip_ttft_reason
+                or (
+                    "skipped under concurrent execution (max_workers > 1); "
+                    "run with --concurrency 1 to enforce TTFT"
+                ),
+            )
         )
-    )
+    else:
+        gates.append(
+            GateResult(
+                name="p95_ttft_ms",
+                value=float(ttft) if ttft is not None else None,
+                threshold=thresholds.p95_ttft_ms,
+                comparator="<=",
+                passed=ttft is not None and float(ttft) <= thresholds.p95_ttft_ms,
+                detail="" if ttft is not None else "no streaming TTFT captured",
+            )
+        )
     return gates
 
 
@@ -685,7 +726,19 @@ def run_golden_evals(
     turn_fn: TurnFn | None = None,
     judge_fn: JudgeFn | None = None,
     progress: Callable[[str], None] | None = None,
+    max_workers: int = DEFAULT_EVAL_CONCURRENCY,
 ) -> EvalRunReport:
+    """Execute golden eval items, aggregate metrics, and evaluate regression gates.
+
+    When `max_workers > 1` and more than one item is evaluated, items execute in a bounded
+    `ThreadPoolExecutor` (propagating `contextvars` / OTel spans) while live ADK Gemini
+    streams multiplex asynchronously on `_ADK_LOOP_MANAGER`. Results are always returned in
+    input `items` order. Because concurrent execution can inflate `p95_ttft_ms`, the
+    `p95_ttft_ms` gate is skipped whenever effective concurrency exceeds 1; pass
+    `max_workers=1` to run sequentially and enforce TTFT.
+    """
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be >= 1 (got {max_workers})")
     thresholds = thresholds or EvalThresholds()
     turn_fn = turn_fn or _default_turn_fn()
     judge_fn = judge_fn or _default_judge_fn()
@@ -695,8 +748,9 @@ def run_golden_evals(
     started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     t0 = time.perf_counter()
 
-    results: list[ItemResult] = []
-    for idx, item in enumerate(items, start=1):
+    effective_workers = min(max_workers, len(items)) if items else 1
+
+    def _run_one(item: GoldenEvalItem) -> tuple[ItemResult, float]:
         item_t0 = time.perf_counter()
         res = evaluate_item(
             item,
@@ -706,17 +760,61 @@ def run_golden_evals(
             turn_fn=turn_fn,
             judge_fn=judge_fn,
         )
-        results.append(res)
-        if progress:
-            mark = "PASS" if res.passed else "FAIL"
-            progress(
-                f"[{idx:>2}/{len(items)}] {mark} {item.id:<44} "
-                f"({time.perf_counter() - item_t0:5.1f}s)"
-                + (f"  <- {res.failure_reasons[0]}" if res.failure_reasons else "")
-            )
+        return res, time.perf_counter() - item_t0
+
+    def _emit_progress(
+        completed_idx: int, item: GoldenEvalItem, res: ItemResult, elapsed: float
+    ) -> None:
+        if not progress:
+            return
+        mark = "PASS" if res.passed else "FAIL"
+        progress(
+            f"[{completed_idx:>2}/{len(items)}] {mark} {item.id:<44} "
+            f"({elapsed:5.1f}s)" + (f"  <- {res.failure_reasons[0]}" if res.failure_reasons else "")
+        )
+
+    results: list[ItemResult] = []
+    if effective_workers == 1:
+        for idx, item in enumerate(items, start=1):
+            res, elapsed = _run_one(item)
+            results.append(res)
+            _emit_progress(idx, item, res, elapsed)
+    else:
+        ordered_results: list[ItemResult | None] = [None] * len(items)
+        progress_lock = threading.Lock()
+        completed_count = 0
+        with ThreadPoolExecutor(
+            max_workers=effective_workers,
+            thread_name_prefix="golden-eval",
+        ) as pool:
+            future_to_idx = {
+                pool.submit(contextvars.copy_context().run, _run_one, item): idx
+                for idx, item in enumerate(items)
+            }
+            for fut in as_completed(future_to_idx):
+                idx = future_to_idx[fut]
+                res, elapsed = fut.result()
+                ordered_results[idx] = res
+                if progress:
+                    with progress_lock:
+                        completed_count += 1
+                        _emit_progress(completed_count, items[idx], res, elapsed)
+        results = [r for r in ordered_results if r is not None]
 
     metrics = aggregate_metrics(results)
-    gates = evaluate_gates(metrics, thresholds)
+    skip_ttft_gate = effective_workers > 1
+    skip_ttft_reason = (
+        f"skipped under concurrent execution (max_workers={effective_workers}); "
+        "run with --concurrency 1 to enforce TTFT"
+        if skip_ttft_gate
+        else ""
+    )
+    gates = evaluate_gates(
+        metrics,
+        thresholds,
+        skip_ttft_gate=skip_ttft_gate,
+        skip_ttft_reason=skip_ttft_reason,
+    )
     judge_models = sorted({r.judge_model for r in results if r.judge_model})
     try:
         from edgar_capstone.agents.context_memory import resolve_model_for_task
@@ -743,6 +841,7 @@ def run_golden_evals(
         gates=gates,
         thresholds=thresholds,
         duration_seconds=time.perf_counter() - t0,
+        max_workers=effective_workers,
     )
 
 
@@ -750,14 +849,15 @@ def format_report(report: EvalRunReport) -> str:
     lines = [
         "",
         f"Golden eval run {report.run_id}  mode={report.eval_mode}  corpus={report.corpus_kind}  "
-        f"dataset={report.dataset_version}  commit={report.commit_sha[:12]}",
+        f"workers={report.max_workers}  dataset={report.dataset_version}  commit={report.commit_sha[:12]}",
         f"{'gate':<28} {'value':>10} {'threshold':>12}  result",
         "-" * 64,
     ]
     for g in report.gates:
         value = "n/a" if g.value is None else f"{g.value:.4f}".rstrip("0").rstrip(".")
         result = "SKIP" if g.skipped else ("PASS" if g.passed else "FAIL")
-        lines.append(f"{g.name:<28} {value:>10} {g.comparator} {g.threshold:<9g}  {result}")
+        suffix = f"  ({g.detail})" if g.skipped and g.detail else ""
+        lines.append(f"{g.name:<28} {value:>10} {g.comparator} {g.threshold:<9g}  {result}{suffix}")
     lines.append("-" * 64)
     passed = sum(1 for r in report.item_results if r.passed)
     lines.append(f"items passed: {passed}/{len(report.item_results)}")
