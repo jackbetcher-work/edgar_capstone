@@ -11,38 +11,37 @@ from google.adk.planners import BasePlanner, BuiltInPlanner
 from google.genai import types as genai_types
 from pydantic import BaseModel
 
-from edgar_capstone.agents.callbacks import (
+from edgar_capstone.agents.core.schemas import (
+    AnalystReport,
+    ModelTaskCategory,
+    NarrativeEvaluationReport,
+)
+from edgar_capstone.agents.prompts.store import make_adk_instruction_provider
+from edgar_capstone.agents.runtime.callbacks import (
     after_model_fact_check_callback,
     after_model_telemetry_callback,
     agent_tool_progress_before_tool_callback,
     agent_tool_timing_after_tool_callback,
     before_agent_telemetry_callback,
-    before_model_safety_and_latency_callback,
     before_model_telemetry_callback,
     before_tool_agent_identity_callback,
     retrieval_budget_before_tool_callback,
 )
-from edgar_capstone.agents.context_memory import (
-    after_agent_memory_callback,
+from edgar_capstone.agents.runtime.context_memory import after_agent_memory_callback
+from edgar_capstone.agents.runtime.model_config import (
     low_thinking_config_for_model,
     resolve_model_for_task,
 )
-from edgar_capstone.agents.disclosure_deltas import DisclosureDeltaTool
-from edgar_capstone.agents.material_variances import AnomalyFlagTool
-from edgar_capstone.agents.prompt_store import make_adk_instruction_provider
-from edgar_capstone.agents.schemas import (
-    AnalystReport,
-    ModelTaskCategory,
-    NarrativeEvaluationReport,
-)
-from edgar_capstone.agents.sector_tool import SectorThematicMapReduceTool
-from edgar_capstone.agents.tools import (
+from edgar_capstone.agents.tools.disclosure_deltas import DisclosureDeltaTool
+from edgar_capstone.agents.tools.material_variances import AnomalyFlagTool
+from edgar_capstone.agents.tools.sec_tools import (
+    AnalyticsViewQueryTool,
     HybridSearchTool,
-    LookerQueryTool,
     MetricFetchTool,
     QueryCached10KTool,
     VarianceCalculationTool,
 )
+from edgar_capstone.agents.tools.sector_tool import SectorThematicMapReduceTool
 
 # The analyst follows the registry's `latest` prompt (v6: agent-driven deterministic tool
 # selection, selective key metrics, structured intent) rather than the store-wide default `v1`.
@@ -68,19 +67,15 @@ def build_edgar_agent(
 ) -> Agent:
     """Build an ADK `Agent` with dynamic model resolution, versioned prompt, and standard callbacks.
 
-    When `include_fact_check_callback=False` (used by `NarrativeEvaluatorAgent`), the agent uses
-    the lightweight telemetry-only `before_model_telemetry_callback` and
-    `after_model_telemetry_callback`, recording exact TTFT/tokens/cost into
-    `ContextLatencyTracker` without firing Model Armor HTTP checks, `parse_analyst_report()`,
-    or `verify_narrative_against_calculations()` on judge JSON.
+    Model Armor prompt/response guardrails are owned at the ADK `App`/`Runner` plugin layer by
+    `ModelArmorSafetyPlugin`, so every agent attaches `before_model_telemetry_callback` to measure
+    input context breakdown and start timers. When `include_fact_check_callback=False` (used by
+    `NarrativeEvaluatorAgent`), the agent also uses `after_model_telemetry_callback` so it records
+    exact TTFT/tokens/cost into `ContextLatencyTracker` without running `parse_analyst_report()` or
+    `verify_narrative_against_calculations()` on judge JSON.
     """
     resolved_model: str | BaseLlm = (
         model if model is not None else resolve_model_for_task(task_category)
-    )
-    before_model_cb = (
-        before_model_safety_and_latency_callback
-        if include_fact_check_callback
-        else before_model_telemetry_callback
     )
     after_model_cb = (
         after_model_fact_check_callback
@@ -94,7 +89,7 @@ def build_edgar_agent(
         "instruction": make_adk_instruction_provider(prompt_id, version=prompt_version),
         "before_agent_callback": before_agent_telemetry_callback,
         "after_agent_callback": after_agent_memory_callback,
-        "before_model_callback": before_model_cb,
+        "before_model_callback": before_model_telemetry_callback,
         "after_model_callback": after_model_cb,
     }
     if tools:
@@ -143,7 +138,7 @@ def create_financial_analyst_agent(
             VarianceCalculationTool,
             AnomalyFlagTool,
             MetricFetchTool,
-            LookerQueryTool,
+            AnalyticsViewQueryTool,
             # Targeted retrieval only: ranked passages and hybrid search, each returning
             # chunk_ids. Whole-section loading (`load_cached_10k_section`) stays with the
             # source-viewer API, not the synthesis agent.

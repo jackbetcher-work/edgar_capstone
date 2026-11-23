@@ -108,6 +108,7 @@ TOOL_TARGET_SERVICE_MAP: dict[str, str] = {
     # Scope / entity resolution routing hop (intent itself is emitted by FinancialAnalystAgent).
     "resolve_query_scope": "intent-router-service",
     "fetch_financial_metrics": "bigquery-metrics-service",
+    "query_analytics_view": "looker-semantic-service",
     "query_looker_financial_explore": "looker-semantic-service",
     "calculate_period_variances": "variance-calculation-service",
     "flag_material_variances": "variance-calculation-service",
@@ -153,6 +154,7 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
             {
                 "resolve_query_scope",
                 "fetch_financial_metrics",
+                "query_analytics_view",
                 "query_looker_financial_explore",
                 "calculate_period_variances",
             }
@@ -201,6 +203,7 @@ PER_AGENT_IDENTITIES: dict[str, AgentIdentitySpec] = {
             {
                 "calculate_period_variances",
                 "fetch_financial_metrics",
+                "query_analytics_view",
                 "query_looker_financial_explore",
                 "search_10k_chunks_rag",
                 "flag_material_variances",

@@ -11,7 +11,7 @@ from edgar_capstone.common.domain import SECTION_TITLES, MetricName, SectionId
 from edgar_capstone.common.models import FilingMetadataBase
 
 # Canonical routing intents (API schemas, Looker telemetry, golden evals, UI badges). Emitted by
-# FinancialAnalystAgent in `AnalystReport.intent`; see `agents.intent.resolve_turn_intent`.
+# FinancialAnalystAgent in `AnalystReport.intent`; see `agents.orchestration.intent.resolve_turn_intent`.
 QueryIntentType = Literal[
     "longitudinal_single_company",
     "multi_company_peer_comparison",

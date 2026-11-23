@@ -21,21 +21,23 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
 
-from edgar_capstone.agents import (
+from edgar_capstone.agents.evaluation.judge import evaluate_variance_explanation
+from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.orchestration.react_loop import flush_pending_evaluations
+from edgar_capstone.agents.runtime import live_runtime as live_runtime_mod
+from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.runtime.factories import create_financial_analyst_agent
+from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
+from edgar_capstone.agents.runtime.live_runtime import (
     build_adk_llm_for_task,
-    calculate_period_variances,
-    create_financial_analyst_agent,
-    evaluate_variance_explanation,
-    flush_pending_evaluations,
-    get_context_latency_tracker,
-    get_conversation_memory_manager,
     get_live_runtime_status_metadata,
     resolve_live_adk_runtime,
     run_adk_agent_stream,
 )
-from edgar_capstone.agents import live_runtime as live_runtime_mod
-from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
-from edgar_capstone.agents.tools import search_10k_chunks_rag
+from edgar_capstone.agents.tools.sec_tools import (
+    calculate_period_variances,
+    search_10k_chunks_rag,
+)
 from edgar_capstone.telemetry import get_telemetry_sink
 from tests.structured_report_helpers import (
     ScriptedBaseLlm,
@@ -278,8 +280,10 @@ def test_adk_runner_sse_streaming_captures_ttft_and_tool_thread_pool_config(
 
 
 def test_extract_raw_json_dict_and_background_loop_lifecycle() -> None:
-    """Cover `_extract_raw_json_dict` fallbacks and `_BackgroundAsyncLoop` stop/restart."""
-    extract = live_runtime_mod._extract_raw_json_dict
+    """Cover `_extract_json_dict` fallbacks and `_BackgroundAsyncLoop` stop/restart."""
+    from edgar_capstone.common.formatting import _extract_json_dict
+
+    extract = _extract_json_dict
 
     assert extract("") is None
     assert extract("   ") is None

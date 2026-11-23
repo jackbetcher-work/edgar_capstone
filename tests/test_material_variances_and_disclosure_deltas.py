@@ -8,9 +8,12 @@ from typing import Any
 
 import pytest
 
-from edgar_capstone.agents import create_financial_analyst_agent
-from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
-from edgar_capstone.agents.disclosure_deltas import (
+from edgar_capstone.agents.core.schemas import AnalystReport
+from edgar_capstone.agents.evaluation.structured_report import verify_analyst_report
+from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.prompts.builders import build_financial_reasoning_prompt
+from edgar_capstone.agents.runtime.factories import create_financial_analyst_agent
+from edgar_capstone.agents.tools.disclosure_deltas import (
     DisclosureDeltaTool,
     SectionMaterial,
     _resolve_target_tickers,
@@ -24,18 +27,13 @@ from edgar_capstone.agents.disclosure_deltas import (
     strip_chunk_header,
     wording_changes,
 )
-from edgar_capstone.agents.live_runtime import _build_financial_reasoning_prompt
-from edgar_capstone.agents.material_variances import (
+from edgar_capstone.agents.tools.material_variances import (
     MaterialityThresholds,
     compute_material_variance_flags,
     flag_material_variances,
 )
-from edgar_capstone.agents.schemas import AnalystReport
-from edgar_capstone.agents.structured_report import verify_analyst_report
-from edgar_capstone.agents.tools import (
-    _build_variance_reports_from_profiles,
-    calculate_period_variances,
-)
+from edgar_capstone.agents.tools.sec_tools import calculate_period_variances
+from edgar_capstone.agents.tools.variance_engine import _build_variance_reports_from_profiles
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.security.agent_identity import authorize_agent_tool_invocation
 from tests.structured_report_helpers import ScriptedAnalystLlm
@@ -463,7 +461,7 @@ def test_analyst_agent_registers_new_tools_with_least_privilege() -> None:
 
 
 def test_prompt_carries_flags_and_disclosure_deltas() -> None:
-    prompt = _build_financial_reasoning_prompt(
+    prompt = build_financial_reasoning_prompt(
         query="How has AI risk wording changed?",
         intent="thematic_trend_tracking",
         scope={"tickers_csv": "NVDA", "start_year": 2024, "end_year": 2026},

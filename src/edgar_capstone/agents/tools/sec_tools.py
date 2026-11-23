@@ -1,4 +1,4 @@
-"""ADK tools: MetricFetchTool, LookerQueryTool, VarianceCalculationTool, HybridSearchTool, and ContextCacheTool.
+"""ADK tools: MetricFetchTool, AnalyticsViewQueryTool, VarianceCalculationTool, HybridSearchTool, and ContextCacheTool.
 
 Every tool reads live GCP data through the modular client adapters under
 `edgar_capstone.agents.adapters`: BigQuery (`financial_metrics`, `filing_chunks`,
@@ -39,20 +39,20 @@ from edgar_capstone.agents.adapters import (
     register_adapter_reset_hook,
     reset_gcp_tool_adapters,
 )
-from edgar_capstone.agents.citations import merge_citations
-from edgar_capstone.agents.hybrid_rag import _execute_live_gcp_hybrid_rag
-from edgar_capstone.agents.prompt_builders import compact_variance_reports_for_prompt
-from edgar_capstone.agents.resilience import with_tool_resilience
-from edgar_capstone.agents.schemas import GroundedCitation
-from edgar_capstone.agents.tool_runtime import (
+from edgar_capstone.agents.core.citations import merge_citations
+from edgar_capstone.agents.core.resilience import with_tool_resilience
+from edgar_capstone.agents.core.schemas import GroundedCitation
+from edgar_capstone.agents.prompts.builders import compact_variance_reports_for_prompt
+from edgar_capstone.agents.tools.hybrid_rag import _execute_live_gcp_hybrid_rag
+from edgar_capstone.agents.tools.runtime import (
+    STATE_ANALYTICS_VIEW_RESULTS,
     STATE_CALCULATED_VARIANCES,
     STATE_CHUNK_HEALTH,
-    STATE_LOOKER_RESULTS,
     STATE_VARIANCE_MISSING_TICKERS,
     cached_turn_profiles,
     variance_map,
 )
-from edgar_capstone.agents.variance_engine import (
+from edgar_capstone.agents.tools.variance_engine import (
     _build_variance_reports_from_profiles,
     _compute_single_metric_variance,
     _numeric_citation_for_profile,
@@ -99,7 +99,7 @@ _SECTION_CACHE_TTL_SECONDS = env_positive_float(
     minimum=1.0,
 )
 
-_SUPPORTED_LOOKER_EXPLORES = frozenset(
+_SUPPORTED_ANALYTICS_VIEWS = frozenset(
     {
         "yoy_variances",
         "sector_benchmarks",
@@ -110,7 +110,7 @@ _SUPPORTED_LOOKER_EXPLORES = frozenset(
         "audit_trail",
     }
 )
-_LOOKER_EXPLORE_ALIASES: dict[str, str] = {
+_ANALYTICS_VIEW_ALIASES: dict[str, str] = {
     "llm_telemetry_and_cost": "llm_telemetry",
     "security_audit_logs": "audit_trail",
 }
@@ -294,7 +294,7 @@ def _update_context_cache_state(
 
 
 # ---------------------------------------------------------------------------
-# Looker Explore Dispatch Helpers
+# Analytics View Dispatch Helpers (BigQuery SQL Views & Telemetry Store)
 # ---------------------------------------------------------------------------
 
 
@@ -437,8 +437,8 @@ def fetch_financial_metrics(
     }
 
 
-@with_tool_resilience(tool_name="query_looker_financial_explore")
-def query_looker_financial_explore(
+@with_tool_resilience(tool_name="query_analytics_view")
+def query_analytics_view(
     explore_name: str,
     tickers: str,
     gics_sector: str,
@@ -446,21 +446,21 @@ def query_looker_financial_explore(
     end_year: int,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
-    """Queries the Looker BI semantic explore for YoY variances, sector benchmarks, peer comparisons, chunk health, telemetry/cost, session analytics, or audit trail.
+    """Queries BigQuery analytics and telemetry views for YoY variances, sector benchmarks, peer comparisons, chunk health, telemetry/cost, session analytics, or audit trail.
 
     Args:
-        explore_name: Looker explore to query: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', 'chunk_health', 'llm_telemetry', 'session_analytics', or 'audit_trail'.
+        explore_name: Analytics view to query: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', 'chunk_health', 'llm_telemetry', 'session_analytics', or 'audit_trail'.
         tickers: Comma-separated ticker symbols (e.g., 'NVDA,AMD,AVGO') or 'ALL'.
         gics_sector: GICS Sector filter (e.g., 'Information Technology', 'Financials') or 'ALL'.
         start_year: Earliest fiscal year to include (e.g., 2024).
         end_year: Latest fiscal year to include (e.g., 2026).
 
     Returns:
-        Dictionary with 'status', 'explore_name', 'row_count', and 'rows' from the requested BI explore.
+        Dictionary with 'status', 'explore_name', 'row_count', and 'rows' from the requested analytics view.
     """
     raw_explore_key = explore_name.strip().lower()
-    explore_key = _LOOKER_EXPLORE_ALIASES.get(raw_explore_key, raw_explore_key)
-    if explore_key not in _SUPPORTED_LOOKER_EXPLORES:
+    explore_key = _ANALYTICS_VIEW_ALIASES.get(raw_explore_key, raw_explore_key)
+    if explore_key not in _SUPPORTED_ANALYTICS_VIEWS:
         return {
             "status": "error",
             "explore_name": explore_name,
@@ -484,7 +484,7 @@ def query_looker_financial_explore(
         )
         _record_gcp_backend_invocation(
             tool_context,
-            tool_name="query_looker_financial_explore",
+            tool_name="query_analytics_view",
             data_source="gcp",
             services_hit=["bigquery"],
         )
@@ -494,10 +494,14 @@ def query_looker_financial_explore(
             if result.get("status") == "success":
                 tool_context.state[STATE_CHUNK_HEALTH] = result
         else:
-            history = list(tool_context.state.get(STATE_LOOKER_RESULTS) or [])
+            history = list(tool_context.state.get(STATE_ANALYTICS_VIEW_RESULTS) or [])
             history.append(result)
-            tool_context.state[STATE_LOOKER_RESULTS] = history
+            tool_context.state[STATE_ANALYTICS_VIEW_RESULTS] = history
     return result
+
+
+# Backward-compatible deprecated alias (prefer `query_analytics_view`).
+query_looker_financial_explore = query_analytics_view
 
 
 @with_tool_resilience(tool_name="calculate_period_variances")
@@ -1016,13 +1020,15 @@ def query_cached_10k_context(
 
 # Explicit ADK FunctionTool instances matching project_reference.md naming
 MetricFetchTool = FunctionTool(fetch_financial_metrics)
-LookerQueryTool = FunctionTool(query_looker_financial_explore)
+AnalyticsViewQueryTool = FunctionTool(query_analytics_view)
+LookerQueryTool = AnalyticsViewQueryTool  # backward-compatible deprecated alias
 VarianceCalculationTool = FunctionTool(calculate_period_variances)
 HybridSearchTool = FunctionTool(search_10k_chunks_rag)
 ContextCacheTool = FunctionTool(load_cached_10k_section)
 QueryCached10KTool = FunctionTool(query_cached_10k_context)
 
 __all__ = [
+    "AnalyticsViewQueryTool",
     "BigQueryAdapter",
     "ContextCacheTool",
     "DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES",
@@ -1069,6 +1075,7 @@ __all__ = [
     "get_gcp_adapters_status_metadata",
     "load_cached_10k_section",
     "parse_10k_cache_key",
+    "query_analytics_view",
     "query_cached_10k_context",
     "query_looker_financial_explore",
     "reset_gcp_tool_adapters",

@@ -26,24 +26,27 @@ from google.adk.models.llm_response import LlmResponse
 from google.auth.exceptions import DefaultCredentialsError
 from google.genai import types as genai_types
 
-from edgar_capstone.agents import (
+from edgar_capstone.agents.adapters.registry import (
     GcpToolAdapters,
     GcpToolConfig,
-    calculate_period_variances,
     configure_gcp_tool_adapters,
-    create_financial_analyst_agent,
-    fetch_financial_metrics,
-    get_context_latency_tracker,
-    get_conversation_memory_manager,
     get_gcp_adapters_status_metadata,
+)
+from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.runtime.factories import create_financial_analyst_agent
+from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
+from edgar_capstone.agents.runtime.live_runtime import run_adk_agent_stream
+from edgar_capstone.agents.runtime.model_config import FINANCIAL_REASONING_MODEL
+from edgar_capstone.agents.tools.sec_tools import (
+    _SECTION_CHUNKS_CACHE,
+    _SESSION_10K_CONTEXT_CACHE,
+    calculate_period_variances,
+    fetch_financial_metrics,
     load_cached_10k_section,
+    query_analytics_view,
     query_cached_10k_context,
-    query_looker_financial_explore,
-    run_adk_agent_stream,
     search_10k_chunks_rag,
 )
-from edgar_capstone.agents.context_memory import FINANCIAL_REASONING_MODEL
-from edgar_capstone.agents.tools import _SECTION_CHUNKS_CACHE, _SESSION_10K_CONTEXT_CACHE
 from edgar_capstone.dataset.extractor import format_combined_10k_markdown
 from tests.fake_gcp import preserve_gcp_caches
 from tests.structured_report_helpers import (
@@ -383,8 +386,8 @@ def test_bigquery_adapter_metrics_variances_and_job_polling() -> None:
     assert sample_metric["provenance"]["notes"] == ["XBRL audited 10-K tag"]
 
 
-def test_bigquery_adapter_all_looker_explores() -> None:
-    """Verify `query_looker_financial_explore` queries `v_financial_variances_yoy`, `financial_metrics`, and `v_chunk_health_metrics`."""
+def test_bigquery_adapter_all_analytics_views() -> None:
+    """Verify `query_analytics_view` queries `v_financial_variances_yoy`, `financial_metrics`, and `v_chunk_health_metrics`."""
     executed_sql: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -600,7 +603,7 @@ def test_bigquery_adapter_all_looker_explores() -> None:
         )
     )
 
-    yoy = query_looker_financial_explore(
+    yoy = query_analytics_view(
         explore_name="yoy_variances",
         tickers="NVDA",
         gics_sector="Information Technology",
@@ -612,7 +615,7 @@ def test_bigquery_adapter_all_looker_explores() -> None:
     assert yoy["rows"][0]["revenue_yoy_pct"] == 65.47
     assert yoy["rows"][0]["operating_margin_pct"] == 60.38
 
-    bench = query_looker_financial_explore(
+    bench = query_analytics_view(
         explore_name="sector_benchmarks",
         tickers="ALL",
         gics_sector="Information Technology",
@@ -623,7 +626,7 @@ def test_bigquery_adapter_all_looker_explores() -> None:
     assert bench["rows"][0]["tickers"] == ["AAPL", "NVDA"]
     assert bench["rows"][0]["company_count"] == 2
 
-    health = query_looker_financial_explore(
+    health = query_analytics_view(
         explore_name="chunk_health",
         tickers="ALL",
         gics_sector="ALL",
@@ -1325,7 +1328,8 @@ def test_http_429_rate_limit_retries_and_missing_credentials_error() -> None:
 
 def test_bigquery_vector_search_sector_top_per_ticker() -> None:
     """Single-query BigQuery ML.DISTANCE + QUALIFY returns top chunks per issuer-year for sector map-reduce."""
-    from edgar_capstone.agents.tools import BigQueryAdapter, GcpToolConfig
+    from edgar_capstone.agents.adapters.bigquery import BigQueryAdapter
+    from edgar_capstone.agents.adapters.registry import GcpToolConfig
 
     captured_sql: list[str] = []
     captured_params: list[list[dict[str, Any]]] = []
@@ -1561,7 +1565,7 @@ def test_gcp_tool_adapters_embed_texts_error_translation_and_context_manager() -
     """Covers `embed_texts` empty list, 429/503/timeout/runtime error translation, and context manager."""
     from unittest.mock import MagicMock
 
-    from edgar_capstone.agents.resilience import (
+    from edgar_capstone.agents.core.resilience import (
         RateLimitExceededError,
         ToolExecutionError,
         UpstreamTimeoutError,

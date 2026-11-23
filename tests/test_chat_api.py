@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from edgar_capstone.agents.chat_engine import EntityCatalogCache
+from edgar_capstone.agents.orchestration.chat_engine import EntityCatalogCache
 from edgar_capstone.agents.tools import calculate_period_variances, get_active_gcp_tool_adapters
 from edgar_capstone.security import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
@@ -254,7 +254,7 @@ def test_entity_catalog_cache_single_flight_and_error_handling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Concurrent cold misses coalesce into one fetch; failures return empty or re-raise."""
-    from edgar_capstone.agents import chat_engine
+    from edgar_capstone.agents.orchestration import chat_engine
 
     cache = EntityCatalogCache(ttl_seconds=60.0)
     # allow_fetch=False on empty cache returns empty without hitting BigQuery

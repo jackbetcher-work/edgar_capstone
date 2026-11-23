@@ -14,13 +14,13 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
 
-from edgar_capstone.agents.context_memory import get_conversation_memory_manager
-from edgar_capstone.agents.sector_map_reduce import run_sector_thematic_map_reduce
-from edgar_capstone.agents.tools import (
+from edgar_capstone.agents.adapters.registry import (
     GcpToolAdapters,
     GcpToolConfig,
     configure_gcp_tool_adapters,
 )
+from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.tools.sector_map_reduce import run_sector_thematic_map_reduce
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.security.auth import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
@@ -456,8 +456,8 @@ def test_sector_map_agent_defaults_to_flash_lite(monkeypatch: pytest.MonkeyPatch
     """SectorMapSummarizerAgent resolves `gemini-3.5-flash-lite` via `context_compaction`."""
     from google.genai import types as genai_types
 
-    from edgar_capstone.agents import sector_map_reduce as smr
-    from edgar_capstone.agents.live_runtime import AdkStreamResult
+    from edgar_capstone.agents.runtime.live_runtime import AdkStreamResult
+    from edgar_capstone.agents.tools import sector_map_reduce as smr
 
     monkeypatch.delenv("EDGAR_LITE_MODEL", raising=False)
     captured: dict[str, Any] = {}

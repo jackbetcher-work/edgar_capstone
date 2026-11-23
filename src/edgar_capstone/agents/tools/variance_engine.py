@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any, Literal
 
-from edgar_capstone.agents.schemas import (
+from edgar_capstone.agents.core.schemas import (
     AnnualStepVariance,
     CompanyVarianceReport,
     MetricRecord,

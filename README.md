@@ -7,8 +7,6 @@ A conversational analysis workspace for S&P 500 Form 10-K filings. Analysts ask 
 
 Answers are written by Gemini through the Google Agent Development Kit (ADK). Every claim is checked against the retrieved passages and computed figures before it reaches the user.
 
-The target architecture and requirements are in [`docs/project_reference.md`](docs/project_reference.md).
-
 ---
 
 ## How a Query Is Answered
@@ -48,33 +46,66 @@ flowchart TD
     JUDGE -.-> TEL
 ```
 
-Each turn runs through [`run_conversational_rag_turn`](src/edgar_capstone/agents/chat_engine.py):
+Each turn runs through [`run_conversational_rag_turn`](src/edgar_capstone/agents/orchestration/chat_engine.py):
 
 1. **Authenticate.** All `/api/v1/*` routes require an identity (IAP assertion, Workspace/Okta OIDC JWT, or a local dev token). Access is controlled by Cloud Identity group RBAC.
 2. **Prompt guardrails.** Model Armor, Cloud Sensitive Data Protection, and an SEC projection filter can block the request before any model call.
-3. **Resolve scope.** The query is mapped to tickers, GICS sector, fiscal years, and 10-K section. This uses the live S&P 500 catalog in BigQuery and earlier turns from Firestore session memory. Ambiguous or out-of-corpus questions end here with a clarification or coverage notice.
-4. **Retrieve evidence.** Hybrid RAG queries BigQuery `VECTOR_SEARCH` over `filing_chunks` and Vertex AI Search in parallel, then balances the hits across the tickers in scope.
-5. **Reason.** `FinancialAnalystAgent` runs a structured ReAct loop and returns a structured `AnalystReport`. It calls deterministic tools only when the question needs them. Nothing is pre-computed, so qualitative questions don't get unrequested variance tables.
-6. **Verify.** Each finding is checked against the retrieved passages and tool outputs. If every finding fails, one regeneration runs with the rejection reasons. If the retry also fails, the answer is withheld (`answer_verified: false`) instead of being replaced with template text.
-7. **Response guardrails, persistence, and telemetry.** The answer is screened again. The turn is saved to Firestore and telemetry is streamed to BigQuery.
-8. **Judge (async).** A Gemini Flash LLM-as-a-Judge scores the answer outside the request path. Its score is written to BigQuery when it finishes; until then the turn is recorded as `pending`.
+3. **Resolve scope.** [`scope_validation.py`](src/edgar_capstone/agents/orchestration/scope_validation.py) maps the query to tickers, GICS sector, fiscal years, and 10-K section using the live S&P 500 catalog in BigQuery and prior turns from Firestore session memory. Ambiguous or out-of-corpus questions end here with a clarification or coverage notice.
+4. **Retrieve evidence.** [`hybrid_rag.py`](src/edgar_capstone/agents/tools/hybrid_rag.py) queries BigQuery `VECTOR_SEARCH` over `filing_chunks` and Vertex AI Search in parallel (with per-company-year coverage slices), then balances hits across the tickers in scope.
+5. **Reason.** [`react_loop.py`](src/edgar_capstone/agents/orchestration/react_loop.py) runs `FinancialAnalystAgent` via the ADK streaming runner ([`live_runtime.py`](src/edgar_capstone/agents/runtime/live_runtime.py)) and returns constrained `AnalystReport` JSON. The agent calls deterministic tools on demand based on the query.
+6. **Verify.** [`structured_report.py`](src/edgar_capstone/agents/evaluation/structured_report.py) checks every finding against the retrieved passages and hydrated tool outputs before rendering Markdown. If every finding fails, one guided regeneration runs with the rejection reasons; if that also fails, the answer is withheld (`answer_verified: false`).
+7. **Response guardrails, persistence, and telemetry.** The answer is screened again, intent is finalized ([`intent.py`](src/edgar_capstone/agents/orchestration/intent.py)), the turn is saved to Firestore, and telemetry is streamed to BigQuery.
+8. **Judge (async).** [`judge.py`](src/edgar_capstone/agents/evaluation/judge.py) scores the answer off the request path with a Gemini Flash LLM-as-a-Judge. Until it finishes, the turn is recorded as `pending`; on completion the real grade and score are written to BigQuery.
 
-There is no offline mode or local corpus. Every request reads live GCP data and calls live Gemini. Upstream failures return HTTP `503`.
+Every request reads live GCP data and calls live Gemini; upstream failures return HTTP `503`.
 
 ### Agents and Tools
 
-| Component | Role |
-| :--- | :--- |
-| `FinancialAnalystAgent` | Primary ADK agent (`gemini-3.8-flash`, native thinking). Output is constrained to the `AnalystReport` schema. |
-| `NarrativeEvaluatorAgent` | LLM-as-a-Judge (`gemini-3.8-flash`, `ThinkingLevel.LOW`). Scores faithfulness, citation precision, and explanation quality. |
-| `calculate_period_variances` / `fetch_financial_metrics` | Deterministic multi-period and YoY variance engine over BigQuery `financial_metrics`. |
-| `flag_material_variances` | Rule-based anomaly flags with MD&A explanations and XBRL provenance. |
-| `compare_disclosures_across_years` | YoY wording deltas (added, removed, or modified) with citations from both years. |
-| `sector_thematic_map_reduce` | Full-sector batched map-reduce for sector-wide thematic questions. Streams progress over SSE. |
-| `search_10k_chunks_rag` / `query_cached_10k_context` | Targeted 10-K passage retrieval that returns citable `chunk_id`s. |
-| `query_looker_financial_explore` | Aggregated metric queries. Despite the name, it queries BigQuery directly; no Looker instance is deployed. |
+| Component | Module | Role |
+| :--- | :--- | :--- |
+| `FinancialAnalystAgent` | [`runtime/factories.py`](src/edgar_capstone/agents/runtime/factories.py) | Primary ADK agent (`gemini-3.8-flash`, native thinking). Output is constrained to the `AnalystReport` schema. |
+| `NarrativeEvaluatorAgent` | [`evaluation/judge.py`](src/edgar_capstone/agents/evaluation/judge.py) | LLM-as-a-Judge (`gemini-3.8-flash`, `ThinkingLevel.LOW`). Scores faithfulness, citation precision, and explanation quality. |
+| `SectorMapSummarizerAgent` | [`tools/sector_map_reduce.py`](src/edgar_capstone/agents/tools/sector_map_reduce.py) | Parallel batch summarizer (`gemini-3.5-flash-lite`) for the map phase of sector-wide thematic reviews. |
+| `calculate_period_variances` · `fetch_financial_metrics` | [`tools/sec_tools.py`](src/edgar_capstone/agents/tools/sec_tools.py), [`tools/variance_engine.py`](src/edgar_capstone/agents/tools/variance_engine.py) | Deterministic multi-period and YoY variance engine over BigQuery `financial_metrics`. |
+| `flag_material_variances` | [`tools/material_variances.py`](src/edgar_capstone/agents/tools/material_variances.py) | Rule-based XBRL anomaly flags paired with MD&A explanations and filing provenance. |
+| `compare_disclosures_across_years` | [`tools/disclosure_deltas.py`](src/edgar_capstone/agents/tools/disclosure_deltas.py) | Deterministic YoY wording deltas (added, removed, modified) using word-trigram alignment with citations from both years. |
+| `sector_thematic_map_reduce` | [`tools/sector_tool.py`](src/edgar_capstone/agents/tools/sector_tool.py), [`tools/sector_map_reduce.py`](src/edgar_capstone/agents/tools/sector_map_reduce.py) | Full-sector batched map-reduce over all issuers in a GICS sector. Streams progress over SSE. |
+| `search_10k_chunks_rag` · `query_cached_10k_context` | [`tools/sec_tools.py`](src/edgar_capstone/agents/tools/sec_tools.py), [`tools/hybrid_rag.py`](src/edgar_capstone/agents/tools/hybrid_rag.py) | Targeted 10-K passage retrieval returning citable `chunk_id`s. |
+| `query_analytics_view` | [`tools/sec_tools.py`](src/edgar_capstone/agents/tools/sec_tools.py) | Aggregated BigQuery analytics views (`sector_benchmarks`, `peer_comparison`, `yoy_variances`, `chunk_health`) and telemetry/audit views. |
 
-Prompts are versioned in [`prompts/`](prompts/registry.yaml). The analyst currently resolves `latest` to `v6`.
+Prompts are versioned in [`prompts/`](prompts/registry.yaml) and loaded through [`prompts/store.py`](src/edgar_capstone/agents/prompts/store.py) (supporting local, GCS, and Vertex AI backends). The analyst resolves `latest` to `v7`.
+
+### Agents Package Architecture
+
+[`src/edgar_capstone/agents/`](src/edgar_capstone/agents/__init__.py) is split into seven subpackages layered from zero-dependency foundations up to orchestration:
+
+```text
+core ──▶ adapters, prompts ──▶ tools ──▶ runtime, evaluation ──▶ orchestration
+```
+
+- **`core/`** — Shared Pydantic schemas (`schemas.py`), retry/exception wrappers and OTel tool spans (`resilience.py`), and inline citation helpers (`citations.py`). No dependencies on other `agents` subpackages.
+- **`adapters/`** — Live GCP REST clients and thread-safe adapter registry (`bigquery.py`, `vertex_search.py`, `gcs.py`, `registry.py`).
+- **`prompts/`** — Versioned prompt loading (`store.py`) and payload compaction / prompt builders (`builders.py`).
+- **`tools/`** — ADK `FunctionTool` wrappers, deterministic analytical engines, and turn-scoped tool plumbing (`runtime.py`).
+- **`runtime/`** — ADK `Runner` and persistent SSE event loop (`live_runtime.py`), agent factories (`factories.py`), lifecycle callbacks for Model Armor/identity/budgets/telemetry (`callbacks.py`), and model routing, latency tracking, and session memory (`context_memory.py`).
+- **`evaluation/`** — Claim-level `AnalystReport` verification and deterministic Markdown rendering (`structured_report.py`), plus the Flash LLM-as-a-Judge (`judge.py`).
+- **`orchestration/`** — Conversational turn entry point and S&P 500 catalog cache (`chat_engine.py`), ReAct loop and background judge pool (`react_loop.py`), scope/coverage validation (`scope_validation.py`), and non-lexical intent resolution (`intent.py`).
+
+Two conventions are worth knowing before editing `agents/`:
+
+- **Turn-scoped tool state (`tools/runtime.py`):** Deterministic tools return compact JSON digests to Gemini to keep prompt prefill small, while writing their full payloads (XBRL provenance, flags, deltas, citations) into ADK `session_state`. `turn_scoped_state_seed()` resets those keys each turn so persistent chat sessions don't leak prior outputs, and `hydrate_tool_outputs()` reads them back before claim verification and UI rendering. Non-serializable per-turn handles (SSE progress callback, cached catalog profiles) travel via `tool_turn_context` (`contextvars`).
+- **Cold-start imports (`__init__.py`):** `agents/__init__.py` contains no eager imports (and subpackages such as `tools/` and `evaluation/` use PEP 562 `__getattr__` lazy exports), keeping `google.adk`, `google.genai`, and ingest SDKs off the cold-start import path (enforced by `test_lazy_imports_avoid_heavy_sdks_on_cold_start`). Import symbols directly from their canonical subpackage modules.
+
+### Storage Architecture
+
+Data is split across Google Cloud storage and retrieval services by workload pattern:
+
+| Service | Workload pattern | What it stores | Role |
+| :--- | :--- | :--- | :--- |
+| **BigQuery** | Analytical scans, vector search, append-only logs | Structured XBRL `financial_metrics`, 768-d embedded `filing_chunks` (`VECTOR_SEARCH`), and streaming telemetry, audit, and eval tables | Serverless SQL and vector analytics at S&P 500 scale |
+| **Vertex AI Search** | Managed hybrid lexical + semantic retrieval | Indexed 10-K filings with auto query expansion, spell correction, and extractive segments | Pairs lexical recall and extractive snippets with BigQuery dense vector search in parallel for stronger grounding |
+| **Cloud Storage (GCS)** | Immutable large text objects | Full Item 1A (Risk Factors) and Item 7 (MD&A) Markdown sections | Low-cost blob storage for serving full filing sections to the source viewer and cached section reads |
+| **Cloud Firestore (Native)** | Low-latency mutable JSON CRUD and per-user state | `analyst_sessions` (multi-turn conversation memory) and `analyst_feedback` (thumbs-up/down ratings and comments) | Fast point `GET`/`PATCH`/`DELETE` and `:runQuery`; serverless scale-to-zero across stateless Cloud Run instances; schemaless nested JSON; SHA-256 `(user_id, session_id)` isolation with `OPTIMISTIC` concurrency via a lightweight REST v1 (`httpx`) client ([`telemetry.py`](src/edgar_capstone/telemetry.py)) |
 
 ---
 
@@ -102,7 +133,7 @@ Prompts are versioned in [`prompts/`](prompts/registry.yaml). The analyst curren
 | `make docker-build` / `make docker-smoke` | Build the production image and smoke-test it over HTTP |
 | `make help` | List all targets, including corpus publishing (`publish-financials`, `index-vertex-search`, `backfill-rd`) |
 
-Run `make smoke` or `make docker-smoke` with `SMOKE_LIVE_DATA=true` to also check a live BigQuery read.
+Run `make smoke` or `make docker-smoke` with `SMOKE_LIVE_DATA=true` to also check a live BigQuery read. For fast local iteration without GCP credentials, run `.venv/bin/pytest -m "not live"` (unit and mocked-transport integration tests; `@pytest.mark.live` tests hit live GCP and Gemini).
 
 ### Configuration
 
@@ -128,7 +159,7 @@ The runtime install (`pip install .`, used by the `Dockerfile` and `requirements
 - `pip install ".[ingest]"` adds the offline dataset and vector-DB build tools (`edgartools`, `pandas`, `google-cloud-storage`).
 - `pip install ".[dev]"` adds test and lint tooling; `make install` uses this.
 
-The container image holds only the runtime package, the built UI, and `prompts/`. No corpus data is included.
+The container image packages the runtime library, the built UI, and `prompts/`; corpus data is read from GCP at runtime.
 
 ---
 
@@ -227,7 +258,13 @@ See [`evals/README.md`](evals/README.md) for the record schema and gate definiti
 │   ├── server.py            # FastAPI app factory and lifespan hooks
 │   ├── api/                 # Routers, request schemas, auth dependencies
 │   ├── agents/              # ADK agents, chat pipeline, ReAct loop, verification, deterministic tools
-│   │   └── adapters/        # BigQuery, Vertex AI Search, and GCS tool adapters
+│   │   ├── core/            # Shared Pydantic schemas, retry/telemetry resilience, citation helpers
+│   │   ├── adapters/        # BigQuery, Vertex AI Search, and GCS tool adapters
+│   │   ├── prompts/         # Versioned prompt store (local/GCS/Vertex) and prompt builders
+│   │   ├── tools/           # ADK tools, turn-scoped runtime, variance/delta/RAG/sector engines
+│   │   ├── runtime/         # ADK Runner/streaming, agent factories, callbacks, context/memory
+│   │   ├── evaluation/      # Structured report claim verification/rendering and Flash judge
+│   │   └── orchestration/   # Conversational RAG chat engine, intent, scope validation, ReAct loop
 │   ├── security/            # IAP/OIDC auth, RBAC, per-agent identities, Secret Manager, Model Armor
 │   ├── observability/       # OpenTelemetry tracing, structured logging, request middleware
 │   ├── telemetry.py         # BigQuery telemetry/audit sinks, Firestore session and feedback stores
@@ -241,19 +278,6 @@ See [`evals/README.md`](evals/README.md) for the record schema and gate definiti
 ├── evals/                   # Golden dataset and regression thresholds
 ├── scripts/                 # CLIs: dataset/vector DB build, corpus publishing, evals, smoke test
 ├── terraform/               # GCP infrastructure as code
-├── tests/                   # pytest suite (live GCP + Gemini)
-└── docs/                    # Reference spec and observability guide
+├── tests/                   # pytest suite (offline unit/integration + `@pytest.mark.live` GCP/Gemini tests)
+└── docs/                    # Observability guide
 ```
-
----
-
-## Known Gaps
-
-Open items against [`docs/project_reference.md`](docs/project_reference.md) (§ = spec section).
-
-| Area | Spec | Status | Next step |
-| :--- | :--- | :--- | :--- |
-| Raw model p95 TTFT `<= 3,000 ms` | §5 · B1 | Open | Warm TTFT is about 1.9 s, but tail latency on the unprovisioned `global` endpoint still exceeds 3 s. Possible fixes: Provisioned Throughput, regional models, or a smaller prefill. In CI, this gate only produces a warning; all other gates block deploys. |
-| End-to-end observability check | §5, §11 | In progress | On the deployed service, confirm that one chat request produces a single trace linked across Cloud Trace, Cloud Logging, BigQuery `trace_id`, and Firestore sessions. |
-| Cloud Build triggers | §9 | Deferred | Authorize the Cloud Build GitHub App, store a GitHub PAT in Secret Manager, and apply with `enable_cloudbuild_trigger = true`. GitHub Actions handles deploys until then. |
-| VPC Service Controls | §9 | Blocked | Needs an org-delegated Access Context Manager policy. The perimeter is defined in `terraform/vpc_service_controls.tf` but disabled. |

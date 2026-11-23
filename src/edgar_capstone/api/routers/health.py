@@ -7,16 +7,14 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 
-from edgar_capstone.agents.chat_engine import (
+from edgar_capstone.agents.orchestration.chat_engine import (
     ACTIVE_AGENT_NAMES,
     PRIMARY_ORCHESTRATOR_NAME,
 )
-from edgar_capstone.agents.context_memory import (
-    get_conversation_memory_manager,
-    get_model_strategy_metadata,
-)
-from edgar_capstone.agents.live_runtime import get_live_runtime_status_metadata
-from edgar_capstone.agents.prompt_store import get_prompt_store_status_metadata
+from edgar_capstone.agents.prompts.store import get_prompt_store_status_metadata
+from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.runtime.live_runtime import get_live_runtime_status_metadata
+from edgar_capstone.agents.runtime.model_config import get_model_strategy_metadata
 from edgar_capstone.agents.tools import get_gcp_adapters_status_metadata
 from edgar_capstone.api.dependencies import get_runtime_sa_config
 from edgar_capstone.gcp.defaults import resolve_gcp_project_id

@@ -266,8 +266,8 @@ def test_golden_expected_variances_are_fully_populated(golden_items: list[Golden
 @pytest.mark.live
 def test_golden_numbers_match_live_bigquery_engine(golden_items: list[GoldenEvalItem]) -> None:
     """Committed golden numbers must equal `calculate_period_variances` over live BigQuery (1 bulk RPC)."""
-    from edgar_capstone.agents.tool_runtime import tool_turn_context
     from edgar_capstone.agents.tools import get_active_gcp_tool_adapters
+    from edgar_capstone.agents.tools.runtime import tool_turn_context
 
     with_variances = [item for item in golden_items if item.expected_variances]
     all_tickers = {ev.ticker for item in with_variances for ev in item.expected_variances}
@@ -853,9 +853,9 @@ def test_golden_subset_runs_end_to_end_with_scripted_llms(
     from google.adk.models.llm_response import LlmResponse
     from google.genai import types as genai_types
 
-    from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
-    from edgar_capstone.agents.context_memory import FINANCIAL_REASONING_MODEL
     from edgar_capstone.agents.evaluation import evaluate_variance_explanation
+    from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+    from edgar_capstone.agents.runtime.model_config import FINANCIAL_REASONING_MODEL
     from tests.structured_report_helpers import (
         ScriptedBaseLlm,
         ScriptedJudgeLlm,

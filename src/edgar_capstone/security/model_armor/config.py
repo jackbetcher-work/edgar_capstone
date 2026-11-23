@@ -118,7 +118,7 @@ def _load_policy_from_yaml_file() -> dict[str, Any] | None:
 def _load_guardrail_policy_dict() -> dict[str, Any]:
     """Load versioned Model Armor & projection filter policy from prompt store or YAML asset."""
     try:
-        from edgar_capstone.agents.prompt_store import get_prompt_store
+        from edgar_capstone.agents.prompts.store import get_prompt_store
 
         artifact = get_prompt_store().load_prompt_artifact("model_armor_policy")
         policy = artifact.raw_metadata.get("policy")

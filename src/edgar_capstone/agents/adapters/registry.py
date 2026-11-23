@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from edgar_capstone.agents.resilience import (
+from edgar_capstone.agents.core.resilience import (
     RateLimitExceededError,
     ToolExecutionError,
     UpstreamTimeoutError,

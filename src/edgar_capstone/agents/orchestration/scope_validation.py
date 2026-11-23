@@ -19,7 +19,7 @@ import re
 from datetime import date
 from typing import Any
 
-from edgar_capstone.agents.schemas import CoverageNotice
+from edgar_capstone.agents.core.schemas import CoverageNotice
 from edgar_capstone.common.domain import lookup_year_key, normalize_edgar_ticker
 
 MIN_CORPUS_YEAR = 2020

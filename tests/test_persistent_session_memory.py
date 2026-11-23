@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 import pytest
 
-from edgar_capstone.agents.context_memory import ConversationMemoryManager
+from edgar_capstone.agents.runtime.context_memory import ConversationMemoryManager
 from edgar_capstone.telemetry import (
     FirestoreSessionStore,
     TelemetryConfig,

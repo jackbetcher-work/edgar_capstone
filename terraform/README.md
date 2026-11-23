@@ -25,7 +25,7 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `v_financial_variances_yoy`: Deterministic YoY variance SQL view built over the **native clustered `financial_metrics` table** (`revenue`, `operating_income`, `net_income`, `research_and_development` deltas and percentages, `rd_intensity_pct`, plus `metric_provenance`).
   - `v_filing_chunk_coverage`: Per-filing (`profile_id`, `ticker`, `fiscal_year`) diagnostic view over native `financial_metrics` and `filing_chunks` reporting exact `item_1a_chunks`, `item_7_chunks`, `valid_embedding_chunks`, and `filing_chunk_status`.
   - `v_chunk_health_metrics`: Chunk health monitoring SQL view over native `financial_metrics` and `filing_chunks` computing ROLLUP health metrics by `(gics_sector, section_id)` including `embedding_coverage_ratio`, `filing_coverage_ratio`, token/character percentiles (`p50`, `p95`), anomaly counts (`missing_embedding`, `dimension_mismatch`, `undersized`, `oversized`, `missing_metadata`), and composite `health_score` (`0–100`) & `health_status` (`HEALTHY`, `DEGRADED`, `UNHEALTHY`).
-  - `golden_eval_set` & `eval_results` (`terraform/evals.tf`): Golden dataset ground-truth table (`63` rows across 6 categories) and regression eval run history table storing all 18 gate metrics (`numeric_citation_coverage`, `selective_display_accuracy`, `metadata_filter_correctness`, `retrieval_precision_at_10`, `wording_delta_accuracy`, `anomaly_flag_recall`, `scope_and_coverage_accuracy`, `judge_citation_precision`, `unsupported_claims_total`, `p95_ttft_ms`, etc.).
+  - `golden_eval_set` & `eval_results` (`terraform/evals.tf`): Golden dataset ground-truth table (`30` rows across 6 categories) and regression eval run history table storing all 18 gate metrics (`numeric_citation_coverage`, `selective_display_accuracy`, `metadata_filter_correctness`, `retrieval_precision_at_10`, `wording_delta_accuracy`, `anomaly_flag_recall`, `scope_and_coverage_accuracy`, `judge_citation_precision`, `unsupported_claims_total`, `p95_ttft_ms`, etc.).
 - **BigQuery Streaming Telemetry & Audit Sinks + Cloud Logging Sink (`terraform/telemetry.tf`, `terraform/schemas/*.json`):**
   - `llm_telemetry_events`: Day-partitioned (`recorded_at`), clustered (`model_name, agent_name, task_category`) sink table capturing per-call cached/uncached input tokens, output/thoughts tokens, USD token cost, cached-token discount savings, prefill/decode/TTFT latency, and the request `trace_id`.
   - `session_telemetry_events`: Day-partitioned (`recorded_at`), clustered (`intent, execution_mode, user_id`) sink table capturing conversational session length, cumulative companies analyzed, report generation counts, ADK tool invocations, and turn latency/cost.
@@ -34,16 +34,16 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `v_session_analytics_summary`: Daily × `intent` × `execution_mode` rollup over `session_telemetry_events` that keeps interactive turns (`execution_mode != 'async_evaluation'`: turn counts, latency, cost, fact-check rate) separate from async judge rows (`avg_evaluation_score` / `p50_evaluation_score` over scored rows only; `pending` `NULL` scores excluded).
   - `v_security_audit_summary`: Daily × `event_type` × `status` × `identity_provider` rollup over `security_audit_logs` (total, `denied_401` / `denied_403`, blocked, distinct principals, SPIFFE S2S attested, IAP-verified, distinct traces).
   - `google_project_iam_custom_role.bigquery_telemetry_sink_writer` (`secEdgarTelemetrySinkAppend`): Least-privilege custom role (`bigquery.tables.get`, `bigquery.tables.updateData`) bound via `google_bigquery_table_iam_member` strictly on the 3 append-only sink tables (keeping dataset-wide `financial_metrics` and `filing_chunks` read-only for `sec-analyst-sa`).
-  - `google_logging_project_sink.telemetry_and_audit_to_bigquery` (`sec-edgar-telemetry-audit-bq-sink`): Project-level Cloud Logging sink exporting structured `sec-edgar-telemetry-sink` LogEntries into partitioned tables in the **dedicated `google_bigquery_dataset.sec_edgar_ops_logs`** dataset (`ops_logs_dataset_id`, default `sec_edgar_ops_logs`, `us-central1`, partition expiry `ops_logs_retention_days` = 90). `google_bigquery_dataset_iam_member.logging_sink_ops_logs_writer` grants the sink writer identity `roles/bigquery.dataEditor` **on that dataset only** (it needs `bigquery.tables.create` to auto-create log tables). The sink has no grant on `sec_edgar`, so `financial_metrics` / `filing_chunks` stay read-only. This replaces the earlier `sec_edgar` destination, which failed with `dataset_permission_denied`.
-  - Cloud Run label hygiene: Cloud Logging copies Cloud Run labels onto each LogEntry, and the BigQuery sink maps `-` to `_`, so `managed-by` (the deploy-cloudrun default) collided with `managed_by` (`var.labels`) as `table_invalid_schema`. `var.labels` now has validations rejecting colliding or hyphenated `managed-by` / `commit-sha` keys. `.github/workflows/deploy.yml` (`skip_default_labels: true`, `commit_sha` / `deployed_by` labels) and `cloudbuild.yaml` (`--update-labels`) deploy with underscore labels and `--remove-labels=managed-by,commit-sha`.
+  - `google_logging_project_sink.telemetry_and_audit_to_bigquery` (`sec-edgar-telemetry-audit-bq-sink`): Project-level Cloud Logging sink exporting structured `sec-edgar-telemetry-sink` LogEntries into partitioned tables in the **dedicated `google_bigquery_dataset.sec_edgar_ops_logs`** dataset (`ops_logs_dataset_id`, default `sec_edgar_ops_logs`, `us-central1`, partition expiry `ops_logs_retention_days` = 90). `google_bigquery_dataset_iam_member.logging_sink_ops_logs_writer` grants the sink writer identity `roles/bigquery.dataEditor` **on that dataset only** (so it can create partitioned log tables while `sec_edgar.financial_metrics` and `filing_chunks` remain read-only).
+  - Cloud Run label hygiene: Cloud Logging copies Cloud Run labels onto each LogEntry and the BigQuery sink normalizes `-` to `_`. `var.labels` validates against keys that collide after normalization (including hyphenated `managed-by` / `commit-sha`), and both `.github/workflows/deploy.yml` (`skip_default_labels: true`, `commit_sha` / `deployed_by` labels) and `cloudbuild.yaml` (`--update-labels`) deploy with underscore labels.
 - **Google Cloud Firestore Persistent Feedback & Session Store (`terraform/telemetry.tf`):**
   - `google_firestore_database.analyst_feedback_db`: Regional `FIRESTORE_NATIVE` database (`(default)`) persisting both analyst thumbs-up/down ratings (`analyst_feedback` collection) and multi-turn conversational sessions (`analyst_sessions` collection, keyed by deterministic SHA-256 of `(user_id, session_id)`), with `roles/datastore.user` granted to `sec-analyst-sa`.
 - **Model Armor & Cloud SDP Templates (`terraform/model_armor.tf`):**
   - `sec-edgar-analyst-armor` (`google_model_armor_template`), `sec-edgar-sdp-inspect` (`google_data_loss_prevention_inspect_template`), and `sec-edgar-sdp-deidentify` (`google_data_loss_prevention_deidentify_template`).
   - `sec-edgar-sdp-inspect` uses `min_likelihood = "LIKELY"` and includes an explicit `EMAIL_ADDRESS` exclusion `rule_set` exempting `.*@.*\.iam\.gserviceaccount\.com$` and `.*@(sec\.gov|.*\.googleapis\.com)$` so service-account emails stay intact while personal emails, SSNs, phones, and credentials are redacted.
 - **Vertex AI Vector Search (`terraform/vector_search.tf`):**
-  - `sec-edgar-10k-chunks-index` (`google_vertex_ai_index`) and `sec-edgar-10k-chunks-endpoint` (`google_vertex_ai_index_endpoint`) remain provisioned (zero destroys on existing idle resources), with `deploy_vertex_vector_index = false` by default.
-  - Runtime hybrid retrieval intentionally uses **BigQuery `VECTOR_SEARCH`** over native `sec_edgar.filing_chunks` (342,945 pre-computed 768-d embeddings) in parallel with **Vertex AI Search** — avoiding ~$50–70/mo of idle deployed replica charges and PSC fallback timeouts while eliminating the unused `google-cloud-aiplatform` runtime dependency.
+  - Defines `sec-edgar-10k-chunks-index` (`google_vertex_ai_index`) and `sec-edgar-10k-chunks-endpoint` (`google_vertex_ai_index_endpoint`), with `deploy_vertex_vector_index = false` by default.
+  - Runtime hybrid retrieval uses **BigQuery `VECTOR_SEARCH`** over native `sec_edgar.filing_chunks` (768-d pre-computed embeddings) in parallel with **Vertex AI Search**.
 - **Vertex AI Search / Discovery Engine (`terraform/vector_search.tf`):**
   - `sec-edgar-10k-corpus-ds` (`google_discovery_engine_data_store`) & `sec-edgar-10k-hybrid-search` (`google_discovery_engine_search_engine`): Unstructured 10-K search datastore and Enterprise LLM-enabled search app.
 - **Google Cloud Monitoring Chunk Health View (`terraform/monitoring.tf`):**
@@ -58,7 +58,7 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
 - **BigQuery Cloud Resource Connection (`vertex-ai-rag-conn`):** Granted `roles/aiplatform.user` and `roles/storage.objectViewer` on the SEC corpus bucket.
 - **Gemini models & APIs (`terraform/variables.tf`, `terraform/apis.tf`):**
   - `financial_reasoning_model` (default `gemini-3.8-flash`), `coding_and_evaluation_model` (`gemini-3.8-flash`, `ThinkingLevel.LOW`), `compaction_and_mapping_model` (`gemini-3.5-flash-lite`), and `gemini_location` (`global`) become Cloud Run's `EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`, `EDGAR_LITE_MODEL`, and `EDGAR_GEMINI_LOCATION`. The Cloud Build triggers pass the same values.
-  - The project can't reach `gemini-2.5-pro`, and both Flash models are served only from the `global` endpoint. BigQuery, GCS, Model Armor, and embeddings stay in `var.region`.
+  - Gemini models are served from the `global` endpoint (`var.gemini_location`), while BigQuery, GCS, Model Armor, and embeddings run in `var.region`.
   - `serviceconsumermanagement.googleapis.com` is enabled because Vertex AI context caching needs it to provision its tenant project.
 - **Observability (`terraform/observability.tf`, `terraform/monitoring.tf`):**
   - `google_logging_metric.api_request_latencies`: log-based distribution metric (`logging.googleapis.com/user/sec_edgar/api_request_latencies`) built from `http_request_completed` access logs (including error responses), labeled by route, method, and status, with trace exemplars.
@@ -70,18 +70,18 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
     - `api_5xx_errors`: PromQL on `…api_request_latencies_count{http_status=~"5.."}`, at least `api_5xx_alert_threshold` (default `5`) per 5 min.
     - `security_audit_blocks`: `security_audit_events` with `status` matching `denied_40[13]|blocked.*` above `security_block_alert_threshold` (default `20`) per 5 min.
   - Dashboards:
-    - `chunk_health_dashboard` (unchanged): chunk health plus Row 5 API p50/p95/p99.
+    - `chunk_health_dashboard`: chunk health plus Row 5 API p50/p95/p99.
     - `llm_observability_dashboard` (*SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit*): a Markdown navigation tile (Trace Explorer, Logs Explorer, Error Reporting, Chunk Health dashboard, BigQuery Studio + SQL recipes); API rate, status class, and latency; LLM TTFT and latency; calls, cache hits, and TTFT SLO; tokens; approximate USD; turns by intent and fact-check; judge score; audit events by type and status; three logs panels (errors, security audit, LLM telemetry); and sink export errors.
     - Outputs: `llm_observability_dashboard_id` / `_url`, `chunk_health_monitoring_dashboard_url`, `observability_log_based_metrics`, `observability_alert_policy_ids`, `session_analytics_summary_view_fqn`, `security_audit_summary_view_fqn`, `ops_logs_dataset_id`, `logging_sink_writer_identity`.
   - The three telemetry tables carry a nullable `trace_id` column. See [`docs/observability.md`](../docs/observability.md).
 - **CI Live Test Access (`terraform/ci_live_test_access.tf`):**
-  - Applied live bindings granting `sec-edgar-cicd-sa` (and Cloud Build runner when enabled) read access to BigQuery `sec_edgar`, `golden_eval_set`, `sec_corpus` bucket, Discovery Engine, Vertex AI, Model Armor, DLP, and append-only write access to `eval_results`.
+  - IAM bindings granting `sec-edgar-cicd-sa` (and the Cloud Build runner when enabled) read access to BigQuery `sec_edgar`, `golden_eval_set`, `sec_corpus` bucket, Discovery Engine, Vertex AI, Model Armor, DLP, and append-only write access to `eval_results`.
 - **Role-Based Access Control via Cloud Identity Groups (`terraform/iam.tf`, `terraform/iap_and_sso.tf`):**
   - `google_cloud_identity_group.rbac_groups`: Optional provisioning of Google Cloud Identity security groups (`sec-edgar-admins`, `sec-edgar-analysts`, `sec-edgar-viewers`), plus variable validation strictly prohibiting individual `user:` bindings.
   - Group-scoped IAM bindings (`group:<group-id>@<domain>`) across IAP (`roles/iap.httpsResourceAccessor`), BigQuery (`roles/bigquery.dataViewer` / `roles/bigquery.metadataViewer`), Discovery Engine (`roles/discoveryengine.viewer`), and Cloud Run/Logging/Monitoring observability for Admins.
 - **App access through IAP (`terraform/iap_and_sso.tf`, `terraform/cicd_and_secrets.tf`, `terraform/load_balancer.tf`):**
   - `cloud_run_access_mode = "iap_direct"` (default): `iap_enabled = true` on the Cloud Run service (google-beta provider). Users open the `app_url` output (`run.app`) and sign in with Google. `google_iap_web_cloud_run_service_iam_member` grants `roles/iap.httpsResourceAccessor` to each `iap_authorized_principals` entry (`group:` or `domain:`). No load balancer is created.
-  - `cloud_run_access_mode = "load_balancer"`: ingress `internal-and-cloud-load-balancing` behind the external HTTPS LB, with IAP on the serverless-NEG backend service and a `RESTRICTED` / TLS 1.2+ SSL policy (`min_tls_version = "TLS_1_2"`, because GCP Compute Engine SSL Policy rejects `TLS_1_3`; Google Front End negotiates TLS 1.3 automatically for modern clients).
+  - `cloud_run_access_mode = "load_balancer"`: ingress `internal-and-cloud-load-balancing` behind the external HTTPS LB, with IAP on the serverless-NEG backend service and a `RESTRICTED` / TLS 1.2+ SSL policy (`min_tls_version = "TLS_1_2"`; Google Front End negotiates TLS 1.3 automatically for supported clients).
   - In both modes only the IAP service agent has `roles/run.invoker`. The IAP JWT audience for the active mode is written to the `sec-edgar-iap-audience` secret.
 - **Private networking for Vector Search (`terraform/network.tf`, PSC mode only):**
   - `google_compute_network.sec_edgar` (`sec-edgar-analyst-vpc`, custom mode) and `google_compute_subnetwork.sec_edgar_private` (`private_subnet_cidr`, default `10.20.0.0/24`, Private Google Access on).
@@ -97,7 +97,7 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `context-cache-agent-sa`: `ContextCacheManager` / `ContextCacheAgent` identity (bucket-scoped `roles/storage.objectViewer` on `sec_corpus_bucket`, `roles/aiplatform.user`; zero BigQuery, Discovery Engine, or Secret Manager access).
   - `model-armor-guardrail-sa`: `ModelArmorGuardrail` identity (`roles/aiplatform.user` and `roles/logging.logWriter` only; zero data plane access).
   - Directed S2S `roles/iam.serviceAccountTokenCreator` edges (`sec-analyst-sa` -> agents, `RootOrchestrator` -> sub-agents, `FinancialAnalystAgent` -> `ContextCacheAgent` / `ModelArmorGuardrail`).
-  - *Note:* `root-orchestrator-agent-sa` and `context-cache-agent-sa` remain provisioned in Terraform and enforced in `security/agent_identity.py` for SPIFFE S2S workload identity attestation and IAM compatibility even though the unused legacy `RootOrchestrator` and `ContextCacheAgent` ADK classes were retired.
+  - All four service accounts are enforced in `security/agent_identity.py` for SPIFFE S2S workload identity attestation.
 - **Google Cloud Secret Manager & Keyless CI/CD Pipeline (`terraform/cicd_and_secrets.tf`):**
   - `google_secret_manager_secret.managed_secrets`: Provisions `sec-edgar-user-agent`, `sec-edgar-gemini-api-key`, and `sec-edgar-iap-audience` with automatic replication and zero plaintext secret values in IaC.
   - `google_artifact_registry_repository.sec_edgar_repo`: Docker container repository (`us-central1-docker.pkg.dev/iron-radio-514217-q7/sec-edgar-repo`).
@@ -120,7 +120,7 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
     #    cloudbuild_github_app_installation_id = <installation-id>
     terraform apply
     ```
-  - Not enabled in the project yet: no triggers exist, so deploys currently go through manual `gcloud builds submit` (or GitHub Actions with `DEPLOY_WITH_GITHUB_ACTIONS=true`).
+  - Disabled by default (`enable_cloudbuild_trigger = false`); deployments can also run via `gcloud builds submit` or GitHub Actions (`DEPLOY_WITH_GITHUB_ACTIONS=true`).
 
 ## Usage
 
@@ -146,13 +146,11 @@ terraform apply
 # (Already-built artifacts: publish without re-embedding)
 ../.venv/bin/python ../scripts/build_vector_db.py --upload-only
 
-# 4. Backfill R&D onto older profiles, load native financial_metrics, and import Vertex AI Search
+# 4. Backfill R&D metrics, load native financial_metrics, and import Vertex AI Search
 cd .. && make backfill-rd publish-financials index-vertex-search
 ```
 
 `seed_vertex_vector_index` defaults to `true`, so the `terraform apply` in step 2 attaches `vector_search/embeddings/` to the Vector Search index. In a fresh project, pass `-var=seed_vertex_vector_index=false` until the embeddings are uploaded.
-
-Current live state (2026-11-17): Terraform apply completed (`13 added, 7 changed, 0 destroyed`). The full corpus (501 tickers, 3,022 profiles, 342,945 Vertex-embedded chunks) is published in BigQuery (`financial_metrics` native table, `filing_chunks`) and Vertex AI Search (`sec-edgar-10k-corpus-ds`). Views (`v_financial_variances_yoy`, `v_filing_chunk_coverage`, `v_chunk_health_metrics`) query the native clustered `financial_metrics` table. `golden_eval_set` (43 rows) and `eval_results` tables, `api_request_latencies` metric, `api_latency_p95` alert policy, dashboard Row 5, `sec_edgar_sdp_inspect` service-account exclusion rules, and CI IAM bindings (`ci_live_test_access.tf`) are all live. `deploy_vertex_vector_index` defaults to `false` (runtime uses BigQuery `VECTOR_SEARCH` + Vertex AI Search).
 
 ## Example Metadata-Filtered RAG Query (`VECTOR_SEARCH`)
 

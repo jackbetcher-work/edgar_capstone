@@ -18,14 +18,15 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
 
-from edgar_capstone.agents import (
-    get_context_latency_tracker,
-    get_conversation_memory_manager,
+from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.prompts.builders import build_financial_reasoning_prompt
+from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
+from edgar_capstone.agents.tools.sec_tools import (
+    get_full_10k_section,
+    load_cached_10k_section,
     query_cached_10k_context,
 )
-from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
-from edgar_capstone.agents.live_runtime import _build_financial_reasoning_prompt
-from edgar_capstone.agents.tools import get_full_10k_section, load_cached_10k_section
 from tests.structured_report_helpers import (
     ScriptedBaseLlm,
     finding_from_citation,
@@ -41,7 +42,7 @@ _RETRIEVAL_TOOLS = {
 
 def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() -> None:
     long_excerpt = "Data center revenue grew on Blackwell demand. " * 40
-    prompt = _build_financial_reasoning_prompt(
+    prompt = build_financial_reasoning_prompt(
         query="Why did NVIDIA's operating income grow faster than revenue?",
         intent="longitudinal_single_company",
         scope={
@@ -325,7 +326,7 @@ def test_qualitative_turn_retrieval_and_citations_resolve_without_variances(
 
 
 def test_judge_sees_the_passages_the_report_cites() -> None:
-    from edgar_capstone.agents.live_runtime import select_citations_for_judge
+    from edgar_capstone.agents.runtime.live_runtime import select_citations_for_judge
 
     citations = [
         {"chunk_id": f"NVDA_2026_item_1a_{i:04d}", "excerpt": "x" * 5000} for i in range(40)
@@ -416,7 +417,7 @@ def test_retrieval_budget_short_circuits_tools_after_limit(
 ) -> None:
     from types import SimpleNamespace
 
-    from edgar_capstone.agents.callbacks import retrieval_budget_before_tool_callback
+    from edgar_capstone.agents.runtime.callbacks import retrieval_budget_before_tool_callback
 
     monkeypatch.setenv("EDGAR_ANALYST_RETRIEVAL_BUDGET", "2")
     ctx = SimpleNamespace(state={})

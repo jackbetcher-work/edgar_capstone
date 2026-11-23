@@ -22,17 +22,21 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
 
-from edgar_capstone.agents import get_context_latency_tracker, get_conversation_memory_manager
-from edgar_capstone.agents.chat_engine import _get_entity_catalog, run_conversational_rag_turn
-from edgar_capstone.agents.prompt_builders import build_financial_reasoning_prompt
-from edgar_capstone.agents.schemas import AnalystReport
-from edgar_capstone.agents.scope_validation import build_coverage_notices
-from edgar_capstone.agents.sector_tool import sector_thematic_map_reduce
-from edgar_capstone.agents.structured_report import (
+from edgar_capstone.agents.core.schemas import AnalystReport
+from edgar_capstone.agents.evaluation.structured_report import (
     render_analyst_report_markdown,
     verify_analyst_report,
 )
-from edgar_capstone.agents.tool_runtime import (
+from edgar_capstone.agents.orchestration.chat_engine import (
+    _get_entity_catalog,
+    run_conversational_rag_turn,
+)
+from edgar_capstone.agents.orchestration.scope_validation import build_coverage_notices
+from edgar_capstone.agents.prompts.builders import build_financial_reasoning_prompt
+from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
+from edgar_capstone.agents.tools import calculate_period_variances
+from edgar_capstone.agents.tools.runtime import (
     STATE_CALCULATED_VARIANCES,
     STATE_DISCLOSURE_DELTAS,
     STATE_MATERIAL_FLAG_SUMMARY,
@@ -43,7 +47,7 @@ from edgar_capstone.agents.tool_runtime import (
     tool_turn_context,
     turn_scoped_state_seed,
 )
-from edgar_capstone.agents.tools import calculate_period_variances
+from edgar_capstone.agents.tools.sector_tool import sector_thematic_map_reduce
 from tests.fake_gcp import use_fake_gcp_adapters
 from tests.structured_report_helpers import (
     ScriptedBaseLlm,
@@ -216,7 +220,7 @@ def test_variance_tool_reuses_cached_catalog_inside_a_turn() -> None:
     direct = calculate_period_variances(tickers="AAPL", start_year=2024, end_year=2026)
     with (
         patch(
-            "edgar_capstone.agents.tools._gcp_adapters",
+            "edgar_capstone.agents.tools.sec_tools._gcp_adapters",
             side_effect=AssertionError("cached turn catalog must avoid BigQuery RPCs"),
         ),
         tool_turn_context(cached_profiles=profiles),
@@ -583,7 +587,7 @@ def test_sector_wide_thematic_turn_runs_map_reduce_tool_with_sse_progress() -> N
     stages: list[str] = []
     sentinel_map_llm = object()
     with patch(
-        "edgar_capstone.agents.sector_map_reduce.run_sector_thematic_map_reduce",
+        "edgar_capstone.agents.tools.sector_map_reduce.run_sector_thematic_map_reduce",
         side_effect=_fake_map_reduce,
     ):
         turn = run_conversational_rag_turn(
@@ -623,7 +627,7 @@ def test_sector_tool_requires_a_sector_and_writes_full_payload_to_state() -> Non
     )
     ctx = SimpleNamespace(state={})
     with patch(
-        "edgar_capstone.agents.sector_map_reduce.run_sector_thematic_map_reduce",
+        "edgar_capstone.agents.tools.sector_map_reduce.run_sector_thematic_map_reduce",
         side_effect=lambda **kw: _fake_sector_payload(
             kw["gics_sector"], kw["start_year"], kw["end_year"]
         ),
@@ -647,7 +651,7 @@ def test_sector_tool_requires_a_sector_and_writes_full_payload_to_state() -> Non
 
 @pytest.mark.parametrize("explain", [True, False])
 def test_flag_tool_attaches_optional_explanations_and_summary_to_state(explain: bool) -> None:
-    from edgar_capstone.agents.material_variances import flag_material_variances
+    from edgar_capstone.agents.tools.material_variances import flag_material_variances
 
     ctx = SimpleNamespace(state={})
     res = flag_material_variances(
@@ -684,8 +688,8 @@ def test_compact_tool_returns_shrink_llm_payloads_while_keeping_full_session_sta
     """Variance, anomaly, and disclosure-delta tools return compact digests when tool_context is set."""
     import json
 
-    from edgar_capstone.agents.disclosure_deltas import compare_disclosures_across_years
-    from edgar_capstone.agents.material_variances import flag_material_variances
+    from edgar_capstone.agents.tools.disclosure_deltas import compare_disclosures_across_years
+    from edgar_capstone.agents.tools.material_variances import flag_material_variances
 
     # 1. calculate_period_variances
     full_var = calculate_period_variances(tickers="NVDA", start_year=2024, end_year=2026)
@@ -742,8 +746,8 @@ def test_compact_tool_returns_shrink_llm_payloads_while_keeping_full_session_sta
 
 def test_compare_disclosures_reuses_cached_profiles_and_batches_chunks_without_gcs() -> None:
     """Disclosure deltas use cached profiles + 1 batched BQ chunk query with 0 GCS downloads."""
-    from edgar_capstone.agents.disclosure_deltas import compare_disclosures_across_years
     from edgar_capstone.agents.tools import get_active_gcp_tool_adapters
+    from edgar_capstone.agents.tools.disclosure_deltas import compare_disclosures_across_years
 
     _, profiles = _get_entity_catalog(allow_fetch=True)
     adapters = get_active_gcp_tool_adapters()
@@ -792,7 +796,7 @@ def test_chat_prepass_overlaps_memory_guardrail_and_catalog_in_parallel() -> Non
     """Memory recall, Model Armor prompt check, and entity catalog fetch run concurrently."""
     import threading
 
-    from edgar_capstone.agents import chat_engine
+    from edgar_capstone.agents.orchestration import chat_engine
     from edgar_capstone.security.model_armor import get_model_armor_guardrail
 
     _reset()

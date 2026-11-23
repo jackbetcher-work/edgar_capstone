@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from edgar_capstone.agents.chat_engine import resolve_query_scope
-from edgar_capstone.agents.scope_validation import (
+from edgar_capstone.agents.orchestration.chat_engine import resolve_query_scope
+from edgar_capstone.agents.orchestration.scope_validation import (
     SECTOR_ALIASES,
     EntityCatalog,
     build_coverage_notices,

@@ -22,8 +22,11 @@ import httpx
 
 from edgar_capstone.agents.adapters import registry as adapter_registry
 from edgar_capstone.agents.adapters.registry import GcpToolAdapters, GcpToolConfig
-from edgar_capstone.agents.chat_engine import _ENTITY_CATALOG_CACHE
-from edgar_capstone.agents.tools import _SECTION_CHUNKS_CACHE, _SESSION_10K_CONTEXT_CACHE
+from edgar_capstone.agents.orchestration.chat_engine import _ENTITY_CATALOG_CACHE
+from edgar_capstone.agents.tools.sec_tools import (
+    _SECTION_CHUNKS_CACHE,
+    _SESSION_10K_CONTEXT_CACHE,
+)
 from edgar_capstone.dataset.extractor import format_combined_10k_markdown
 
 EMBEDDING_DIMS = 768

@@ -7,15 +7,15 @@ from typing import Any
 
 import pytest
 
-from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
-from edgar_capstone.agents.schemas import AnalystFinding, AnalystReport
-from edgar_capstone.agents.structured_report import (
+from edgar_capstone.agents.core.schemas import AnalystFinding, AnalystReport
+from edgar_capstone.agents.evaluation.structured_report import (
     extract_figures,
     parse_analyst_report,
     render_analyst_report_markdown,
     verify_analyst_report,
 )
-from edgar_capstone.agents.tools import _build_variance_reports_from_profiles
+from edgar_capstone.agents.runtime.callbacks import verify_narrative_against_calculations
+from edgar_capstone.agents.tools.variance_engine import _build_variance_reports_from_profiles
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.security.model_armor import schema_safe_block_text
 from tests.fake_gcp import use_fake_gcp_adapters

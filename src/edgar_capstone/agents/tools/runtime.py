@@ -2,7 +2,7 @@
 
 `FinancialAnalystAgent` decides which deterministic engines a question needs
 (`calculate_period_variances`, `flag_material_variances`, `compare_disclosures_across_years`,
-`sector_thematic_map_reduce`, `query_looker_financial_explore`). Each tool writes its full,
+`sector_thematic_map_reduce`, `query_analytics_view`). Each tool writes its full,
 deterministic output into ADK `session_state` under the keys below, and the chat pipeline
 hydrates those outputs back (`hydrate_tool_outputs`) BEFORE claim verification, Markdown
 rendering, and the numeric fact-check run. Nothing is pre-computed for the agent.
@@ -44,7 +44,8 @@ STATE_DISCLOSURE_DELTA_SUMMARY = "disclosure_delta_summary"
 STATE_SECTOR_COVERAGE = "sector_coverage"
 STATE_SECTOR_MAP_SUMMARIES = "sector_map_summaries"
 STATE_CHUNK_HEALTH = "chunk_health"
-STATE_LOOKER_RESULTS = "looker_query_results"
+STATE_ANALYTICS_VIEW_RESULTS = "analytics_view_results"
+STATE_LOOKER_RESULTS = STATE_ANALYTICS_VIEW_RESULTS  # backward-compatible alias
 STATE_RETRIEVED_CITATIONS = "retrieved_citations"
 
 # Deterministic engines whose outputs surface as UI payloads (cards, badges, XBRL chips).
@@ -54,6 +55,7 @@ DETERMINISTIC_TOOL_NAMES: frozenset[str] = frozenset(
         "flag_material_variances",
         "compare_disclosures_across_years",
         "sector_thematic_map_reduce",
+        "query_analytics_view",
         "query_looker_financial_explore",
         "fetch_financial_metrics",
     }
@@ -265,7 +267,7 @@ def turn_scoped_state_seed(
         STATE_SECTOR_COVERAGE: p.sector_coverage,
         STATE_SECTOR_MAP_SUMMARIES: p.sector_map_summaries,
         STATE_CHUNK_HEALTH: p.chunk_health,
-        STATE_LOOKER_RESULTS: (
+        STATE_ANALYTICS_VIEW_RESULTS: (
             [
                 {
                     "status": "success",
@@ -295,7 +297,7 @@ def hydrate_tool_outputs(session_state: dict[str, Any] | None) -> ToolOutputs:
     chunk_health = state.get(STATE_CHUNK_HEALTH)
 
     benchmarks: list[dict[str, Any]] = []
-    for res in state.get(STATE_LOOKER_RESULTS) or []:
+    for res in state.get(STATE_ANALYTICS_VIEW_RESULTS) or []:
         if (
             isinstance(res, dict)
             and res.get("status") == "success"
@@ -321,6 +323,7 @@ def hydrate_tool_outputs(session_state: dict[str, Any] | None) -> ToolOutputs:
 
 __all__ = [
     "DETERMINISTIC_TOOL_NAMES",
+    "STATE_ANALYTICS_VIEW_RESULTS",
     "STATE_CALCULATED_VARIANCES",
     "STATE_CHUNK_HEALTH",
     "STATE_DISCLOSURE_DELTAS",

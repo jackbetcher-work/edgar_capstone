@@ -24,21 +24,23 @@ from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
 import edgar_capstone.security.model_armor as model_armor_mod
-from edgar_capstone.agents import (
+from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.prompts.store import (
     VersionedPromptStore,
     configure_prompt_store,
-    create_financial_analyst_agent,
-    create_narrative_evaluator_agent,
-    get_context_latency_tracker,
-    get_conversation_memory_manager,
     get_prompt_store,
     load_agent_prompt,
     load_agent_prompt_artifact,
     make_adk_instruction_provider,
     reset_prompt_store,
-    run_adk_agent_stream,
 )
-from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.runtime.factories import (
+    create_financial_analyst_agent,
+    create_narrative_evaluator_agent,
+)
+from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
+from edgar_capstone.agents.runtime.live_runtime import run_adk_agent_stream
 from edgar_capstone.security import (
     GcpAgentIamCredentialsClient,
     ModelArmorConfig,
@@ -174,7 +176,7 @@ def test_model_armor_v1_gcp_rest_client_s2s_token_and_429_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify regional Model Armor v1 wire calls, S2S downscoped token auth, and HTTP 429 retries."""
-    monkeypatch.setattr("edgar_capstone.agents.resilience.time.sleep", lambda _s: None)
+    monkeypatch.setattr("edgar_capstone.agents.core.resilience.time.sleep", lambda _s: None)
     seen_urls: list[str] = []
     seen_headers: list[dict[str, str]] = []
     attempt_counter = {"sanitize_prompt": 0}
@@ -309,7 +311,7 @@ def test_model_armor_strict_gcp_mode_fails_closed_on_upstream_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """In strict `gcp` mode, upstream API failures must fail closed rather than bypassing safety."""
-    monkeypatch.setattr("edgar_capstone.agents.resilience.time.sleep", lambda _s: None)
+    monkeypatch.setattr("edgar_capstone.agents.core.resilience.time.sleep", lambda _s: None)
 
     def _failing_handler(req: httpx.Request) -> httpx.Response:
         _ = req
@@ -562,7 +564,7 @@ def test_versioned_prompt_store_local_gcs_and_vertex_backends(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Verify `VersionedPromptStore` across `local` (`prompts/`), `gcs`, and `vertex` backends."""
-    monkeypatch.setattr("edgar_capstone.agents.resilience.time.sleep", lambda _s: None)
+    monkeypatch.setattr("edgar_capstone.agents.core.resilience.time.sleep", lambda _s: None)
     # 1. Local `prompts/` registry & SHA-256 verification
     default_store = get_prompt_store()
     registered_entries = default_store.list_registered_prompts()
@@ -828,7 +830,7 @@ def test_model_armor_config_fail_closed_invalid_mode_and_yaml_fallback(
     assert ma_cfg_mod._load_policy_from_yaml_file() is policy_from_file
 
     monkeypatch.setattr(
-        "edgar_capstone.agents.prompt_store.get_prompt_store",
+        "edgar_capstone.agents.prompts.store.get_prompt_store",
         lambda: (_ for _ in ()).throw(RuntimeError("store unavailable")),
     )
     fallback_policy = ma_cfg_mod._load_guardrail_policy_dict()
@@ -873,7 +875,7 @@ def test_dlp_retry_429_and_skip_when_model_armor_already_ran_sdp(
     """Cloud DLP `:deidentify` retries 429; skipped when Model Armor already ran SDP successfully."""
     from edgar_capstone.security.model_armor.client import ModelArmorClient
 
-    monkeypatch.setattr("edgar_capstone.agents.resilience.time.sleep", lambda _s: None)
+    monkeypatch.setattr("edgar_capstone.agents.core.resilience.time.sleep", lambda _s: None)
     attempts = [0]
 
     def _dlp_handler(request: httpx.Request) -> httpx.Response:
@@ -1030,7 +1032,7 @@ def test_prompt_store_latest_resolution_fallback_and_document_parsing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Resolve `latest` dynamically for GCS/Vertex, verify 404/500 fallback, and cover parsers."""
-    from edgar_capstone.agents.prompt_store import (
+    from edgar_capstone.agents.prompts.store import (
         GcsPromptStoreBackend,
         LocalPromptStoreBackend,
         VertexPromptStoreBackend,
@@ -1038,7 +1040,7 @@ def test_prompt_store_latest_resolution_fallback_and_document_parsing(
         _parse_prompt_document,
     )
 
-    monkeypatch.setattr("edgar_capstone.agents.resilience.time.sleep", lambda _s: None)
+    monkeypatch.setattr("edgar_capstone.agents.core.resilience.time.sleep", lambda _s: None)
     local_backend = LocalPromptStoreBackend()
     expected_tag = local_backend.load_registry()["prompts"]["financial_analyst"]["latest"]
     local_latest = load_agent_prompt_artifact("financial_analyst", version="latest")
@@ -1131,7 +1133,7 @@ def test_prompt_store_latest_resolution_fallback_and_document_parsing(
 
 def test_chat_engine_prompt_blocked_uses_nested_model_armor_dict() -> None:
     """Blocked chat turns expose nested `model_armor.prompt_inspection` metadata without crashing."""
-    from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
+    from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
 
     configure_model_armor_guardrail(config=ModelArmorConfig(mode="emulator"))
     try:

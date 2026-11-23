@@ -37,23 +37,8 @@ from typing import Any
 from google.adk.models.base_llm import BaseLlm
 from pydantic import ValidationError
 
-from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
-from edgar_capstone.agents.citations import merge_citations
-from edgar_capstone.agents.context_memory import (
-    get_context_latency_tracker,
-    resolve_model_for_task,
-)
-from edgar_capstone.agents.evaluation import (
-    evaluate_variance_explanation,
-    evaluate_variance_explanation_with_latency,
-)
-from edgar_capstone.agents.live_runtime import (
-    AdkStreamResult,
-    LiveRuntimeResolution,
-    resolve_live_adk_runtime,
-    run_live_adk_financial_reasoning,
-)
-from edgar_capstone.agents.schemas import (
+from edgar_capstone.agents.core.citations import merge_citations
+from edgar_capstone.agents.core.schemas import (
     AnalystReport,
     Cached10KExplanation,
     FactCheckVerification,
@@ -62,19 +47,32 @@ from edgar_capstone.agents.schemas import (
     ReActStep,
     VarianceEvaluationItem,
 )
-from edgar_capstone.agents.scope_validation import extend_coverage_notices
-from edgar_capstone.agents.structured_report import (
+from edgar_capstone.agents.evaluation.judge import (
+    evaluate_variance_explanation,
+    evaluate_variance_explanation_with_latency,
+)
+from edgar_capstone.agents.evaluation.structured_report import (
     ReportVerification,
     parse_analyst_report,
     render_analyst_report_markdown,
     verify_analyst_report,
 )
-from edgar_capstone.agents.tool_runtime import (
+from edgar_capstone.agents.orchestration.scope_validation import extend_coverage_notices
+from edgar_capstone.agents.runtime.callbacks import verify_narrative_against_calculations
+from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
+from edgar_capstone.agents.runtime.live_runtime import (
+    AdkStreamResult,
+    LiveRuntimeResolution,
+    resolve_live_adk_runtime,
+    run_live_adk_financial_reasoning,
+)
+from edgar_capstone.agents.runtime.model_config import resolve_model_for_task
+from edgar_capstone.agents.tools.runtime import (
     DETERMINISTIC_TOOL_NAMES,
     ToolOutputs,
     hydrate_tool_outputs,
 )
-from edgar_capstone.agents.tools import calculate_period_variances
+from edgar_capstone.agents.tools.sec_tools import calculate_period_variances
 from edgar_capstone.common.domain import RETRIEVAL_TOOL_NAMES, MetricName
 from edgar_capstone.common.formatting import fmt_bps, fmt_pct, fmt_usd
 from edgar_capstone.observability.tracing import current_trace_correlation, traced
@@ -256,6 +254,7 @@ def evaluate_calculated_variances(
     *,
     query: str = "",
     section_filter: str = "ALL",
+    include_targeted_queries: bool = True,
 ) -> list[VarianceEvaluationItem]:
     """Step 1 of ReAct reasoning: evaluate deterministic variances to isolate drivers & 10-K targets."""
     evaluations: list[VarianceEvaluationItem] = []
@@ -351,33 +350,34 @@ def evaluate_calculated_variances(
 
         # Build targeted cached 10-K section queries driven by the variance evaluation
         targeted_queries: list[dict[str, Any]] = []
-        q_clean = query.strip()
-        if sec_norm in ("all", "item_7"):
-            mda_focus = (
-                f"{ticker} FY{fy_e} revenue operating income margin segment drivers R&D {q_clean}"
-            ).strip()
-            targeted_queries.append(
-                {
-                    "ticker": ticker,
-                    "fiscal_year": fy_e,
-                    "section_id": "item_7",
-                    "variance_query": mda_focus,
-                    "driver_focus": f"FY{fy_s}–FY{fy_e} {primary_mover.replace('_', ' ')} & margin variance drivers",
-                }
-            )
-        if sec_norm in ("all", "item_1a"):
-            risk_focus = (
-                f"{ticker} FY{fy_e} risk factors headwinds supply chain export controls competition {q_clean}"
-            ).strip()
-            targeted_queries.append(
-                {
-                    "ticker": ticker,
-                    "fiscal_year": fy_e,
-                    "section_id": "item_1a",
-                    "variance_query": risk_focus,
-                    "driver_focus": f"FY{fy_e} material risk disclosures & operational headwinds",
-                }
-            )
+        if include_targeted_queries:
+            q_clean = query.strip()
+            if sec_norm in ("all", "item_7"):
+                mda_focus = (
+                    f"{ticker} FY{fy_e} revenue operating income margin segment drivers R&D {q_clean}"
+                ).strip()
+                targeted_queries.append(
+                    {
+                        "ticker": ticker,
+                        "fiscal_year": fy_e,
+                        "section_id": "item_7",
+                        "variance_query": mda_focus,
+                        "driver_focus": f"FY{fy_s}–FY{fy_e} {primary_mover.replace('_', ' ')} & margin variance drivers",
+                    }
+                )
+            if sec_norm in ("all", "item_1a"):
+                risk_focus = (
+                    f"{ticker} FY{fy_e} risk factors headwinds supply chain export controls competition {q_clean}"
+                ).strip()
+                targeted_queries.append(
+                    {
+                        "ticker": ticker,
+                        "fiscal_year": fy_e,
+                        "section_id": "item_1a",
+                        "variance_query": risk_focus,
+                        "driver_focus": f"FY{fy_e} material risk disclosures & operational headwinds",
+                    }
+                )
 
         evaluations.append(
             VarianceEvaluationItem(
@@ -469,6 +469,27 @@ def _summarize_agent_retrieval(
         "cited_xbrl_accessions": cited_xbrl_accessions,
         "unresolved_cited_chunk_ids": [cid for cid in cited_ids if cid not in known_ids],
     }
+
+
+@dataclass
+class _ReasoningInput:
+    """Bundled inputs for synthesis and verification-guided regeneration."""
+
+    query: str
+    intent: str
+    scope: dict[str, Any]
+    initial_outputs: ToolOutputs
+    variance_evaluations: list[VarianceEvaluationItem]
+    cached_explanations: list[Cached10KExplanation]
+    merged_citations: list[dict[str, Any]]
+    memory_context: dict[str, Any] | None
+    session_id: str | None
+    user_id: str
+    runtime_res: LiveRuntimeResolution
+    reasoning_model: str
+    coverage_notices: list[dict[str, Any]] | None
+    prompt_already_verified: bool
+    on_progress: Callable[[str, str, dict[str, Any] | None], None] | None
 
 
 @dataclass
@@ -665,22 +686,11 @@ class StructuredReActExecutor:
 
     def _maybe_regenerate_structured_report(
         self,
+        req: _ReasoningInput,
         *,
         verified: Any,
         live_stream_result: AdkStreamResult,
-        query: str,
-        intent: str,
-        scope: dict[str, Any],
         tool_outputs: ToolOutputs,
-        variance_evaluations: list[VarianceEvaluationItem],
-        cached_explanations: list[Cached10KExplanation],
-        merged_citations: list[dict[str, Any]],
-        memory_context: dict[str, Any] | None,
-        session_id: str | None,
-        user_id: str,
-        runtime_res: LiveRuntimeResolution,
-        coverage_notices: list[dict[str, Any]] | None,
-        prompt_already_verified: bool,
         latency_records: list[ModelContextLatencyRecord],
         agent_retrieved_citations: list[dict[str, Any]],
     ) -> tuple[Any, AdkStreamResult, ToolOutputs, str | None]:
@@ -701,24 +711,24 @@ class StructuredReActExecutor:
             # The retry is seeded with every deterministic output and citation already retrieved
             # this turn, so it runs tool-less with low thinking as a single JSON repair call.
             retry_res = self._invoke_financial_reasoning(
-                query=query,
-                intent=intent,
-                scope=scope,
+                query=req.query,
+                intent=req.intent,
+                scope=req.scope,
                 variance_reports=tool_outputs.variance_reports,
-                variance_evaluations=variance_evaluations,
-                cached_explanations=cached_explanations,
-                citations=merged_citations,
+                variance_evaluations=req.variance_evaluations,
+                cached_explanations=req.cached_explanations,
+                citations=req.merged_citations,
                 sector_benchmarks=tool_outputs.sector_benchmarks,
                 chunk_health=tool_outputs.chunk_health,
-                memory_context=memory_context,
-                session_id=f"{session_id or 'sess'}-retry",
-                user_id=user_id,
-                runtime_res=runtime_res,
+                memory_context=req.memory_context,
+                session_id=f"{req.session_id or 'sess'}-retry",
+                user_id=req.user_id,
+                runtime_res=req.runtime_res,
                 material_variance_flags=tool_outputs.material_variance_flags,
                 disclosure_deltas=tool_outputs.disclosure_deltas,
-                coverage_notices=coverage_notices,
+                coverage_notices=req.coverage_notices,
                 sector_map_summaries=tool_outputs.sector_map_summaries,
-                prompt_already_verified=prompt_already_verified,
+                prompt_already_verified=req.prompt_already_verified,
                 custom_llm=None,
                 verification_feedback="\n".join(feedback_lines),
                 ephemeral=True,
@@ -728,7 +738,7 @@ class StructuredReActExecutor:
             latency_records.extend(live_stream_result.latency_records)
             tool_outputs = tool_outputs.merge(hydrate_tool_outputs(retry_res.session_state))
             agent_retrieved_citations.extend(
-                _merge_agent_retrieved_citations(merged_citations, tool_outputs.citations)
+                _merge_agent_retrieved_citations(req.merged_citations, tool_outputs.citations)
             )
             retry_structured = parse_analyst_report(
                 retry_res.session_state.get("financial_analyst_report")
@@ -737,12 +747,12 @@ class StructuredReActExecutor:
             if retry_structured is not None:
                 retry_intent = retry_structured.intent
                 tool_outputs, _ = _backfill_key_metric_variances(
-                    retry_structured, tool_outputs, scope
+                    retry_structured, tool_outputs, req.scope
                 )
                 verified = verify_analyst_report(
                     retry_structured,
                     variance_reports=tool_outputs.variance_reports,
-                    citations=merged_citations,
+                    citations=req.merged_citations,
                     material_flags=tool_outputs.material_variance_flags,
                 )
             return verified, retry_res, tool_outputs, retry_intent
@@ -753,30 +763,7 @@ class StructuredReActExecutor:
             )
             return verified, live_stream_result, tool_outputs, None
 
-    def _synthesize_and_verify_with_retry(
-        self,
-        *,
-        query: str,
-        intent: str,
-        scope: dict[str, Any],
-        variance_reports: list[dict[str, Any]],
-        variance_evaluations: list[VarianceEvaluationItem],
-        cached_explanations: list[Cached10KExplanation],
-        merged_citations: list[dict[str, Any]],
-        sector_benchmarks: list[dict[str, Any]],
-        chunk_health: dict[str, Any] | None,
-        memory_context: dict[str, Any] | None,
-        session_id: str | None,
-        user_id: str,
-        runtime_res: LiveRuntimeResolution,
-        reasoning_model: str,
-        material_variance_flags: list[dict[str, Any]],
-        disclosure_deltas: dict[str, Any] | None,
-        coverage_notices: list[dict[str, Any]] | None,
-        sector_map_summaries: dict[str, Any] | None,
-        prompt_already_verified: bool,
-        on_progress: Callable[[str, str, dict[str, Any] | None], None] | None,
-    ) -> _SynthesisOutcome:
+    def _synthesize_and_verify_with_retry(self, req: _ReasoningInput) -> _SynthesisOutcome:
         """Run the live agent, hydrate its tool outputs, then verify, render, and fact-check.
 
         Deterministic tool outputs (variance reports, material flags + MD&A explanations,
@@ -789,33 +776,34 @@ class StructuredReActExecutor:
         latency_records: list[ModelContextLatencyRecord] = []
         schema_failure_reason: str | None = None
 
-        if on_progress is not None:
-            on_progress(
+        if req.on_progress is not None:
+            req.on_progress(
                 "synthesizing",
-                f"Synthesizing grounded report via {reasoning_model}...",
-                {"citation_count": len(merged_citations)},
+                f"Synthesizing grounded report via {req.reasoning_model}...",
+                {"citation_count": len(req.merged_citations)},
             )
 
+        init_out = req.initial_outputs
         try:
             live_stream_result = self._invoke_financial_reasoning(
-                query=query,
-                intent=intent,
-                scope=scope,
-                variance_reports=variance_reports,
-                variance_evaluations=variance_evaluations,
-                cached_explanations=cached_explanations,
-                citations=merged_citations,
-                sector_benchmarks=sector_benchmarks,
-                chunk_health=chunk_health,
-                memory_context=memory_context,
-                session_id=session_id,
-                user_id=user_id,
-                runtime_res=runtime_res,
-                material_variance_flags=material_variance_flags,
-                disclosure_deltas=disclosure_deltas,
-                coverage_notices=coverage_notices,
-                sector_map_summaries=sector_map_summaries,
-                prompt_already_verified=prompt_already_verified,
+                query=req.query,
+                intent=req.intent,
+                scope=req.scope,
+                variance_reports=init_out.variance_reports,
+                variance_evaluations=req.variance_evaluations,
+                cached_explanations=req.cached_explanations,
+                citations=req.merged_citations,
+                sector_benchmarks=init_out.sector_benchmarks,
+                chunk_health=init_out.chunk_health,
+                memory_context=req.memory_context,
+                session_id=req.session_id,
+                user_id=req.user_id,
+                runtime_res=req.runtime_res,
+                material_variance_flags=init_out.material_variance_flags,
+                disclosure_deltas=init_out.disclosure_deltas,
+                coverage_notices=req.coverage_notices,
+                sector_map_summaries=init_out.sector_map_summaries,
+                prompt_already_verified=req.prompt_already_verified,
                 custom_llm=self.reasoning_llm,
             )
         except Exception as exc:
@@ -828,26 +816,17 @@ class StructuredReActExecutor:
             live_stream_result = AdkStreamResult(
                 agent_name="FinancialAnalystAgent",
                 app_name="edgar_chat_app",
-                session_id=session_id or "",
-                backend=runtime_res.backend,
+                session_id=req.session_id or "",
+                backend=req.runtime_res.backend,
                 final_text="",
             )
 
         # Hydrate every deterministic output the agent invoked this turn (pre-supplied outputs
         # were seeded into the same keys, so they round-trip unchanged).
-        prior_outputs = ToolOutputs(
-            variance_reports=list(variance_reports),
-            material_variance_flags=list(material_variance_flags),
-            disclosure_deltas=disclosure_deltas,
-            sector_coverage=(sector_map_summaries or {}).get("sector_coverage"),
-            sector_map_summaries=sector_map_summaries,
-            sector_benchmarks=list(sector_benchmarks),
-            chunk_health=chunk_health,
-        )
-        tool_outputs = prior_outputs.merge(hydrate_tool_outputs(live_stream_result.session_state))
+        tool_outputs = init_out.merge(hydrate_tool_outputs(live_stream_result.session_state))
         candidate_md = live_stream_result.final_text
         agent_retrieved_citations = _merge_agent_retrieved_citations(
-            merged_citations, tool_outputs.citations
+            req.merged_citations, tool_outputs.citations
         )
 
         answer_markdown = candidate_md
@@ -863,8 +842,8 @@ class StructuredReActExecutor:
 
         def _final_notices() -> list[dict[str, Any]]:
             return extend_coverage_notices(
-                list(coverage_notices or []),
-                query=query,
+                list(req.coverage_notices or []),
+                query=req.query,
                 variance_reports=tool_outputs.variance_reports,
                 sector_coverage=tool_outputs.sector_coverage,
             )
@@ -886,31 +865,20 @@ class StructuredReActExecutor:
         ) is not None:
             agent_intent = structured.intent
             tool_outputs, backfill_tickers = _backfill_key_metric_variances(
-                structured, tool_outputs, scope
+                structured, tool_outputs, req.scope
             )
             verified = verify_analyst_report(
                 structured,
                 variance_reports=tool_outputs.variance_reports,
-                citations=merged_citations,
+                citations=req.merged_citations,
                 material_flags=tool_outputs.material_variance_flags,
             )
             verified, live_stream_result, tool_outputs, retry_intent = (
                 self._maybe_regenerate_structured_report(
+                    req,
                     verified=verified,
                     live_stream_result=live_stream_result,
-                    query=query,
-                    intent=intent,
-                    scope=scope,
                     tool_outputs=tool_outputs,
-                    variance_evaluations=variance_evaluations,
-                    cached_explanations=cached_explanations,
-                    merged_citations=merged_citations,
-                    memory_context=memory_context,
-                    session_id=session_id,
-                    user_id=user_id,
-                    runtime_res=runtime_res,
-                    coverage_notices=coverage_notices,
-                    prompt_already_verified=prompt_already_verified,
                     latency_records=latency_records,
                     agent_retrieved_citations=agent_retrieved_citations,
                 )
@@ -933,14 +901,14 @@ class StructuredReActExecutor:
                     answer_markdown = render_analyst_report_markdown(
                         verified,
                         variance_reports=tool_outputs.variance_reports,
-                        citations=merged_citations,
-                        scope=scope,
+                        citations=req.merged_citations,
+                        scope=req.scope,
                         coverage_notices=_final_notices(),
                     )
                     check = verify_narrative_against_calculations(
                         response_text=answer_markdown,
                         calculated_variances=tool_outputs.calculated_variances_map,
-                        retrieved_citations=merged_citations,
+                        retrieved_citations=req.merged_citations,
                     )
                     if check.passed:
                         fact_check_verification = check
@@ -952,7 +920,7 @@ class StructuredReActExecutor:
             check = verify_narrative_against_calculations(
                 response_text=candidate_md,
                 calculated_variances=tool_outputs.calculated_variances_map,
-                retrieved_citations=merged_citations,
+                retrieved_citations=req.merged_citations,
             )
             if check.passed:
                 fact_check_verification = check
@@ -1105,10 +1073,10 @@ class StructuredReActExecutor:
         query: str,
         intent: str,
         scope: dict[str, Any],
-        variance_reports: list[dict[str, Any]],
         citations: list[dict[str, Any]],
-        sector_benchmarks: list[dict[str, Any]],
-        chunk_health: dict[str, Any] | None,
+        variance_reports: list[dict[str, Any]] | None = None,
+        sector_benchmarks: list[dict[str, Any]] | None = None,
+        chunk_health: dict[str, Any] | None = None,
         memory_tokens: int = 0,
         memory_prep_latency_ms: float = 0.0,
         memory_context: dict[str, Any] | None = None,
@@ -1116,7 +1084,6 @@ class StructuredReActExecutor:
         telemetry_session_id: str | None = None,
         turn_id: str | None = None,
         user_id: str = "analyst",
-        on_cache_s2s_call: Callable[[str, int, str], None] | None = None,
         material_variance_flags: list[dict[str, Any]] | None = None,
         disclosure_deltas: dict[str, Any] | None = None,
         coverage_notices: list[dict[str, Any]] | None = None,
@@ -1126,8 +1093,16 @@ class StructuredReActExecutor:
         skip_background_judge: bool = False,
         on_progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
     ) -> dict[str, Any]:
-        """Run the variance pre-pass, cached 10-K querying, live synthesis, and Flash evaluation."""
-        material_flags = list(material_variance_flags or [])
+        """Run the variance pre-pass, live synthesis, verification, and Flash evaluation."""
+        initial_outputs = ToolOutputs(
+            variance_reports=list(variance_reports or []),
+            material_variance_flags=list(material_variance_flags or []),
+            disclosure_deltas=disclosure_deltas,
+            sector_coverage=(sector_map_summaries or {}).get("sector_coverage"),
+            sector_map_summaries=sector_map_summaries,
+            sector_benchmarks=list(sector_benchmarks or []),
+            chunk_health=chunk_health,
+        )
         reasoning_model = (
             self.reasoning_llm.model
             if self.reasoning_llm is not None
@@ -1141,9 +1116,9 @@ class StructuredReActExecutor:
             query=query,
             intent=intent,
             scope=scope,
-            variance_reports=variance_reports,
+            variance_reports=initial_outputs.variance_reports,
             citations=citations,
-            sector_benchmarks=sector_benchmarks,
+            sector_benchmarks=initial_outputs.sector_benchmarks,
             memory_tokens=memory_tokens,
             memory_prep_latency_ms=memory_prep_latency_ms,
         )
@@ -1151,32 +1126,28 @@ class StructuredReActExecutor:
 
         # Pre-pass citations are already coverage-balanced by hybrid RAG; cached 10-K sections
         # are queried on demand by the agent via QueryCached10KTool instead of a redundant pre-pass.
-        _ = on_cache_s2s_call
         cached_explanations: list[Cached10KExplanation] = []
         merged_citations = list(citations)
 
         # Iteration 2: Live synthesis & claim verification (with optional tool-less repair pass)
         outcome = self._synthesize_and_verify_with_retry(
-            query=query,
-            intent=intent,
-            scope=scope,
-            variance_reports=variance_reports,
-            variance_evaluations=variance_evaluations,
-            cached_explanations=cached_explanations,
-            merged_citations=merged_citations,
-            sector_benchmarks=sector_benchmarks,
-            chunk_health=chunk_health,
-            memory_context=memory_context,
-            session_id=session_id,
-            user_id=user_id,
-            runtime_res=runtime_res,
-            reasoning_model=reasoning_model,
-            material_variance_flags=material_flags,
-            disclosure_deltas=disclosure_deltas,
-            coverage_notices=coverage_notices,
-            sector_map_summaries=sector_map_summaries,
-            prompt_already_verified=prompt_already_verified,
-            on_progress=on_progress,
+            _ReasoningInput(
+                query=query,
+                intent=intent,
+                scope=scope,
+                initial_outputs=initial_outputs,
+                variance_evaluations=variance_evaluations,
+                cached_explanations=cached_explanations,
+                merged_citations=merged_citations,
+                memory_context=memory_context,
+                session_id=session_id,
+                user_id=user_id,
+                runtime_res=runtime_res,
+                reasoning_model=reasoning_model,
+                coverage_notices=coverage_notices,
+                prompt_already_verified=prompt_already_verified,
+                on_progress=on_progress,
+            )
         )
         live_stream_result = outcome.live_stream_result
         tool_outputs = outcome.tool_outputs
@@ -1188,6 +1159,7 @@ class StructuredReActExecutor:
                 hydrated_reports,
                 query=query,
                 section_filter=scope.get("section_id", "ALL"),
+                include_targeted_queries=False,
             )
         turn_latency_records = list(outcome.latency_records)
         rec_synth = (

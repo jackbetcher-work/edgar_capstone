@@ -25,33 +25,44 @@ from google.adk.runners import Runner
 from google.adk.sessions import InMemorySessionService
 from google.genai import types as genai_types
 
-from edgar_capstone.agents import (
+from edgar_capstone.agents.core.schemas import ContextBreakdown
+from edgar_capstone.agents.orchestration.react_loop import (
+    StructuredReActExecutor,
+    evaluate_calculated_variances,
+    flush_pending_evaluations,
+)
+from edgar_capstone.agents.runtime.callbacks import (
+    after_model_fact_check_callback,
+    after_model_telemetry_callback,
+    before_model_telemetry_callback,
+)
+from edgar_capstone.agents.runtime.context_memory import (
+    ConversationMemoryManager,
+    create_edgar_adk_app,
+    get_conversation_memory_manager,
+)
+from edgar_capstone.agents.runtime.factories import (
+    create_financial_analyst_agent,
+    create_narrative_evaluator_agent,
+)
+from edgar_capstone.agents.runtime.latency_tracker import (
+    ContextLatencyTracker,
+    attribute_context_latency,
+    extract_llm_request_context_breakdown,
+    get_context_latency_tracker,
+    reconcile_breakdown_with_usage_metadata,
+)
+from edgar_capstone.agents.runtime.model_config import (
     FINANCIAL_REASONING_MODEL,
     FLASH_CODING_AND_EVAL_MODEL,
     FLASH_LITE_MODEL,
-    ContextBreakdown,
-    ContextLatencyTracker,
-    ConversationMemoryManager,
-    QueryCached10KTool,
-    StructuredReActExecutor,
-    after_model_fact_check_callback,
-    after_model_telemetry_callback,
-    attribute_context_latency,
-    before_model_safety_and_latency_callback,
-    before_model_telemetry_callback,
-    calculate_period_variances,
-    create_edgar_adk_app,
-    create_financial_analyst_agent,
-    create_narrative_evaluator_agent,
-    evaluate_calculated_variances,
-    extract_llm_request_context_breakdown,
-    flush_pending_evaluations,
-    get_context_latency_tracker,
-    get_conversation_memory_manager,
     get_model_strategy_metadata,
-    query_cached_10k_context,
-    reconcile_breakdown_with_usage_metadata,
     resolve_model_for_task,
+)
+from edgar_capstone.agents.tools.sec_tools import (
+    QueryCached10KTool,
+    calculate_period_variances,
+    query_cached_10k_context,
 )
 from edgar_capstone.security import issue_local_dev_workspace_sso_token
 from edgar_capstone.server import app
@@ -267,7 +278,7 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     # Gemini 3.x write tool calls as prose instead of issuing function calls.
     assert isinstance(analyst.planner, BuiltInPlanner)
     assert analyst.planner.thinking_config.include_thoughts is True
-    assert analyst.before_model_callback is before_model_safety_and_latency_callback
+    assert analyst.before_model_callback is before_model_telemetry_callback
     assert analyst.after_model_callback is after_model_fact_check_callback
 
     assert evaluator.model == "gemini-3.8-flash"
@@ -667,7 +678,7 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     tracker.reset()
     get_conversation_memory_manager().reset()
 
-    from edgar_capstone.agents import react_loop as react_loop_mod
+    from edgar_capstone.agents.orchestration import react_loop as react_loop_mod
 
     judge_llm = ScriptedJudgeLlm()
     orig_eval = react_loop_mod.evaluate_variance_explanation
@@ -758,9 +769,9 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify async background judge updates local telemetry sink from pending/None to scored."""
-    from edgar_capstone.agents import react_loop
-    from edgar_capstone.agents.live_runtime import AdkStreamResult
-    from edgar_capstone.agents.schemas import NarrativeEvaluationReport
+    from edgar_capstone.agents.core.schemas import NarrativeEvaluationReport
+    from edgar_capstone.agents.orchestration import react_loop
+    from edgar_capstone.agents.runtime.live_runtime import AdkStreamResult
     from edgar_capstone.telemetry import get_telemetry_sink
 
     excerpt = "Data center demand drove strong revenue expansion across hyperscale cloud customers."
@@ -885,8 +896,8 @@ def test_react_guided_regeneration_retry_recovers_and_handles_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When attempt 1 fails claim verification, one guided retry receives rejection reasons and can recover."""
-    from edgar_capstone.agents import react_loop
-    from edgar_capstone.agents.live_runtime import AdkStreamResult
+    from edgar_capstone.agents.orchestration import react_loop
+    from edgar_capstone.agents.runtime.live_runtime import AdkStreamResult
 
     excerpt = "Blackwell GPUs drove strong Data Center revenue expansion across cloud customers."
     citation = {
@@ -978,8 +989,8 @@ def test_react_guided_regeneration_retry_recovers_and_handles_exception(
     assert "Blackwell" in recovered["answer_markdown"]
 
     # Verify create_financial_analyst_agent honors enable_tools=False, low_thinking=True
-    from edgar_capstone.agents.factories import create_financial_analyst_agent
-    from edgar_capstone.agents.prompt_builders import build_financial_reasoning_prompt
+    from edgar_capstone.agents.prompts.builders import build_financial_reasoning_prompt
+    from edgar_capstone.agents.runtime.factories import create_financial_analyst_agent
 
     repair_agent = create_financial_analyst_agent(enable_tools=False, low_thinking=True)
     assert list(repair_agent.tools or []) == []
@@ -1055,7 +1066,7 @@ def test_react_guided_regeneration_retry_recovers_and_handles_exception(
 
 def test_background_judge_manager_shutdown_and_error_isolation() -> None:
     """Exercise `_BackgroundJudgeManager` error handling and `shutdown()` cleanly."""
-    from edgar_capstone.agents.react_loop import _BackgroundJudgeManager
+    from edgar_capstone.agents.orchestration.react_loop import _BackgroundJudgeManager
 
     mgr = _BackgroundJudgeManager(max_workers=1)
     ran: list[str] = []
@@ -1082,8 +1093,8 @@ def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
     """gemini-3.8-flash has its own cost profile and agents render the configured model names."""
     from types import SimpleNamespace
 
-    from edgar_capstone.agents.context_memory import _get_profile_for_model
-    from edgar_capstone.agents.prompt_store import make_adk_instruction_provider
+    from edgar_capstone.agents.prompts.store import make_adk_instruction_provider
+    from edgar_capstone.agents.runtime.model_config import _get_profile_for_model
 
     prof = _get_profile_for_model("gemini-3.8-flash")
     assert prof.model_name == "gemini-3.8-flash"

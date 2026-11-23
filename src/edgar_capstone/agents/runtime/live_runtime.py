@@ -19,7 +19,6 @@ import atexit
 import concurrent.futures
 import contextlib
 import contextvars
-import json
 import os
 import threading
 import time
@@ -37,38 +36,41 @@ from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.runners import Runner
 from google.genai import types as genai_types
 
-from edgar_capstone.agents.callbacks import (
-    _DEFER_STRUCTURED_VERIFICATION_KEY,
-    ModelTelemetryPlugin,
-)
-from edgar_capstone.agents.context_memory import (
-    create_edgar_adk_app,
-    get_context_latency_tracker,
-    get_conversation_memory_manager,
-    is_ephemeral_session_id,
-    resolve_model_for_task,
-)
-from edgar_capstone.agents.factories import (
-    create_financial_analyst_agent,
-    create_narrative_evaluator_agent,
-)
-from edgar_capstone.agents.prompt_builders import (
-    _build_financial_reasoning_prompt,
-    _compact_evidence_leads,
-    _compact_variance_reports_for_prompt,
-    build_financial_reasoning_prompt,
-    build_narrative_evaluation_prompt,
-    select_citations_for_judge,
-)
-from edgar_capstone.agents.schemas import (
+from edgar_capstone.agents.core.schemas import (
     ModelContextLatencyRecord,
     ModelTaskCategory,
     NarrativeEvaluationReport,
 )
-from edgar_capstone.agents.tool_runtime import ToolOutputs, turn_scoped_state_seed
+from edgar_capstone.agents.prompts.builders import (
+    build_financial_reasoning_prompt,
+    build_narrative_evaluation_prompt,
+    select_citations_for_judge,
+)
+from edgar_capstone.agents.runtime.callbacks import (
+    _DEFER_STRUCTURED_VERIFICATION_KEY,
+    ModelTelemetryPlugin,
+)
+from edgar_capstone.agents.runtime.context_memory import (
+    create_edgar_adk_app,
+    get_conversation_memory_manager,
+)
+from edgar_capstone.agents.runtime.factories import (
+    create_financial_analyst_agent,
+    create_narrative_evaluator_agent,
+)
+from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
+from edgar_capstone.agents.runtime.model_config import (
+    is_ephemeral_session_id,
+    resolve_model_for_task,
+)
+from edgar_capstone.agents.tools.runtime import (
+    ToolOutputs,
+    turn_scoped_state_seed,
+    variance_map,
+)
 from edgar_capstone.common.domain import sha256_text
 from edgar_capstone.common.env import TRUTHY_ENV_VALUES
-from edgar_capstone.common.formatting import parse_model_output
+from edgar_capstone.common.formatting import _extract_json_dict, parse_model_output
 from edgar_capstone.gcp.defaults import resolve_gcp_project_id
 from edgar_capstone.observability.tracing import set_span_attributes, traced
 from edgar_capstone.security.model_armor import ModelArmorSafetyPlugin
@@ -345,35 +347,6 @@ def _resolve_runner_plugins(plugins: list[BasePlugin] | None) -> list[BasePlugin
     return resolved
 
 
-def _extract_raw_json_dict(raw_text: str) -> dict[str, Any] | None:
-    """Fallback dict parser when structured JSON fails strict Pydantic range constraints."""
-    cleaned = raw_text.strip()
-    if not cleaned:
-        return None
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        if len(lines) >= 2:
-            body = lines[1:-1] if lines[-1].strip().startswith("```") else lines[1:]
-            cleaned = "\n".join(body).strip()
-    for candidate in (cleaned,):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end > start:
-        try:
-            parsed = json.loads(cleaned[start : end + 1])
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            return None
-    return None
-
-
 @dataclass
 class _StreamAccumulator:
     stream_start: float
@@ -450,138 +423,6 @@ class _StreamAccumulator:
 
 
 @traced("adk.run_agent_stream", record_args=("app_name", "backend", "session_id", "max_llm_calls"))
-async def run_adk_agent_stream_async(
-    *,
-    agent: BaseAgent,
-    prompt_text: str,
-    user_id: str = "analyst",
-    session_id: str | None = None,
-    app_name: str = "edgar_adk_runtime",
-    state_delta: dict[str, Any] | None = None,
-    use_adk_app: bool = True,
-    summarizer_llm: BaseLlm | None = None,
-    backend: LiveBackendType = "vertex_ai",
-    max_llm_calls: int = 8,
-    plugins: list[BasePlugin] | None = None,
-    ephemeral: bool = False,
-) -> AdkStreamResult:
-    """Drive an ADK `Agent` via `Runner.run_async` with `StreamingMode.SSE` and capture real TTFT."""
-    set_span_attributes(**{"adk.agent_name": getattr(agent, "name", type(agent).__name__)})
-    memory_mgr = get_conversation_memory_manager()
-    session_svc = memory_mgr.adk_session_service
-    memory_svc = memory_mgr.adk_memory_service
-    raw_session_id = (session_id or "").strip()
-    session_was_generated = not raw_session_id
-    eff_session_id = raw_session_id or f"adk-sess-{uuid.uuid4().hex[:12]}"
-    should_cleanup = ephemeral or session_was_generated or is_ephemeral_session_id(eff_session_id)
-
-    prior_session = await session_svc.get_session(
-        app_name=app_name,
-        user_id=user_id,
-        session_id=eff_session_id,
-    )
-    prior_call_ids: set[str] = set()
-    if prior_session is not None and isinstance(prior_session.state.get("latency_metrics"), list):
-        prior_call_ids = {
-            str(item.get("call_id"))
-            for item in prior_session.state["latency_metrics"]
-            if isinstance(item, dict) and item.get("call_id")
-        }
-
-    resolved_plugins = _resolve_runner_plugins(plugins)
-    if use_adk_app:
-        adk_app = create_edgar_adk_app(
-            agent,
-            app_name=app_name,
-            summarizer_llm=summarizer_llm,
-            enable_context_cache=backend in ("vertex_ai", "custom_llm"),
-            plugins=resolved_plugins,
-        )
-    else:
-        adk_app = App(
-            name=app_name,
-            root_agent=agent,
-            plugins=resolved_plugins,
-        )
-    runner = Runner(
-        app=adk_app,
-        session_service=session_svc,
-        memory_service=memory_svc,
-        auto_create_session=True,
-    )
-
-    run_config = RunConfig(
-        streaming_mode=StreamingMode.SSE,
-        max_llm_calls=max_llm_calls,
-        tool_thread_pool_config=ToolThreadPoolConfig(max_workers=_DEFAULT_TOOL_THREAD_POOL_WORKERS),
-    )
-    user_content = genai_types.Content(
-        role="user",
-        parts=[genai_types.Part(text=prompt_text)],
-    )
-
-    acc = _StreamAccumulator(stream_start=time.perf_counter())
-    session_state: dict[str, Any] = {}
-    try:
-        async for event in runner.run_async(
-            user_id=user_id,
-            session_id=eff_session_id,
-            new_message=user_content,
-            state_delta=state_delta,
-            run_config=run_config,
-        ):
-            acc.ingest(event, agent.name)
-
-        updated_session = await session_svc.get_session(
-            app_name=app_name,
-            user_id=user_id,
-            session_id=eff_session_id,
-        )
-        session_state = dict(updated_session.state) if updated_session is not None else {}
-    finally:
-        if should_cleanup:
-            with contextlib.suppress(Exception):
-                await session_svc.delete_session(
-                    app_name=app_name,
-                    user_id=user_id,
-                    session_id=eff_session_id,
-                )
-
-    total_stream_ms = round((time.perf_counter() - acc.stream_start) * 1000.0, 3)
-
-    new_call_ids: list[str] = []
-    callback_ttft_ms: float | None = None
-    for item in session_state.get("latency_metrics") or []:
-        if not isinstance(item, dict):
-            continue
-        cid = str(item.get("call_id") or "")
-        if cid and cid not in prior_call_ids:
-            new_call_ids.append(cid)
-            if callback_ttft_ms is None and item.get("observed_ttft_ms") is not None:
-                callback_ttft_ms = float(item["observed_ttft_ms"])
-
-    latency_records = get_context_latency_tracker().get_records_by_ids(new_call_ids)
-    effective_ttft = callback_ttft_ms if callback_ttft_ms is not None else acc.client_ttft_ms
-
-    return AdkStreamResult(
-        agent_name=agent.name,
-        app_name=app_name,
-        session_id=eff_session_id,
-        backend=backend,
-        final_text=acc.final_text,
-        thoughts=[t for t in acc.thoughts if t],
-        function_calls=acc.fn_calls,
-        function_responses=acc.fn_responses,
-        authors=acc.authors,
-        partial_chunks_count=acc.partial_chunks,
-        total_events_count=acc.total_events,
-        observed_ttft_ms=effective_ttft,
-        total_stream_latency_ms=total_stream_ms,
-        session_state=session_state,
-        latency_records=latency_records,
-    )
-
-
 def run_adk_agent_stream(
     *,
     agent: BaseAgent,
@@ -597,26 +438,134 @@ def run_adk_agent_stream(
     plugins: list[BasePlugin] | None = None,
     ephemeral: bool = False,
 ) -> AdkStreamResult:
-    """Synchronous wrapper around `run_adk_agent_stream_async`."""
-    return _run_coro_sync(
-        run_adk_agent_stream_async(
-            agent=agent,
-            prompt_text=prompt_text,
-            user_id=user_id,
-            session_id=session_id,
-            app_name=app_name,
-            state_delta=state_delta,
-            use_adk_app=use_adk_app,
-            summarizer_llm=summarizer_llm,
-            backend=backend,
-            max_llm_calls=max_llm_calls,
-            plugins=plugins,
-            ephemeral=ephemeral,
+    """Drive an ADK `Agent` via `Runner.run_async` with `StreamingMode.SSE` and capture real TTFT."""
+
+    async def _run() -> AdkStreamResult:
+        set_span_attributes(**{"adk.agent_name": getattr(agent, "name", type(agent).__name__)})
+        memory_mgr = get_conversation_memory_manager()
+        session_svc = memory_mgr.adk_session_service
+        memory_svc = memory_mgr.adk_memory_service
+        raw_session_id = (session_id or "").strip()
+        session_was_generated = not raw_session_id
+        eff_session_id = raw_session_id or f"adk-sess-{uuid.uuid4().hex[:12]}"
+        should_cleanup = (
+            ephemeral or session_was_generated or is_ephemeral_session_id(eff_session_id)
         )
-    )
+
+        prior_session = await session_svc.get_session(
+            app_name=app_name,
+            user_id=user_id,
+            session_id=eff_session_id,
+        )
+        prior_call_ids: set[str] = set()
+        if prior_session is not None and isinstance(
+            prior_session.state.get("latency_metrics"), list
+        ):
+            prior_call_ids = {
+                str(item.get("call_id"))
+                for item in prior_session.state["latency_metrics"]
+                if isinstance(item, dict) and item.get("call_id")
+            }
+
+        resolved_plugins = _resolve_runner_plugins(plugins)
+        if use_adk_app:
+            adk_app = create_edgar_adk_app(
+                agent,
+                app_name=app_name,
+                summarizer_llm=summarizer_llm,
+                enable_context_cache=backend in ("vertex_ai", "custom_llm"),
+                plugins=resolved_plugins,
+            )
+        else:
+            adk_app = App(
+                name=app_name,
+                root_agent=agent,
+                plugins=resolved_plugins,
+            )
+        runner = Runner(
+            app=adk_app,
+            session_service=session_svc,
+            memory_service=memory_svc,
+            auto_create_session=True,
+        )
+
+        run_config = RunConfig(
+            streaming_mode=StreamingMode.SSE,
+            max_llm_calls=max_llm_calls,
+            tool_thread_pool_config=ToolThreadPoolConfig(
+                max_workers=_DEFAULT_TOOL_THREAD_POOL_WORKERS
+            ),
+        )
+        user_content = genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(text=prompt_text)],
+        )
+
+        acc = _StreamAccumulator(stream_start=time.perf_counter())
+        session_state: dict[str, Any] = {}
+        try:
+            async for event in runner.run_async(
+                user_id=user_id,
+                session_id=eff_session_id,
+                new_message=user_content,
+                state_delta=state_delta,
+                run_config=run_config,
+            ):
+                acc.ingest(event, agent.name)
+
+            updated_session = await session_svc.get_session(
+                app_name=app_name,
+                user_id=user_id,
+                session_id=eff_session_id,
+            )
+            session_state = dict(updated_session.state) if updated_session is not None else {}
+        finally:
+            if should_cleanup:
+                with contextlib.suppress(Exception):
+                    await session_svc.delete_session(
+                        app_name=app_name,
+                        user_id=user_id,
+                        session_id=eff_session_id,
+                    )
+
+        total_stream_ms = round((time.perf_counter() - acc.stream_start) * 1000.0, 3)
+
+        new_call_ids: list[str] = []
+        callback_ttft_ms: float | None = None
+        for item in session_state.get("latency_metrics") or []:
+            if not isinstance(item, dict):
+                continue
+            cid = str(item.get("call_id") or "")
+            if cid and cid not in prior_call_ids:
+                new_call_ids.append(cid)
+                if callback_ttft_ms is None and item.get("observed_ttft_ms") is not None:
+                    callback_ttft_ms = float(item["observed_ttft_ms"])
+
+        latency_records = get_context_latency_tracker().get_records_by_ids(new_call_ids)
+        effective_ttft = callback_ttft_ms if callback_ttft_ms is not None else acc.client_ttft_ms
+
+        return AdkStreamResult(
+            agent_name=agent.name,
+            app_name=app_name,
+            session_id=eff_session_id,
+            backend=backend,
+            final_text=acc.final_text,
+            thoughts=[t for t in acc.thoughts if t],
+            function_calls=acc.fn_calls,
+            function_responses=acc.fn_responses,
+            authors=acc.authors,
+            partial_chunks_count=acc.partial_chunks,
+            total_events_count=acc.total_events,
+            observed_ttft_ms=effective_ttft,
+            total_stream_latency_ms=total_stream_ms,
+            session_state=session_state,
+            latency_records=latency_records,
+        )
+
+    return _run_coro_sync(_run())
 
 
-async def run_live_adk_financial_reasoning_async(
+def run_live_adk_financial_reasoning(
     *,
     query: str,
     intent: str,
@@ -722,7 +671,7 @@ async def run_live_adk_financial_reasoning_async(
     eff_max_llm_calls = (
         max_llm_calls if max_llm_calls is not None else (2 if not enable_tools else 10)
     )
-    return await run_adk_agent_stream_async(
+    return run_adk_agent_stream(
         agent=analyst_agent,
         prompt_text=prompt_text,
         user_id=user_id,
@@ -740,69 +689,7 @@ async def run_live_adk_financial_reasoning_async(
     )
 
 
-def run_live_adk_financial_reasoning(
-    *,
-    query: str,
-    intent: str,
-    scope: dict[str, Any],
-    variance_reports: list[dict[str, Any]],
-    variance_evaluations: list[dict[str, Any]],
-    cached_explanations: list[dict[str, Any]],
-    citations: list[dict[str, Any]],
-    sector_benchmarks: list[dict[str, Any]],
-    chunk_health: dict[str, Any] | None,
-    memory_context: dict[str, Any] | None = None,
-    session_id: str | None = None,
-    user_id: str = "analyst",
-    resolution: LiveRuntimeResolution | None = None,
-    custom_llm: BaseLlm | None = None,
-    summarizer_llm: BaseLlm | None = None,
-    material_variance_flags: list[dict[str, Any]] | None = None,
-    disclosure_deltas: dict[str, Any] | None = None,
-    coverage_notices: list[dict[str, Any]] | None = None,
-    sector_map_summaries: dict[str, Any] | None = None,
-    prompt_already_verified: bool = False,
-    verification_feedback: str | None = None,
-    defer_callback_fact_check: bool = False,
-    ephemeral: bool = False,
-    enable_tools: bool = True,
-    low_thinking: bool = False,
-    max_llm_calls: int | None = None,
-) -> AdkStreamResult:
-    """Synchronous wrapper around `run_live_adk_financial_reasoning_async`."""
-    return _run_coro_sync(
-        run_live_adk_financial_reasoning_async(
-            query=query,
-            intent=intent,
-            scope=scope,
-            variance_reports=variance_reports,
-            variance_evaluations=variance_evaluations,
-            cached_explanations=cached_explanations,
-            citations=citations,
-            sector_benchmarks=sector_benchmarks,
-            chunk_health=chunk_health,
-            memory_context=memory_context,
-            session_id=session_id,
-            user_id=user_id,
-            resolution=resolution,
-            custom_llm=custom_llm,
-            summarizer_llm=summarizer_llm,
-            material_variance_flags=material_variance_flags,
-            disclosure_deltas=disclosure_deltas,
-            coverage_notices=coverage_notices,
-            sector_map_summaries=sector_map_summaries,
-            prompt_already_verified=prompt_already_verified,
-            verification_feedback=verification_feedback,
-            defer_callback_fact_check=defer_callback_fact_check,
-            ephemeral=ephemeral,
-            enable_tools=enable_tools,
-            low_thinking=low_thinking,
-            max_llm_calls=max_llm_calls,
-        )
-    )
-
-
-async def run_live_adk_narrative_evaluation_async(
+def run_live_adk_narrative_evaluation(
     *,
     query: str,
     response_markdown: str,
@@ -830,10 +717,7 @@ async def run_live_adk_narrative_evaluation_async(
         model=flash_llm,
     )
 
-    calc_map = {
-        f"{r.get('ticker', 'UNK')}_{r.get('start_year', 0)}_{r.get('end_year', 0)}": r
-        for r in variance_reports
-    }
+    calc_map = variance_map(variance_reports)
     judge_citations = select_citations_for_judge(response_markdown, citations)
     eval_prompt = build_narrative_evaluation_prompt(
         query=query,
@@ -845,7 +729,7 @@ async def run_live_adk_narrative_evaluation_async(
     )
 
     eval_prompt_hash = sha256_text(eval_prompt)
-    stream_res = await run_adk_agent_stream_async(
+    stream_res = run_adk_agent_stream(
         agent=evaluator_agent,
         prompt_text=eval_prompt,
         user_id="evaluator",
@@ -874,54 +758,22 @@ async def run_live_adk_narrative_evaluation_async(
     elif isinstance(raw_state_obj, dict):
         parsed = dict(raw_state_obj)
     else:
-        parsed = _extract_raw_json_dict(stream_res.final_text) or {}
+        parsed = _extract_json_dict(stream_res.final_text) or {}
 
     return parsed, stream_res
-
-
-def run_live_adk_narrative_evaluation(
-    *,
-    query: str,
-    response_markdown: str,
-    variance_reports: list[dict[str, Any]],
-    citations: list[dict[str, Any]],
-    cached_explanations_count: int = 0,
-    resolution: LiveRuntimeResolution | None = None,
-    custom_llm: BaseLlm | None = None,
-    reference_explanation: str | None = None,
-) -> tuple[dict[str, Any], AdkStreamResult]:
-    """Synchronous wrapper around `run_live_adk_narrative_evaluation_async`."""
-    return _run_coro_sync(
-        run_live_adk_narrative_evaluation_async(
-            query=query,
-            response_markdown=response_markdown,
-            variance_reports=variance_reports,
-            citations=citations,
-            cached_explanations_count=cached_explanations_count,
-            resolution=resolution,
-            custom_llm=custom_llm,
-            reference_explanation=reference_explanation,
-        )
-    )
 
 
 __all__ = [
     "AdkStreamResult",
     "LiveBackendType",
     "LiveRuntimeResolution",
-    "_build_financial_reasoning_prompt",
-    "_compact_evidence_leads",
-    "_compact_variance_reports_for_prompt",
     "build_adk_llm_for_task",
     "build_financial_reasoning_prompt",
     "build_narrative_evaluation_prompt",
     "get_live_runtime_status_metadata",
     "resolve_live_adk_runtime",
     "run_adk_agent_stream",
-    "run_adk_agent_stream_async",
     "run_live_adk_financial_reasoning",
-    "run_live_adk_financial_reasoning_async",
     "run_live_adk_narrative_evaluation",
-    "run_live_adk_narrative_evaluation_async",
     "select_citations_for_judge",
 ]

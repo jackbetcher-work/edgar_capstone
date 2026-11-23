@@ -26,7 +26,7 @@ import httpx
 import yaml
 from google.auth.exceptions import DefaultCredentialsError
 
-from edgar_capstone.agents.resilience import (
+from edgar_capstone.agents.core.resilience import (
     RateLimitExceededError,
     ToolExecutionError,
     UpstreamTimeoutError,
@@ -823,7 +823,7 @@ def make_adk_instruction_provider(
     def _instruction_provider(readonly_context: Any) -> str:
         # Render the models actually configured for this deployment (EDGAR_ANALYST_MODEL /
         # EDGAR_FLASH_MODEL) instead of the defaults recorded in the prompt file.
-        from edgar_capstone.agents.context_memory import resolve_model_for_task
+        from edgar_capstone.agents.runtime.model_config import resolve_model_for_task
 
         reasoning_model = resolve_model_for_task("financial_reasoning")
         runtime_variables: dict[str, Any] = {

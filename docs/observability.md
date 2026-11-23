@@ -2,7 +2,7 @@
 
 The FastAPI service exports **OpenTelemetry spans to Cloud Trace** and writes **structured JSON logs carrying trace IDs** to stdout. Cloud Run ingests those logs into **Cloud Logging**. A single `/api/v1/chat` request produces one trace covering the Cloud Run front end (or the HTTPS load balancer in `load_balancer` access mode), FastAPI, guardrails, ReAct steps, tools, ADK model calls, and outbound GCP REST calls. That request's log lines appear grouped under the trace, and its BigQuery telemetry rows carry the same `trace_id`.
 
-Everything is operated from the **Google Cloud Console**: two Cloud Monitoring dashboards, low-cardinality log-based metrics, alert policies, and BigQuery SQL views queried from BigQuery Studio. There is no separate BI tool (see [Why no Looker / LookML](#why-no-looker--lookml)).
+Everything is operated from the **Google Cloud Console**: two Cloud Monitoring dashboards, low-cardinality log-based metrics, alert policies, and BigQuery SQL views queried from BigQuery Studio.
 
 Code lives in [`src/edgar_capstone/observability/`](../src/edgar_capstone/observability):
 
@@ -35,7 +35,7 @@ flowchart TD
 ```
 
 - **Server span:** `opentelemetry-instrumentation-fastapi`. It continues the upstream W3C `traceparent` (or the legacy `X-Cloud-Trace-Context`), so Cloud Run's own request span and the app spans share one trace. Health probes and static assets are excluded (`EDGAR_TRACE_EXCLUDED_URLS`).
-- **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.retrieve_citations`), intent fallback (`orchestrator.infer_intent_from_tools`; the analyst emits intent in `AnalystReport.intent`), anomaly explanation linker (`anomaly.attach_explanations`), ReAct steps (`react.execute`, `react.evaluate_variances`, `react.query_cached_10k`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and narrative evaluator. `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls (such as `prompt_store.py`).
+- **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.retrieve_citations`), intent fallback (`orchestrator.infer_intent_from_tools`; the analyst emits intent in `AnalystReport.intent`), anomaly explanation linker (`anomaly.attach_explanations`), ReAct steps (`react.execute`, `react.evaluate_variances`, `react.query_cached_10k`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and narrative evaluator. `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls (such as `agents/prompts/store.py`).
 - **Model calls:** ADK's built-in `gcp.vertex.agent` spans (`invoke_agent`, `call_llm`, `execute_tool`) attach to the same global provider. Every recorded model call also adds an `llm.call` span event with `gen_ai.request.model`, input/output/cached/thinking tokens, `edgar.ttft_ms`, latency, and cost.
 - **Outbound HTTP:** `opentelemetry-instrumentation-httpx` creates client spans for Vertex AI (google-genai), BigQuery, Firestore, Model Armor, SDP, Secret Manager, and IAM Credentials, and propagates context on them.
 - **Thread hops:** `_run_coro_sync` (persistent background ADK `asyncio` event loop), `POST /api/v1/chat/stream` SSE worker threads, `sector.map_reduce` batch pools, and the off-critical-path background Flash judge pool all copy `contextvars` (`contextvars.copy_context().run` / `loop.create_task(coro, context=ctx)`), so live ADK runs, map-reduce batches, and background evaluations stay correlated under the parent request trace.
@@ -90,7 +90,7 @@ Example `http_request_completed` access log line as written to stdout (`EDGAR_LO
 
 ## Guardrail audit attribution
 
-Model Armor, SDP, and projection-filter guardrail blocks (`model_armor_{prompt,response}_blocked`, `projection_filter_*_blocked`, `sdp_sensitive_*_blocked`, `*_fail_closed`) are raised deep inside the ADK turn, where no `AuthenticatedUser` is threaded through. The chat router binds the authenticated principal for the duration of the turn (`security.auth.bind_audit_principal`), `contextvars` carries it across the SSE worker, the ADK loop, and parallel tool workers, and the guardrail service records its audit events with `inherit_request_principal=True`. The block is therefore attributed to the caller's email / identity provider / IAP verification state instead of `unauthenticated`. Existing `record_security_audit_event` signatures are unchanged (the flag defaults to `False`), and events outside an authenticated request stay `unauthenticated`. `trace_id` is always attached by the telemetry sink from the active span, or from the inbound `X-Cloud-Trace-Context` / `traceparent` fallback on Cloud Run.
+Model Armor, SDP, and projection-filter guardrail blocks (`model_armor_{prompt,response}_blocked`, `projection_filter_*_blocked`, `sdp_sensitive_*_blocked`, `*_fail_closed`) are raised deep inside the ADK turn, where no `AuthenticatedUser` is threaded through. The chat router binds the authenticated principal for the duration of the turn (`security.auth.bind_audit_principal`), `contextvars` carries it across the SSE worker, the ADK loop, and parallel tool workers, and the guardrail service records its audit events with `inherit_request_principal=True`. The block is therefore attributed to the caller's email / identity provider / IAP verification state instead of `unauthenticated`. The `inherit_request_principal` flag on `record_security_audit_event` defaults to `False`, and events outside an authenticated request are recorded as `unauthenticated`. `trace_id` is always attached by the telemetry sink from the active span, or from the inbound `X-Cloud-Trace-Context` / `traceparent` fallback on Cloud Run.
 
 ## Cloud Monitoring dashboards
 
@@ -142,7 +142,7 @@ There are two complementary paths:
 2. **Cloud Logging export (raw, durable).** Project sink `sec-edgar-telemetry-audit-bq-sink` routes `jsonPayload.component="sec-edgar-telemetry-sink"` LogEntries into partitioned tables in the dedicated dataset **`sec_edgar_ops_logs`** (`us-central1`, 90-day partition expiry via `ops_logs_retention_days`). Its writer identity holds `roles/bigquery.dataEditor` **on that dataset only**. `sec_edgar.financial_metrics` / `filing_chunks` remain read-only.
 
 > [!NOTE]
-> **Fixed sink errors.** (a) `dataset_permission_denied`: the sink previously wrote into `sec_edgar` with `secEdgarTelemetrySinkAppend` (`tables.get` + `tables.updateData`), which lacks `bigquery.tables.create`, so it couldn't create its log table. (b) `table_invalid_schema (Field labels.managed_by is present multiple times)`: Cloud Logging copies Cloud Run labels onto every LogEntry, and the BigQuery sink maps `managed-by` (added by `deploy-cloudrun@v2`) and Terraform's `managed_by` to the same column. Both pipelines now deploy with underscore labels only (`skip_default_labels: true` + `commit_sha` / `deployed_by` in `deploy.yml`, `--update-labels` in `cloudbuild.yaml`) and strip `managed-by,commit-sha` with `--remove-labels`. A `var.labels` validation rejects keys that collide after `-` → `_` normalization. Watch the *Cloud Logging → BigQuery Sink Export Errors* tile, or run `gcloud logging read 'logName:"sink_error"' --freshness=1h`.
+> Cloud Run labels are copied onto every Cloud Logging entry, and the BigQuery sink normalizes `-` to `_`. Both CI pipelines deploy with underscore-only labels (`commit_sha`, `deployed_by`), and `var.labels` validation rejects keys that collide after `-` → `_` normalization. Sink export errors can be checked on the *Cloud Logging → BigQuery Sink Export Errors* tile or with `gcloud logging read 'logName:"sink_error"' --freshness=1h`.
 
 ### SQL semantic views (BigQuery Studio)
 
@@ -185,7 +185,7 @@ ORDER BY recorded_at DESC;
 ```
 
 > [!TIP]
-> If executive reporting is ever needed, open any of these views in BigQuery Studio and choose **Explore data → Explore with Looker Studio** (two clicks, no semantic layer to maintain).
+> Any of these views can be explored interactively in BigQuery Studio via **Explore data → Explore with Looker Studio**.
 
 ## Correlation walkthrough (one request end-to-end)
 
@@ -201,10 +201,6 @@ ORDER BY recorded_at DESC;
    ```
 5. **Cloud Monitoring:** latency points on `api_request_latencies` keep trace exemplars, so a spike on either dashboard links back to the trace that caused it.
 
-## Why no Looker / LookML
-
-The repository used to ship an un-deployed LookML project (`looker/`) and a catalog loader (`lookml.py`) surfaced on `GET /health`. Both were removed on purpose. No Looker instance was ever provisioned, the LookML formulas duplicated logic that now lives in version-controlled BigQuery SQL views, and every operational question (latency, cost, cache efficiency, session quality, audit trail) is answered inside the Cloud Console with the dashboards, metrics, and alerts above. The ADK tool `query_looker_financial_explore` keeps its name for now; it already queries BigQuery views directly, and a follow-up PR will rename it.
-
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -219,7 +215,7 @@ The repository used to ship an un-deployed LookML project (`looker/`) and a cata
 | `EDGAR_LOG_LEVEL` | `INFO` | Root log level |
 | `OTEL_SERVICE_NAME` / `K_SERVICE`, `COMMIT_SHA` | — | `service.name` / `service.version` resource attributes |
 
-IAM and APIs were already in place: `cloudtrace.googleapis.com` and `logging.googleapis.com` are enabled in `terraform/apis.tf`, and `sec-analyst-sa` holds `roles/cloudtrace.agent` and `roles/logging.logWriter` in `terraform/iam.tf`. No Cloud Build or GitHub Actions env changes are needed, because `auto` detects Cloud Run.
+Terraform enables `cloudtrace.googleapis.com` and `logging.googleapis.com` in `terraform/apis.tf` and grants `sec-analyst-sa` `roles/cloudtrace.agent` and `roles/logging.logWriter` in `terraform/iam.tf`. With `EDGAR_TRACE_EXPORTER=auto` and `EDGAR_LOG_FORMAT=auto`, Cloud Run is detected automatically.
 
 > [!TIP]
 > Spans are exported in batches on a background thread. With Cloud Run's default request-based CPU allocation, an idle instance may hold spans until the next request or shutdown, when the lifespan hook flushes them. If you need spans to show up within seconds even under low traffic, deploy with `--no-cpu-throttling` (instance-based billing).

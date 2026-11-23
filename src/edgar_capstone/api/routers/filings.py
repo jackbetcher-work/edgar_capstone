@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from edgar_capstone.agents.chat_engine import list_curated_companies
+from edgar_capstone.agents.orchestration.chat_engine import list_curated_companies
 from edgar_capstone.agents.tools import (
     get_active_gcp_tool_adapters,
     load_cached_10k_section,

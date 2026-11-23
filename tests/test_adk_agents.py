@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -12,35 +13,40 @@ from google.adk.models.llm_response import LlmResponse
 from google.adk.tools import FunctionTool
 from google.genai import types as genai_types
 
-from edgar_capstone.agents import (
-    AnomalyFlagTool,
+from edgar_capstone.agents.core.resilience import RateLimitExceededError, with_tool_resilience
+from edgar_capstone.agents.orchestration.intent import (
+    infer_intent_from_tool_calls,
+    resolve_turn_intent,
+)
+from edgar_capstone.agents.runtime.callbacks import (
+    after_model_fact_check_callback,
+    after_model_telemetry_callback,
+    before_agent_telemetry_callback,
+    before_model_telemetry_callback,
+)
+from edgar_capstone.agents.runtime.factories import (
+    create_financial_analyst_agent,
+    create_narrative_evaluator_agent,
+)
+from edgar_capstone.agents.tools.disclosure_deltas import DisclosureDeltaTool
+from edgar_capstone.agents.tools.material_variances import AnomalyFlagTool
+from edgar_capstone.agents.tools.sec_tools import (
+    AnalyticsViewQueryTool,
     ContextCacheTool,
-    DisclosureDeltaTool,
     HybridSearchTool,
     LookerQueryTool,
     MetricFetchTool,
     QueryCached10KTool,
-    RateLimitExceededError,
     VarianceCalculationTool,
-    after_model_fact_check_callback,
-    after_model_telemetry_callback,
-    before_agent_telemetry_callback,
-    before_model_safety_and_latency_callback,
-    before_model_telemetry_callback,
     calculate_period_variances,
-    create_financial_analyst_agent,
-    create_narrative_evaluator_agent,
     fetch_financial_metrics,
+    get_active_gcp_tool_adapters,
     load_cached_10k_section,
+    query_analytics_view,
     query_looker_financial_explore,
     search_10k_chunks_rag,
-    with_tool_resilience,
 )
-from edgar_capstone.agents.intent import (
-    infer_intent_from_tool_calls,
-    resolve_turn_intent,
-)
-from edgar_capstone.agents.tools import get_active_gcp_tool_adapters
+from edgar_capstone.security.model_armor.adk_plugin import ModelArmorSafetyPlugin
 
 
 def _dummy_tool_context() -> SimpleNamespace:
@@ -52,7 +58,7 @@ def test_adk_agent_factories_and_tool_registration() -> None:
     assert isinstance(analyst, Agent)
     assert analyst.name == "FinancialAnalystAgent"
     assert callable(analyst.instruction)
-    assert analyst.before_model_callback is before_model_safety_and_latency_callback
+    assert analyst.before_model_callback is before_model_telemetry_callback
     assert analyst.after_model_callback is after_model_fact_check_callback
 
     evaluator = create_narrative_evaluator_agent()
@@ -70,10 +76,12 @@ def test_adk_agent_factories_and_tool_registration() -> None:
     assert evaluator.before_model_callback is before_model_telemetry_callback
     assert evaluator.after_model_callback is after_model_telemetry_callback
 
-    # Verify explicit ADK FunctionTool wrappers
+    # Verify explicit ADK FunctionTool wrappers and backward-compatible aliases
+    assert LookerQueryTool is AnalyticsViewQueryTool
+    assert query_looker_financial_explore is query_analytics_view
     for tool_obj in (
         MetricFetchTool,
-        LookerQueryTool,
+        AnalyticsViewQueryTool,
         VarianceCalculationTool,
         HybridSearchTool,
         ContextCacheTool,
@@ -87,7 +95,7 @@ def test_adk_agent_factories_and_tool_registration() -> None:
     assert "calculate_period_variances" in tool_names
     assert "flag_material_variances" in tool_names
     assert "fetch_financial_metrics" in tool_names
-    assert "query_looker_financial_explore" in tool_names
+    assert "query_analytics_view" in tool_names
     assert "search_10k_chunks_rag" in tool_names
     assert "query_cached_10k_context" in tool_names
     assert "compare_disclosures_across_years" in tool_names
@@ -121,7 +129,7 @@ def test_intent_is_agent_emitted_with_non_lexical_tool_fallback() -> None:
     assert (
         infer_intent_from_tool_calls(
             {"tickers": [], "gics_sector": "ALL"},
-            [{"name": "query_looker_financial_explore", "args": {"explore_name": "chunk_health"}}],
+            [{"name": "query_analytics_view", "args": {"explore_name": "chunk_health"}}],
         )
         == "chunk_health_monitoring"
     )
@@ -130,12 +138,20 @@ def test_intent_is_agent_emitted_with_non_lexical_tool_fallback() -> None:
             sector,
             [
                 {
-                    "name": "query_looker_financial_explore",
+                    "name": "query_analytics_view",
                     "args": {"explore_name": "sector_benchmarks"},
                 }
             ],
         )
         == "multi_company_peer_comparison"
+    )
+    # Legacy tool name still resolves cleanly for historical traces
+    assert (
+        infer_intent_from_tool_calls(
+            {"tickers": [], "gics_sector": "ALL"},
+            [{"name": "query_looker_financial_explore", "args": {"explore_name": "chunk_health"}}],
+        )
+        == "chunk_health_monitoring"
     )
     # Query wording never changes the inferred intent (no lexical classification)
     assert infer_intent_from_tool_calls(single, [{"name": "calculate_period_variances"}]) == (
@@ -162,11 +178,11 @@ def test_metric_fetch_tool_on_curated_dataset() -> None:
 
 
 @pytest.mark.live
-def test_looker_query_tool_explores() -> None:
+def test_analytics_view_query_tool_explores() -> None:
     ctx = _dummy_tool_context()
 
-    # 1. YoY variances explore
-    yoy = query_looker_financial_explore(
+    # 1. YoY variances view
+    yoy = query_analytics_view(
         explore_name="yoy_variances",
         tickers="NVDA",
         gics_sector="ALL",
@@ -181,8 +197,8 @@ def test_looker_query_tool_explores() -> None:
     assert fy26_row["revenue_yoy_delta"] is not None
     assert fy26_row["revenue_yoy_pct"] is not None
 
-    # 2. Sector benchmarks explore
-    bench = query_looker_financial_explore(
+    # 2. Sector benchmarks view
+    bench = query_analytics_view(
         explore_name="sector_benchmarks",
         tickers="ALL",
         gics_sector="Information Technology",
@@ -209,8 +225,8 @@ def test_looker_query_tool_explores() -> None:
     assert bench_row["company_count"] == len(bench_row["tickers"]) == len(expected_it_tickers)
     assert {"AAPL", "MSFT", "NVDA"} <= expected_it_tickers
 
-    # 3. Chunk health explore
-    health = query_looker_financial_explore(
+    # 3. Chunk health view
+    health = query_analytics_view(
         explore_name="chunk_health",
         tickers="ALL",
         gics_sector="ALL",
@@ -304,7 +320,7 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
     assert attempts["count"] == 3
     assert ctx.state["tool_telemetry"][0]["attempts"] == 3
 
-    # Test Model Armor prompt-injection blocking callback
+    # Test Model Armor prompt-injection blocking via the single-owner ADK plugin
     cb_ctx = MagicMock()
     cb_ctx.agent_name = "FinancialAnalystAgent"
     cb_ctx.state = {}
@@ -322,9 +338,14 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
             )
         ]
     )
-    blocked_resp = before_model_safety_and_latency_callback(cb_ctx, inj_req)
+    plugin = ModelArmorSafetyPlugin()
+    blocked_resp = asyncio.run(
+        plugin.before_model_callback(callback_context=cb_ctx, llm_request=inj_req)
+    )
     assert blocked_resp is not None
     assert cb_ctx.state["model_armor_blocked"] is True
+    assert before_model_telemetry_callback(cb_ctx, inj_req) is None
+    assert cb_ctx.state["last_model_context_tokens"] > 0
 
     # Test post-generation numeric & citation fact-check callback
     cb_ctx.state["calculated_variances"] = {
@@ -380,9 +401,9 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
 
 
 def test_financial_analyst_module_exports() -> None:
-    """Verify the `edgar_capstone.agents.financial_analyst` entrypoint re-exports expected symbols."""
-    from edgar_capstone.agents import financial_analyst
-    from edgar_capstone.agents.context_memory import FINANCIAL_REASONING_MODEL
+    """Verify the `edgar_capstone.agents.runtime.financial_analyst` entrypoint re-exports expected symbols."""
+    from edgar_capstone.agents.runtime import financial_analyst
+    from edgar_capstone.agents.runtime.model_config import FINANCIAL_REASONING_MODEL
 
     assert financial_analyst.DEFAULT_ANALYST_MODEL == FINANCIAL_REASONING_MODEL
     assert financial_analyst.DEFAULT_ANALYST_PROMPT_VERSION
@@ -396,12 +417,12 @@ def test_financial_analyst_module_exports() -> None:
 
 def test_hybrid_rag_parallel_branch_partial_failure_and_rrf_filtering() -> None:
     """Covers `_run_parallel_branches` graceful degradation, retryable re-raise, and `_upsert_canonical_hit`."""
-    from edgar_capstone.agents.hybrid_rag import (
+    from edgar_capstone.agents.core.resilience import ToolExecutionError
+    from edgar_capstone.agents.tools.hybrid_rag import (
         _reconcile_vais_hits,
         _run_parallel_branches,
         _upsert_canonical_hit,
     )
-    from edgar_capstone.agents.resilience import ToolExecutionError
 
     bq_row = {
         "chunk_id": "NVDA_2026_item_7_0001",
@@ -557,7 +578,7 @@ def _chunk_row(ticker: str, fy: int, idx: int, text: str, similarity: float) -> 
 
 
 def test_coverage_slices_prioritize_boundary_years_and_respect_limits() -> None:
-    from edgar_capstone.agents.hybrid_rag import MAX_COVERAGE_SLICES, coverage_slices
+    from edgar_capstone.agents.tools.hybrid_rag import MAX_COVERAGE_SLICES, coverage_slices
 
     assert coverage_slices({"PFE", "MRK"}, 2022, 2024) == [
         ("MRK", 2022),
@@ -575,7 +596,7 @@ def test_coverage_slices_prioritize_boundary_years_and_respect_limits() -> None:
 
 def test_hybrid_rag_coverage_keeps_crowded_out_company_years() -> None:
     """MRK/PFE FY2022-FY2024: VECTOR_SEARCH favors FY2022/FY2024; coverage restores FY2023."""
-    from edgar_capstone.agents.hybrid_rag import _execute_live_gcp_hybrid_rag
+    from edgar_capstone.agents.tools.hybrid_rag import _execute_live_gcp_hybrid_rag
 
     strong = [
         _chunk_row(tk, fy, i, f"{tk} research and development expense {fy} pipeline", 0.9)
@@ -620,7 +641,7 @@ def test_hybrid_rag_coverage_keeps_crowded_out_company_years() -> None:
 
 
 def test_hybrid_rag_coverage_is_best_effort_and_skipped_for_single_slices() -> None:
-    from edgar_capstone.agents.hybrid_rag import _execute_live_gcp_hybrid_rag
+    from edgar_capstone.agents.tools.hybrid_rag import _execute_live_gcp_hybrid_rag
 
     rows = [_chunk_row("MRK", 2024, i, "Merck research and development", 0.8) for i in range(3)]
     adapters = MagicMock()
@@ -658,7 +679,7 @@ def test_hybrid_rag_coverage_is_best_effort_and_skipped_for_single_slices() -> N
 
 
 def test_retrieval_instructions_state_citation_coverage_without_extra_calls() -> None:
-    from edgar_capstone.agents.prompt_builders import build_retrieval_instructions
+    from edgar_capstone.agents.prompts.builders import build_retrieval_instructions
 
     peer = build_retrieval_instructions(
         {"tickers": ["DAL", "UAL", "LUV"], "start_year": 2022, "end_year": 2024}, []
@@ -670,3 +691,25 @@ def test_retrieval_instructions_state_citation_coverage_without_extra_calls() ->
         {"tickers": ["NVDA"], "start_year": 2026, "end_year": 2026}, []
     )
     assert "Citation coverage" not in single_year
+
+
+def test_agents_subpackages_import_cleanly() -> None:
+    """Verify every canonical agents subpackage imports cleanly and public barrels resolve."""
+    import importlib
+
+    subpackages = (
+        "edgar_capstone.agents",
+        "edgar_capstone.agents.core",
+        "edgar_capstone.agents.adapters",
+        "edgar_capstone.agents.prompts",
+        "edgar_capstone.agents.tools",
+        "edgar_capstone.agents.runtime",
+        "edgar_capstone.agents.evaluation",
+        "edgar_capstone.agents.orchestration",
+    )
+    for pkg_name in subpackages:
+        pkg = importlib.import_module(pkg_name)
+        for symbol in getattr(pkg, "__all__", ()):
+            assert getattr(pkg, symbol) is not None or symbol in pkg.__dict__
+        with pytest.raises(AttributeError):
+            _ = pkg.__nonexistent_symbol__

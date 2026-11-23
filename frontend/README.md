@@ -18,7 +18,7 @@ From the repo root, `make dev` starts FastAPI (`:8000`) and this UI (`:5173`) to
 
 ```text
 src/
-├── App.tsx                      # Workspace state: auth/session bootstrap, chat turns, feedback, source pane (no scope filters — the backend resolves scope from the question)
+├── App.tsx                      # Workspace state: auth/session bootstrap, chat turns, feedback, source pane (the backend resolves scope from the question)
 ├── components/
 │   ├── AuthGatePanel.tsx        # Sign-in gate (IAP session, Workspace/Okta OIDC, local dev token)
 │   ├── HeaderBar.tsx            # Signed-in identity, role badge, sign-out
@@ -39,11 +39,12 @@ src/
 ├── services/
 │   ├── httpClient.ts            # Shared authenticated fetch, `ApiAuthError` (401/403), and FastAPI/GCP JSON error extraction
 │   ├── authService.ts           # Bearer token storage, /api/v1/auth/* calls, OIDC fragment handling
-│   └── edgarApi.ts              # SSE streaming (/api/v1/chat/stream), /companies, /section, /feedback (live backend only; no offline fallback)
+│   └── edgarApi.ts              # SSE streaming (/api/v1/chat/stream), /companies, /section, /feedback
 ├── types/edgar.ts               # API response, SSE progress, NumericCitation, CoverageNotice & XBRL types
 └── utils/
     ├── citationDedup.ts         # Collapses repeated / cross-year duplicate passages and maps aliases to the kept card
     ├── citationTokens.ts        # Builds canonical inline-citation tokens for the source pane
+    ├── deterministicEvidence.ts # Render predicates for variance, anomaly-flag, and disclosure-delta cards
     ├── filingMarkdown.ts        # Parses corpus chunk Markdown (strips header/escapes/footers, repairs SEC tables)
     ├── formatters.ts            # USD / percent / bps / period-end date formatting, combined text+XBRL citation parser & status badges
     ├── resolvedScope.ts         # Formats the backend's `resolved_scope` for the per-answer scope echo
@@ -53,7 +54,7 @@ src/
 
 ## How answers are rendered
 
-The UI streams turns over **`POST /api/v1/chat/stream`** (SSE) with live progress events (`connected`, `scope_resolved`, `sector_map_progress`, `synthesizing`, `result`, `error`). The backend also retains `POST /api/v1/chat` and `/api/v1/sessions` for non-streaming / programmatic API clients, though their unused frontend wrappers were removed from `edgarApi.ts`.
+The UI streams turns over **`POST /api/v1/chat/stream`** (SSE) with live progress events (`connected`, `scope_resolved`, `sector_map_progress`, `synthesizing`, `result`, `error`).
 
 Responses return `answer_markdown` containing:
 - **Inline text citation tags:** `[TICKER FYxxxx | Section Title | chunk_id](sec_filing_url)` — opens the **Cited Chunk** / **Full Section** view in `SourceInspectorPane`.
@@ -67,9 +68,9 @@ For verified live answers, `answer_markdown` is rendered server-side from the an
 - `#### Key Metrics (deterministic engine)` with `period_of_report` dates and inline clickable XBRL tags;
 - `#### Findings`, each backed by verified `chunk_id`(s) and a verbatim `*Evidence:*` quote.
 
-There is **no uncited `Notes` section** (`notes` was removed from `AnalystReport`). Clarification (`clarification_needed`) and out-of-corpus (`out_of_corpus`) turns display plain-English explanations plus clickable suggested follow-up chips. If all findings fail verification (even after the single verification-guided regeneration attempt), the answer is shown as **Answer Withheld**.
+Clarification (`clarification_needed`) and out-of-corpus (`out_of_corpus`) turns display plain-English explanations plus clickable suggested follow-up chips. If all findings fail verification (even after the single verification-guided regeneration attempt), the answer is shown as **Answer Withheld**.
 
-There is **no offline/mock fallback** in `edgarApi.ts`; API failures propagate as explicit error states.
+API requests target the live backend directly, and backend errors surface as explicit states in the UI.
 
 ## Authentication
 
@@ -83,8 +84,15 @@ A 403 from the backend's domain or RBAC policy is shown in the gate panel.
 
 ## Tests
 
-- `src/__tests__/App.test.tsx`: workspace shell, SSE streaming progress & result rendering, peer-comparison query with variance math, inline XBRL & text citation chips, `XBRL Fact` inspector pane, coverage notices / suggested follow-up chips, and `/` keyboard shortcut with `<GO>`.
-- `src/__tests__/Auth.test.tsx`: SSO gate with bearer JWTs and sign-out, dev vs. strict OIDC configuration, direct IAP/OIDC bearer verification with a 403 domain error, and silent IAP-session sign-in.
-- `src/__tests__/GroundingFactCards.test.tsx`: `VarianceTableCard` (`period_of_report` dates, `DIFFERING FY-END DATES` badge, `[XBRL]` provenance triggers), `MaterialFlagsCard`, and `DisclosureDeltaCard` rendering.
+Vitest + Testing Library suite under `src/__tests__/` (`cd frontend && npm test -- --run`):
 
-Total: **14 Vitest tests** (`cd frontend && npm test -- --run`).
+- `App.test.tsx`: workspace shell, SSE streaming progress & result rendering, peer-comparison query with variance math, inline XBRL & text citation chips, `XBRL Fact` inspector pane, coverage notices / suggested follow-up chips, and `/` keyboard shortcut with `<GO>`.
+- `Auth.test.tsx`: SSO gate with bearer JWTs and sign-out, dev vs. strict OIDC configuration, direct IAP/OIDC bearer verification with a 403 domain error, and silent IAP-session sign-in.
+- `ChatTurnItem.test.tsx`: per-turn rendering, selective display of variance/flag/delta cards, coverage notices, and withheld-answer states.
+- `Components.test.tsx`: `GroundedMarkdown`, `VarianceTableCard`, and `FilingReaderTab` rendering and interaction.
+- `EvidenceUi.test.tsx`: `EvidencePanel`, `CitationsTab`, and inline table/excerpt rendering.
+- `GroundingFactCards.test.tsx`: `MaterialFlagsCard` and `DisclosureDeltaCard` rendering and `[XBRL]` provenance triggers.
+- `resolvedScope.test.tsx`: `resolved_scope` formatting and per-answer scope echo rendering.
+- `filingEvidence.test.ts`: citation deduplication, corpus chunk Markdown parsing, and XBRL/section label helpers.
+- `services.test.ts`: `httpClient`, `authService`, and `edgarApi` SSE streaming and error handling.
+- `utils.test.ts`: formatting helpers and `xbrlFactSelection` builders.

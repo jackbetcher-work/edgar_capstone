@@ -12,12 +12,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from edgar_capstone.agents import (
-    before_tool_agent_identity_callback,
+from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.runtime.callbacks import before_tool_agent_identity_callback
+from edgar_capstone.agents.runtime.factories import (
     create_financial_analyst_agent,
     create_narrative_evaluator_agent,
 )
-from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
 from edgar_capstone.dataset.extractor import DEFAULT_SEC_USER_AGENT
 from edgar_capstone.security import (
     ADMIN_PERMISSIONS,

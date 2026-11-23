@@ -43,7 +43,7 @@ def _call_with_retries(
     base_delay_seconds: float = 0.05,
 ) -> _R:
     """Invoke ``fn`` wrapped with ``retry_transient_errors`` (lazy import avoids package cycle)."""
-    from edgar_capstone.agents.resilience import retry_transient_errors
+    from edgar_capstone.agents.core.resilience import retry_transient_errors
 
     wrapped = retry_transient_errors(
         operation_name=operation_name,
@@ -72,7 +72,7 @@ def _raise_for_security_http_status(resp: httpx.Response, service_label: str) ->
 
 
 def _is_retryable_dlp_error(exc: BaseException) -> bool:
-    from edgar_capstone.agents.resilience import RateLimitExceededError, UpstreamTimeoutError
+    from edgar_capstone.agents.core.resilience import RateLimitExceededError, UpstreamTimeoutError
 
     if isinstance(
         exc,
@@ -165,7 +165,7 @@ class ModelArmorClient(GcpRestClient):
             _raise_for_security_http_status(resp, f"{service_label} (Emulator)")
             return resp.json(), "emulator_model_armor_v1"
 
-        from edgar_capstone.agents.resilience import ToolExecutionError
+        from edgar_capstone.agents.core.resilience import ToolExecutionError
 
         try:
             token = self._get_auth_token(target_service=target_service)

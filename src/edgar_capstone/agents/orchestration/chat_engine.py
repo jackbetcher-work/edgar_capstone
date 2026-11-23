@@ -16,22 +16,13 @@ from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
 
-from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
-from edgar_capstone.agents.context_memory import (
-    get_context_latency_tracker,
-    get_conversation_memory_manager,
-    get_model_strategy_metadata,
-    resolve_model_for_task,
-)
-from edgar_capstone.agents.intent import (
+from edgar_capstone.agents.orchestration.intent import (
     infer_intent_from_tool_calls,
     is_sector_wide_scope,
     resolve_turn_intent,
 )
-from edgar_capstone.agents.live_runtime import get_live_runtime_status_metadata
-from edgar_capstone.agents.prompt_store import get_prompt_store_status_metadata
-from edgar_capstone.agents.react_loop import StructuredReActExecutor
-from edgar_capstone.agents.scope_validation import (
+from edgar_capstone.agents.orchestration.react_loop import StructuredReActExecutor
+from edgar_capstone.agents.orchestration.scope_validation import (
     MAX_CORPUS_YEAR,
     MIN_CORPUS_YEAR,
     SECTOR_ALIASES,
@@ -42,13 +33,22 @@ from edgar_capstone.agents.scope_validation import (
     is_broad_corpus_query,
     validate_query_scope_and_coverage,
 )
-from edgar_capstone.agents.tool_runtime import (
+from edgar_capstone.agents.prompts.store import get_prompt_store_status_metadata
+from edgar_capstone.agents.runtime.callbacks import verify_narrative_against_calculations
+from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
+from edgar_capstone.agents.runtime.live_runtime import get_live_runtime_status_metadata
+from edgar_capstone.agents.runtime.model_config import (
+    get_model_strategy_metadata,
+    resolve_model_for_task,
+)
+from edgar_capstone.agents.tools.runtime import (
     DETERMINISTIC_TOOL_NAMES,
     ToolOutputs,
     ToolTurnContext,
     tool_turn_context,
 )
-from edgar_capstone.agents.tools import (
+from edgar_capstone.agents.tools.sec_tools import (
     _parse_ticker_list,
     _profile_to_metric_record,
     get_active_gcp_tool_adapters,
@@ -547,48 +547,142 @@ def _append_trace_step(
     agent_trace.append(entry)
 
 
-def _build_turn_response(
+@dataclass
+class _TurnContext:
+    """Mutable per-turn plumbing shared across guardrails, scope validation, and finalization."""
+
+    turn_start: float
+    telemetry_session_id: str
+    session_id: str | None
+    user_id: str
+    memory_ctx: dict[str, Any] = field(default_factory=dict)
+    agent_trace: list[dict[str, Any]] = field(default_factory=list)
+    identities_used_by_agent: dict[str, dict[str, str]] = field(default_factory=dict)
+    on_progress: ProgressCallback | None = None
+
+    def elapsed_ms(self) -> float:
+        return round((time.perf_counter() - self.turn_start) * 1000.0, 2)
+
+    def emit(self, stage: str, message: str, meta: dict[str, Any] | None = None) -> None:
+        if self.on_progress is not None:
+            self.on_progress(stage, message, meta)
+
+    def track_identity(self, claims: VerifiedAgentS2SClaims) -> None:
+        _track_identity(self.identities_used_by_agent, claims)
+
+    def append_trace(
+        self,
+        *,
+        agent: str,
+        claims: VerifiedAgentS2SClaims,
+        tool: str,
+        status: str,
+        duration_ms: float,
+        summary: str,
+        model_used: str | None = None,
+    ) -> None:
+        _append_trace_step(
+            self.agent_trace,
+            agent=agent,
+            claims=claims,
+            tool=tool,
+            status=status,
+            duration_ms=duration_ms,
+            summary=summary,
+            model_used=model_used,
+        )
+
+
+def _finalize_turn(
+    ctx: _TurnContext,
     *,
     status: str,
     model_armor_blocked: bool,
     prompt_decision: GuardrailDecision,
-    response_decision: GuardrailDecision | None,
+    response_decision: GuardrailDecision | None = None,
     execution_mode: str,
-    adk_runtime: dict[str, Any],
+    adk_runtime: dict[str, Any] | None = None,
     intent: str,
+    intent_source: str = "scope_gate",
     resolved_scope: dict[str, Any],
     answer_markdown: str,
     answer_verified: bool,
     fact_check: dict[str, Any],
     react_execution: dict[str, Any],
-    context_and_memory: dict[str, Any],
-    agent_trace: list[dict[str, Any]],
-    identities_used_by_agent: dict[str, dict[str, str]],
-    total_latency_ms: float,
+    telemetry_tickers: list[str],
+    telemetry_report_generated: bool,
+    telemetry_fact_check_passed: bool,
+    turn_latency_records: list[Any] | None = None,
+    turn_latency_summary: Any | None = None,
+    memory_persist: dict[str, Any] | None = None,
     structured_report: dict[str, Any] | None = None,
     report_verification: dict[str, Any] | None = None,
     clarification_reason: str | None = None,
     suggested_followups: list[str] | None = None,
     coverage_notices: list[dict[str, Any]] | None = None,
-    sector_coverage: dict[str, Any] | None = None,
-    missing_tickers: list[str] | None = None,
-    variance_reports: list[dict[str, Any]] | None = None,
-    sector_benchmarks: list[dict[str, Any]] | None = None,
-    material_variance_flags: list[dict[str, Any]] | None = None,
-    material_variance_summary: dict[str, Any] | None = None,
-    disclosure_deltas: dict[str, Any] | None = None,
-    citations: list[dict[str, Any]] | None = None,
-    candidates_searched: int = 0,
-    context_cache: dict[str, Any] | None = None,
+    bundle: _RetrievalBundle | None = None,
+    citations_override: list[dict[str, Any]] | None = None,
     evaluation: dict[str, Any] | None = None,
-    intent_source: str = "scope_gate",
+    evaluation_grade: str | None = None,
+    evaluation_score: float | None = None,
+    emit_complete: bool = False,
 ) -> dict[str, Any]:
-    """Canonical response builder shared across ALL 4 return paths (always nested `model_armor`).
+    """Record session telemetry and build the canonical turn response across ALL exit paths."""
+    total_ms = ctx.elapsed_ms()
+    eff_records = list(turn_latency_records or [])
+    eff_citations = (
+        list(citations_override)
+        if citations_override is not None
+        else (list(bundle.citations) if bundle is not None else [])
+    )
+    variance_reports = list(bundle.variance_reports) if bundle is not None else []
+    tel_kwargs: dict[str, Any] = {
+        "session_id": ctx.telemetry_session_id,
+        "user_id": ctx.user_id,
+        "intent": intent,
+        "execution_mode": execution_mode,
+        "status_outcome": status,
+        "tickers_analyzed": telemetry_tickers,
+        "gics_sector": str(resolved_scope.get("gics_sector") or "ALL"),
+        "start_year": int(resolved_scope.get("start_year") or 2024),
+        "end_year": int(resolved_scope.get("end_year") or 2026),
+        "report_generated": telemetry_report_generated,
+        "variance_reports_count": len(variance_reports),
+        "citations_count": len(eff_citations),
+        "agent_trace": ctx.agent_trace,
+        "turn_latency_records": eff_records,
+        "total_latency_ms": total_ms,
+        "fact_check_passed": telemetry_fact_check_passed,
+    }
+    if evaluation_grade is not None:
+        tel_kwargs["evaluation_grade"] = evaluation_grade
+    if evaluation_score is not None:
+        tel_kwargs["evaluation_score"] = evaluation_score
+    sess_tel = get_telemetry_sink().record_session_turn_telemetry(**tel_kwargs)
 
-    `variance_reports`, `material_variance_flags`, `material_variance_summary`, and
-    `disclosure_deltas` are populated only when FinancialAnalystAgent invoked the matching
-    deterministic tool this turn (empty / None otherwise).
-    """
+    session_memory_payload = (
+        {**ctx.memory_ctx, "persistence": memory_persist}
+        if memory_persist is not None
+        else ctx.memory_ctx
+    )
+    context_and_memory = {
+        "models": get_model_strategy_metadata(),
+        "session_memory": session_memory_payload,
+        "turn_context_latency": (
+            turn_latency_summary.model_dump(mode="json")
+            if turn_latency_summary is not None
+            else None
+        ),
+        "model_call_records": [r.model_dump(mode="json") for r in eff_records],
+        "global_context_latency": (
+            get_context_latency_tracker().summarize().model_dump(mode="json")
+        ),
+        "context_cache_runtime": get_context_cache_runtime_stats(),
+        "session_telemetry": sess_tel["row"],
+    }
+    if emit_complete:
+        ctx.emit("complete", "Grounded report ready.", {"total_latency_ms": total_ms})
+
     return {
         "status": status,
         "model_armor_blocked": model_armor_blocked,
@@ -599,7 +693,9 @@ def _build_turn_response(
             ),
         },
         "execution_mode": execution_mode,
-        "adk_runtime": adk_runtime,
+        "adk_runtime": (
+            adk_runtime if adk_runtime is not None else get_live_runtime_status_metadata()
+        ),
         "structured_report": structured_report,
         "report_verification": report_verification,
         "prompt_store": get_prompt_store_status_metadata(),
@@ -612,27 +708,30 @@ def _build_turn_response(
         "clarification_reason": clarification_reason,
         "suggested_followups": list(suggested_followups or []),
         "coverage_notices": list(coverage_notices or []),
-        "sector_coverage": sector_coverage,
-        "missing_tickers": list(missing_tickers or []),
-        "variance_reports": list(variance_reports or []),
-        "sector_benchmarks": list(sector_benchmarks or []),
-        "material_variance_flags": list(material_variance_flags or []),
-        "material_variance_summary": material_variance_summary,
-        "disclosure_deltas": disclosure_deltas,
-        "citations": list(citations or []),
-        "candidates_searched": candidates_searched,
-        "context_cache": context_cache,
+        "sector_coverage": bundle.sector_coverage if bundle is not None else None,
+        "missing_tickers": list(bundle.missing_tickers) if bundle is not None else [],
+        "variance_reports": variance_reports,
+        "sector_benchmarks": list(bundle.sector_benchmarks) if bundle is not None else [],
+        "material_variance_flags": list(bundle.material_flags) if bundle is not None else [],
+        "material_variance_summary": (
+            bundle.material_flags_summary if bundle is not None else None
+        ),
+        "disclosure_deltas": bundle.disclosure_deltas if bundle is not None else None,
+        "citations": eff_citations,
+        "candidates_searched": bundle.candidates_searched if bundle is not None else 0,
+        "context_cache": None,
         "fact_check": fact_check,
         "evaluation": evaluation,
         "react_execution": react_execution,
         "context_and_memory": context_and_memory,
-        "agent_trace": agent_trace,
-        "agent_identities_used": list(identities_used_by_agent.values()),
-        "total_latency_ms": total_latency_ms,
+        "agent_trace": ctx.agent_trace,
+        "agent_identities_used": list(ctx.identities_used_by_agent.values()),
+        "total_latency_ms": total_ms,
     }
 
 
 def _early_return_response(
+    ctx: _TurnContext,
     *,
     status: str,
     intent: str,
@@ -640,12 +739,6 @@ def _early_return_response(
     message: str,
     scope: dict[str, Any],
     prompt_decision: GuardrailDecision,
-    memory_ctx: dict[str, Any],
-    agent_trace: list[dict[str, Any]],
-    identities_used_by_agent: dict[str, dict[str, str]],
-    turn_start: float,
-    telemetry_session_id: str,
-    user_id: str,
     coverage_notices: list[dict[str, Any]],
     suggested_followups: list[str],
     reason: str | None,
@@ -656,32 +749,12 @@ def _early_return_response(
         bullets = "\n".join(f"- *{s}*" for s in suggested_followups)
         suggestions_md = f"\n\n**Try one of these queries:**\n{bullets}"
     answer_markdown = f"### {title}\n\n{message}{suggestions_md}\n"
-    total_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
-    sess_tel = get_telemetry_sink().record_session_turn_telemetry(
-        session_id=telemetry_session_id,
-        user_id=user_id,
-        intent=intent,
-        execution_mode=status,
-        status_outcome=status,
-        tickers_analyzed=list(scope.get("tickers") or []),
-        gics_sector=str(scope.get("gics_sector") or "ALL"),
-        start_year=int(scope.get("start_year") or 2024),
-        end_year=int(scope.get("end_year") or 2026),
-        report_generated=False,
-        variance_reports_count=0,
-        citations_count=0,
-        agent_trace=agent_trace,
-        turn_latency_records=[],
-        total_latency_ms=total_ms,
-        fact_check_passed=True,
-    )
-    return _build_turn_response(
+    return _finalize_turn(
+        ctx,
         status=status,
         model_armor_blocked=False,
         prompt_decision=prompt_decision,
-        response_decision=None,
         execution_mode=status,
-        adk_runtime=get_live_runtime_status_metadata(),
         intent=intent,
         resolved_scope=scope,
         answer_markdown=answer_markdown,
@@ -689,13 +762,16 @@ def _early_return_response(
         clarification_reason=reason,
         suggested_followups=suggested_followups,
         coverage_notices=coverage_notices,
+        telemetry_tickers=list(scope.get("tickers") or []),
+        telemetry_report_generated=False,
+        telemetry_fact_check_passed=True,
         fact_check={
             "passed": True,
             "checked_metrics_count": 0,
             "matched_citations_count": 0,
             "has_required_citations": True,
             "discrepancies": [],
-            "model_latency_ms": total_ms,
+            "model_latency_ms": ctx.elapsed_ms(),
         },
         react_execution={
             "strategy": "scope_validation_gate",
@@ -705,36 +781,17 @@ def _early_return_response(
             "variance_evaluations": [],
             "cached_10k_explanations": [],
         },
-        context_and_memory={
-            "models": get_model_strategy_metadata(),
-            "session_memory": memory_ctx,
-            "turn_context_latency": None,
-            "model_call_records": [],
-            "global_context_latency": (
-                get_context_latency_tracker().summarize().model_dump(mode="json")
-            ),
-            "context_cache_runtime": get_context_cache_runtime_stats(),
-            "session_telemetry": sess_tel["row"],
-        },
-        agent_trace=agent_trace,
-        identities_used_by_agent=identities_used_by_agent,
-        total_latency_ms=total_ms,
     )
 
 
 def _run_prompt_guardrail(
+    ctx: _TurnContext,
     *,
     query: str,
     gics_sector: str,
     section_id: str,
     start_year: int,
     end_year: int,
-    memory_ctx: dict[str, Any],
-    agent_trace: list[dict[str, Any]],
-    identities_used_by_agent: dict[str, dict[str, str]],
-    turn_start: float,
-    telemetry_session_id: str,
-    user_id: str,
     precomputed_decision: GuardrailDecision | None = None,
     precomputed_guard_ms: float | None = None,
 ) -> tuple[str, GuardrailDecision, dict[str, Any] | None]:
@@ -760,16 +817,14 @@ def _run_prompt_guardrail(
             caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
             callee_agent="ModelArmorGuardrail",
         )
-        _track_identity(identities_used_by_agent, guard_claims)
-        guard_ms = elapsed_guard_ms
+        ctx.track_identity(guard_claims)
         cats_str = ", ".join(prompt_decision.matched_categories) or "policy_violation"
-        _append_trace_step(
-            agent_trace,
+        ctx.append_trace(
             agent="ModelArmorGuardrail",
             claims=guard_claims,
             tool="model_armor_sanitize_user_prompt",
             status="blocked",
-            duration_ms=guard_ms,
+            duration_ms=elapsed_guard_ms,
             summary=(
                 "Blocked user prompt via Google Cloud Model Armor / Compliance Filter "
                 f"(categories=[{cats_str}], backend={prompt_decision.backend_used})."
@@ -780,32 +835,12 @@ def _run_prompt_guardrail(
             if prompt_decision.projection_blocked
             else "safety_guardrail_block"
         )
-        blocked_total_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
-        blocked_sess_tel = get_telemetry_sink().record_session_turn_telemetry(
-            session_id=telemetry_session_id,
-            user_id=user_id,
-            intent=blocked_intent,
-            execution_mode="guardrail_blocked",
-            status_outcome="blocked",
-            tickers_analyzed=[],
-            gics_sector=gics_sector,
-            start_year=start_year,
-            end_year=end_year,
-            report_generated=False,
-            variance_reports_count=0,
-            citations_count=0,
-            agent_trace=agent_trace,
-            turn_latency_records=[],
-            total_latency_ms=blocked_total_ms,
-            fact_check_passed=True,
-        )
-        blocked_resp = _build_turn_response(
+        blocked_resp = _finalize_turn(
+            ctx,
             status="blocked",
             model_armor_blocked=True,
             prompt_decision=prompt_decision,
-            response_decision=None,
             execution_mode="guardrail_blocked",
-            adk_runtime=get_live_runtime_status_metadata(),
             intent=blocked_intent,
             resolved_scope={
                 "tickers": [],
@@ -819,13 +854,16 @@ def _run_prompt_guardrail(
                 f"{prompt_decision.block_message}"
             ),
             answer_verified=False,
+            telemetry_tickers=[],
+            telemetry_report_generated=False,
+            telemetry_fact_check_passed=True,
             fact_check={
                 "passed": True,
                 "checked_metrics_count": 0,
                 "matched_citations_count": 0,
                 "has_required_citations": True,
                 "discrepancies": [],
-                "model_latency_ms": guard_ms,
+                "model_latency_ms": elapsed_guard_ms,
             },
             react_execution={
                 "strategy": "structured_react_loop",
@@ -835,20 +873,6 @@ def _run_prompt_guardrail(
                 "variance_evaluations": [],
                 "cached_10k_explanations": [],
             },
-            context_and_memory={
-                "models": get_model_strategy_metadata(),
-                "session_memory": memory_ctx,
-                "turn_context_latency": None,
-                "model_call_records": [],
-                "global_context_latency": (
-                    get_context_latency_tracker().summarize().model_dump(mode="json")
-                ),
-                "context_cache_runtime": get_context_cache_runtime_stats(),
-                "session_telemetry": blocked_sess_tel["row"],
-            },
-            agent_trace=agent_trace,
-            identities_used_by_agent=identities_used_by_agent,
-            total_latency_ms=blocked_total_ms,
         )
         return query, prompt_decision, blocked_resp
 
@@ -858,9 +882,8 @@ def _run_prompt_guardrail(
             caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
             callee_agent="ModelArmorGuardrail",
         )
-        _track_identity(identities_used_by_agent, guard_claims)
-        _append_trace_step(
-            agent_trace,
+        ctx.track_identity(guard_claims)
+        ctx.append_trace(
             agent="ModelArmorGuardrail",
             claims=guard_claims,
             tool="cloud_sdp_deidentify_content",
@@ -984,12 +1007,12 @@ def _agent_tool_summary(tool: str, bundle: _RetrievalBundle, calls: list[dict[st
             f"({int(cov.get('total_chunks_evaluated', 0) or 0):,} passages in "
             f"{cov.get('batches_processed', 0)} parallel Flash batches)."
         )
-    if tool == "query_looker_financial_explore":
+    if tool in ("query_analytics_view", "query_looker_financial_explore"):
         explores = sorted(
             {str((c.get("args") or {}).get("explore_name") or "") for c in calls} - {""}
         )
         return (
-            f"Agent-invoked Looker explore(s) {explores}: {len(bundle.sector_benchmarks)} sector "
+            f"Agent-invoked analytics view(s) {explores}: {len(bundle.sector_benchmarks)} sector "
             f"benchmark row(s); chunk health "
             f"{(bundle.chunk_health or {}).get('health_status', 'not requested')}."
         )
@@ -1021,8 +1044,8 @@ def _append_agent_tool_trace_steps(
         )
         _track_identity(identities_used_by_agent, claims)
         trace_tool = (
-            f"query_looker_financial_explore({','.join(sorted({str((c.get('args') or {}).get('explore_name') or '') for c in calls}))})"
-            if name == "query_looker_financial_explore"
+            f"{name}({','.join(sorted({str((c.get('args') or {}).get('explore_name') or '') for c in calls}))})"
+            if name in ("query_analytics_view", "query_looker_financial_explore")
             else name
         )
         _append_trace_step(
@@ -1058,6 +1081,7 @@ def _append_agent_tool_trace_steps(
 
 
 def _inspect_response_guardrail(
+    ctx: _TurnContext,
     *,
     react_result: dict[str, Any],
     answer_markdown: str,
@@ -1065,13 +1089,6 @@ def _inspect_response_guardrail(
     public_scope: dict[str, Any],
     coverage_notices: list[dict[str, Any]],
     bundle: _RetrievalBundle,
-    context_cache_info: dict[str, Any] | None,
-    memory_ctx: dict[str, Any],
-    agent_trace: list[dict[str, Any]],
-    identities_used_by_agent: dict[str, dict[str, str]],
-    turn_start: float,
-    telemetry_session_id: str,
-    user_id: str,
 ) -> tuple[str, GuardrailDecision, bool, dict[str, Any] | None]:
     """Reconcile ADK/Model Armor response inspection; return `(text, decision, sdp_modified, blocked_resp)`."""
     t_resp_armor = time.perf_counter()
@@ -1102,11 +1119,10 @@ def _inspect_response_guardrail(
             caller_agent="FinancialAnalystAgent",
             callee_agent="ModelArmorGuardrail",
         )
-        _track_identity(identities_used_by_agent, out_guard_claims)
+        ctx.track_identity(out_guard_claims)
         out_guard_ms = round((time.perf_counter() - t_resp_armor) * 1000.0, 2)
         cats_str = ", ".join(resp_decision.matched_categories) or "policy_violation"
-        _append_trace_step(
-            agent_trace,
+        ctx.append_trace(
             agent="ModelArmorGuardrail",
             claims=out_guard_claims,
             tool="model_armor_sanitize_model_response",
@@ -1122,31 +1138,9 @@ def _inspect_response_guardrail(
             if resp_decision.projection_blocked
             else "safety_guardrail_block"
         )
-        resp_blocked_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
-        turn_latency_records = react_result["turn_latency_records"]
-        turn_latency_summary = react_result["turn_latency_summary"]
         react_steps = react_result["react_steps"]
-        variance_evaluations = react_result["variance_evaluations"]
-        cached_explanations = react_result["cached_explanations"]
-        resp_blocked_tel = get_telemetry_sink().record_session_turn_telemetry(
-            session_id=telemetry_session_id,
-            user_id=user_id,
-            intent=resp_blocked_intent,
-            execution_mode="guardrail_blocked",
-            status_outcome="blocked",
-            tickers_analyzed=public_scope["tickers"],
-            gics_sector=public_scope["gics_sector"],
-            start_year=public_scope["start_year"],
-            end_year=public_scope["end_year"],
-            report_generated=False,
-            variance_reports_count=len(bundle.variance_reports),
-            citations_count=0,
-            agent_trace=agent_trace,
-            turn_latency_records=turn_latency_records,
-            total_latency_ms=resp_blocked_ms,
-            fact_check_passed=False,
-        )
-        blocked_resp = _build_turn_response(
+        blocked_resp = _finalize_turn(
+            ctx,
             status="blocked",
             model_armor_blocked=True,
             prompt_decision=prompt_decision,
@@ -1161,16 +1155,13 @@ def _inspect_response_guardrail(
             ),
             answer_verified=False,
             coverage_notices=coverage_notices,
-            sector_coverage=bundle.sector_coverage,
-            missing_tickers=bundle.missing_tickers,
-            variance_reports=bundle.variance_reports,
-            sector_benchmarks=bundle.sector_benchmarks,
-            material_variance_flags=bundle.material_flags,
-            material_variance_summary=bundle.material_flags_summary,
-            disclosure_deltas=bundle.disclosure_deltas,
-            citations=[],
-            candidates_searched=bundle.candidates_searched,
-            context_cache=context_cache_info,
+            bundle=bundle,
+            citations_override=[],
+            telemetry_tickers=public_scope["tickers"],
+            telemetry_report_generated=False,
+            telemetry_fact_check_passed=False,
+            turn_latency_records=react_result["turn_latency_records"],
+            turn_latency_summary=react_result["turn_latency_summary"],
             fact_check={
                 "passed": False,
                 "checked_metrics_count": 0,
@@ -1184,23 +1175,13 @@ def _inspect_response_guardrail(
                 "execution_mode": react_result["execution_mode"],
                 "iterations": len(react_steps),
                 "steps": [s.model_dump(mode="json") for s in react_steps],
-                "variance_evaluations": [v.model_dump(mode="json") for v in variance_evaluations],
-                "cached_10k_explanations": [e.model_dump(mode="json") for e in cached_explanations],
+                "variance_evaluations": [
+                    v.model_dump(mode="json") for v in react_result["variance_evaluations"]
+                ],
+                "cached_10k_explanations": [
+                    e.model_dump(mode="json") for e in react_result["cached_explanations"]
+                ],
             },
-            context_and_memory={
-                "models": get_model_strategy_metadata(),
-                "session_memory": memory_ctx,
-                "turn_context_latency": turn_latency_summary.model_dump(mode="json"),
-                "model_call_records": [r.model_dump(mode="json") for r in turn_latency_records],
-                "global_context_latency": (
-                    get_context_latency_tracker().summarize().model_dump(mode="json")
-                ),
-                "context_cache_runtime": get_context_cache_runtime_stats(),
-                "session_telemetry": resp_blocked_tel["row"],
-            },
-            agent_trace=agent_trace,
-            identities_used_by_agent=identities_used_by_agent,
-            total_latency_ms=resp_blocked_ms,
         )
         return answer_markdown, resp_decision, False, blocked_resp
 
@@ -1213,9 +1194,8 @@ def _inspect_response_guardrail(
             caller_agent="FinancialAnalystAgent",
             callee_agent="ModelArmorGuardrail",
         )
-        _track_identity(identities_used_by_agent, out_guard_claims)
-        _append_trace_step(
-            agent_trace,
+        ctx.track_identity(out_guard_claims)
+        ctx.append_trace(
             agent="ModelArmorGuardrail",
             claims=out_guard_claims,
             tool="cloud_sdp_deidentify_content",
@@ -1228,6 +1208,303 @@ def _inspect_response_guardrail(
         )
 
     return answer_markdown, resp_decision, sdp_modified, None
+
+
+def _run_parallel_prepass(
+    *,
+    memory_mgr: Any,
+    session_id: str | None,
+    user_id: str,
+    query: str,
+) -> tuple[dict[str, Any], tuple[GuardrailDecision, float], tuple[EntityCatalog, list[Any]]]:
+    """Overlap independent Firestore memory recall, Model Armor prompt check, and catalog fetch."""
+
+    def _run_branch(branch: str) -> Any:
+        if branch == "memory":
+            return memory_mgr.recall_session_context(session_id, user_id=user_id)
+        if branch == "guardrail":
+            t_g = time.perf_counter()
+            dec = get_model_armor_guardrail().inspect_user_prompt(
+                query,
+                caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+            )
+            return dec, (time.perf_counter() - t_g) * 1000.0
+        return _get_entity_catalog(allow_fetch=True)
+
+    return tuple(  # type: ignore[return-value]
+        run_parallel_with_context(["memory", "guardrail", "catalog"], _run_branch, max_workers=3)
+    )
+
+
+def _resolve_and_validate_scope(
+    ctx: _TurnContext,
+    *,
+    query: str,
+    tickers: str,
+    gics_sector: str,
+    section_id: str,
+    start_year: int,
+    end_year: int,
+    catalog: EntityCatalog,
+    prompt_decision: GuardrailDecision,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict[str, Any] | None]:
+    """Resolve scope, run coverage/clarification gates, and return `(public_scope, pre_notices, provisional_intent, early_resp)`."""
+    t1 = time.perf_counter()
+    route_claims = authorize_agent_tool_invocation(
+        agent_name=_S2S_ROUTER_IDENTITY_NAME,
+        tool_name="resolve_query_scope",
+        caller=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
+    )
+    ctx.track_identity(route_claims)
+    scope = resolve_query_scope(
+        query=query,
+        tickers=tickers,
+        gics_sector=gics_sector,
+        section_id=section_id,
+        start_year=start_year,
+        end_year=end_year,
+        memory_context=ctx.memory_ctx,
+        catalog=catalog,
+    )
+    validation = validate_query_scope_and_coverage(
+        query=query,
+        scope=scope,
+        explicit_tickers=list(scope.get("explicit_tickers") or []),
+        unknown_entities=list(scope.get("unknown_entities") or []),
+        catalog=catalog,
+        memory_context=ctx.memory_ctx,
+    )
+    pre_notices: list[dict[str, Any]] = list(validation.get("pre_notices") or [])
+    public_scope = {
+        k: v for k, v in scope.items() if k not in ("explicit_tickers", "unknown_entities")
+    }
+
+    if validation["action"] in ("clarification", "out_of_corpus"):
+        is_clarification = validation["action"] == "clarification"
+        early_status = "clarification" if is_clarification else "out_of_corpus"
+        early_intent = "clarification_needed" if is_clarification else "out_of_corpus"
+        early_title = (
+            "Clarification Needed"
+            if is_clarification
+            else "Outside Curated SEC 10-K Corpus Coverage"
+        )
+        ctx.append_trace(
+            agent=_S2S_ROUTER_IDENTITY_NAME,
+            claims=route_claims,
+            model_used=resolve_model_for_task("orchestration"),
+            tool="validate_query_scope_and_coverage",
+            status=early_status,
+            duration_ms=round((time.perf_counter() - t1) * 1000.0, 2),
+            summary=(
+                f"Scope validation returned '{early_intent}' (reason={validation.get('reason')})."
+            ),
+        )
+        ctx.emit("scope_validation", early_title, {"action": early_status})
+        early_resp = _early_return_response(
+            ctx,
+            status=early_status,
+            intent=early_intent,
+            title=early_title,
+            message=str(validation["message"]),
+            scope=public_scope,
+            prompt_decision=prompt_decision,
+            coverage_notices=pre_notices,
+            suggested_followups=list(validation.get("suggested_followups") or []),
+            reason=validation.get("reason"),
+        )
+        return public_scope, pre_notices, early_intent, early_resp
+
+    # Intent is emitted by FinancialAnalystAgent (`AnalystReport.intent`); the router only
+    # resolves scope. `provisional_intent` is a structural (non-lexical) routing hint.
+    provisional_intent = infer_intent_from_tool_calls(public_scope, [])
+    sector_wide_scope = is_sector_wide_scope(public_scope)
+    orchestrator_model = resolve_model_for_task("orchestration")
+    mem_suffix = " (recalled from session memory)" if public_scope.get("memory_inherited") else ""
+    ctx.append_trace(
+        agent=_S2S_ROUTER_IDENTITY_NAME,
+        claims=route_claims,
+        model_used=orchestrator_model,
+        tool="resolve_query_scope",
+        status="completed",
+        duration_ms=round((time.perf_counter() - t1) * 1000.0, 2),
+        summary=(
+            f"Resolved scope ({orchestrator_model}) · Tickers: {public_scope['tickers_csv']}{mem_suffix} · "
+            f"Sector: {public_scope['gics_sector']} · Section: {public_scope['section_id']} · "
+            f"FY{public_scope['start_year']}–FY{public_scope['end_year']} · intent and "
+            "deterministic tools are selected by FinancialAnalystAgent"
+        ),
+    )
+    ctx.emit(
+        "scope_resolved",
+        (
+            f"Scoped to {public_scope['gics_sector']} sector (FY{public_scope['start_year']}–FY{public_scope['end_year']})"
+            if sector_wide_scope
+            else f"Scoped to {public_scope['tickers_csv']} (FY{public_scope['start_year']}–FY{public_scope['end_year']})"
+        ),
+        {
+            "intent": None,
+            "provisional_intent": provisional_intent,
+            "tickers": public_scope["tickers"],
+            "gics_sector": public_scope["gics_sector"],
+            "sector_wide_scope": sector_wide_scope,
+        },
+    )
+    return public_scope, pre_notices, provisional_intent, None
+
+
+def _verify_and_finalize_success(
+    ctx: _TurnContext,
+    *,
+    query: str,
+    public_scope: dict[str, Any],
+    prompt_decision: GuardrailDecision,
+    react_result: dict[str, Any],
+    bundle: _RetrievalBundle,
+    coverage_notices: list[dict[str, Any]],
+    intent: str,
+    intent_source: str,
+    memory_mgr: Any,
+) -> dict[str, Any]:
+    """Run S2S fact-check attestation, response guardrail, memory persistence, and turn finalization."""
+    answer_markdown: str = react_result["answer_markdown"]
+    citations: list[dict[str, Any]] = react_result["citations"]
+    variance_evaluations = react_result["variance_evaluations"]
+    cached_explanations = react_result["cached_explanations"]
+    react_steps = react_result["react_steps"]
+    eval_report = react_result["evaluation_report"]
+    reasoning_model: str = react_result["reasoning_model"]
+    evaluation_model: str = react_result["evaluation_model"]
+    active_execution_mode: str = react_result["execution_mode"]
+    adk_runtime_meta: dict[str, Any] = react_result["adk_runtime"]
+
+    ctx.emit(
+        "verifying", "Verifying citations, XBRL provenance, and compliance guardrails...", None
+    )
+    t5 = time.perf_counter()
+    s2s_broker = get_agent_s2s_broker()
+    raw_fc_assertion = s2s_broker.mint_s2s_assertion(
+        agent_name="FinancialAnalystAgent",
+        target_service="fact-check-verification-service",
+        caller=_S2S_ROUTER_IDENTITY_NAME,
+    )
+    fc_claims = s2s_broker.verify_s2s_assertion(
+        raw_fc_assertion,
+        expected_target_service="fact-check-verification-service",
+    )
+    ctx.track_identity(fc_claims)
+    synth_step = next(
+        (s for s in react_steps if s.phase == "format_grounded_output"), react_steps[-1]
+    )
+    fc_ms = round((time.perf_counter() - t5) * 1000.0 + synth_step.duration_ms, 2)
+
+    answer_markdown, resp_decision, sdp_modified, blocked_resp = _inspect_response_guardrail(
+        ctx,
+        react_result=react_result,
+        answer_markdown=answer_markdown,
+        prompt_decision=prompt_decision,
+        public_scope=public_scope,
+        coverage_notices=coverage_notices,
+        bundle=bundle,
+    )
+    if blocked_resp is not None:
+        return blocked_resp
+
+    # Reuse the single FactCheckVerification computed by `react_loop` unless SDP modified the text.
+    cached_fc = react_result.get("fact_check_verification")
+    if cached_fc is not None and not sdp_modified:
+        fact_check = cached_fc.model_copy(update={"model_latency_ms": round(fc_ms, 2)})
+    else:
+        fact_check = verify_narrative_against_calculations(
+            response_text=answer_markdown,
+            calculated_variances=bundle.calculated_variances_map,
+            retrieved_citations=citations,
+            model_latency_ms=fc_ms,
+        )
+
+    score_label = (
+        f"{eval_report.overall_score:.2f}" if eval_report.overall_score is not None else "pending"
+    )
+    ctx.append_trace(
+        agent="FinancialAnalystAgent",
+        claims=fc_claims,
+        model_used=f"{reasoning_model} + {evaluation_model}",
+        tool="after_model_fact_check_callback",
+        status="completed" if fact_check.passed else "warning",
+        duration_ms=fc_ms,
+        summary=(
+            f"Formatted grounded report (`{reasoning_model}`) & verification "
+            f"(judge_mode={react_result.get('judge_mode', 'async_background')}, "
+            f"grade={eval_report.grade}, score={score_label}) · "
+            f"Verified {fact_check.checked_metrics_count} variance figure(s) & "
+            f"{fact_check.matched_citations_count} citation tag(s) · Passed: {fact_check.passed}."
+        ),
+    )
+
+    variance_highlights = [
+        ev.material_findings[0] for ev in variance_evaluations if ev.material_findings
+    ]
+    memory_persist = memory_mgr.record_turn(
+        session_id=ctx.session_id,
+        user_id=ctx.user_id,
+        query=query,
+        intent=intent,
+        tickers=public_scope["tickers"],
+        gics_sector=public_scope["gics_sector"],
+        start_year=public_scope["start_year"],
+        end_year=public_scope["end_year"],
+        variance_highlights=variance_highlights,
+        cited_chunk_ids=[c["chunk_id"] for c in citations],
+        cached_10k_keys=[e.cache_key for e in cached_explanations],
+        answer_markdown=answer_markdown,
+    )
+
+    analyzed_tickers = sorted(
+        {
+            *(public_scope.get("tickers") or []),
+            *(r["ticker"] for r in bundle.variance_reports if r.get("ticker")),
+            *(c["ticker"] for c in citations if c.get("ticker")),
+        }
+    )
+    return _finalize_turn(
+        ctx,
+        status="success",
+        model_armor_blocked=False,
+        prompt_decision=prompt_decision,
+        response_decision=resp_decision,
+        execution_mode=active_execution_mode,
+        adk_runtime=adk_runtime_meta,
+        structured_report=adk_runtime_meta.get("structured_report"),
+        report_verification=adk_runtime_meta.get("report_verification"),
+        intent=intent,
+        intent_source=intent_source,
+        resolved_scope=public_scope,
+        answer_markdown=answer_markdown,
+        answer_verified=bool(react_result.get("answer_verified")),
+        coverage_notices=coverage_notices,
+        bundle=bundle,
+        citations_override=citations,
+        fact_check=fact_check.model_dump(mode="json"),
+        evaluation=eval_report.model_dump(mode="json"),
+        evaluation_grade=eval_report.grade,
+        evaluation_score=eval_report.overall_score,
+        telemetry_tickers=analyzed_tickers,
+        telemetry_report_generated=bool(react_result.get("answer_verified")),
+        telemetry_fact_check_passed=fact_check.passed,
+        turn_latency_records=react_result["turn_latency_records"],
+        turn_latency_summary=react_result["turn_latency_summary"],
+        memory_persist=memory_persist,
+        emit_complete=True,
+        react_execution={
+            "strategy": "structured_react_loop",
+            "execution_mode": active_execution_mode,
+            "observed_ttft_ms": adk_runtime_meta.get("observed_ttft_ms"),
+            "judge_mode": react_result.get("judge_mode", "async_background"),
+            "iterations": len(react_steps),
+            "steps": [s.model_dump(mode="json") for s in react_steps],
+            "variance_evaluations": [v.model_dump(mode="json") for v in variance_evaluations],
+            "cached_10k_explanations": [e.model_dump(mode="json") for e in cached_explanations],
+        },
+    )
 
 
 @traced(
@@ -1261,172 +1538,54 @@ def run_conversational_rag_turn(
     on_progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     """Execute a full source-grounded Hybrid RAG conversational turn with ADK Runner & streaming progress."""
-    turn_start = time.perf_counter()
-    agent_trace: list[dict[str, Any]] = []
-    identities_used_by_agent: dict[str, dict[str, str]] = {}
-    telemetry_session_id = (session_id or "").strip() or f"ephemeral-{uuid.uuid4().hex[:10]}"
+    ctx = _TurnContext(
+        turn_start=time.perf_counter(),
+        telemetry_session_id=(session_id or "").strip() or f"ephemeral-{uuid.uuid4().hex[:10]}",
+        session_id=session_id,
+        user_id=user_id,
+        on_progress=on_progress,
+    )
+    ctx.emit("starting", "Checking safety guardrails and session memory...", None)
 
-    def _emit(stage: str, message: str, meta: dict[str, Any] | None = None) -> None:
-        if on_progress is not None:
-            on_progress(stage, message, meta)
-
-    _emit("starting", "Checking safety guardrails and session memory...", None)
-
-    # Parallel pre-pass: overlap Firestore memory recall, Model Armor prompt check, and the
-    # read-only S&P 500 entity catalog fetch (all three are independent; if Model Armor blocks,
-    # the catalog result is discarded and the exact blocked payload is returned).
+    # Step 0: Parallel pre-pass (Firestore memory recall, Model Armor prompt check, entity catalog)
     memory_mgr = get_conversation_memory_manager()
-
-    def _run_prepass_branch(branch: str) -> Any:
-        if branch == "memory":
-            return memory_mgr.recall_session_context(session_id, user_id=user_id)
-        if branch == "guardrail":
-            t_g = time.perf_counter()
-            dec = get_model_armor_guardrail().inspect_user_prompt(
-                query,
-                caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-            )
-            return dec, (time.perf_counter() - t_g) * 1000.0
-        return _get_entity_catalog(allow_fetch=True)
-
     memory_ctx, (raw_prompt_decision, raw_guard_ms), (catalog, all_profiles) = (
-        run_parallel_with_context(
-            ["memory", "guardrail", "catalog"],
-            _run_prepass_branch,
-            max_workers=3,
+        _run_parallel_prepass(
+            memory_mgr=memory_mgr,
+            session_id=session_id,
+            user_id=user_id,
+            query=query,
         )
     )
+    ctx.memory_ctx = memory_ctx
 
-    # Step 0: Managed Google Cloud Model Armor, Cloud SDP/DLP & Financial Projection Guardrails
     query, prompt_decision, blocked_prompt_resp = _run_prompt_guardrail(
+        ctx,
         query=query,
         gics_sector=gics_sector,
         section_id=section_id,
         start_year=start_year,
         end_year=end_year,
-        memory_ctx=memory_ctx,
-        agent_trace=agent_trace,
-        identities_used_by_agent=identities_used_by_agent,
-        turn_start=turn_start,
-        telemetry_session_id=telemetry_session_id,
-        user_id=user_id,
         precomputed_decision=raw_prompt_decision,
         precomputed_guard_ms=raw_guard_ms,
     )
     if blocked_prompt_resp is not None:
         return blocked_prompt_resp
 
-    # Step 1: Scope Resolution, Full S&P 500 Catalog Validation, Session Memory Recall & Routing
-    t1 = time.perf_counter()
-    route_claims = authorize_agent_tool_invocation(
-        agent_name=_S2S_ROUTER_IDENTITY_NAME,
-        tool_name="resolve_query_scope",
-        caller=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-    )
-    _track_identity(identities_used_by_agent, route_claims)
-    scope = resolve_query_scope(
+    # Step 1: Scope resolution, S&P 500 catalog validation, and clarification / out-of-corpus gate
+    public_scope, pre_notices, provisional_intent, early_resp = _resolve_and_validate_scope(
+        ctx,
         query=query,
         tickers=tickers,
         gics_sector=gics_sector,
         section_id=section_id,
         start_year=start_year,
         end_year=end_year,
-        memory_context=memory_ctx,
         catalog=catalog,
+        prompt_decision=prompt_decision,
     )
-
-    validation = validate_query_scope_and_coverage(
-        query=query,
-        scope=scope,
-        explicit_tickers=list(scope.get("explicit_tickers") or []),
-        unknown_entities=list(scope.get("unknown_entities") or []),
-        catalog=catalog,
-        memory_context=memory_ctx,
-    )
-    pre_notices: list[dict[str, Any]] = list(validation.get("pre_notices") or [])
-    public_scope = {
-        k: v for k, v in scope.items() if k not in ("explicit_tickers", "unknown_entities")
-    }
-
-    if validation["action"] in ("clarification", "out_of_corpus"):
-        is_clarification = validation["action"] == "clarification"
-        early_status = "clarification" if is_clarification else "out_of_corpus"
-        early_intent = "clarification_needed" if is_clarification else "out_of_corpus"
-        early_title = (
-            "Clarification Needed"
-            if is_clarification
-            else "Outside Curated SEC 10-K Corpus Coverage"
-        )
-        route_ms = round((time.perf_counter() - t1) * 1000.0, 2)
-        _append_trace_step(
-            agent_trace,
-            agent=_S2S_ROUTER_IDENTITY_NAME,
-            claims=route_claims,
-            model_used=resolve_model_for_task("orchestration"),
-            tool="validate_query_scope_and_coverage",
-            status=early_status,
-            duration_ms=route_ms,
-            summary=(
-                f"Scope validation returned '{early_intent}' (reason={validation.get('reason')})."
-            ),
-        )
-        _emit("scope_validation", early_title, {"action": early_status})
-        return _early_return_response(
-            status=early_status,
-            intent=early_intent,
-            title=early_title,
-            message=str(validation["message"]),
-            scope=public_scope,
-            prompt_decision=prompt_decision,
-            memory_ctx=memory_ctx,
-            agent_trace=agent_trace,
-            identities_used_by_agent=identities_used_by_agent,
-            turn_start=turn_start,
-            telemetry_session_id=telemetry_session_id,
-            user_id=user_id,
-            coverage_notices=pre_notices,
-            suggested_followups=list(validation.get("suggested_followups") or []),
-            reason=validation.get("reason"),
-        )
-
-    # Intent is emitted by FinancialAnalystAgent (`AnalystReport.intent`); the router only
-    # resolves scope. `provisional_intent` is a structural (non-lexical) routing hint.
-    provisional_intent = infer_intent_from_tool_calls(public_scope, [])
-    sector_wide_scope = is_sector_wide_scope(public_scope)
-    orchestrator_model = resolve_model_for_task("orchestration")
-    route_ms = round((time.perf_counter() - t1) * 1000.0, 2)
-    mem_suffix = " (recalled from session memory)" if public_scope.get("memory_inherited") else ""
-    _append_trace_step(
-        agent_trace,
-        agent=_S2S_ROUTER_IDENTITY_NAME,
-        claims=route_claims,
-        model_used=orchestrator_model,
-        tool="resolve_query_scope",
-        status="completed",
-        duration_ms=route_ms,
-        summary=(
-            f"Resolved scope ({orchestrator_model}) · Tickers: {public_scope['tickers_csv']}{mem_suffix} · "
-            f"Sector: {public_scope['gics_sector']} · Section: {public_scope['section_id']} · "
-            f"FY{public_scope['start_year']}–FY{public_scope['end_year']} · intent and "
-            "deterministic tools are selected by FinancialAnalystAgent"
-        ),
-    )
-
-    _emit(
-        "scope_resolved",
-        (
-            f"Scoped to {public_scope['gics_sector']} sector (FY{public_scope['start_year']}–FY{public_scope['end_year']})"
-            if sector_wide_scope
-            else f"Scoped to {public_scope['tickers_csv']} (FY{public_scope['start_year']}–FY{public_scope['end_year']})"
-        ),
-        {
-            "intent": None,
-            "provisional_intent": provisional_intent,
-            "tickers": public_scope["tickers"],
-            "gics_sector": public_scope["gics_sector"],
-            "sector_wide_scope": sector_wide_scope,
-        },
-    )
+    if early_resp is not None:
+        return early_resp
 
     # Step 2: Hybrid RAG evidence-lead pre-pass (deterministic engines are agent-invoked tools)
     authorize_agent_s2s_hop(
@@ -1438,18 +1597,15 @@ def run_conversational_rag_turn(
         tool_name="search_10k_chunks_rag",
         caller=_S2S_ROUTER_IDENTITY_NAME,
     )
-    _track_identity(identities_used_by_agent, rag_claims)
-    _emit("retrieving", "Retrieving 10-K evidence leads...", None)
+    ctx.track_identity(rag_claims)
+    ctx.emit("retrieving", "Retrieving 10-K evidence leads...", None)
     prepass_citations, prepass_candidates = _run_rag_prepass(
         query=query,
         public_scope=public_scope,
         top_k=top_k,
         rag_claims=rag_claims,
-        agent_trace=agent_trace,
+        agent_trace=ctx.agent_trace,
     )
-
-    # Missing-fiscal-year / fiscal-calendar / missing-ticker notices come from the cached
-    # BigQuery profile catalog, independent of whether the agent computes variance reports.
     base_coverage_notices = build_coverage_notices(
         variance_reports=[],
         query=query,
@@ -1473,256 +1629,72 @@ def run_conversational_rag_turn(
             query=query,
             intent=provisional_intent,
             scope=public_scope,
-            variance_reports=[],
             citations=prepass_citations,
-            sector_benchmarks=[],
-            chunk_health=None,
             memory_tokens=int(memory_ctx.get("memory_tokens", 0) or 0),
             memory_prep_latency_ms=float(memory_ctx.get("memory_lookup_latency_ms", 0.0) or 0.0),
             memory_context=memory_ctx,
             session_id=session_id,
-            telemetry_session_id=telemetry_session_id,
+            telemetry_session_id=ctx.telemetry_session_id,
             user_id=user_id,
-            material_variance_flags=[],
-            disclosure_deltas=None,
             coverage_notices=base_coverage_notices,
-            sector_map_summaries=None,
             prompt_already_verified=True,
             run_judge_sync=run_judge_sync,
             skip_background_judge=skip_background_judge,
             on_progress=on_progress,
         )
 
-    answer_markdown: str = react_result["answer_markdown"]
-    citations: list[dict[str, Any]] = react_result["citations"]
-    variance_evaluations = react_result["variance_evaluations"]
-    cached_explanations = react_result["cached_explanations"]
-    react_steps = react_result["react_steps"]
-    eval_report = react_result["evaluation_report"]
-    turn_latency_records = react_result["turn_latency_records"]
-    turn_latency_summary = react_result["turn_latency_summary"]
-    reasoning_model: str = react_result["reasoning_model"]
-    evaluation_model: str = react_result["evaluation_model"]
-    active_execution_mode: str = react_result["execution_mode"]
-    adk_runtime_meta: dict[str, Any] = react_result["adk_runtime"]
-    agent_tool_calls: list[dict[str, Any]] = list(react_result.get("agent_tool_calls") or [])
-
-    # Deterministic tool outputs hydrated from ADK session_state (before verification ran)
     bundle = _bundle_from_tool_outputs(
         react_result.get("tool_outputs") or ToolOutputs(),
-        citations=citations,
+        citations=react_result["citations"],
         candidates_searched=prepass_candidates,
     )
     coverage_notices: list[dict[str, Any]] = list(
         react_result.get("coverage_notices") or base_coverage_notices
     )
+    agent_tool_calls: list[dict[str, Any]] = list(react_result.get("agent_tool_calls") or [])
     intent, intent_source = resolve_turn_intent(
         agent_intent=react_result.get("agent_intent"),
         scope=public_scope,
         tool_calls=agent_tool_calls,
     )
 
-    eval_var_step = react_steps[0]
-    _append_trace_step(
-        agent_trace,
+    eval_var_step = react_result["react_steps"][0]
+    ctx.append_trace(
         agent="FinancialAnalystAgent",
         claims=rag_claims,
-        model_used=reasoning_model,
+        model_used=react_result["reasoning_model"],
         tool="evaluate_calculated_variances",
         status="completed",
         duration_ms=round(eval_var_step.duration_ms, 2),
         summary=(
-            f"ReAct [Thought→Action]: Evaluated {len(variance_evaluations)} variance report(s) "
-            f"using `{reasoning_model}` (context_latency={eval_var_step.context_latency_ms:.2f}ms)."
+            f"ReAct [Thought→Action]: Evaluated {len(react_result['variance_evaluations'])} variance report(s) "
+            f"using `{react_result['reasoning_model']}` (context_latency={eval_var_step.context_latency_ms:.2f}ms)."
         ),
     )
     invoked_tools = _append_agent_tool_trace_steps(
-        agent_trace=agent_trace,
-        identities_used_by_agent=identities_used_by_agent,
+        agent_trace=ctx.agent_trace,
+        identities_used_by_agent=ctx.identities_used_by_agent,
         tool_calls=agent_tool_calls,
         bundle=bundle,
         turn_ctx=turn_ctx,
     )
-    _emit(
+    ctx.emit(
         "intent_resolved",
         f"Intent: {intent} ({intent_source}); deterministic tools: {', '.join(invoked_tools) or 'none'}",
         {"intent": intent, "intent_source": intent_source, "agent_invoked_tools": invoked_tools},
     )
 
-    context_cache_info: dict[str, Any] | None = None
-
-    # Post-Generation Numeric Fact-Check S2S Attestation
-    _emit("verifying", "Verifying citations, XBRL provenance, and compliance guardrails...", None)
-    t5 = time.perf_counter()
-    s2s_broker = get_agent_s2s_broker()
-    raw_fc_assertion = s2s_broker.mint_s2s_assertion(
-        agent_name="FinancialAnalystAgent",
-        target_service="fact-check-verification-service",
-        caller=_S2S_ROUTER_IDENTITY_NAME,
-    )
-    fc_claims = s2s_broker.verify_s2s_assertion(
-        raw_fc_assertion,
-        expected_target_service="fact-check-verification-service",
-    )
-    _track_identity(identities_used_by_agent, fc_claims)
-    synth_step = next(
-        (s for s in react_steps if s.phase == "format_grounded_output"), react_steps[-1]
-    )
-    fc_ms = round((time.perf_counter() - t5) * 1000.0 + synth_step.duration_ms, 2)
-
-    # Post-Generation Managed Model Armor, Cloud SDP & Projection Leak Filter
-    answer_markdown, resp_decision, sdp_modified, blocked_resp = _inspect_response_guardrail(
-        react_result=react_result,
-        answer_markdown=answer_markdown,
-        prompt_decision=prompt_decision,
-        public_scope=public_scope,
-        coverage_notices=coverage_notices,
-        bundle=bundle,
-        context_cache_info=context_cache_info,
-        memory_ctx=memory_ctx,
-        agent_trace=agent_trace,
-        identities_used_by_agent=identities_used_by_agent,
-        turn_start=turn_start,
-        telemetry_session_id=telemetry_session_id,
-        user_id=user_id,
-    )
-    if blocked_resp is not None:
-        return blocked_resp
-
-    # Reuse the single FactCheckVerification computed by `react_loop` unless SDP modified the text.
-    cached_fc = react_result.get("fact_check_verification")
-    if cached_fc is not None and not sdp_modified:
-        fact_check = cached_fc.model_copy(update={"model_latency_ms": round(fc_ms, 2)})
-    else:
-        fact_check = verify_narrative_against_calculations(
-            response_text=answer_markdown,
-            calculated_variances=bundle.calculated_variances_map,
-            retrieved_citations=citations,
-            model_latency_ms=fc_ms,
-        )
-
-    score_label = (
-        f"{eval_report.overall_score:.2f}" if eval_report.overall_score is not None else "pending"
-    )
-    _append_trace_step(
-        agent_trace,
-        agent="FinancialAnalystAgent",
-        claims=fc_claims,
-        model_used=f"{reasoning_model} + {evaluation_model}",
-        tool="after_model_fact_check_callback",
-        status="completed" if fact_check.passed else "warning",
-        duration_ms=fc_ms,
-        summary=(
-            f"Formatted grounded report (`{reasoning_model}`) & verification "
-            f"(judge_mode={react_result.get('judge_mode', 'async_background')}, "
-            f"grade={eval_report.grade}, score={score_label}) · "
-            f"Verified {fact_check.checked_metrics_count} variance figure(s) & "
-            f"{fact_check.matched_citations_count} citation tag(s) · Passed: {fact_check.passed}."
-        ),
-    )
-
-    # Persist turn into durable Firestore-backed ConversationMemoryManager (keyed by user_id + session_id)
-    variance_highlights = [
-        ev.material_findings[0] for ev in variance_evaluations if ev.material_findings
-    ]
-    memory_persist = memory_mgr.record_turn(
-        session_id=session_id,
-        user_id=user_id,
+    return _verify_and_finalize_success(
+        ctx,
         query=query,
-        intent=intent,
-        tickers=public_scope["tickers"],
-        gics_sector=public_scope["gics_sector"],
-        start_year=public_scope["start_year"],
-        end_year=public_scope["end_year"],
-        variance_highlights=variance_highlights,
-        cited_chunk_ids=[c["chunk_id"] for c in citations],
-        cached_10k_keys=[e.cache_key for e in cached_explanations],
-        answer_markdown=answer_markdown,
-    )
-
-    total_latency_ms = round((time.perf_counter() - turn_start) * 1000.0, 2)
-    analyzed_tickers = sorted(
-        {
-            *(public_scope.get("tickers") or []),
-            *(r["ticker"] for r in bundle.variance_reports if r.get("ticker")),
-            *(c["ticker"] for c in citations if c.get("ticker")),
-        }
-    )
-    session_tel = get_telemetry_sink().record_session_turn_telemetry(
-        session_id=telemetry_session_id,
-        user_id=user_id,
-        intent=intent,
-        execution_mode=active_execution_mode,
-        status_outcome="success",
-        tickers_analyzed=analyzed_tickers,
-        gics_sector=public_scope["gics_sector"],
-        start_year=public_scope["start_year"],
-        end_year=public_scope["end_year"],
-        report_generated=bool(react_result.get("answer_verified")),
-        variance_reports_count=len(bundle.variance_reports),
-        citations_count=len(citations),
-        agent_trace=agent_trace,
-        turn_latency_records=turn_latency_records,
-        total_latency_ms=total_latency_ms,
-        fact_check_passed=fact_check.passed,
-        evaluation_grade=eval_report.grade,
-        evaluation_score=eval_report.overall_score,
-    )
-    _emit("complete", "Grounded report ready.", {"total_latency_ms": total_latency_ms})
-    return _build_turn_response(
-        status="success",
-        model_armor_blocked=False,
+        public_scope=public_scope,
         prompt_decision=prompt_decision,
-        response_decision=resp_decision,
-        execution_mode=active_execution_mode,
-        adk_runtime=adk_runtime_meta,
-        structured_report=adk_runtime_meta.get("structured_report"),
-        report_verification=adk_runtime_meta.get("report_verification"),
+        react_result=react_result,
+        bundle=bundle,
+        coverage_notices=coverage_notices,
         intent=intent,
         intent_source=intent_source,
-        resolved_scope=public_scope,
-        answer_markdown=answer_markdown,
-        answer_verified=bool(react_result.get("answer_verified")),
-        coverage_notices=coverage_notices,
-        sector_coverage=bundle.sector_coverage,
-        missing_tickers=bundle.missing_tickers,
-        variance_reports=bundle.variance_reports,
-        sector_benchmarks=bundle.sector_benchmarks,
-        material_variance_flags=bundle.material_flags,
-        material_variance_summary=bundle.material_flags_summary,
-        disclosure_deltas=bundle.disclosure_deltas,
-        citations=citations,
-        candidates_searched=bundle.candidates_searched,
-        context_cache=context_cache_info,
-        fact_check=fact_check.model_dump(mode="json"),
-        evaluation=eval_report.model_dump(mode="json"),
-        react_execution={
-            "strategy": "structured_react_loop",
-            "execution_mode": active_execution_mode,
-            "observed_ttft_ms": adk_runtime_meta.get("observed_ttft_ms"),
-            "judge_mode": react_result.get("judge_mode", "async_background"),
-            "iterations": len(react_steps),
-            "steps": [s.model_dump(mode="json") for s in react_steps],
-            "variance_evaluations": [v.model_dump(mode="json") for v in variance_evaluations],
-            "cached_10k_explanations": [e.model_dump(mode="json") for e in cached_explanations],
-        },
-        context_and_memory={
-            "models": get_model_strategy_metadata(),
-            "session_memory": {
-                **memory_ctx,
-                "persistence": memory_persist,
-            },
-            "turn_context_latency": turn_latency_summary.model_dump(mode="json"),
-            "model_call_records": [r.model_dump(mode="json") for r in turn_latency_records],
-            "global_context_latency": (
-                get_context_latency_tracker().summarize().model_dump(mode="json")
-            ),
-            "context_cache_runtime": get_context_cache_runtime_stats(),
-            "session_telemetry": session_tel["row"],
-        },
-        agent_trace=agent_trace,
-        identities_used_by_agent=identities_used_by_agent,
-        total_latency_ms=total_latency_ms,
+        memory_mgr=memory_mgr,
     )
 
 

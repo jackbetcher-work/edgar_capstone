@@ -14,15 +14,15 @@ import pytest
 from fastapi.testclient import TestClient
 from google.auth.exceptions import DefaultCredentialsError
 
-from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
-from edgar_capstone.agents.context_memory import (
+from edgar_capstone.agents.core.schemas import ContextBreakdown
+from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.runtime.latency_tracker import (
     ContextLatencyTracker,
     attribute_context_latency,
     get_context_latency_tracker,
-    get_model_strategy_metadata,
 )
-from edgar_capstone.agents.schemas import ContextBreakdown
-from edgar_capstone.agents.tools import query_looker_financial_explore
+from edgar_capstone.agents.runtime.model_config import get_model_strategy_metadata
+from edgar_capstone.agents.tools import query_analytics_view
 from edgar_capstone.security import (
     GOOGLE_IAP_ISSUER,
     GOOGLE_IAP_JWKS_URI,
@@ -833,7 +833,7 @@ def test_health_and_bigquery_explores(
     assert chat_json["evaluation"]["overall_score"] is None
 
     for explore_slug in ("llm_telemetry", "session_analytics", "audit_trail"):
-        exp_res = query_looker_financial_explore(
+        exp_res = query_analytics_view(
             explore_name=explore_slug,
             tickers="ALL",
             gics_sector="ALL",

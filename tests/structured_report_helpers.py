@@ -12,11 +12,11 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types as genai_types
 
-from edgar_capstone.agents.context_memory import (
+from edgar_capstone.agents.core.schemas import AnalystReport
+from edgar_capstone.agents.runtime.model_config import (
     FINANCIAL_REASONING_MODEL,
     FLASH_CODING_AND_EVAL_MODEL,
 )
-from edgar_capstone.agents.schemas import AnalystReport
 
 try:
     from google.adk.models.base_llm import LlmCapabilities

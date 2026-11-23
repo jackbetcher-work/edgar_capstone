@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
-from edgar_capstone.agents.chat_engine import (
+from edgar_capstone.agents.orchestration.chat_engine import (
     run_conversational_rag_turn as _default_run_conversational_rag_turn,
 )
 from edgar_capstone.api.dependencies import LiveRuntimeUnavailableError

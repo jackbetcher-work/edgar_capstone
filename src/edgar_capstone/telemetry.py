@@ -70,7 +70,7 @@ from edgar_capstone.gcp.rest_client import (
 from edgar_capstone.observability.tracing import add_span_event, current_trace_correlation
 
 if TYPE_CHECKING:
-    from edgar_capstone.agents.schemas import ModelContextLatencyRecord
+    from edgar_capstone.agents.core.schemas import ModelContextLatencyRecord
 
 logger = logging.getLogger(__name__)
 cloud_sink_logger = logging.getLogger("edgar_capstone.cloud_logging_sink")
@@ -775,7 +775,7 @@ class BigQueryTelemetrySink(GcpRestClient):
         for step in agent_trace:
             raw_tool = str(step.get("tool") or "").strip()
             if raw_tool:
-                # Normalize e.g. 'query_looker_financial_explore(chunk_health)' -> canonical base
+                # Normalize e.g. 'query_analytics_view(chunk_health)' -> canonical base
                 base_tool = raw_tool.split("(", 1)[0].strip()
                 if base_tool:
                     tools_used.append(base_tool)

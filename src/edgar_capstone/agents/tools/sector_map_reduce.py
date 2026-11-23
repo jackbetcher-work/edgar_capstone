@@ -31,22 +31,22 @@ from google.adk.models.base_llm import BaseLlm
 from google.genai import types as genai_types
 from pydantic import BaseModel, Field
 
-from edgar_capstone.agents.context_memory import (
+from edgar_capstone.agents.runtime.live_runtime import (
+    resolve_live_adk_runtime,
+    run_adk_agent_stream,
+)
+from edgar_capstone.agents.runtime.model_config import (
     low_thinking_config_for_model,
     resolve_model_for_task,
 )
-from edgar_capstone.agents.disclosure_deltas import (
+from edgar_capstone.agents.tools.disclosure_deltas import (
     SectionMaterial,
     build_company_evolution,
     chunk_row_to_citation,
     count_theme_mentions,
     resolve_theme_terms,
 )
-from edgar_capstone.agents.live_runtime import (
-    resolve_live_adk_runtime,
-    run_adk_agent_stream,
-)
-from edgar_capstone.agents.tools import _gcp_adapters
+from edgar_capstone.agents.tools.sec_tools import _gcp_adapters
 from edgar_capstone.common.concurrency import run_parallel_with_context
 from edgar_capstone.common.domain import normalize_edgar_ticker, sha256_text
 from edgar_capstone.common.formatting import normalize_quote_text, parse_model_output
@@ -216,7 +216,7 @@ def _summarize_batch_via_flash(
         model_obj: str | BaseLlm = map_llm
         model_used = map_llm.model
     else:
-        from edgar_capstone.agents.live_runtime import build_adk_llm_for_task
+        from edgar_capstone.agents.runtime.live_runtime import build_adk_llm_for_task
 
         model_obj = build_adk_llm_for_task("context_compaction", resolution=resolved)
         model_used = resolve_model_for_task("context_compaction")

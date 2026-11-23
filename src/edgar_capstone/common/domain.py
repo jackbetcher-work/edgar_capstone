@@ -66,6 +66,17 @@ RETRIEVAL_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
+# Authoritative set of ADK structured variance / quantitative tools for telemetry & ReAct phase tagging
+VARIANCE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "calculate_period_variances",
+        "fetch_financial_metrics",
+        "query_analytics_view",
+        "query_looker_financial_explore",
+        "flag_material_variances",
+    }
+)
+
 
 def normalize_edgar_ticker(raw_ticker: str) -> str:
     """Normalize ticker symbol to SEC EDGAR & Discovery Engine safe format (e.g., BRK.B -> BRK-B)."""

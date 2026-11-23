@@ -11,8 +11,8 @@ from importlib import metadata
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
-from edgar_capstone.agents.react_loop import flush_pending_evaluations
+from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.orchestration.react_loop import flush_pending_evaluations
 from edgar_capstone.api.dependencies import (
     LiveRuntimeUnavailableError,
     register_exception_handlers,

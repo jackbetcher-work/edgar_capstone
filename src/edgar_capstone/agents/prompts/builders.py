@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from edgar_capstone.common.domain import CORE_METRICS
+
 # Evidence lead budget: generous enough that the analyst can extract verbatim quotes directly
 # without burning extra ReAct tool round-trips for passages already retrieved, while keeping
 # prompt prefill lean for sub-3s TTFT.
@@ -51,12 +53,8 @@ def compact_variance_reports_for_prompt(
         if not isinstance(rep, dict):
             continue
         slim: dict[str, Any] = {k: v for k, v in rep.items() if k not in _DROP_REPORT_KEYS}
-        for mv_key in (
-            "revenue_variance",
-            "operating_income_variance",
-            "net_income_variance",
-            "research_and_development_variance",
-        ):
+        for metric in CORE_METRICS:
+            mv_key = f"{metric}_variance"
             mv = slim.get(mv_key)
             if isinstance(mv, dict):
                 slim[mv_key] = {
@@ -241,7 +239,7 @@ def build_tool_selection_policy(scope: dict[str, Any], *, has_prior_outputs: boo
             "sector in scope); it scans every issuer in the sector. Populate `theme_terms` with "
             "comma-separated key phrases and synonyms. Do not also call "
             "`compare_disclosures_across_years` for the same sector theme.",
-            "- `query_looker_financial_explore(explore_name, ...)`: `sector_benchmarks` / "
+            "- `query_analytics_view(explore_name, ...)`: `sector_benchmarks` / "
             "`peer_comparison` for sector-level financial benchmarks, `chunk_health` for vector "
             "index / corpus health questions.",
             f"- Scope structure: {_scope_structure_label(scope)}.",
@@ -317,33 +315,39 @@ def build_retrieval_instructions(
     return "\n".join(lines)
 
 
+def _compact_flag_base(flag: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build the shared lean field projection and raw explanation dict for one material flag."""
+    src = flag.get("source") or {}
+    exp = flag.get("explanation") or {}
+    entry: dict[str, Any] = {
+        "flag_id": flag.get("flag_id"),
+        "ticker": flag.get("ticker"),
+        "fiscal_year": flag.get("fiscal_year"),
+        "prior_fiscal_year": flag.get("prior_fiscal_year"),
+        "metric": flag.get("metric"),
+        "rule": flag.get("rule"),
+        "severity": flag.get("severity"),
+        "value": flag.get("value"),
+        "unit": flag.get("unit"),
+        "description": flag.get("description"),
+        "period_of_report": src.get("period_of_report"),
+        "prior_period_of_report": src.get("prior_period_of_report"),
+        "accession_number": src.get("accession_number"),
+        "xbrl_concept": src.get("xbrl_concept"),
+        "explanation_query": flag.get("explanation_query"),
+    }
+    return entry, exp
+
+
 def _compact_material_flag_entries(flags: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Compact material variance flags to lean LLM-ready dicts (full payloads stay in session_state)."""
     compact: list[dict[str, Any]] = []
     for f in flags[:_MAX_PROMPT_FLAGS]:
-        src = f.get("source") or {}
-        exp = f.get("explanation") or {}
-        entry: dict[str, Any] = {
-            "flag_id": f.get("flag_id"),
-            "ticker": f.get("ticker"),
-            "fiscal_year": f.get("fiscal_year"),
-            "prior_fiscal_year": f.get("prior_fiscal_year"),
-            "metric": f.get("metric"),
-            "rule": f.get("rule"),
-            "severity": f.get("severity"),
-            "value": f.get("value"),
-            "unit": f.get("unit"),
-            "description": f.get("description"),
-            "period_of_report": src.get("period_of_report"),
-            "prior_period_of_report": src.get("prior_period_of_report"),
-            "accession_number": src.get("accession_number"),
-            "xbrl_concept": src.get("xbrl_concept"),
-            "explanation_query": f.get("explanation_query"),
-            "explanation_chunk_id": exp.get("chunk_id"),
-            "explanation_excerpt": " ".join(str(exp.get("excerpt") or "").split())[:600]
-            if exp.get("excerpt")
-            else None,
-        }
+        entry, exp = _compact_flag_base(f)
+        entry["explanation_chunk_id"] = exp.get("chunk_id")
+        entry["explanation_excerpt"] = (
+            " ".join(str(exp.get("excerpt") or "").split())[:600] if exp.get("excerpt") else None
+        )
         compact.append({k: v for k, v in entry.items() if v is not None})
     return compact
 
@@ -358,25 +362,7 @@ def compact_material_flags_for_tool(result: dict[str, Any]) -> dict[str, Any]:
         return result
     compact_flags: list[dict[str, Any]] = []
     for f in list(result.get("flags") or [])[:_MAX_PROMPT_FLAGS]:
-        src = f.get("source") or {}
-        exp = f.get("explanation") or {}
-        entry: dict[str, Any] = {
-            "flag_id": f.get("flag_id"),
-            "ticker": f.get("ticker"),
-            "fiscal_year": f.get("fiscal_year"),
-            "prior_fiscal_year": f.get("prior_fiscal_year"),
-            "metric": f.get("metric"),
-            "rule": f.get("rule"),
-            "severity": f.get("severity"),
-            "value": f.get("value"),
-            "unit": f.get("unit"),
-            "description": f.get("description"),
-            "period_of_report": src.get("period_of_report"),
-            "prior_period_of_report": src.get("prior_period_of_report"),
-            "accession_number": src.get("accession_number"),
-            "xbrl_concept": src.get("xbrl_concept"),
-            "explanation_query": f.get("explanation_query"),
-        }
+        entry, exp = _compact_flag_base(f)
         if exp:
             entry["explanation"] = {
                 k: v
@@ -763,14 +749,6 @@ def build_narrative_evaluation_prompt(
         )
     return eval_prompt
 
-
-# Backward-compatible underscore aliases retained for internal callers & tests.
-_compact_variance_reports_for_prompt = compact_variance_reports_for_prompt
-_compact_evidence_leads = compact_evidence_leads
-_retrieval_instructions = build_retrieval_instructions
-_material_flags_prompt_section = build_material_flags_prompt_section
-_disclosure_deltas_prompt_section = build_disclosure_deltas_prompt_section
-_build_financial_reasoning_prompt = build_financial_reasoning_prompt
 
 __all__ = [
     "build_disclosure_deltas_prompt_section",

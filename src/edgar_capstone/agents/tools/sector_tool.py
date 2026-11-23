@@ -16,9 +16,9 @@ from typing import Any
 
 from google.adk.tools import FunctionTool, ToolContext
 
-from edgar_capstone.agents.citations import merge_citations
-from edgar_capstone.agents.resilience import with_tool_resilience
-from edgar_capstone.agents.tool_runtime import (
+from edgar_capstone.agents.core.citations import merge_citations
+from edgar_capstone.agents.core.resilience import with_tool_resilience
+from edgar_capstone.agents.tools.runtime import (
     STATE_DISCLOSURE_DELTA_SUMMARY,
     STATE_DISCLOSURE_DELTAS,
     STATE_RETRIEVED_CITATIONS,
@@ -29,7 +29,7 @@ from edgar_capstone.agents.tool_runtime import (
     merge_disclosure_deltas,
     turn_map_llm,
 )
-from edgar_capstone.agents.tools import _record_gcp_backend_invocation
+from edgar_capstone.agents.tools.sec_tools import _record_gcp_backend_invocation
 from edgar_capstone.common.domain import canonicalize_gics_sector
 
 _DIGEST_MAX_CITATIONS = 12
@@ -139,7 +139,7 @@ def sector_thematic_map_reduce(
                 "use compare_disclosures_across_years or search_10k_chunks_rag for named companies."
             ),
         }
-    from edgar_capstone.agents.sector_map_reduce import run_sector_thematic_map_reduce
+    from edgar_capstone.agents.tools.sector_map_reduce import run_sector_thematic_map_reduce
 
     turn_ctx = current_tool_turn_context()
     result = run_sector_thematic_map_reduce(

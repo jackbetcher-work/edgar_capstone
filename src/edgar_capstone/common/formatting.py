@@ -127,6 +127,11 @@ def _extract_json_dict(raw_text: str) -> dict[str, Any] | None:
     fenced = _JSON_FENCE_RE.search(text)
     if fenced:
         text = fenced.group(1).strip()
+    elif text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 2:
+            body = lines[1:-1] if lines[-1].strip().startswith("```") else lines[1:]
+            text = "\n".join(body).strip()
     try:
         loaded = json.loads(text)
         if isinstance(loaded, dict):

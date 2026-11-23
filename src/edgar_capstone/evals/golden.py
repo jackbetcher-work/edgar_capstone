@@ -200,7 +200,7 @@ class GoldenEvalItem(BaseModel):
     fiscal_years: list[int] = Field(default_factory=list)
     gics_sector: str | None = None
     # Agent-emitted `AnalystReport.intent` (falls back to a deterministic tool-trace / scope
-    # inference, see `agents.intent.resolve_turn_intent`); scope-gate values for early exits.
+    # inference, see `agents.orchestration.intent.resolve_turn_intent`); scope-gate values for early exits.
     expected_intent: QueryIntent | None = None
     expected_variances: list[ExpectedVariance] = Field(default_factory=list)
     expected_sections: list[ExpectedSection] = Field(default_factory=list)

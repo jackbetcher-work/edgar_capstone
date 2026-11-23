@@ -318,7 +318,7 @@ def detect_commit_sha() -> str:
 
 
 def _default_turn_fn() -> TurnFn:
-    from edgar_capstone.agents.chat_engine import run_conversational_rag_turn
+    from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
 
     return run_conversational_rag_turn
 
@@ -817,7 +817,7 @@ def run_golden_evals(
     )
     judge_models = sorted({r.judge_model for r in results if r.judge_model})
     try:
-        from edgar_capstone.agents.context_memory import resolve_model_for_task
+        from edgar_capstone.agents.runtime.model_config import resolve_model_for_task
 
         analyst_model: str | None = resolve_model_for_task("financial_reasoning")
     except Exception as exc:

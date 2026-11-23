@@ -12,7 +12,7 @@ from edgar_capstone.agents.adapters.registry import (
     GcpAdapterErrorTranslationMixin,
     GcpToolConfig,
 )
-from edgar_capstone.agents.resilience import ToolExecutionError, UpstreamTimeoutError
+from edgar_capstone.agents.core.resilience import ToolExecutionError, UpstreamTimeoutError
 from edgar_capstone.common.domain import CORE_METRICS, normalize_edgar_ticker
 from edgar_capstone.common.formatting import ratio_pct
 from edgar_capstone.dataset.models import FinancialDataProfile

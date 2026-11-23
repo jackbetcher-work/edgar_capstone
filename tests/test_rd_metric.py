@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import httpx
 import pandas as pd
 
-from edgar_capstone.agents.tools import _build_variance_reports_from_profiles
+from edgar_capstone.agents.tools.variance_engine import _build_variance_reports_from_profiles
 from edgar_capstone.dataset.extractor import (
     RESEARCH_AND_DEVELOPMENT_CONCEPTS,
     extract_research_and_development_expense,

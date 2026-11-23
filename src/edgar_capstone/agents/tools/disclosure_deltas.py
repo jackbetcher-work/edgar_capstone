@@ -31,23 +31,23 @@ from typing import Any, Literal
 
 from google.adk.tools import FunctionTool, ToolContext
 
-from edgar_capstone.agents.citations import clean_excerpt, merge_citations
-from edgar_capstone.agents.prompt_builders import compact_disclosure_deltas_for_tool
-from edgar_capstone.agents.resilience import with_tool_resilience
-from edgar_capstone.agents.schemas import (
+from edgar_capstone.agents.core.citations import clean_excerpt, merge_citations
+from edgar_capstone.agents.core.resilience import with_tool_resilience
+from edgar_capstone.agents.core.schemas import (
     CompanyDisclosureEvolution,
     DisclosureDelta,
     DisclosureYearPair,
     GroundedCitation,
 )
-from edgar_capstone.agents.tool_runtime import (
+from edgar_capstone.agents.prompts.builders import compact_disclosure_deltas_for_tool
+from edgar_capstone.agents.tools.runtime import (
     STATE_DISCLOSURE_DELTA_SUMMARY,
     STATE_DISCLOSURE_DELTAS,
     STATE_RETRIEVED_CITATIONS,
     cached_turn_profiles,
     merge_disclosure_deltas,
 )
-from edgar_capstone.agents.tools import (
+from edgar_capstone.agents.tools.sec_tools import (
     _gcp_adapters,
     _parse_ticker_list,
     _record_gcp_backend_invocation,

@@ -32,10 +32,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from edgar_capstone.agents.citations import format_inline_citation
-from edgar_capstone.agents.material_variances import material_flag_payload_figures
-from edgar_capstone.agents.schemas import AnalystFinding, AnalystMetricReference, AnalystReport
-from edgar_capstone.agents.tools import get_full_10k_section
+from edgar_capstone.agents.core.citations import format_inline_citation
+from edgar_capstone.agents.core.schemas import AnalystFinding, AnalystMetricReference, AnalystReport
+from edgar_capstone.agents.tools.material_variances import material_flag_payload_figures
+from edgar_capstone.agents.tools.sec_tools import get_full_10k_section
 from edgar_capstone.common.domain import CORE_METRICS, METRIC_LABELS, lookup_year_key
 from edgar_capstone.common.formatting import (
     fmt_pct,

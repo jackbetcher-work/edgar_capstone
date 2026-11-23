@@ -18,8 +18,8 @@ from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import SpanKind, StatusCode
 
-from edgar_capstone.agents.live_runtime import _run_coro_sync
-from edgar_capstone.agents.resilience import with_tool_resilience
+from edgar_capstone.agents.core.resilience import with_tool_resilience
+from edgar_capstone.agents.runtime.live_runtime import _run_coro_sync
 from edgar_capstone.agents.tools import calculate_period_variances
 from edgar_capstone.observability import (
     CloudLoggingJsonFormatter,

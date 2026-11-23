@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from edgar_capstone.agents.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
 from edgar_capstone.security.auth import (
     AuthenticatedUser,
     record_security_audit_event,

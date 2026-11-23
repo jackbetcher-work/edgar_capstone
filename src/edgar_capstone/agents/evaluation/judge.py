@@ -1,7 +1,7 @@
 """Gemini 3.8 Flash (low-thinking) LLM-as-a-Judge evaluation specialist for SEC 10-K narratives.
 
 Model Strategy:
-- `gemini-3.8-flash` with `ThinkingLevel.LOW` (`DEFAULT_FLASH_MODEL` / `EDGAR_FLASH_MODEL`):
+- `gemini-3.8-flash` with `ThinkingLevel.LOW` (`EDGAR_FLASH_MODEL`):
   Dedicated to LLM-as-a-Judge evaluation tasks (`NarrativeEvaluatorAgent`,
   `evaluate_variance_explanation`), while `FinancialAnalystAgent` runs `gemini-3.8-flash` with
   default native thinking and `SectorMapSummarizerAgent` / `LlmEventSummarizer` run
@@ -14,24 +14,19 @@ from typing import Any, Literal
 
 from google.adk.models.base_llm import BaseLlm
 
-from edgar_capstone.agents.callbacks import verify_narrative_against_calculations
-from edgar_capstone.agents.context_memory import (
-    FLASH_CODING_AND_EVAL_MODEL,
-    resolve_model_for_task,
-)
-from edgar_capstone.agents.factories import create_narrative_evaluator_agent
-from edgar_capstone.agents.live_runtime import (
-    resolve_live_adk_runtime,
-    run_live_adk_narrative_evaluation,
-)
-from edgar_capstone.agents.schemas import (
+from edgar_capstone.agents.core.schemas import (
     FactCheckVerification,
     ModelContextLatencyRecord,
     NarrativeEvaluationReport,
 )
+from edgar_capstone.agents.runtime.callbacks import verify_narrative_against_calculations
+from edgar_capstone.agents.runtime.live_runtime import (
+    resolve_live_adk_runtime,
+    run_live_adk_narrative_evaluation,
+)
+from edgar_capstone.agents.runtime.model_config import resolve_model_for_task
+from edgar_capstone.agents.tools.runtime import variance_map
 from edgar_capstone.observability.tracing import traced
-
-DEFAULT_FLASH_MODEL: str = FLASH_CODING_AND_EVAL_MODEL
 
 
 def _clamp(value: Any, default: float) -> float:
@@ -39,13 +34,6 @@ def _clamp(value: Any, default: float) -> float:
         return max(0.0, min(1.0, float(value)))
     except (TypeError, ValueError):
         return default
-
-
-def _build_calc_map(variance_reports: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {
-        f"{r.get('ticker', 'UNK')}_{r.get('start_year', 0)}_{r.get('end_year', 0)}": r
-        for r in variance_reports
-    }
 
 
 @traced("evaluation.narrative_judge")
@@ -71,7 +59,7 @@ def evaluate_variance_explanation_with_latency(
         if fact_check is not None
         else verify_narrative_against_calculations(
             response_text=response_markdown,
-            calculated_variances=_build_calc_map(variance_reports),
+            calculated_variances=variance_map(variance_reports),
             retrieved_citations=citations,
         )
     )
@@ -167,8 +155,6 @@ def evaluate_variance_explanation(
 
 
 __all__ = [
-    "DEFAULT_FLASH_MODEL",
-    "create_narrative_evaluator_agent",
     "evaluate_variance_explanation",
     "evaluate_variance_explanation_with_latency",
 ]
