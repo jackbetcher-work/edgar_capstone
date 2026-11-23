@@ -491,3 +491,78 @@ def test_year_only_mentions_keep_existing_window_rules() -> None:
     # ... and "may" as a verb is not a month.
     s = resolve_query_scope(query="What risks may affect CrowdStrike in 2025?", catalog=catalog)
     assert (s["start_year"], s["end_year"]) == (2024, 2025)
+
+
+def test_fuzzy_company_name_resolution_handles_typos_without_false_positives() -> None:
+    """Common company-name misspellings resolve accurately while non-S&P 500 & prose stay clean."""
+    profiles = [
+        *_sample_profiles(),
+        SimpleNamespace(
+            ticker="PG",
+            cik="0000080424",
+            company_name="PROCTER & GAMBLE Co",
+            gics_sector="Consumer Staples",
+        ),
+        SimpleNamespace(
+            ticker="CAT",
+            cik="0000018230",
+            company_name="CATERPILLAR INC",
+            gics_sector="Industrials",
+        ),
+        SimpleNamespace(
+            ticker="WAT",
+            cik="0001000697",
+            company_name="WATERS CORP /DE/",
+            gics_sector="Health Care",
+        ),
+        SimpleNamespace(
+            ticker="GOOG",
+            cik="0001652044",
+            company_name="Alphabet Inc.",
+            gics_sector="Communication Services",
+        ),
+        SimpleNamespace(
+            ticker="GOOGL",
+            cik="0001652044",
+            company_name="Alphabet Inc.",
+            gics_sector="Communication Services",
+        ),
+    ]
+    catalog = EntityCatalog(profiles)
+
+    # Multi-word typos ("Proctor & Gamble", "Proctor and Gamble", "Proctor Gamble") -> PG
+    for query in (
+        "What was Proctor & Gamble's revenue CAGR from fiscal 2020 to fiscal 2026?",
+        "Compare Proctor and Gamble operating income in FY2024 and FY2025",
+        "Analyze Proctor Gamble net sales growth",
+    ):
+        found, unknown = catalog.detect_tickers_in_query(query)
+        assert found == ["PG"], f"Failed on {query!r}: got {found}"
+        assert unknown == []
+
+    # Peer query combining exact + misspelled names
+    found_peer, _ = catalog.detect_tickers_in_query(
+        "Compare NVIDIA and Proctor & Gamble revenue growth"
+    )
+    assert set(found_peer) == {"NVDA", "PG"}
+
+    # Single-word proper-noun typos (len >= 7, edit distance == 1) + dual-class CIK dedup
+    found_single, _ = catalog.detect_tickers_in_query(
+        "Compare Microsft, Caterpiller, and Alphabett revenue"
+    )
+    assert set(found_single) == {"MSFT", "CAT", "GOOGL"}
+    assert "GOOG" not in found_single
+
+    # Zero false positives on generic prose, lowercase near-matches ("water" vs Waters), & non-S&P 500
+    found_prose, unknown_prose = catalog.detect_tickers_in_query(
+        "How did public water systems and revenue margins change?"
+    )
+    assert found_prose == []
+    assert unknown_prose == []
+
+    found_oos, unknown_oos = catalog.detect_tickers_in_query(
+        "Compare Rivian and Snowflake revenue from 2024 to 2025"
+    )
+    assert found_oos == []
+    assert any("rivian" in u.lower() for u in unknown_oos)
+    assert any("snowflake" in u.lower() for u in unknown_oos)

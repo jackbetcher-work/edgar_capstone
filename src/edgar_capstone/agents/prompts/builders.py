@@ -411,10 +411,29 @@ def _compact_disclosure_delta_companies(
     for comp in companies:
         pairs = []
         for pair in comp.get("year_pairs") or []:
+            substantive = [
+                d for d in (pair.get("deltas") or []) if d.get("change_type") != "unchanged"
+            ]
+            # Round-robin across substantive change types so added/removed risk factors are not
+            # hidden behind several modified paragraphs in the LLM tool digest.
+            by_kind: dict[str, list[dict[str, Any]]] = {"modified": [], "added": [], "removed": []}
+            for d in substantive:
+                kind = str(d.get("change_type") or "")
+                by_kind.setdefault(kind, []).append(d)
+            ordered: list[dict[str, Any]] = []
+            max_bucket = max((len(v) for v in by_kind.values()), default=0)
+            for slot in range(max_bucket):
+                for kind in ("modified", "added", "removed"):
+                    bucket = by_kind.get(kind) or []
+                    if slot < len(bucket):
+                        ordered.append(bucket[slot])
+                        if len(ordered) >= _MAX_PROMPT_DELTAS_PER_PAIR:
+                            break
+                if len(ordered) >= _MAX_PROMPT_DELTAS_PER_PAIR:
+                    break
+
             compact_deltas = []
-            for d in pair.get("deltas") or []:
-                if d.get("change_type") == "unchanged":
-                    continue
+            for d in ordered:
                 delta_entry: dict[str, Any] = {
                     "change_type": d["change_type"],
                     "section_id": d.get("section_id"),
@@ -429,8 +448,6 @@ def _compact_disclosure_delta_companies(
                 if d["change_type"] == "modified" and d.get("prior_excerpt"):
                     delta_entry["prior_excerpt"] = " ".join(str(d["prior_excerpt"]).split())[:350]
                 compact_deltas.append(delta_entry)
-                if len(compact_deltas) >= _MAX_PROMPT_DELTAS_PER_PAIR:
-                    break
             pairs.append(
                 {
                     "years": f"FY{pair['prior_fiscal_year']}->FY{pair['current_fiscal_year']}",

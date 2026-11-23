@@ -70,6 +70,9 @@ _MINIMAL_FALLBACK_POLICY: dict[str, Any] = {
     "mnpi_markers": [],
     "future_fiscal_years": [],
     "projection_verbs_and_nouns": [],
+    "future_prompt_cues": [],
+    "relative_future_phrases": [],
+    "financial_metric_terms": [],
 }
 
 _YAML_CACHE_LOCK = threading.Lock()

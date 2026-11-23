@@ -281,23 +281,97 @@ def _contains_token_sequence(words: list[str], phrase_tokens: list[str]) -> bool
     return False
 
 
+def _find_token_sequence_positions(words: list[str], phrase_tokens: list[str]) -> list[int]:
+    """Return start indices where `phrase_tokens` appears contiguously inside `words`."""
+    k = len(phrase_tokens)
+    if k == 0 or k > len(words):
+        return []
+    first = phrase_tokens[0]
+    return [
+        idx
+        for idx in range(len(words) - k + 1)
+        if words[idx] == first and words[idx : idx + k] == phrase_tokens
+    ]
+
+
 def _find_future_projection_rule(
     words: list[str],
     policy: dict[str, Any],
     *,
+    stage: Literal["prompt", "response"] = "prompt",
     window: int = 8,
+    prompt_window: int = 14,
 ) -> str | None:
     future_years = {str(y).strip() for y in policy.get("future_fiscal_years", [])}
     future_year_tokens = future_years.union({f"fy{y}" for y in future_years})
     proj_terms = {str(t).strip().lower() for t in policy.get("projection_verbs_and_nouns", [])}
 
     year_positions = [(i, tok) for i, tok in enumerate(words) if tok in future_year_tokens]
+    if not year_positions:
+        return None
+
     proj_positions = [(i, tok) for i, tok in enumerate(words) if tok in proj_terms]
     for y_idx, y_tok in year_positions:
         for p_idx, p_tok in proj_positions:
             if abs(y_idx - p_idx) <= window:
                 clean_yr = y_tok[2:] if y_tok.startswith("fy") else y_tok
                 return f"future_period_projection:FY{clean_yr}+{p_tok}"
+
+    if stage == "prompt":
+        prompt_cues = {str(t).strip().lower() for t in policy.get("future_prompt_cues", [])}
+        cue_positions = [(i, tok) for i, tok in enumerate(words) if tok in prompt_cues]
+        for y_idx, y_tok in year_positions:
+            for c_idx, c_tok in cue_positions:
+                if abs(y_idx - c_idx) <= prompt_window:
+                    clean_yr = y_tok[2:] if y_tok.startswith("fy") else y_tok
+                    return f"future_period_projection:FY{clean_yr}+{c_tok}"
+    return None
+
+
+def _find_relative_future_projection_rule(
+    words: list[str],
+    policy: dict[str, Any],
+    *,
+    window: int = 14,
+) -> str | None:
+    """Detect forward-looking financial calls over relative horizons (e.g. 'next fiscal year')."""
+    phrases = [str(p).strip().lower() for p in policy.get("relative_future_phrases", []) if p]
+    if not phrases:
+        return None
+    metric_terms = {str(t).strip().lower() for t in policy.get("financial_metric_terms", [])}
+    spec_terms = {str(t).strip().lower() for t in policy.get("projection_verbs_and_nouns", [])} | {
+        str(t).strip().lower() for t in policy.get("future_prompt_cues", [])
+    }
+    if not metric_terms or not spec_terms:
+        return None
+
+    metric_positions = [(i, tok) for i, tok in enumerate(words) if tok in metric_terms]
+    spec_positions = [(i, tok) for i, tok in enumerate(words) if tok in spec_terms]
+    if not metric_positions or not spec_positions:
+        return None
+
+    for phrase in phrases:
+        p_toks = _normalize_words(phrase)
+        for start_idx in _find_token_sequence_positions(words, p_toks):
+            end_idx = start_idx + len(p_toks) - 1
+            near_metric = next(
+                (
+                    tok
+                    for m_idx, tok in metric_positions
+                    if min(abs(m_idx - start_idx), abs(m_idx - end_idx)) <= window
+                ),
+                None,
+            )
+            near_spec = next(
+                (
+                    tok
+                    for s_idx, tok in spec_positions
+                    if min(abs(s_idx - start_idx), abs(s_idx - end_idx)) <= window
+                ),
+                None,
+            )
+            if near_metric and near_spec:
+                return f"relative_future_projection:{phrase}+{near_metric}+{near_spec}"
     return None
 
 
@@ -378,13 +452,18 @@ class FinancialProjectionFilter:
                 matched_rules.append(f"projection_phrase:{phrase_norm}")
 
         # 3. Future fiscal-year projections beyond the verified 10-K window (FY2027+)
+        #    and relative-horizon forward-looking calls ("next fiscal year", etc.) on prompts
         is_refusal_response = stage == "response" and any(
             ref in lowered for ref in _REFUSAL_RESPONSE_MARKERS
         )
         if not is_refusal_response:
-            future_rule = _find_future_projection_rule(words, policy)
+            future_rule = _find_future_projection_rule(words, policy, stage=stage)
             if future_rule:
                 matched_rules.append(future_rule)
+            if stage == "prompt":
+                relative_rule = _find_relative_future_projection_rule(words, policy)
+                if relative_rule:
+                    matched_rules.append(relative_rule)
 
         if matched_rules:
             return ProjectionFilterResult(

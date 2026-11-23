@@ -479,6 +479,155 @@ _CANONICAL_DUAL_CLASS_PREFERENCE: dict[str, str] = {
     "NWS": "NWSA",
 }
 
+_STATE_TAG_RE = re.compile(r"\\[a-z]+\\", re.IGNORECASE)
+_FUZZY_TOKEN_RE = re.compile(r"[A-Za-z0-9]+|&")
+
+# Common English / financial words that must never trigger single-word fuzzy company matching
+_FUZZY_SINGLE_STOPWORDS: frozenset[str] = frozenset(
+    {
+        "revenue",
+        "revenues",
+        "margins",
+        "operating",
+        "income",
+        "earnings",
+        "profits",
+        "profitability",
+        "pricing",
+        "changes",
+        "changed",
+        "compare",
+        "comparing",
+        "between",
+        "through",
+        "company",
+        "companies",
+        "factors",
+        "filings",
+        "quarter",
+        "quarterly",
+        "average",
+        "general",
+        "capital",
+        "markets",
+        "product",
+        "products",
+        "service",
+        "services",
+        "segment",
+        "segments",
+        "million",
+        "billion",
+        "percent",
+        "decline",
+        "declined",
+        "growing",
+        "numbers",
+        "systems",
+        "network",
+        "networks",
+        "digital",
+        "global",
+        "national",
+        "federal",
+        "natural",
+        "current",
+        "forward",
+        "looking",
+        "outlook",
+        "guidance",
+        "exports",
+        "controls",
+        "tariffs",
+        "litigation",
+        "earplug",
+        "wildfire",
+        "deposit",
+        "deposits",
+        "failures",
+        "staples",
+        "utilities",
+        "healthcare",
+        "financial",
+        "financials",
+        "consumer",
+        "technology",
+        "industrial",
+        "industrials",
+        "materials",
+        "streaming",
+        "airlines",
+        "cruises",
+        "outages",
+        "sensors",
+        "spending",
+        "research",
+        "development",
+        "spinoff",
+        "continuing",
+        "operations",
+        "results",
+        "balance",
+        "inflation",
+        "interest",
+        "foreign",
+        "exchange",
+        "currency",
+        "disruption",
+        "restructuring",
+        "impairment",
+        "disclosure",
+        "disclosures",
+        "wording",
+        "variance",
+        "variances",
+        "anomaly",
+        "anomalies",
+    }
+)
+
+
+def _damerau_levenshtein(a: str, b: str, *, max_dist: int = 2) -> int:
+    """Bounded optimal string alignment distance (handles typos & adjacent transpositions)."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if abs(la - lb) > max_dist:
+        return max_dist + 1
+    d = [[0] * (lb + 1) for _ in range(la + 1)]
+    for i in range(la + 1):
+        d[i][0] = i
+    for j in range(lb + 1):
+        d[0][j] = j
+    for i in range(1, la + 1):
+        row_min = max_dist + 1
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            val = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                val = min(val, d[i - 2][j - 2] + 1)
+            d[i][j] = val
+            if val < row_min:
+                row_min = val
+        if row_min > max_dist:
+            return max_dist + 1
+    return d[la][lb]
+
+
+def _fuzzy_name_tokens(norm_name: str) -> list[str]:
+    """Tokenize a normalized company name for fuzzy matching (`&` -> `'and'`, no state tags)."""
+    cleaned = _STATE_TAG_RE.sub(" ", norm_name.lower())
+    cleaned = cleaned.replace("&", " and ")
+    tokens = [m.group(0) for m in _FUZZY_TOKEN_RE.finditer(cleaned) if m.group(0) != "&"]
+    while tokens and tokens[-1] == "and":
+        tokens.pop()
+    return tokens
+
+
+def _spans_overlap(span: tuple[int, int], blocked: list[tuple[int, int]]) -> bool:
+    s0, e0 = span
+    return any(s0 < e1 and s1 < e0 for s1, e1 in blocked)
+
 
 class EntityCatalog:
     """In-memory lookup built from all ~501 S&P 500 issuers cached from BigQuery."""
@@ -494,6 +643,9 @@ class EntityCatalog:
         # ("the July 2024 outage") onto each issuer's own fiscal calendar.
         self.ticker_period_ends: dict[str, dict[int, date]] = {}
         self._name_patterns: list[tuple[re.Pattern[str], str]] = []
+        self._fuzzy_multi_targets: list[tuple[tuple[str, ...], str]] = []
+        self._fuzzy_single_targets: list[tuple[str, str]] = []
+        self._exact_single_words: set[str] = set()
 
         seen_norm_names: dict[str, str] = {}
         for p in profiles:
@@ -523,6 +675,8 @@ class EntityCatalog:
                     seen_norm_names[norm_name] = tk
 
         # Longest company names first so e.g. "bank of america" matches before "america"
+        seen_fuzzy_multi: set[tuple[tuple[str, ...], str]] = set()
+        seen_fuzzy_single: set[tuple[str, str]] = set()
         for norm_name, tk in sorted(
             seen_norm_names.items(), key=lambda kv: len(kv[0]), reverse=True
         ):
@@ -531,6 +685,116 @@ class EntityCatalog:
                 tk = canonical_tk
             escaped = re.escape(norm_name).replace(r"\ ", r"\s+")
             self._name_patterns.append((re.compile(rf"\b{escaped}\b", re.IGNORECASE), tk))
+
+            ftoks = _fuzzy_name_tokens(norm_name)
+            non_conn = [t for t in ftoks if t != "and"]
+            if len(non_conn) >= 2 and sum(len(t) for t in non_conn) >= 8:
+                for variant in (
+                    (tuple(ftoks), tuple(non_conn)) if "and" in ftoks else (tuple(ftoks),)
+                ):
+                    key = (variant, tk)
+                    if key not in seen_fuzzy_multi:
+                        seen_fuzzy_multi.add(key)
+                        self._fuzzy_multi_targets.append(key)
+            elif len(non_conn) == 1:
+                self._exact_single_words.add(non_conn[0])
+                if len(non_conn[0]) >= 7:
+                    skey = (non_conn[0], tk)
+                    if skey not in seen_fuzzy_single:
+                        seen_fuzzy_single.add(skey)
+                        self._fuzzy_single_targets.append(skey)
+
+    def _fuzzy_detect_company_names(
+        self,
+        query: str,
+        *,
+        found: list[str],
+        found_ciks: set[str],
+        blocked_spans: list[tuple[int, int]],
+    ) -> list[str]:
+        """High-precision edit-distance fallback for misspelled S&P 500 company names."""
+        if not self._fuzzy_multi_targets and not self._fuzzy_single_targets:
+            return []
+
+        tokens: list[tuple[str, str, tuple[int, int]]] = []
+        for m in _FUZZY_TOKEN_RE.finditer(query):
+            raw = m.group(0)
+            start, end = m.span()
+            # Drop possessive "'s" token so "Proctor & Gamble's" -> ["proctor", "and", "gamble"]
+            if raw.lower() == "s" and start > 0 and query[start - 1] in ("'", "\u2019"):
+                continue
+            norm = "and" if raw == "&" else raw.lower()
+            tokens.append((raw, norm, (start, end)))
+
+        if not tokens:
+            return []
+
+        hits: list[str] = []
+        used_spans = list(blocked_spans)
+
+        def _accept(tk: str, span: tuple[int, int]) -> bool:
+            if tk in found or tk in hits:
+                return False
+            tk_cik = self.ticker_to_cik.get(tk)
+            if tk_cik and tk_cik in found_ciks:
+                return False
+            hits.append(tk)
+            if tk_cik:
+                found_ciks.add(tk_cik)
+            used_spans.append(span)
+            return True
+
+        # 1. Multi-word catalog names (e.g. "Proctor & Gamble" -> "procter & gamble" -> PG)
+        q_norms = [t[1] for t in tokens]
+        for target_toks, tk in self._fuzzy_multi_targets:
+            if tk in found or tk in hits:
+                continue
+            k = len(target_toks)
+            if k > len(q_norms):
+                continue
+            max_total = 1 if sum(len(t) for t in target_toks) < 12 else 2
+            for i in range(len(q_norms) - k + 1):
+                win_span = (tokens[i][2][0], tokens[i + k - 1][2][1])
+                if _spans_overlap(win_span, used_spans):
+                    continue
+                total_d = 0
+                ok = True
+                for w, target in zip(q_norms[i : i + k], target_toks, strict=True):
+                    if w == target:
+                        continue
+                    if len(target) <= 3 or len(w) <= 3 or target == "and" or w == "and":
+                        ok = False
+                        break
+                    dist = _damerau_levenshtein(w, target, max_dist=1)
+                    if dist > 1:
+                        ok = False
+                        break
+                    total_d += dist
+                    if total_d > max_total:
+                        ok = False
+                        break
+                if ok and 1 <= total_d <= max_total:
+                    _accept(tk, win_span)
+                    break
+
+        # 2. Single-word catalog names (capitalized proper-noun token, len >= 7, edit dist == 1)
+        for raw, low, span in tokens:
+            if len(low) < 7 or low in _FUZZY_SINGLE_STOPWORDS or low in self._exact_single_words:
+                continue
+            if not raw[0].isupper() or _spans_overlap(span, used_spans):
+                continue
+            matches = [
+                tk
+                for target, tk in self._fuzzy_single_targets
+                if tk not in found
+                and tk not in hits
+                and target[0] == low[0]
+                and _damerau_levenshtein(low, target, max_dist=1) == 1
+            ]
+            if len(set(matches)) == 1:
+                _accept(matches[0], span)
+
+        return hits
 
     def contains_ticker(self, ticker: str) -> bool:
         return normalize_edgar_ticker(ticker) in self.tickers
@@ -559,6 +823,7 @@ class EntityCatalog:
         """Return `(detected_known_tickers, unknown_ticker_mentions)` from natural language."""
         found: list[str] = []
         unknown: list[str] = []
+        blocked_spans: list[tuple[int, int]] = []
 
         def _add_known(sym: str) -> None:
             norm = normalize_edgar_ticker(sym)
@@ -567,6 +832,7 @@ class EntityCatalog:
 
         # 1. Explicit `$TICKER` or `ticker XYZ`
         for m in _DOLLAR_TICKER_RE.finditer(query):
+            blocked_spans.append(m.span())
             sym = normalize_edgar_ticker(m.group(1))
             if not self.tickers or sym in self.tickers:
                 _add_known(sym)
@@ -579,6 +845,7 @@ class EntityCatalog:
                 continue
             if sym in _AMBIGUOUS_TICKER_WORDS and not raw.isupper():
                 continue
+            blocked_spans.append(m.span())
             if not self.tickers or sym in self.tickers:
                 _add_known(sym)
             elif sym not in unknown:
@@ -586,8 +853,10 @@ class EntityCatalog:
 
         # 2. High-precision curated brand aliases (includes "Visa" -> "V")
         for pattern, sym in _COMMON_BRAND_ALIASES:
-            if pattern.search(query):
+            m = pattern.search(query)
+            if m:
                 _add_known(sym)
+                blocked_spans.append(m.span())
 
         # 3. Dynamic S&P 500 uppercase 2-5 char ticker matching (excluding ambiguous words)
         if self.tickers:
@@ -597,6 +866,7 @@ class EntityCatalog:
                     continue
                 if tok in self.tickers:
                     _add_known(tok)
+                    blocked_spans.append(m.span())
 
         # 4. Context-guarded standalone uppercase 'V' (Visa) — requires financial/peer context
         if "V" not in found and _has_visa_ticker_mention(query, has_peer_context=bool(found)):
@@ -611,15 +881,29 @@ class EntityCatalog:
             tk_cik = self.ticker_to_cik.get(tk)
             if tk_cik and tk_cik in found_ciks:
                 continue
-            if pattern.search(query):
+            m = pattern.search(query)
+            if m:
                 _add_known(tk)
+                blocked_spans.append(m.span())
                 if tk_cik:
                     found_ciks.add(tk_cik)
 
         # 6. Detect well-known private / foreign / non-S&P 500 entities
         for pattern, label in _KNOWN_NON_SP500_ENTITIES:
-            if pattern.search(query) and label not in unknown:
-                unknown.append(label)
+            m = pattern.search(query)
+            if m:
+                blocked_spans.append(m.span())
+                if label not in unknown:
+                    unknown.append(label)
+
+        # 7. High-precision fuzzy company-name fallback for common typos (e.g. "Proctor & Gamble")
+        for sec_pat, _ in SECTOR_ALIASES:
+            for m in sec_pat.finditer(query):
+                blocked_spans.append(m.span())
+        for fuzzy_tk in self._fuzzy_detect_company_names(
+            query, found=found, found_ciks=found_ciks, blocked_spans=blocked_spans
+        ):
+            _add_known(fuzzy_tk)
 
         return found, unknown
 

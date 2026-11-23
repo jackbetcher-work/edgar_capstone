@@ -1151,3 +1151,54 @@ def test_chat_engine_prompt_blocked_uses_nested_model_armor_dict() -> None:
         assert ma["response_inspection"] is None
     finally:
         reset_model_armor_guardrail()
+
+
+def test_projection_filter_blocks_conversational_and_relative_horizon_evasion(
+    fake_gcp_adapters: Any,
+) -> None:
+    """Conversational FY2027 calls and relative-horizon projections are blocked without false positives."""
+    svc = configure_model_armor_guardrail(config=ModelArmorConfig(mode="emulator"))
+
+    # 1. Conversational FY2027 evasion without explicit "forecast"/"predict" verbs
+    evasion_q = (
+        "Gut check: will Costco's operating margin be higher or lower in fiscal 2027? "
+        "No hedging, just give me your call."
+    )
+    evasion_dec = svc.inspect_user_prompt(evasion_q)
+    assert evasion_dec.blocked is True
+    assert evasion_dec.projection_blocked is True
+
+    # End-to-end chat turn blocks as projection_compliance_block (never falling through to out_of_corpus)
+    turn = run_conversational_rag_turn(
+        query=evasion_q,
+        session_id="test-proj-evasion",
+        user_id="analyst@fde-workspace.corp",
+        skip_background_judge=True,
+    )
+    assert turn["status"] == "blocked"
+    assert turn["model_armor_blocked"] is True
+    assert turn["intent"] == "projection_compliance_block"
+    assert turn["citations"] == []
+
+    # 2. Relative-horizon projection evasion (no explicit 2027 year)
+    rel_dec = svc.inspect_user_prompt(
+        "Will Costco's operating margin be higher or lower next fiscal year? Just give me your call."
+    )
+    assert rel_dec.blocked is True
+    assert rel_dec.projection_blocked is True
+
+    # 3. Non-projection prompts and historical 10-K quotes in responses must NOT be false-blocked
+    for safe_prompt in (
+        "What was Apple's revenue in 2027?",
+        "What risks did NVIDIA disclose for the next 12 months?",
+        "How did Meta's 2025 10-K describe debt maturing in 2027?",
+    ):
+        dec = svc.projection_filter.evaluate(safe_prompt, stage="prompt")
+        assert dec.matched is False, f"Unexpected projection block on {safe_prompt!r}: {dec}"
+
+    safe_resp = svc.projection_filter.evaluate(
+        "Meta's FY2026 Form 10-K files in early 2027; CrowdStrike stated the incident is expected "
+        "to continue to have an adverse effect and 3M's settlement is payable through 2036.",
+        stage="response",
+    )
+    assert safe_resp.matched is False

@@ -699,3 +699,87 @@ def test_chat_turn_runs_disclosure_delta_pipeline_for_thematic_queries(
     for cit in deltas["citations"]:
         assert cit["chunk_id"] in known
     _assert_citations_resolve(resp)
+
+
+def test_build_company_evolution_supplements_term_matched_chunks_and_preserves_change_diversity() -> (
+    None
+):
+    """Term-matched section chunks surface modified/added deltas missed by narrow top-k vector hits."""
+    from edgar_capstone.agents.prompts.builders import compact_disclosure_deltas_for_tool
+
+    # 4 unchanged PFAS paragraphs + 2 modified PFAS paragraphs + 1 brand-new added risk factor
+    unchanged_paras = [
+        (
+            f"PFAS paragraph {i}: We monitor environmental regulations related to fluorochemicals "
+            "and PFAS across multiple jurisdictions where we manufacture industrial materials."
+        )
+        for i in range(4)
+    ]
+    prior_mod_1 = (
+        "PFAS exit plan: The company announced its commitment to exit all PFAS manufacturing "
+        "and work to discontinue the use of PFAS across its product portfolio by the end of 2025, "
+        "and will continue to address legacy fluorochemical liabilities."
+    )
+    curr_mod_1 = (
+        "PFAS exit plan: The company completed its exit of all PFAS manufacturing "
+        "and continues to discontinue the use of PFAS across its product portfolio by the end of 2025, "
+        "and will continue to address legacy fluorochemical liabilities."
+    )
+    prior_mod_2 = (
+        "PFAS remediation: State and municipal public water systems have asserted claims "
+        "seeking remediation costs tied to legacy PFAS compounds in groundwater."
+    )
+    curr_mod_2 = (
+        "PFAS remediation: Court approval of the PWS Settlement with public water systems "
+        "addresses remediation costs tied to legacy PFAS compounds in groundwater."
+    )
+    added_earplug = (
+        "Combat Arms Earplug Settlement: Following voluntary proceedings, the company entered "
+        "into the CAE Settlement covering more than 99 percent of Combat Arms claimants."
+    )
+
+    m24 = _material(2024, [*unchanged_paras, prior_mod_1, prior_mod_2])
+    m25 = _material(2025, [*unchanged_paras, curr_mod_1, curr_mod_2, added_earplug])
+
+    # Simulate narrow vector retrieval returning ONLY the 4 unchanged PFAS paragraphs
+    terms = resolve_theme_terms("PFAS and Combat Arms", "PFAS, Combat Arms, CAE Settlement")
+    evo, cited = build_company_evolution(
+        ticker="ACME",
+        company_name="ACME Corp",
+        gics_sector="Industrials",
+        window_years=[2024, 2025],
+        available_years=[2024, 2025],
+        theme_terms=terms,
+        sections={(2024, "item_1a"): m24, (2025, "item_1a"): m25},
+        theme_passages={
+            2024: [_as_passage(m24, i, score=0.9 - i * 0.05) for i in range(4)],
+            2025: [_as_passage(m25, i, score=0.9 - i * 0.05) for i in range(4)],
+        },
+        max_deltas_per_pair=4,
+    )
+    assert len(evo.year_pairs) == 1
+    pair = evo.year_pairs[0]
+    assert pair.counts["modified"] == 2
+    assert pair.counts["added"] == 1
+    kept_types = {d.change_type for d in pair.deltas}
+    assert {"modified", "added"} <= kept_types
+    assert any(
+        "exit of all pfas manufacturing" in (d.current_excerpt or "").lower() for d in pair.deltas
+    )
+    assert any("cae settlement" in (d.current_excerpt or "").lower() for d in pair.deltas)
+
+    # Compact tool digest for the LLM also preserves both modified and added change types
+    compact = compact_disclosure_deltas_for_tool(
+        {
+            "status": "success",
+            "theme": "PFAS and Combat Arms",
+            "companies": [evo.model_dump(mode="json")],
+        }
+    )
+    compact_types = {d["change_type"] for d in compact["companies"][0]["year_pairs"][0]["deltas"]}
+    assert {"modified", "added"} <= compact_types
+    cited_ids = {c["chunk_id"] for c in cited}
+    for d in pair.deltas:
+        for cid in (d.prior_chunk_id, d.current_chunk_id):
+            if cid:
+                assert cid in cited_ids

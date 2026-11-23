@@ -66,8 +66,9 @@ UNCHANGED_MIN = 0.90
 MODIFIED_MIN = 0.40
 SHINGLE_SIZE = 3
 DEFAULT_MAX_COMPANIES = 5
-DEFAULT_PASSAGES_PER_YEAR = 4
-DEFAULT_MAX_DELTAS_PER_PAIR = 6
+DEFAULT_PASSAGES_PER_YEAR = 6
+DEFAULT_MAX_DELTAS_PER_PAIR = 8
+_MAX_TERM_SUPPLEMENT_CHUNKS = 12
 _MAX_PHRASES = 5
 _MAX_PHRASE_WORDS = 18
 _EXCERPT_CHARS = 420
@@ -505,6 +506,65 @@ def _classify_prior_passages(
         )
 
 
+def _select_top_deltas(
+    deltas: list[DisclosureDelta],
+    max_deltas: int,
+) -> list[DisclosureDelta]:
+    """Select up to `max_deltas` preserving substantive change-type diversity and relevance.
+
+    Guarantees representation for each present substantive change type (`modified`, `added`,
+    `removed`) so several modified paragraphs cannot crowd out a newly added or removed risk
+    factor, then fills remaining slots by `theme_relevance` (substantive changes ahead of
+    `unchanged`), and returns the selected items in canonical display order.
+    """
+    limit = max(0, int(max_deltas))
+    if limit == 0 or not deltas:
+        return []
+
+    substantive_kinds: tuple[ChangeType, ...] = ("modified", "added", "removed")
+    by_kind: dict[ChangeType, list[DisclosureDelta]] = {k: [] for k in _CHANGE_ORDER}
+    for d in deltas:
+        by_kind[d.change_type].append(d)
+    for items in by_kind.values():
+        items.sort(key=lambda d: (-d.theme_relevance, d.delta_id))
+
+    selected: list[DisclosureDelta] = []
+    seen_ids: set[str] = set()
+
+    def _add(item: DisclosureDelta) -> None:
+        if item.delta_id not in seen_ids and len(selected) < limit:
+            seen_ids.add(item.delta_id)
+            selected.append(item)
+
+    # Pass 1: reserve up to 2 highest-relevance deltas from each substantive kind (round-robin)
+    for slot in range(2):
+        for kind in substantive_kinds:
+            bucket = by_kind[kind]
+            if slot < len(bucket):
+                _add(bucket[slot])
+
+    # Pass 2: fill remaining slots with highest-relevance substantive changes across all kinds
+    remaining_substantive = [
+        d for kind in substantive_kinds for d in by_kind[kind] if d.delta_id not in seen_ids
+    ]
+    remaining_substantive.sort(
+        key=lambda d: (-d.theme_relevance, _CHANGE_ORDER[d.change_type], d.delta_id)
+    )
+    for d in remaining_substantive:
+        if len(selected) >= limit:
+            break
+        _add(d)
+
+    # Pass 3: fill any leftover slots with unchanged passages
+    for d in by_kind["unchanged"]:
+        if len(selected) >= limit:
+            break
+        _add(d)
+
+    selected.sort(key=lambda d: (_CHANGE_ORDER[d.change_type], -d.theme_relevance, d.delta_id))
+    return selected
+
+
 def align_year_pair(
     *,
     ticker: str,
@@ -554,13 +614,50 @@ def align_year_pair(
     counts: dict[str, int] = {kind: 0 for kind in _CHANGE_ORDER}
     for d in deltas:
         counts[d.change_type] += 1
-    deltas.sort(key=lambda d: (_CHANGE_ORDER[d.change_type], -d.theme_relevance, d.delta_id))
-    kept = deltas[: max(0, max_deltas)]
+    kept = _select_top_deltas(deltas, max_deltas)
     kept_ids = {cid for d in kept for cid in (d.prior_chunk_id, d.current_chunk_id) if cid}
     pair = DisclosureYearPair(
         prior_fiscal_year=py, current_fiscal_year=cy, counts=counts, deltas=kept
     )
     return pair, [c for cid, c in cited.items() if cid in kept_ids]
+
+
+def _supplement_theme_passages(
+    passages: list[dict[str, Any]],
+    material: SectionMaterial,
+    theme_terms: Sequence[str],
+    *,
+    max_extra: int = _MAX_TERM_SUPPLEMENT_CHUNKS,
+) -> list[dict[str, Any]]:
+    """Augment vector-retrieved passages with unseen section chunks matching `theme_terms`.
+
+    Multi-topic or multi-chunk risk factors (e.g. PFAS + earplug litigation spanning 8-10 chunks)
+    can overflow `per_year_k` vector hits with unchanged paragraphs, hiding modified chunks.
+    `SectionMaterial.chunks` is already loaded in memory from `fetch_sections_chunks_batch`, so
+    scanning it for `theme_terms` adds zero extra BigQuery RPCs.
+    """
+    if not theme_terms or not material.chunks or max_extra <= 0:
+        return passages
+    seen_ids = {str(c.get("chunk_id") or "") for c in passages}
+    candidates: list[tuple[int, int, str, dict[str, Any]]] = []
+    for idx, chunk in enumerate(material.chunks):
+        cid = str(chunk.get("chunk_id") or "")
+        if not cid or cid in seen_ids:
+            continue
+        hits = count_theme_mentions(_passage_text(chunk), theme_terms)
+        if hits > 0:
+            chunk_idx = int(
+                chunk.get("chunk_index") if chunk.get("chunk_index") is not None else idx
+            )
+            candidates.append((hits, chunk_idx, cid, chunk))
+    if not candidates:
+        return passages
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    extras = [
+        chunk_row_to_citation(chunk, score=round(min(0.45, 0.15 + 0.05 * hits), 4))
+        for hits, _, _, chunk in candidates[:max_extra]
+    ]
+    return [*passages, *extras]
 
 
 def build_company_evolution(
@@ -597,6 +694,8 @@ def build_company_evolution(
             curr_p = [c for c in theme_passages.get(cy, []) if c.get("section_id") == section_id]
             if prior is None or current is None or not (prior_p or curr_p):
                 continue
+            prior_p = _supplement_theme_passages(prior_p, prior, theme_terms)
+            curr_p = _supplement_theme_passages(curr_p, current, theme_terms)
             pair, cited = align_year_pair(
                 ticker=ticker,
                 company_name=company_name,
@@ -616,10 +715,7 @@ def build_company_evolution(
                     merged_pair.counts[kind] = merged_pair.counts.get(kind, 0) + n
                 merged_pair.deltas.extend(pair.deltas)
         if merged_pair is not None:
-            merged_pair.deltas.sort(
-                key=lambda d: (_CHANGE_ORDER[d.change_type], -d.theme_relevance, d.delta_id)
-            )
-            merged_pair.deltas = merged_pair.deltas[:max_deltas_per_pair]
+            merged_pair.deltas = _select_top_deltas(merged_pair.deltas, max_deltas_per_pair)
             year_pairs.append(merged_pair)
 
     kept_ids = {
