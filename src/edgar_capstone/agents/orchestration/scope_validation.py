@@ -489,6 +489,7 @@ class EntityCatalog:
         self.ticker_to_sector: dict[str, str] = {}
         self.ticker_to_cik: dict[str, str] = {}
         self.ticker_years: dict[str, set[int]] = {}
+        self.profiles_by_key: dict[tuple[str, int], Any] = {}
         # ticker -> fiscal_year -> fiscal period end date, used to map calendar event dates
         # ("the July 2024 outage") onto each issuer's own fiscal calendar.
         self.ticker_period_ends: dict[str, dict[int, date]] = {}
@@ -509,10 +510,12 @@ class EntityCatalog:
             if cik:
                 self.ticker_to_cik[tk] = cik
             if fy is not None:
-                self.ticker_years.setdefault(tk, set()).add(int(fy))
+                fy_int = int(fy)
+                self.ticker_years.setdefault(tk, set()).add(fy_int)
+                self.profiles_by_key[(tk, fy_int)] = p
                 period_end = _parse_iso_date(getattr(p, "period_of_report", None))
                 if period_end is not None:
-                    self.ticker_period_ends.setdefault(tk, {})[int(fy)] = period_end
+                    self.ticker_period_ends.setdefault(tk, {})[fy_int] = period_end
             norm_name = _normalize_company_name(cname)
             if len(norm_name) >= 4:
                 existing = seen_norm_names.get(norm_name)
@@ -531,6 +534,10 @@ class EntityCatalog:
 
     def contains_ticker(self, ticker: str) -> bool:
         return normalize_edgar_ticker(ticker) in self.tickers
+
+    def get_profile(self, ticker: str, fiscal_year: int) -> Any | None:
+        """Return the cached profile for `(ticker, fiscal_year)` in O(1), or `None` if absent."""
+        return self.profiles_by_key.get((normalize_edgar_ticker(ticker), int(fiscal_year)))
 
     def fiscal_year_for_date(self, ticker: str, event_date: date) -> int | None:
         """Return the issuer's fiscal year whose period contains `event_date`.

@@ -327,6 +327,8 @@ class ConversationMemoryManager:
         now = time.monotonic()
         with self._lock:
             cached = self._sessions.get(key)
+            if cached is not None:
+                self._sessions.move_to_end(key)
         store = self._get_store()
         live = store.is_live_enabled()
         if cached is not None:
@@ -435,8 +437,16 @@ class ConversationMemoryManager:
         cited_chunk_ids: list[str] | None = None,
         cached_10k_keys: list[str] | None = None,
         answer_markdown: str = "",
+        recalled_prior_memory: bool | None = None,
     ) -> dict[str, Any]:
-        """Persist a completed turn into durable session memory and compact if over token threshold."""
+        """Persist a completed turn into durable session memory and compact if over token threshold.
+
+        When ``recalled_prior_memory`` is supplied (because the caller already ran
+        ``recall_session_context`` at the start of this turn), the local L1 cache is reused
+        without issuing a redundant remote Firestore ``GET`` even if the turn ran longer than
+        ``refresh_ttl_seconds``. If ``recalled_prior_memory`` is ``True`` but the entry was
+        evicted from L1 mid-turn, it safely falls back to a remote read so history is never lost.
+        """
         if not session_id or not session_id.strip():
             return {"persisted": False, "compaction_triggered": False, "turn_count": 0}
 
@@ -445,7 +455,17 @@ class ConversationMemoryManager:
 
         # Serialize load -> mutate -> remote save per `(user_id, session_id)` to prevent lost updates.
         with session_lock:
-            existing = self._load_or_refresh_session(session_id, user_id)
+            if recalled_prior_memory is not None:
+                with self._lock:
+                    cached = self._sessions.get(key)
+                if cached is not None:
+                    existing: SessionMemoryState | None = cached[1]
+                elif recalled_prior_memory:
+                    existing = self._load_or_refresh_session(session_id, user_id)
+                else:
+                    existing = None
+            else:
+                existing = self._load_or_refresh_session(session_id, user_id)
             with self._lock:
                 sess = existing or SessionMemoryState(session_id=key[1], user_id=key[0])
 

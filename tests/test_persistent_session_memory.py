@@ -173,3 +173,146 @@ def test_firestore_session_store_local_noop_and_upstream_error_tracking() -> Non
             live_store.list_sessions("alice@corp")
     finally:
         fail_client.close()
+
+
+def test_record_turn_skips_redundant_firestore_get_after_recall_and_recovers_on_eviction() -> None:
+    """Passing `recalled_prior_memory` avoids a second Firestore GET after TTL expiry, while recovering on LRU eviction."""
+    transport, docs, calls = _mock_firestore_transport()
+    cfg = TelemetryConfig(
+        telemetry_backend="local",
+        feedback_backend="gcp",
+        project_id="iron-radio-514217-q7",
+    )
+    store = FirestoreSessionStore(
+        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
+    )
+    # refresh_ttl_seconds=0.0 simulates every live Gemini turn exceeding the 5s L1 refresh TTL.
+    mgr = ConversationMemoryManager(
+        session_store=store,
+        refresh_ttl_seconds=0.0,
+        max_local_sessions=1,
+    )
+
+    # Turn 1 (brand-new session): recall gets 404 (1 GET), record_turn skips redundant GET -> 1 PATCH.
+    recalled_1 = mgr.recall_session_context("sess-1", user_id="alice@corp")
+    assert recalled_1["has_prior_memory"] is False
+    assert [m for m, _ in calls] == ["GET"]
+
+    calls.clear()
+    res_1 = mgr.record_turn(
+        session_id="sess-1",
+        user_id="alice@corp",
+        query="Analyze NVDA FY2024 to FY2026 revenue",
+        intent="longitudinal_single_company",
+        tickers=["NVDA"],
+        gics_sector="Information Technology",
+        start_year=2024,
+        end_year=2026,
+        recalled_prior_memory=bool(recalled_1["has_prior_memory"]),
+    )
+    assert res_1["turn_count"] == 1
+    assert [m for m, _ in calls] == ["PATCH"]
+
+    # Turn 2 (existing session, TTL expired): recall hydrates via 1 GET, record_turn reuses L1 -> 0 GETs, 1 PATCH.
+    calls.clear()
+    recalled_2 = mgr.recall_session_context("sess-1", user_id="alice@corp")
+    assert recalled_2["has_prior_memory"] is True
+    assert recalled_2["turn_count"] == 1
+    assert [m for m, _ in calls] == ["GET"]
+
+    calls.clear()
+    res_2 = mgr.record_turn(
+        session_id="sess-1",
+        user_id="alice@corp",
+        query="Now add AAPL",
+        intent="multi_company_peer_comparison",
+        tickers=["NVDA", "AAPL"],
+        gics_sector="Information Technology",
+        start_year=2024,
+        end_year=2026,
+        recalled_prior_memory=bool(recalled_2["has_prior_memory"]),
+    )
+    assert res_2["turn_count"] == 2
+    assert [m for m, _ in calls] == ["PATCH"]
+
+    # Turn 3 with mid-turn LRU eviction (`max_local_sessions=1`): safely falls back to 1 remote GET so turns 1-2 aren't lost.
+    recalled_3 = mgr.recall_session_context("sess-1", user_id="alice@corp")
+    assert recalled_3["has_prior_memory"] is True
+    assert recalled_3["turn_count"] == 2
+
+    # Evict `sess-1` from L1 by recording a different session.
+    mgr.record_turn(
+        session_id="other-sess",
+        user_id="bob@corp",
+        query="Check MSFT",
+        intent="longitudinal_single_company",
+        tickers=["MSFT"],
+        gics_sector="Information Technology",
+        start_year=2024,
+        end_year=2026,
+    )
+
+    calls.clear()
+    res_3 = mgr.record_turn(
+        session_id="sess-1",
+        user_id="alice@corp",
+        query="Drop AAPL",
+        intent="longitudinal_single_company",
+        tickers=["NVDA"],
+        gics_sector="Information Technology",
+        start_year=2024,
+        end_year=2026,
+        recalled_prior_memory=bool(recalled_3["has_prior_memory"]),
+    )
+    assert res_3["turn_count"] == 3
+    assert [m for m, _ in calls] == ["GET", "PATCH"]
+    assert len(docs) == 2
+
+
+def test_chat_turn_issues_only_one_firestore_get_and_one_patch_even_past_refresh_ttl(
+    fake_gcp_adapters: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end `run_conversational_rag_turn` avoids a redundant Firestore GET on save."""
+    from edgar_capstone.agents.orchestration import chat_engine
+    from tests.structured_report_helpers import ScriptedAnalystLlm
+
+    transport, _docs, calls = _mock_firestore_transport()
+    cfg = TelemetryConfig(
+        telemetry_backend="local",
+        feedback_backend="gcp",
+        project_id="iron-radio-514217-q7",
+    )
+    store = FirestoreSessionStore(
+        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
+    )
+    mgr = ConversationMemoryManager(session_store=store, refresh_ttl_seconds=0.0)
+    monkeypatch.setattr(chat_engine, "get_conversation_memory_manager", lambda: mgr)
+
+    for turn_num, query in enumerate(
+        (
+            "Analyze NVDA FY2024 to FY2026 revenue drivers",
+            "How did operating margins trend over the same period?",
+        ),
+        start=1,
+    ):
+        calls.clear()
+        resp = chat_engine.run_conversational_rag_turn(
+            query=query,
+            session_id="e2e-no-dup-get",
+            user_id="analyst@fde-workspace.corp",
+            reasoning_llm=ScriptedAnalystLlm(
+                tool_calls=[
+                    (
+                        "calculate_period_variances",
+                        {"tickers": "NVDA", "start_year": 2024, "end_year": 2026},
+                    )
+                ],
+                headline=f"Turn {turn_num} NVDA summary.",
+                intent="longitudinal_single_company",
+            ),
+            skip_background_judge=True,
+        )
+        assert resp["status"] == "success"
+        assert resp["context_and_memory"]["session_memory"]["persistence"]["turn_count"] == turn_num
+        assert [m for m, _ in calls] == ["GET", "PATCH"]

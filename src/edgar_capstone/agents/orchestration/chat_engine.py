@@ -209,6 +209,11 @@ class EntityCatalogCache:
         _, profiles = self.get_catalog_and_profiles(allow_fetch=True, raise_on_error=True)
         return profiles
 
+    def lookup_cached_profile(self, ticker: str, fiscal_year: int) -> Any | None:
+        """Return a cached `(ticker, fiscal_year)` profile if the catalog is warm, else `None`."""
+        catalog, _ = self.get_catalog_and_profiles(allow_fetch=False, raise_on_error=False)
+        return catalog.get_profile(ticker, fiscal_year)
+
     def clear(self) -> None:
         """Clear cached profiles (for internal cache invalidation)."""
         with self._lock:
@@ -229,6 +234,11 @@ def _get_entity_catalog(*, allow_fetch: bool = True) -> tuple[EntityCatalog, lis
         allow_fetch=allow_fetch,
         raise_on_error=False,
     )
+
+
+def lookup_cached_profile(ticker: str, fiscal_year: int) -> Any | None:
+    """Return a cached `(ticker, fiscal_year)` profile from the warm catalog without hitting BigQuery."""
+    return _ENTITY_CATALOG_CACHE.lookup_cached_profile(ticker, fiscal_year)
 
 
 def list_curated_companies() -> dict[str, Any]:
@@ -1456,6 +1466,7 @@ def _verify_and_finalize_success(
         cited_chunk_ids=[c["chunk_id"] for c in citations],
         cached_10k_keys=[e.cache_key for e in cached_explanations],
         answer_markdown=answer_markdown,
+        recalled_prior_memory=bool(ctx.memory_ctx.get("has_prior_memory")),
     )
 
     analyzed_tickers = sorted(
@@ -1704,6 +1715,7 @@ __all__ = [
     "EntityCatalogCache",
     "ProgressCallback",
     "list_curated_companies",
+    "lookup_cached_profile",
     "resolve_query_scope",
     "run_conversational_rag_turn",
 ]

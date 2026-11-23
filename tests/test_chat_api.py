@@ -250,6 +250,70 @@ def test_request_validation_rejects_inverted_years_and_bad_section_params() -> N
     )
 
 
+def test_section_viewer_reuses_section_and_catalog_caches_without_redundant_bigquery_rpcs(
+    fake_gcp_adapters: Any,
+) -> None:
+    """`/api/v1/section` avoids redundant BigQuery profile fetches on both cold miss and warm cache hits."""
+    _, requests_log = fake_gcp_adapters
+    client = TestClient(app)
+    headers = _bearer_headers()
+
+    def _bq_and_gcs_counts() -> tuple[int, int]:
+        bq_count = sum(1 for _, url in requests_log if "bigquery.googleapis.com" in url)
+        gcs_count = sum(1 for _, url in requests_log if "storage.googleapis.com" in url)
+        return bq_count, gcs_count
+
+    # 1. Cold catalog + cold section: 1 targeted BigQuery profile fetch + 1 GCS download (never 2 BQ RPCs).
+    requests_log.clear()
+    r1 = client.get(
+        "/api/v1/section",
+        headers=headers,
+        params={"ticker": "NVDA", "fiscal_year": 2026, "section_id": "item_7", "max_chars": 8000},
+    )
+    assert r1.status_code == 200
+    b1 = r1.json()
+    assert b1["cache_hit"] is False
+    assert b1["cik"] == "0001045810"
+    assert b1["gics_sector"] == "Information Technology"
+    assert b1["accession_number"]
+    assert b1["filing_date"]
+    assert b1["period_of_report"]
+    assert b1["gics_sub_industry"]
+    assert _bq_and_gcs_counts() == (1, 1)
+
+    # 2. Warm L1 section cache hit: 0 BigQuery RPCs and 0 GCS RPCs while keeping full profile metadata.
+    requests_log.clear()
+    r2 = client.get(
+        "/api/v1/section",
+        headers=headers,
+        params={"ticker": "NVDA", "fiscal_year": 2026, "section_id": "item_7", "max_chars": 8000},
+    )
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["cache_hit"] is True
+    assert b2["cik"] == b1["cik"]
+    assert b2["accession_number"] == b1["accession_number"]
+    assert b2["gics_sector"] == b1["gics_sector"]
+    assert _bq_and_gcs_counts() == (0, 0)
+
+    # 3. Warm `_ENTITY_CATALOG_CACHE` (via `/api/v1/companies`) + cold section: 0 BigQuery RPCs, 1 GCS download.
+    cat_resp = client.get("/api/v1/companies", headers=headers)
+    assert cat_resp.status_code == 200
+    requests_log.clear()
+    r3 = client.get(
+        "/api/v1/section",
+        headers=headers,
+        params={"ticker": "AAPL", "fiscal_year": 2026, "section_id": "item_1a", "max_chars": 8000},
+    )
+    assert r3.status_code == 200
+    b3 = r3.json()
+    assert b3["cache_hit"] is False
+    assert b3["ticker"] == "AAPL"
+    assert b3["cik"] == "0000320193"
+    assert b3["gics_sector"] == "Information Technology"
+    assert _bq_and_gcs_counts() == (0, 1)
+
+
 def test_entity_catalog_cache_single_flight_and_error_handling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

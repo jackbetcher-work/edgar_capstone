@@ -697,12 +697,24 @@ def load_cached_10k_section(
 
     if entry is None:
         adapters = _gcp_adapters()
-        bq_profiles = adapters.bigquery.fetch_profiles(
-            tickers={norm_ticker},
-            start_year=fiscal_year,
-            end_year=fiscal_year,
+        cached_profiles = cached_turn_profiles()
+        matched_prof = next(
+            (
+                p
+                for p in cached_profiles
+                if normalize_edgar_ticker(p.ticker) == norm_ticker
+                and int(p.fiscal_year) == int(fiscal_year)
+            ),
+            None,
         )
-        matched_prof = bq_profiles[0] if bq_profiles else None
+        profile_from_cache = matched_prof is not None
+        if matched_prof is None:
+            bq_profiles = adapters.bigquery.fetch_profiles(
+                tickers={norm_ticker},
+                start_year=fiscal_year,
+                end_year=fiscal_year,
+            )
+            matched_prof = bq_profiles[0] if bq_profiles else None
         if matched_prof is None:
             return {
                 "status": "error",
@@ -714,7 +726,7 @@ def load_cached_10k_section(
             tool_context,
             tool_name="load_cached_10k_section",
             data_source="gcp",
-            services_hit=["bigquery", "gcs"],
+            services_hit=["gcs"] if profile_from_cache else ["bigquery", "gcs"],
         )
 
         sections = extract_sections_from_combined_markdown(md_content)
@@ -726,6 +738,12 @@ def load_cached_10k_section(
             "company_name": matched_prof.company_name,
             "fiscal_year": matched_prof.fiscal_year,
             "section_id": sec_key,
+            "cik": matched_prof.cik,
+            "accession_number": matched_prof.accession_number,
+            "filing_date": matched_prof.filing_date,
+            "period_of_report": matched_prof.period_of_report,
+            "gics_sector": matched_prof.gics_sector,
+            "gics_sub_industry": matched_prof.gics_sub_industry,
             "sec_filing_url": matched_prof.sec_filing_url,
             "unstructured_gcs_uri": matched_prof.unstructured_gcs_uri,
             "token_estimate": token_est,
@@ -758,7 +776,7 @@ def load_cached_10k_section(
         cache_key=cache_id,
     )
 
-    return {
+    response: dict[str, Any] = {
         "status": "success",
         "cache_key": cache_id,
         "cache_hit": cache_hit,
@@ -775,6 +793,17 @@ def load_cached_10k_section(
         "content": excerpt,
         "truncated": len(str(entry["full_text"])) > effective_max,
     }
+    for meta_key in (
+        "cik",
+        "accession_number",
+        "filing_date",
+        "period_of_report",
+        "gics_sector",
+        "gics_sub_industry",
+    ):
+        if meta_key in entry:
+            response[meta_key] = entry[meta_key]
+    return response
 
 
 def get_full_10k_section(cache_key: str) -> dict[str, Any] | None:

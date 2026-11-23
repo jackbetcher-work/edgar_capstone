@@ -6,11 +6,15 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from edgar_capstone.agents.orchestration.chat_engine import list_curated_companies
+from edgar_capstone.agents.orchestration.chat_engine import (
+    list_curated_companies,
+    lookup_cached_profile,
+)
 from edgar_capstone.agents.tools import (
     get_active_gcp_tool_adapters,
     load_cached_10k_section,
 )
+from edgar_capstone.agents.tools.runtime import tool_turn_context
 from edgar_capstone.api.dependencies import audited_permissions
 from edgar_capstone.common.domain import normalize_edgar_ticker
 from edgar_capstone.security.auth import (
@@ -21,6 +25,15 @@ from edgar_capstone.security.auth import (
 from edgar_capstone.security.rbac import Permission
 
 router = APIRouter(tags=["SEC Filings"])
+
+_SECTION_PROFILE_META_FIELDS: tuple[str, ...] = (
+    "cik",
+    "accession_number",
+    "filing_date",
+    "period_of_report",
+    "gics_sector",
+    "gics_sub_industry",
+)
 
 
 def _enrich_section_response(
@@ -36,28 +49,37 @@ def _enrich_section_response(
             detail="ticker must contain at least one non-whitespace character",
         )
 
-    res = load_cached_10k_section(
-        ticker=norm_ticker,
-        fiscal_year=fiscal_year,
-        section_id=section_id,
-        max_chars=max_chars,
-    )
+    cached_prof = lookup_cached_profile(norm_ticker, fiscal_year)
+    if cached_prof is not None:
+        with tool_turn_context(cached_profiles=[cached_prof]):
+            res = load_cached_10k_section(
+                ticker=norm_ticker,
+                fiscal_year=fiscal_year,
+                section_id=section_id,
+                max_chars=max_chars,
+            )
+    else:
+        res = load_cached_10k_section(
+            ticker=norm_ticker,
+            fiscal_year=fiscal_year,
+            section_id=section_id,
+            max_chars=max_chars,
+        )
     if res.get("status") == "error":
         raise HTTPException(status_code=404, detail=res.get("message", "Section not found"))
 
-    profiles = get_active_gcp_tool_adapters().bigquery.fetch_profiles(
-        tickers={norm_ticker},
-        start_year=fiscal_year,
-        end_year=fiscal_year,
-    )
-    matched_prof = profiles[0] if profiles else None
-    if matched_prof is not None:
-        res["cik"] = matched_prof.cik
-        res["accession_number"] = matched_prof.accession_number
-        res["filing_date"] = matched_prof.filing_date
-        res["period_of_report"] = matched_prof.period_of_report
-        res["gics_sector"] = matched_prof.gics_sector
-        res["gics_sub_industry"] = matched_prof.gics_sub_industry
+    if any(field not in res for field in _SECTION_PROFILE_META_FIELDS):
+        matched_prof = cached_prof
+        if matched_prof is None:
+            profiles = get_active_gcp_tool_adapters().bigquery.fetch_profiles(
+                tickers={norm_ticker},
+                start_year=fiscal_year,
+                end_year=fiscal_year,
+            )
+            matched_prof = profiles[0] if profiles else None
+        if matched_prof is not None:
+            for field in _SECTION_PROFILE_META_FIELDS:
+                res.setdefault(field, getattr(matched_prof, field))
     return res
 
 
