@@ -81,9 +81,13 @@ def test_telemetry_log_based_metric_definitions_are_low_cardinality() -> None:
     label_lists = [
         json.loads(raw) for raw in re.findall(r"labels\s*=\s*(\[[^\]]*\])", locals_block)
     ]
-    assert len(label_lists) >= 10
+    assert len(label_lists) >= 8
     for labels in label_lists:
         assert not (set(labels) & FORBIDDEN_METRIC_LABELS), f"High-cardinality label in {labels}"
+
+    # LLM token reporting lives exclusively in BigQuery (no duplicate Cloud Monitoring token metrics).
+    assert "llm_input_tokens" not in obs
+    assert "llm_output_tokens" not in obs
 
     described = set(
         re.findall(

@@ -16,10 +16,12 @@
 # metric labels: per-request drill-down goes through trace exemplars, the
 # dashboard logs panels, and the BigQuery sink tables instead.
 #
-# Cumulative USD totals: Cloud Logging counter metrics count entries and cannot sum
-# float fields, so cost/cache-savings are DISTRIBUTION metrics (per-call spread,
-# approximate). Exact cumulative USD lives in BigQuery
-# `sec_edgar.v_telemetry_cost_and_latency` (telemetry.tf).
+# Token usage & exact cumulative USD totals: LLM token counts are reported
+# exclusively in BigQuery (`sec_edgar.llm_telemetry_events` /
+# `v_telemetry_cost_and_latency`) rather than duplicated as Cloud Monitoring
+# log-based metrics. Cloud Logging counter metrics count entries and cannot sum
+# float fields, so cost/cache-savings remain approximate DISTRIBUTION metrics in
+# Cloud Monitoring while exact cumulative USD lives in BigQuery (telemetry.tf).
 # ------------------------------------------------------------------------------
 
 resource "google_logging_metric" "api_request_latencies" {
@@ -156,8 +158,6 @@ locals {
 
   # Exponential latency buckets: 5 ms .. ~38 min (same as api_request_latencies).
   latency_ms_buckets = { type = "exponential", num_finite_buckets = 40, growth_factor = 1.4, scale = 5, width = 0, offset = 0 }
-  # Exponential token buckets: 10 .. ~4.3M tokens.
-  token_buckets = { type = "exponential", num_finite_buckets = 32, growth_factor = 1.5, scale = 10, width = 0, offset = 0 }
   # Exponential USD buckets for sub-cent .. dollar LLM calls: $0.0001 .. ~$12.8 (+ overflow).
   usd_buckets = { type = "exponential", num_finite_buckets = 29, growth_factor = 1.5, scale = 0.0001, width = 0, offset = 0 }
   # Linear 0.0 .. 1.05 judge score buckets (width 0.05; a perfect 1.0 lands in [1.0, 1.05)).
@@ -183,26 +183,6 @@ locals {
       value_field  = "total_model_latency_ms"
       labels       = ["model_name", "agent_name", "task_category"]
       buckets      = local.latency_ms_buckets
-    }
-    llm_input_tokens = {
-      display_name = "SEC EDGAR LLM Input (Context) Tokens"
-      description  = "Per-call total context tokens sent to Gemini (cached + uncached)."
-      unit         = "1"
-      target       = "llm_telemetry_events"
-      extra_filter = ""
-      value_field  = "total_context_tokens"
-      labels       = ["model_name", "cache_hit"]
-      buckets      = local.token_buckets
-    }
-    llm_output_tokens = {
-      display_name = "SEC EDGAR LLM Output Tokens"
-      description  = "Per-call Gemini output tokens."
-      unit         = "1"
-      target       = "llm_telemetry_events"
-      extra_filter = ""
-      value_field  = "output_tokens"
-      labels       = ["model_name", "cache_hit"]
-      buckets      = local.token_buckets
     }
     llm_cost_usd = {
       display_name = "SEC EDGAR LLM Cost per Call (USD, approximate)"
@@ -472,11 +452,11 @@ locals {
   llm_dashboard_markdown = <<-MD
     **Drill-down:** [Cloud Trace Explorer](${local.llm_dash_trace_url}) (filter `service.name: ${var.cloud_run_service_name}`) · [Cloud Logging Explorer](${local.llm_dash_logs_url}) · [Error Reporting](${local.llm_dash_errors_url}) · [Chunk Health Dashboard](${local.chunk_health_dashboard_console_url}) · [BigQuery Studio](${local.llm_dash_bq_studio_url})
 
-    Every log line, BigQuery telemetry row (`trace_id` column), and API response (`X-Trace-Id`) carries the same Cloud Trace ID. Charts below come from low-cardinality log-based metrics; **USD tiles are per-call distributions (approximate)** — exact cumulative totals live in the BigQuery SQL views (copy into BigQuery Studio):
+    Every log line, BigQuery telemetry row (`trace_id` column), and API response (`X-Trace-Id`) carries the same Cloud Trace ID. Charts below come from low-cardinality log-based metrics; **LLM token reporting and exact cumulative USD totals live in BigQuery** (USD tiles below are approximate per-call distributions; copy into BigQuery Studio):
 
     ```sql
-    -- Exact daily LLM cost & cached-token savings
-    SELECT telemetry_date, model_name, SUM(call_count) AS calls, ROUND(SUM(total_cost_usd), 4) AS cost_usd, ROUND(SUM(cached_token_savings_usd), 4) AS savings_usd
+    -- Exact daily LLM tokens, cost & cached-token savings
+    SELECT telemetry_date, model_name, SUM(call_count) AS calls, SUM(total_context_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens, ROUND(SUM(total_cost_usd), 4) AS cost_usd, ROUND(SUM(cached_token_savings_usd), 4) AS savings_usd
     FROM `${local.llm_dash_bq}.v_telemetry_cost_and_latency` WHERE telemetry_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY) GROUP BY 1, 2 ORDER BY 1 DESC;
     -- Interactive turns vs async judge scores
     SELECT session_date, intent, SUM(interactive_turn_count) AS turns, ROUND(AVG(avg_turn_latency_ms)) AS avg_latency_ms, SUM(scored_evaluation_count) AS evals, ROUND(AVG(avg_evaluation_score), 3) AS avg_score
@@ -715,66 +695,10 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
 
-        # Row 4: Token distributions
+        # Row 4: USD cost / cache savings (approximate; exact token & USD totals in BigQuery)
         {
           xPos   = 0
           yPos   = 18
-          width  = 6
-          height = 4
-          widget = {
-            title = "LLM Input (Context) Tokens per Call p50 / p95 by Model"
-            xyChart = {
-              dataSets = [for pct in ["50", "95"] : {
-                plotType       = "LINE"
-                legendTemplate = "p${pct} $${metric.labels.model_name}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/llm_input_tokens\" ${local.llm_dash_rf}"
-                    aggregation = {
-                      alignmentPeriod    = "300s"
-                      perSeriesAligner   = "ALIGN_DELTA"
-                      crossSeriesReducer = "REDUCE_PERCENTILE_${pct}"
-                      groupByFields      = ["metric.label.model_name"]
-                    }
-                  }
-                }
-              }]
-              yAxis = { label = "Tokens", scale = "LINEAR" }
-            }
-          }
-        },
-        {
-          xPos   = 6
-          yPos   = 18
-          width  = 6
-          height = 4
-          widget = {
-            title = "LLM Output Tokens per Call p50 / p95 by Model"
-            xyChart = {
-              dataSets = [for pct in ["50", "95"] : {
-                plotType       = "LINE"
-                legendTemplate = "p${pct} $${metric.labels.model_name}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/llm_output_tokens\" ${local.llm_dash_rf}"
-                    aggregation = {
-                      alignmentPeriod    = "300s"
-                      perSeriesAligner   = "ALIGN_DELTA"
-                      crossSeriesReducer = "REDUCE_PERCENTILE_${pct}"
-                      groupByFields      = ["metric.label.model_name"]
-                    }
-                  }
-                }
-              }]
-              yAxis = { label = "Tokens", scale = "LINEAR" }
-            }
-          }
-        },
-
-        # Row 5: USD cost / cache savings (approximate; exact totals in BigQuery)
-        {
-          xPos   = 0
-          yPos   = 22
           width  = 4
           height = 4
           widget = {
@@ -801,7 +725,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         },
         {
           xPos   = 4
-          yPos   = 22
+          yPos   = 18
           width  = 4
           height = 4
           widget = {
@@ -828,7 +752,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         },
         {
           xPos   = 8
-          yPos   = 22
+          yPos   = 18
           width  = 4
           height = 4
           widget = {
@@ -853,10 +777,10 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
 
-        # Row 6: Conversational turns and async judge evaluation scores
+        # Row 5: Conversational turns and async judge evaluation scores
         {
           xPos   = 0
-          yPos   = 26
+          yPos   = 22
           width  = 4
           height = 4
           widget = {
@@ -883,7 +807,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         },
         {
           xPos   = 4
-          yPos   = 26
+          yPos   = 22
           width  = 4
           height = 4
           widget = {
@@ -910,7 +834,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         },
         {
           xPos   = 8
-          yPos   = 26
+          yPos   = 22
           width  = 4
           height = 4
           widget = {
@@ -935,10 +859,10 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
 
-        # Row 7: Security audit events
+        # Row 6: Security audit events
         {
           xPos   = 0
-          yPos   = 30
+          yPos   = 26
           width  = 6
           height = 4
           widget = {
@@ -965,7 +889,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         },
         {
           xPos   = 6
-          yPos   = 30
+          yPos   = 26
           width  = 6
           height = 4
           widget = {
@@ -995,10 +919,10 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
 
-        # Row 8: Embedded Cloud Logging panels
+        # Row 7: Embedded Cloud Logging panels
         {
           xPos   = 0
-          yPos   = 34
+          yPos   = 30
           width  = 4
           height = 6
           widget = {
@@ -1011,7 +935,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         },
         {
           xPos   = 4
-          yPos   = 34
+          yPos   = 30
           width  = 4
           height = 6
           widget = {
@@ -1024,7 +948,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         },
         {
           xPos   = 8
-          yPos   = 34
+          yPos   = 30
           width  = 4
           height = 6
           widget = {
@@ -1036,10 +960,10 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
 
-        # Row 9: Cloud Logging -> BigQuery export health (sec-edgar-telemetry-audit-bq-sink)
+        # Row 8: Cloud Logging -> BigQuery export health (sec-edgar-telemetry-audit-bq-sink)
         {
           xPos   = 0
-          yPos   = 40
+          yPos   = 36
           width  = 12
           height = 3
           widget = {

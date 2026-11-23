@@ -97,7 +97,7 @@ Model Armor, SDP, and projection-filter guardrail blocks (`model_armor_{prompt,r
 | Dashboard | Terraform | Contents |
 | :-- | :-- | :-- |
 | **SEC EDGAR RAG Vector Database — Chunk Health & Ingestion Monitoring** | `google_monitoring_dashboard.chunk_health_dashboard` (`monitoring.tf`) | Chunk health score, embedding / filing coverage, chunks by sector and section, anomalies, BigQuery query rate, chunk-health logs, API p50/p95/p99 by route |
-| **SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit** | `google_monitoring_dashboard.llm_observability_dashboard` (`observability.tf`) | Navigation tile (Trace Explorer, Logs Explorer, Error Reporting, Chunk Health dashboard, BigQuery Studio + SQL recipes); API request rate by route, responses by status class (2xx/4xx/5xx), server latency p50/p95/p99; LLM TTFT and end-to-end model latency p50/p95 by model & task; LLM calls by model, cache hit vs miss, TTFT SLO compliance; input/output token p50/p95; per-call USD cost and cache savings (mean/p95) and estimated USD/hour; interactive turns by intent and by `fact_check_passed`; async judge score mean/p50; security audit events by `event_type` and `status`; logs panels for operational errors, security audit logs, and LLM telemetry logs; Cloud Logging → BigQuery sink export errors |
+| **SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit** | `google_monitoring_dashboard.llm_observability_dashboard` (`observability.tf`) | Navigation tile (Trace Explorer, Logs Explorer, Error Reporting, Chunk Health dashboard, BigQuery Studio + SQL recipes); API request rate by route, responses by status class (2xx/4xx/5xx), server latency p50/p95/p99; LLM TTFT and end-to-end model latency p50/p95 by model & task; LLM calls by model, cache hit vs miss, TTFT SLO compliance; per-call USD cost and cache savings (mean/p95) and estimated USD/hour; interactive turns by intent and by `fact_check_passed`; async judge score mean/p50; security audit events by `event_type` and `status`; logs panels for operational errors, security audit logs, and LLM telemetry logs; Cloud Logging → BigQuery sink export errors |
 
 `terraform output llm_observability_dashboard_url` / `chunk_health_monitoring_dashboard_url` print the Console links.
 
@@ -114,15 +114,13 @@ All telemetry metrics filter on `resource.type="cloud_run_revision" AND resource
 | `sec_edgar/llm_ttft_ms` | DISTRIBUTION, ms | `llm_telemetry_events` → `ttft_ms` | `model_name`, `agent_name`, `task_category`, `within_ttft_slo` |
 | `sec_edgar/llm_model_latency_ms` | DISTRIBUTION, ms | `llm_telemetry_events` → `total_model_latency_ms` | `model_name`, `agent_name`, `task_category` |
 | `sec_edgar/llm_calls` | DELTA INT64 counter | `llm_telemetry_events` | `model_name`, `agent_name`, `task_category`, `cache_hit`, `within_ttft_slo` |
-| `sec_edgar/llm_input_tokens` | DISTRIBUTION, 1 | `llm_telemetry_events` → `total_context_tokens` | `model_name`, `cache_hit` |
-| `sec_edgar/llm_output_tokens` | DISTRIBUTION, 1 | `llm_telemetry_events` → `output_tokens` | `model_name`, `cache_hit` |
 | `sec_edgar/llm_cost_usd` | DISTRIBUTION, 1 (USD) | `llm_telemetry_events` → `total_cost_usd` | `model_name`, `task_category` |
 | `sec_edgar/llm_cache_savings_usd` | DISTRIBUTION, 1 (USD) | `llm_telemetry_events` → `cached_token_savings_usd` | `model_name`, `task_category` |
 | `sec_edgar/session_turns` | DELTA INT64 counter | `session_telemetry_events` with `execution_mode!="async_evaluation"` | `intent`, `execution_mode`, `status`, `fact_check_passed`, `report_generated` |
 | `sec_edgar/evaluation_scores` | DISTRIBUTION, 1 (0–1) | `session_telemetry_events` with `execution_mode="async_evaluation" AND evaluation_score>=0` | `intent`, `evaluation_grade` |
 | `sec_edgar/security_audit_events` | DELTA INT64 counter | `security_audit_logs` | `event_type`, `status`, `identity_provider` |
 
-USD distributions use exponential buckets from `$0.0001` (scale `0.0001`, growth `1.5`, 29 buckets, about `$12.8` plus overflow). Log-based counter metrics count entries and cannot sum float fields, so the dashboard's USD tiles are **approximate**. Exact cumulative USD totals come from BigQuery `sec_edgar.v_telemetry_cost_and_latency`.
+LLM token reporting (`total_context_tokens`, `cached_context_tokens`, `uncached_context_tokens`, `output_tokens`, `thoughts_tokens`) lives exclusively in BigQuery (`sec_edgar.llm_telemetry_events` and `sec_edgar.v_telemetry_cost_and_latency`) rather than being duplicated in Cloud Monitoring. USD distributions use exponential buckets from `$0.0001` (scale `0.0001`, growth `1.5`, 29 buckets, about `$12.8` plus overflow). Log-based counter metrics count entries and cannot sum float fields, so the dashboard's USD tiles are **approximate**. Exact cumulative USD totals also come from BigQuery `sec_edgar.v_telemetry_cost_and_latency`.
 
 ## Alert policies
 
