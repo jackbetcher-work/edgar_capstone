@@ -449,10 +449,14 @@ locals {
   llm_dash_bq_studio_url = "https://console.cloud.google.com/bigquery?project=${var.project_id}&p=${var.project_id}&d=${google_bigquery_dataset.sec_edgar.dataset_id}&page=dataset"
   llm_dash_errors_url    = "https://console.cloud.google.com/errors?project=${var.project_id}"
 
-  llm_dashboard_markdown = <<-MD
+  llm_dashboard_nav_markdown = <<-MD
     **Drill-down:** [Cloud Trace Explorer](${local.llm_dash_trace_url}) (filter `service.name: ${var.cloud_run_service_name}`) · [Cloud Logging Explorer](${local.llm_dash_logs_url}) · [Error Reporting](${local.llm_dash_errors_url}) · [Chunk Health Dashboard](${local.chunk_health_dashboard_console_url}) · [BigQuery Studio](${local.llm_dash_bq_studio_url})
 
-    Every log line, BigQuery telemetry row (`trace_id` column), and API response (`X-Trace-Id`) carries the same Cloud Trace ID. Charts below come from low-cardinality log-based metrics; **LLM token reporting and exact cumulative USD totals live in BigQuery** (USD tiles below are approximate per-call distributions; copy into BigQuery Studio):
+    Every log line, BigQuery telemetry row (`trace_id`), and API response (`X-Trace-Id`) shares the same Cloud Trace ID. Top scorecards summarize rolling **7-day** totals/percentiles; charts below are aggregated **hourly** for readability on interactive traffic. Exact cumulative token & USD BigQuery SQL recipes are at the bottom of this dashboard.
+  MD
+
+  llm_dashboard_sql_markdown = <<-MD
+    **LLM token reporting and exact cumulative USD totals live in BigQuery** (USD charts above come from approximate Cloud Logging distributions; copy into [BigQuery Studio](${local.llm_dash_bq_studio_url})):
 
     ```sql
     -- Exact daily LLM tokens, cost & cached-token savings
@@ -477,158 +481,385 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
     mosaicLayout = {
       columns = 12
       tiles = [
-        # Row 0: Console deep links + BigQuery Studio SQL recipes
+        # Row 0: Compact Console navigation links (keeps KPI scorecards above the fold)
         {
           xPos   = 0
           yPos   = 0
           width  = 12
-          height = 6
+          height = 2
           widget = {
-            title = "Observability Navigation & BigQuery Studio Recipes"
+            title = "Observability Quick Links"
             text = {
-              content = local.llm_dashboard_markdown
+              content = local.llm_dashboard_nav_markdown
               format  = "MARKDOWN"
             }
           }
         },
 
-        # Row 1: API request rate, status breakdown, latency percentiles
+        # Row 1: Executive KPI Scorecards — Traffic, Chat Latency, TTFT & Judge Quality (7d rolling)
         {
           xPos   = 0
-          yPos   = 6
-          width  = 4
-          height = 4
+          yPos   = 2
+          width  = 3
+          height = 3
           widget = {
-            title = "API Request Rate by Route (req/s)"
-            xyChart = {
-              dataSets = [{
-                plotType = "LINE"
-                timeSeriesQuery = {
-                  prometheusQuery = "sum by (http_route) (rate(${local.api_request_count_promql}{${local.cloud_run_promql_selector}}[5m]))"
-                }
-              }]
-              yAxis = { label = "req/s", scale = "LINEAR" }
+            title = "Chat Turns (7d)"
+            scorecard = {
+              timeSeriesQuery = {
+                prometheusQuery = "sum(increase(logging_googleapis_com:user_sec_edgar_session_turns{${local.cloud_run_promql_selector}}[7d])) or vector(0)"
+              }
+              sparkChartView = {
+                sparkChartType = "SPARK_LINE"
+              }
             }
           }
         },
         {
-          xPos   = 4
-          yPos   = 6
-          width  = 4
-          height = 4
+          xPos   = 3
+          yPos   = 2
+          width  = 3
+          height = 3
           widget = {
-            title = "API Responses by Status Class (2xx / 4xx / 5xx per 5 min)"
-            xyChart = {
-              dataSets = [{
-                plotType = "STACKED_BAR"
-                timeSeriesQuery = {
-                  prometheusQuery = "sum by (status_class) (label_replace(increase(${local.api_request_count_promql}{${local.cloud_run_promql_selector}}[5m]), \"status_class\", \"$${1}xx\", \"http_status\", \"([0-9])..\"))"
+            title = "Chat API p95 Latency (7d)"
+            scorecard = {
+              timeSeriesQuery = {
+                prometheusQuery = "histogram_quantile(0.95, sum by (le) (increase(logging_googleapis_com:user_sec_edgar_api_request_latencies_bucket{${local.cloud_run_promql_selector},http_route=~\"/api/v1/chat(/stream)?\"}[7d]))) / 1000"
+                unitOverride    = "s"
+              }
+              sparkChartView = {
+                sparkChartType = "SPARK_LINE"
+              }
+              thresholds = [
+                {
+                  label     = "Slow Chat"
+                  value     = 30.0
+                  color     = "YELLOW"
+                  direction = "ABOVE"
+                },
+                {
+                  label     = "Critical Chat Latency"
+                  value     = 60.0
+                  color     = "RED"
+                  direction = "ABOVE"
                 }
-              }]
-              yAxis = { label = "Responses / 5 min", scale = "LINEAR" }
-            }
-          }
-        },
-        {
-          xPos   = 8
-          yPos   = 6
-          width  = 4
-          height = 4
-          widget = {
-            title = "API Server Latency p50 / p95 / p99 (ms)"
-            xyChart = {
-              dataSets = [for pct in ["50", "95", "99"] : {
-                plotType       = "LINE"
-                legendTemplate = "p${pct}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/api_request_latencies\" ${local.llm_dash_rf}"
-                    aggregation = {
-                      alignmentPeriod    = "300s"
-                      perSeriesAligner   = "ALIGN_DELTA"
-                      crossSeriesReducer = "REDUCE_PERCENTILE_${pct}"
-                    }
-                  }
-                }
-              }]
-              yAxis = { label = "Latency (ms)", scale = "LINEAR" }
-            }
-          }
-        },
-
-        # Row 2: LLM TTFT and end-to-end model latency
-        {
-          xPos   = 0
-          yPos   = 10
-          width  = 6
-          height = 4
-          widget = {
-            title = "LLM Time-to-First-Token p50 / p95 by Model & Task (ms)"
-            xyChart = {
-              dataSets = [for pct in ["50", "95"] : {
-                plotType       = "LINE"
-                legendTemplate = "p${pct} $${metric.labels.model_name} / $${metric.labels.task_category}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/llm_ttft_ms\" ${local.llm_dash_rf}"
-                    aggregation = {
-                      alignmentPeriod    = "300s"
-                      perSeriesAligner   = "ALIGN_DELTA"
-                      crossSeriesReducer = "REDUCE_PERCENTILE_${pct}"
-                      groupByFields      = ["metric.label.model_name", "metric.label.task_category"]
-                    }
-                  }
-                }
-              }]
-              yAxis = { label = "TTFT (ms)", scale = "LINEAR" }
+              ]
             }
           }
         },
         {
           xPos   = 6
-          yPos   = 10
-          width  = 6
-          height = 4
+          yPos   = 2
+          width  = 3
+          height = 3
           widget = {
-            title = "LLM End-to-End Model Latency p50 / p95 by Model & Task (ms)"
-            xyChart = {
-              dataSets = [for pct in ["50", "95"] : {
-                plotType       = "LINE"
-                legendTemplate = "p${pct} $${metric.labels.model_name} / $${metric.labels.task_category}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/llm_model_latency_ms\" ${local.llm_dash_rf}"
-                    aggregation = {
-                      alignmentPeriod    = "300s"
-                      perSeriesAligner   = "ALIGN_DELTA"
-                      crossSeriesReducer = "REDUCE_PERCENTILE_${pct}"
-                      groupByFields      = ["metric.label.model_name", "metric.label.task_category"]
-                    }
-                  }
+            title = "LLM TTFT p95 (7d)"
+            scorecard = {
+              timeSeriesQuery = {
+                prometheusQuery = "histogram_quantile(0.95, sum by (le) (increase(logging_googleapis_com:user_sec_edgar_llm_ttft_ms_bucket{${local.cloud_run_promql_selector}}[7d]))) / 1000"
+                unitOverride    = "s"
+              }
+              sparkChartView = {
+                sparkChartType = "SPARK_LINE"
+              }
+              thresholds = [
+                {
+                  label     = "Above TTFT Target"
+                  value     = 3.0
+                  color     = "YELLOW"
+                  direction = "ABOVE"
+                },
+                {
+                  label     = "High TTFT"
+                  value     = 8.0
+                  color     = "RED"
+                  direction = "ABOVE"
                 }
-              }]
-              yAxis = { label = "Latency (ms)", scale = "LINEAR" }
+              ]
+            }
+          }
+        },
+        {
+          xPos   = 9
+          yPos   = 2
+          width  = 3
+          height = 3
+          widget = {
+            title = "Async Judge Mean Score (7d, 0-1)"
+            scorecard = {
+              timeSeriesQuery = {
+                prometheusQuery = "sum(increase(logging_googleapis_com:user_sec_edgar_evaluation_scores_sum{${local.cloud_run_promql_selector}}[7d])) / clamp_min(sum(increase(logging_googleapis_com:user_sec_edgar_evaluation_scores_count{${local.cloud_run_promql_selector}}[7d])), 1)"
+              }
+              gaugeView = {
+                lowerBound = 0.0
+                upperBound = 1.0
+              }
+              thresholds = [
+                {
+                  label     = "Low Quality"
+                  value     = 0.70
+                  color     = "RED"
+                  direction = "BELOW"
+                },
+                {
+                  label     = "Below Target"
+                  value     = 0.85
+                  color     = "YELLOW"
+                  direction = "BELOW"
+                }
+              ]
             }
           }
         },
 
-        # Row 3: LLM call volume, cache hit breakdown, TTFT SLO compliance
+        # Row 2: Executive KPI Scorecards — Cache Efficiency, Cost & Security (7d rolling)
         {
           xPos   = 0
-          yPos   = 14
+          yPos   = 5
+          width  = 3
+          height = 3
+          widget = {
+            title = "LLM Cache Hit Rate (7d)"
+            scorecard = {
+              timeSeriesQuery = {
+                prometheusQuery = "100 * (sum(increase(logging_googleapis_com:user_sec_edgar_llm_calls{${local.cloud_run_promql_selector},cache_hit=\"true\"}[7d])) or vector(0)) / clamp_min(sum(increase(logging_googleapis_com:user_sec_edgar_llm_calls{${local.cloud_run_promql_selector}}[7d])), 1)"
+                unitOverride    = "%"
+              }
+              gaugeView = {
+                lowerBound = 0.0
+                upperBound = 100.0
+              }
+            }
+          }
+        },
+        {
+          xPos   = 3
+          yPos   = 5
+          width  = 3
+          height = 3
+          widget = {
+            title = "Est. LLM Spend (7d, USD)"
+            scorecard = {
+              timeSeriesQuery = {
+                prometheusQuery = "sum(increase(logging_googleapis_com:user_sec_edgar_llm_cost_usd_sum{${local.cloud_run_promql_selector}}[7d])) or vector(0)"
+              }
+              sparkChartView = {
+                sparkChartType = "SPARK_LINE"
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 5
+          width  = 3
+          height = 3
+          widget = {
+            title = "Est. Cache Savings (7d, USD)"
+            scorecard = {
+              timeSeriesQuery = {
+                prometheusQuery = "sum(increase(logging_googleapis_com:user_sec_edgar_llm_cache_savings_usd_sum{${local.cloud_run_promql_selector}}[7d])) or vector(0)"
+              }
+              sparkChartView = {
+                sparkChartType = "SPARK_LINE"
+              }
+            }
+          }
+        },
+        {
+          xPos   = 9
+          yPos   = 5
+          width  = 3
+          height = 3
+          widget = {
+            title = "Auth Denials & Guardrail Blocks (7d)"
+            scorecard = {
+              timeSeriesQuery = {
+                prometheusQuery = "sum(increase(logging_googleapis_com:user_sec_edgar_security_audit_events{${local.cloud_run_promql_selector},status=~\"denied_40[13]|blocked.*\"}[7d])) or vector(0)"
+              }
+              sparkChartView = {
+                sparkChartType = "SPARK_LINE"
+              }
+              thresholds = [
+                {
+                  label     = "Elevated Blocks"
+                  value     = var.security_block_alert_threshold
+                  color     = "RED"
+                  direction = "ABOVE"
+                }
+              ]
+            }
+          }
+        },
+
+        # Row 3: API traffic by route & status class (hourly counts) + Chat-only latency
+        {
+          xPos   = 0
+          yPos   = 8
           width  = 4
           height = 4
           widget = {
-            title = "LLM Calls by Model (per 5 min)"
+            title = "API Requests by Route (per hour)"
             xyChart = {
               dataSets = [{
                 plotType       = "STACKED_BAR"
-                legendTemplate = "$${metric.labels.model_name}"
+                legendTemplate = "{{http_route}}"
+                timeSeriesQuery = {
+                  prometheusQuery = "sum by (http_route) (increase(${local.api_request_count_promql}{${local.cloud_run_promql_selector}}[1h]))"
+                }
+              }]
+              yAxis = { label = "Requests / hr", scale = "LINEAR" }
+            }
+          }
+        },
+        {
+          xPos   = 4
+          yPos   = 8
+          width  = 4
+          height = 4
+          widget = {
+            title = "API Responses by Status Class (2xx / 4xx / 5xx per hour)"
+            xyChart = {
+              dataSets = [
+                {
+                  plotType       = "STACKED_BAR"
+                  legendTemplate = "2xx"
+                  timeSeriesQuery = {
+                    prometheusQuery = "sum(increase(${local.api_request_count_promql}{${local.cloud_run_promql_selector},http_status=~\"2..\"}[1h]))"
+                  }
+                },
+                {
+                  plotType       = "STACKED_BAR"
+                  legendTemplate = "4xx"
+                  timeSeriesQuery = {
+                    prometheusQuery = "sum(increase(${local.api_request_count_promql}{${local.cloud_run_promql_selector},http_status=~\"4..\"}[1h]))"
+                  }
+                },
+                {
+                  plotType       = "STACKED_BAR"
+                  legendTemplate = "5xx"
+                  timeSeriesQuery = {
+                    prometheusQuery = "sum(increase(${local.api_request_count_promql}{${local.cloud_run_promql_selector},http_status=~\"5..\"}[1h]))"
+                  }
+                }
+              ]
+              yAxis = { label = "Responses / hr", scale = "LINEAR" }
+            }
+          }
+        },
+        {
+          xPos   = 8
+          yPos   = 8
+          width  = 4
+          height = 4
+          widget = {
+            title = "Chat API Latency p50 / p95 (/api/v1/chat*, seconds)"
+            xyChart = {
+              dataSets = [
+                {
+                  plotType       = "LINE"
+                  legendTemplate = "p50 (chat)"
+                  timeSeriesQuery = {
+                    prometheusQuery = "histogram_quantile(0.50, sum by (le) (increase(logging_googleapis_com:user_sec_edgar_api_request_latencies_bucket{${local.cloud_run_promql_selector},http_route=~\"/api/v1/chat(/stream)?\"}[1h]))) / 1000"
+                    unitOverride    = "s"
+                  }
+                },
+                {
+                  plotType       = "LINE"
+                  legendTemplate = "p95 (chat)"
+                  timeSeriesQuery = {
+                    prometheusQuery = "histogram_quantile(0.95, sum by (le) (increase(logging_googleapis_com:user_sec_edgar_api_request_latencies_bucket{${local.cloud_run_promql_selector},http_route=~\"/api/v1/chat(/stream)?\"}[1h]))) / 1000"
+                    unitOverride    = "s"
+                  }
+                }
+              ]
+              yAxis = { label = "Latency (s)", scale = "LINEAR" }
+              thresholds = [{
+                label = "p95 Alert Threshold (30s)"
+                value = var.api_latency_p95_alert_threshold_ms / 1000.0
+              }]
+            }
+          }
+        },
+
+        # Row 4: LLM TTFT and end-to-end model latency (hourly quantiles in seconds, grouped by task)
+        {
+          xPos   = 0
+          yPos   = 12
+          width  = 6
+          height = 4
+          widget = {
+            title = "LLM Time-to-First-Token p50 / p95 by Task (seconds)"
+            xyChart = {
+              dataSets = [
+                {
+                  plotType       = "LINE"
+                  legendTemplate = "p50 {{task_category}}"
+                  timeSeriesQuery = {
+                    prometheusQuery = "histogram_quantile(0.50, sum by (le, task_category) (increase(logging_googleapis_com:user_sec_edgar_llm_ttft_ms_bucket{${local.cloud_run_promql_selector}}[1h]))) / 1000"
+                    unitOverride    = "s"
+                  }
+                },
+                {
+                  plotType       = "LINE"
+                  legendTemplate = "p95 {{task_category}}"
+                  timeSeriesQuery = {
+                    prometheusQuery = "histogram_quantile(0.95, sum by (le, task_category) (increase(logging_googleapis_com:user_sec_edgar_llm_ttft_ms_bucket{${local.cloud_run_promql_selector}}[1h]))) / 1000"
+                    unitOverride    = "s"
+                  }
+                }
+              ]
+              yAxis = { label = "TTFT (s)", scale = "LINEAR" }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 12
+          width  = 6
+          height = 4
+          widget = {
+            title = "LLM End-to-End Model Latency p50 / p95 by Task (seconds)"
+            xyChart = {
+              dataSets = [
+                {
+                  plotType       = "LINE"
+                  legendTemplate = "p50 {{task_category}}"
+                  timeSeriesQuery = {
+                    prometheusQuery = "histogram_quantile(0.50, sum by (le, task_category) (increase(logging_googleapis_com:user_sec_edgar_llm_model_latency_ms_bucket{${local.cloud_run_promql_selector}}[1h]))) / 1000"
+                    unitOverride    = "s"
+                  }
+                },
+                {
+                  plotType       = "LINE"
+                  legendTemplate = "p95 {{task_category}}"
+                  timeSeriesQuery = {
+                    prometheusQuery = "histogram_quantile(0.95, sum by (le, task_category) (increase(logging_googleapis_com:user_sec_edgar_llm_model_latency_ms_bucket{${local.cloud_run_promql_selector}}[1h]))) / 1000"
+                    unitOverride    = "s"
+                  }
+                }
+              ]
+              yAxis = { label = "Latency (s)", scale = "LINEAR" }
+            }
+          }
+        },
+
+        # Row 5: LLM call volume, cache hit breakdown, TTFT SLO compliance (hourly buckets)
+        {
+          xPos   = 0
+          yPos   = 16
+          width  = 4
+          height = 4
+          widget = {
+            title = "LLM Calls by Model (per hour)"
+            xyChart = {
+              dataSets = [{
+                plotType       = "STACKED_BAR"
+                legendTemplate = "$${metric.label.model_name}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
                     filter = "metric.type=\"${local.llm_dash_m}/llm_calls\" ${local.llm_dash_rf}"
                     aggregation = {
-                      alignmentPeriod    = "300s"
+                      alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
                       groupByFields      = ["metric.label.model_name"]
@@ -636,26 +867,26 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                   }
                 }
               }]
-              yAxis = { label = "Calls / 5 min", scale = "LINEAR" }
+              yAxis = { label = "Calls / hr", scale = "LINEAR" }
             }
           }
         },
         {
           xPos   = 4
-          yPos   = 14
+          yPos   = 16
           width  = 4
           height = 4
           widget = {
-            title = "LLM Context Cache Hits vs Misses (cache_hit, per 5 min)"
+            title = "LLM Context Cache Hits vs Misses (per hour)"
             xyChart = {
               dataSets = [{
                 plotType       = "STACKED_BAR"
-                legendTemplate = "cache_hit=$${metric.labels.cache_hit}"
+                legendTemplate = "cache_hit=$${metric.label.cache_hit}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
                     filter = "metric.type=\"${local.llm_dash_m}/llm_calls\" ${local.llm_dash_rf}"
                     aggregation = {
-                      alignmentPeriod    = "300s"
+                      alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
                       groupByFields      = ["metric.label.cache_hit"]
@@ -663,26 +894,26 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                   }
                 }
               }]
-              yAxis = { label = "Calls / 5 min", scale = "LINEAR" }
+              yAxis = { label = "Calls / hr", scale = "LINEAR" }
             }
           }
         },
         {
           xPos   = 8
-          yPos   = 14
+          yPos   = 16
           width  = 4
           height = 4
           widget = {
-            title = "LLM Calls Within TTFT SLO (within_ttft_slo, per 5 min)"
+            title = "LLM Calls Within TTFT SLO (per hour)"
             xyChart = {
               dataSets = [{
                 plotType       = "STACKED_BAR"
-                legendTemplate = "within_ttft_slo=$${metric.labels.within_ttft_slo}"
+                legendTemplate = "within_ttft_slo=$${metric.label.within_ttft_slo}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
                     filter = "metric.type=\"${local.llm_dash_m}/llm_calls\" ${local.llm_dash_rf}"
                     aggregation = {
-                      alignmentPeriod    = "300s"
+                      alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
                       groupByFields      = ["metric.label.within_ttft_slo"]
@@ -690,85 +921,33 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                   }
                 }
               }]
-              yAxis = { label = "Calls / 5 min", scale = "LINEAR" }
+              yAxis = { label = "Calls / hr", scale = "LINEAR" }
             }
           }
         },
 
-        # Row 4: USD cost / cache savings (approximate; exact token & USD totals in BigQuery)
+        # Row 6: USD spend vs cache savings + per-call cost by model
         {
           xPos   = 0
-          yPos   = 18
-          width  = 4
+          yPos   = 20
+          width  = 6
           height = 4
           widget = {
-            title = "LLM Cost per Call (USD, mean / p95 by Model) — approximate"
-            xyChart = {
-              dataSets = [for agg in ["MEAN", "PERCENTILE_95"] : {
-                plotType       = "LINE"
-                legendTemplate = "${lower(agg)} $${metric.labels.model_name}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/llm_cost_usd\" ${local.llm_dash_rf}"
-                    aggregation = {
-                      alignmentPeriod    = "300s"
-                      perSeriesAligner   = "ALIGN_DELTA"
-                      crossSeriesReducer = "REDUCE_${agg}"
-                      groupByFields      = ["metric.label.model_name"]
-                    }
-                  }
-                }
-              }]
-              yAxis = { label = "USD / call", scale = "LINEAR" }
-            }
-          }
-        },
-        {
-          xPos   = 4
-          yPos   = 18
-          width  = 4
-          height = 4
-          widget = {
-            title = "LLM Cached-Token Savings per Call (USD, mean / p95) — approximate"
-            xyChart = {
-              dataSets = [for agg in ["MEAN", "PERCENTILE_95"] : {
-                plotType       = "LINE"
-                legendTemplate = "${lower(agg)} $${metric.labels.model_name}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/llm_cache_savings_usd\" ${local.llm_dash_rf}"
-                    aggregation = {
-                      alignmentPeriod    = "300s"
-                      perSeriesAligner   = "ALIGN_DELTA"
-                      crossSeriesReducer = "REDUCE_${agg}"
-                      groupByFields      = ["metric.label.model_name"]
-                    }
-                  }
-                }
-              }]
-              yAxis = { label = "USD / call", scale = "LINEAR" }
-            }
-          }
-        },
-        {
-          xPos   = 8
-          yPos   = 18
-          width  = 4
-          height = 4
-          widget = {
-            title = "Estimated LLM Spend vs Cache Savings (USD / hour) — approximate; exact in v_telemetry_cost_and_latency"
+            title = "Estimated LLM Spend vs Cache Savings (USD / hour)"
             xyChart = {
               dataSets = [
                 {
-                  plotType = "LINE"
+                  plotType       = "LINE"
+                  legendTemplate = "Est. Spend (USD/hr)"
                   timeSeriesQuery = {
-                    prometheusQuery = "label_replace(sum(increase(logging_googleapis_com:user_sec_edgar_llm_cost_usd_sum{${local.cloud_run_promql_selector}}[1h])), \"series\", \"spend\", \"\", \"\")"
+                    prometheusQuery = "sum(increase(logging_googleapis_com:user_sec_edgar_llm_cost_usd_sum{${local.cloud_run_promql_selector}}[1h]))"
                   }
                 },
                 {
-                  plotType = "LINE"
+                  plotType       = "LINE"
+                  legendTemplate = "Cache Savings (USD/hr)"
                   timeSeriesQuery = {
-                    prometheusQuery = "label_replace(sum(increase(logging_googleapis_com:user_sec_edgar_llm_cache_savings_usd_sum{${local.cloud_run_promql_selector}}[1h])), \"series\", \"cache_savings\", \"\", \"\")"
+                    prometheusQuery = "sum(increase(logging_googleapis_com:user_sec_edgar_llm_cache_savings_usd_sum{${local.cloud_run_promql_selector}}[1h]))"
                   }
                 }
               ]
@@ -776,24 +955,68 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
             }
           }
         },
+        {
+          xPos   = 6
+          yPos   = 20
+          width  = 6
+          height = 4
+          widget = {
+            title = "LLM Cost per Call by Model (Mean / p95, USD)"
+            xyChart = {
+              dataSets = [
+                {
+                  plotType       = "LINE"
+                  legendTemplate = "Mean ($${metric.label.model_name})"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.llm_dash_m}/llm_cost_usd\" ${local.llm_dash_rf}"
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_MEAN"
+                        groupByFields      = ["metric.label.model_name"]
+                      }
+                    }
+                  }
+                },
+                {
+                  plotType       = "LINE"
+                  legendTemplate = "p95 ($${metric.label.model_name})"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"${local.llm_dash_m}/llm_cost_usd\" ${local.llm_dash_rf}"
+                      aggregation = {
+                        alignmentPeriod    = "3600s"
+                        perSeriesAligner   = "ALIGN_DELTA"
+                        crossSeriesReducer = "REDUCE_PERCENTILE_95"
+                        groupByFields      = ["metric.label.model_name"]
+                      }
+                    }
+                  }
+                }
+              ]
+              yAxis = { label = "USD / call", scale = "LINEAR" }
+            }
+          }
+        },
 
-        # Row 5: Conversational turns and async judge evaluation scores
+        # Row 7: Conversational turns and async judge quality (exact mean <= 1.0)
         {
           xPos   = 0
-          yPos   = 22
+          yPos   = 24
           width  = 4
           height = 4
           widget = {
-            title = "Interactive Turns by Intent (per 5 min)"
+            title = "Interactive Turns by Intent (per hour)"
             xyChart = {
               dataSets = [{
                 plotType       = "STACKED_BAR"
-                legendTemplate = "$${metric.labels.intent}"
+                legendTemplate = "$${metric.label.intent}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
                     filter = "metric.type=\"${local.llm_dash_m}/session_turns\" ${local.llm_dash_rf}"
                     aggregation = {
-                      alignmentPeriod    = "300s"
+                      alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
                       groupByFields      = ["metric.label.intent"]
@@ -801,26 +1024,26 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                   }
                 }
               }]
-              yAxis = { label = "Turns / 5 min", scale = "LINEAR" }
+              yAxis = { label = "Turns / hr", scale = "LINEAR" }
             }
           }
         },
         {
           xPos   = 4
-          yPos   = 22
+          yPos   = 24
           width  = 4
           height = 4
           widget = {
-            title = "Interactive Turns by Claim Verification (fact_check_passed, per 5 min)"
+            title = "Claim Verification Outcomes (per hour)"
             xyChart = {
               dataSets = [{
                 plotType       = "STACKED_BAR"
-                legendTemplate = "fact_check_passed=$${metric.labels.fact_check_passed}"
+                legendTemplate = "fact_check_passed=$${metric.label.fact_check_passed}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
                     filter = "metric.type=\"${local.llm_dash_m}/session_turns\" ${local.llm_dash_rf}"
                     aggregation = {
-                      alignmentPeriod    = "300s"
+                      alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
                       groupByFields      = ["metric.label.fact_check_passed"]
@@ -828,54 +1051,59 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                   }
                 }
               }]
-              yAxis = { label = "Turns / 5 min", scale = "LINEAR" }
+              yAxis = { label = "Turns / hr", scale = "LINEAR" }
             }
           }
         },
         {
           xPos   = 8
-          yPos   = 22
+          yPos   = 24
           width  = 4
           height = 4
           widget = {
-            title = "Async Flash Judge Evaluation Score (mean / p50, 0-1)"
+            title = "Async Judge Mean Score by Intent (0.0 - 1.0)"
             xyChart = {
-              dataSets = [for agg in ["MEAN", "PERCENTILE_50"] : {
+              dataSets = [{
                 plotType       = "LINE"
-                legendTemplate = lower(agg)
+                legendTemplate = "$${metric.label.intent}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
                     filter = "metric.type=\"${local.llm_dash_m}/evaluation_scores\" ${local.llm_dash_rf}"
                     aggregation = {
                       alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_DELTA"
-                      crossSeriesReducer = "REDUCE_${agg}"
+                      crossSeriesReducer = "REDUCE_MEAN"
+                      groupByFields      = ["metric.label.intent"]
                     }
                   }
                 }
               }]
-              yAxis = { label = "Score", scale = "LINEAR" }
+              yAxis = { label = "Mean Score (0-1)", scale = "LINEAR" }
+              thresholds = [{
+                label = "Target Quality (0.85)"
+                value = 0.85
+              }]
             }
           }
         },
 
-        # Row 6: Security audit events
+        # Row 8: Security audit events (all types vs denials/blocks only with matching threshold)
         {
           xPos   = 0
-          yPos   = 26
+          yPos   = 28
           width  = 6
           height = 4
           widget = {
-            title = "Security Audit Events by Event Type (per 5 min)"
+            title = "Security Audit Events by Event Type (per hour)"
             xyChart = {
               dataSets = [{
                 plotType       = "STACKED_BAR"
-                legendTemplate = "$${metric.labels.event_type}"
+                legendTemplate = "$${metric.label.event_type}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
                     filter = "metric.type=\"${local.llm_dash_m}/security_audit_events\" ${local.llm_dash_rf}"
                     aggregation = {
-                      alignmentPeriod    = "300s"
+                      alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
                       groupByFields      = ["metric.label.event_type"]
@@ -883,26 +1111,26 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                   }
                 }
               }]
-              yAxis = { label = "Events / 5 min", scale = "LINEAR" }
+              yAxis = { label = "Events / hr", scale = "LINEAR" }
             }
           }
         },
         {
           xPos   = 6
-          yPos   = 26
+          yPos   = 28
           width  = 6
           height = 4
           widget = {
-            title = "Security Audit Events by Status (success / denied_401 / denied_403 / blocked)"
+            title = "Auth Denials & Guardrail Blocks by Status (per hour)"
             xyChart = {
               dataSets = [{
                 plotType       = "STACKED_BAR"
-                legendTemplate = "$${metric.labels.status}"
+                legendTemplate = "$${metric.label.status}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/security_audit_events\" ${local.llm_dash_rf}"
+                    filter = "metric.type=\"${local.llm_dash_m}/security_audit_events\" ${local.llm_dash_rf} metric.labels.status=monitoring.regex.full_match(\"denied_40[13]|blocked.*\")"
                     aggregation = {
-                      alignmentPeriod    = "300s"
+                      alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
                       groupByFields      = ["metric.label.status"]
@@ -910,19 +1138,19 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                   }
                 }
               }]
-              yAxis = { label = "Events / 5 min", scale = "LINEAR" }
+              yAxis = { label = "Denials / Blocks / hr", scale = "LINEAR" }
               thresholds = [{
-                label = "Block alert threshold"
+                label = "5-min Block Alert Threshold"
                 value = var.security_block_alert_threshold
               }]
             }
           }
         },
 
-        # Row 7: Embedded Cloud Logging panels
+        # Row 9: Embedded Cloud Logging panels
         {
           xPos   = 0
-          yPos   = 30
+          yPos   = 32
           width  = 4
           height = 6
           widget = {
@@ -935,7 +1163,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         },
         {
           xPos   = 4
-          yPos   = 30
+          yPos   = 32
           width  = 4
           height = 6
           widget = {
@@ -948,7 +1176,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         },
         {
           xPos   = 8
-          yPos   = 30
+          yPos   = 32
           width  = 4
           height = 6
           widget = {
@@ -960,10 +1188,10 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
 
-        # Row 8: Cloud Logging -> BigQuery export health (sec-edgar-telemetry-audit-bq-sink)
+        # Row 10: Cloud Logging -> BigQuery export health (sec-edgar-telemetry-audit-bq-sink)
         {
           xPos   = 0
-          yPos   = 36
+          yPos   = 38
           width  = 12
           height = 3
           widget = {
@@ -971,12 +1199,12 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
             xyChart = {
               dataSets = [{
                 plotType       = "STACKED_BAR"
-                legendTemplate = "$${resource.labels.name}"
+                legendTemplate = "$${resource.label.name}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
                     filter = "metric.type=\"logging.googleapis.com/exports/error_count\" resource.type=\"logging_sink\""
                     aggregation = {
-                      alignmentPeriod    = "300s"
+                      alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
                       groupByFields      = ["resource.label.name"]
@@ -984,7 +1212,22 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                   }
                 }
               }]
-              yAxis = { label = "Errors / 5 min", scale = "LINEAR" }
+              yAxis = { label = "Errors / hr", scale = "LINEAR" }
+            }
+          }
+        },
+
+        # Row 11: BigQuery Studio SQL recipes (below charts so KPIs sit above the fold)
+        {
+          xPos   = 0
+          yPos   = 41
+          width  = 12
+          height = 5
+          widget = {
+            title = "BigQuery Studio SQL Recipes (Exact Cumulative Tokens, Spend & Audit Rollups)"
+            text = {
+              content = local.llm_dashboard_sql_markdown
+              format  = "MARKDOWN"
             }
           }
         }

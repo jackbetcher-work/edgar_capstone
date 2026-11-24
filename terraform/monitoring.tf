@@ -360,7 +360,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
               dataSets = [
                 {
                   plotType       = "STACKED_BAR"
-                  legendTemplate = "$${metric.labels.gics_sector}"
+                  legendTemplate = "$${metric.label.gics_sector}"
                   timeSeriesQuery = {
                     timeSeriesFilter = {
                       filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/total_chunks\" resource.type=\"global\" metric.labels.section_id=\"all\""
@@ -392,7 +392,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
               dataSets = [
                 {
                   plotType       = "LINE"
-                  legendTemplate = "$${metric.labels.section_id}"
+                  legendTemplate = "$${metric.label.section_id}"
                   timeSeriesQuery = {
                     timeSeriesFilter = {
                       filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/total_chunks\" resource.type=\"global\" metric.labels.gics_sector=\"all\""
@@ -426,7 +426,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
               dataSets = [
                 {
                   plotType       = "LINE"
-                  legendTemplate = "$${metric.labels.anomaly_type}"
+                  legendTemplate = "$${metric.label.anomaly_type}"
                   timeSeriesQuery = {
                     timeSeriesFilter = {
                       filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/anomaly_chunk_count\" resource.type=\"global\" metric.labels.anomaly_type!=\"missing_section_filings\""
@@ -458,7 +458,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
               dataSets = [
                 {
                   plotType       = "LINE"
-                  legendTemplate = "$${metric.labels.section_id}"
+                  legendTemplate = "$${metric.label.section_id}"
                   timeSeriesQuery = {
                     timeSeriesFilter = {
                       filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/token_count_mean\" resource.type=\"global\""

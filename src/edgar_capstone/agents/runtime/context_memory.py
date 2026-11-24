@@ -101,7 +101,8 @@ class BoundedInMemoryMemoryService(InMemoryMemoryService):
                     matching_sids = [
                         sid
                         for sid in list(user_map.keys())
-                        if sid == session_id or (isinstance(sid, str) and sid.startswith(topic_prefix))
+                        if sid == session_id
+                        or (isinstance(sid, str) and sid.startswith(topic_prefix))
                     ]
                     for sid in matching_sids:
                         user_map.pop(sid, None)
@@ -180,6 +181,7 @@ class SessionMemoryState:
     last_start_year: int = 2024
     last_end_year: int = 2026
     last_gics_sector: str = "ALL"
+    last_gics_sub_industry: str | None = None
     topic_epoch: int = 0
     updated_at: str = field(default_factory=utc_now_iso)
 
@@ -193,6 +195,7 @@ class SessionMemoryState:
             "last_start_year": int(self.last_start_year),
             "last_end_year": int(self.last_end_year),
             "last_gics_sector": self.last_gics_sector,
+            "last_gics_sub_industry": self.last_gics_sub_industry or "",
             "topic_epoch": int(self.topic_epoch),
             "turn_count": len(self.turns),
             "turns_json": json.dumps([asdict(t) for t in self.turns]),
@@ -232,6 +235,7 @@ class SessionMemoryState:
                     topic_epoch=int(t.get("topic_epoch") or 0),
                 )
             )
+        raw_sub = str(doc.get("last_gics_sub_industry") or "").strip()
         return cls(
             session_id=str(doc.get("session_id") or ""),
             user_id=str(doc.get("user_id") or "analyst"),
@@ -242,6 +246,7 @@ class SessionMemoryState:
             last_start_year=int(doc.get("last_start_year") or 2024),
             last_end_year=int(doc.get("last_end_year") or 2026),
             last_gics_sector=str(doc.get("last_gics_sector") or "ALL"),
+            last_gics_sub_industry=raw_sub or None,
             topic_epoch=int(doc.get("topic_epoch") or 0),
             updated_at=str(doc.get("updated_at") or utc_now_iso()),
         )
@@ -363,7 +368,8 @@ class ConversationMemoryManager:
                     matching_sids = [
                         sid
                         for sid in list(user_sessions.keys())
-                        if sid == session_id or (isinstance(sid, str) and sid.startswith(topic_prefix))
+                        if sid == session_id
+                        or (isinstance(sid, str) and sid.startswith(topic_prefix))
                     ]
                     for sid in matching_sids:
                         del user_sessions[sid]
@@ -417,6 +423,7 @@ class ConversationMemoryManager:
             "last_start_year": None,
             "last_end_year": None,
             "last_gics_sector": "ALL",
+            "last_gics_sub_industry": None,
             "topic_epoch": 0,
             "compaction_count": 0,
             "memory_summary_text": "",
@@ -424,6 +431,90 @@ class ConversationMemoryManager:
             "persistence_backend": backend_label,
             "memory_lookup_latency_ms": round((time.perf_counter() - started_at) * 1000.0, 3),
         }
+
+    def _build_recalled_context(
+        self,
+        sess: SessionMemoryState,
+        *,
+        backend_label: str,
+        started_at: float,
+    ) -> dict[str, Any]:
+        lines: list[str] = []
+        if sess.compacted_summary:
+            lines.append(f"[Compacted Prior Context]: {sess.compacted_summary}")
+        active_turns = [t for t in sess.turns if t.topic_epoch == sess.topic_epoch]
+        for t in active_turns[-self.retention_turns :]:
+            highlights = "; ".join(t.variance_highlights[:2]) if t.variance_highlights else "N/A"
+            lines.append(
+                f"[Turn {t.turn_index} | {','.join(t.tickers) or t.gics_sector} FY{t.start_year}-FY{t.end_year}]: "
+                f"Query='{t.query}' -> {highlights}"
+            )
+        summary_text = "\n".join(lines)
+        mem_tokens = estimate_token_count(summary_text)
+        return {
+            "session_id": sess.session_id,
+            "user_id": sess.user_id,
+            "has_prior_memory": True,
+            "turn_count": len(sess.turns),
+            "remembered_tickers": list(sess.remembered_tickers),
+            "last_start_year": sess.last_start_year,
+            "last_end_year": sess.last_end_year,
+            "last_gics_sector": sess.last_gics_sector,
+            "last_gics_sub_industry": sess.last_gics_sub_industry,
+            "topic_epoch": sess.topic_epoch,
+            "compaction_count": sess.compaction_count,
+            "memory_summary_text": summary_text,
+            "memory_tokens": mem_tokens,
+            "persistence_backend": backend_label,
+            "memory_lookup_latency_ms": round((time.perf_counter() - started_at) * 1000.0, 3),
+        }
+
+    def peek_warm_session_context(
+        self,
+        session_id: str | None,
+        user_id: str = "analyst",
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Non-blocking L1 memory peek for speculative parallel prepass (never hits Firestore).
+
+        Returns `(is_warm, memory_context_snapshot)`:
+        - `(True, empty_ctx)` when `session_id` is empty or the store is local-only with no entry.
+        - `(True, snapshot)` when the session is resident in the L1 cache (even past TTL, so a
+          speculative Flash-Lite call can overlap with Firestore refresh and verify scope equality
+          once the authoritative recall returns).
+        - `(False, None)` on a cold live-Firestore session miss (must wait for remote recall).
+        """
+        t0 = time.perf_counter()
+        live = self._get_store().is_live_enabled()
+        backend_label = "firestore" if live else "in_memory"
+        norm_user = (user_id or "analyst").strip().lower()
+        if not session_id or not session_id.strip():
+            return True, self._empty_memory_context(
+                session_id=None,
+                user_id=norm_user,
+                backend_label=backend_label,
+                started_at=t0,
+            )
+        key = self._session_key(session_id, user_id)
+        with self._lock:
+            cached = self._sessions.get(key)
+        if cached is None:
+            if not live:
+                return True, self._empty_memory_context(
+                    session_id=session_id.strip(),
+                    user_id=norm_user,
+                    backend_label=backend_label,
+                    started_at=t0,
+                )
+            return False, None
+        sess = cached[1]
+        if not sess.turns and not sess.compacted_summary:
+            return True, self._empty_memory_context(
+                session_id=session_id.strip(),
+                user_id=norm_user,
+                backend_label=backend_label,
+                started_at=t0,
+            )
+        return True, self._build_recalled_context(sess, backend_label=backend_label, started_at=t0)
 
     def recall_session_context(
         self,
@@ -450,35 +541,7 @@ class ConversationMemoryManager:
                 backend_label=backend_label,
                 started_at=t0,
             )
-
-        lines: list[str] = []
-        if sess.compacted_summary:
-            lines.append(f"[Compacted Prior Context]: {sess.compacted_summary}")
-        active_turns = [t for t in sess.turns if t.topic_epoch == sess.topic_epoch]
-        for t in active_turns[-self.retention_turns :]:
-            highlights = "; ".join(t.variance_highlights[:2]) if t.variance_highlights else "N/A"
-            lines.append(
-                f"[Turn {t.turn_index} | {','.join(t.tickers) or t.gics_sector} FY{t.start_year}-FY{t.end_year}]: "
-                f"Query='{t.query}' -> {highlights}"
-            )
-        summary_text = "\n".join(lines)
-        mem_tokens = estimate_token_count(summary_text)
-        return {
-            "session_id": sess.session_id,
-            "user_id": sess.user_id,
-            "has_prior_memory": True,
-            "turn_count": len(sess.turns),
-            "remembered_tickers": list(sess.remembered_tickers),
-            "last_start_year": sess.last_start_year,
-            "last_end_year": sess.last_end_year,
-            "last_gics_sector": sess.last_gics_sector,
-            "topic_epoch": sess.topic_epoch,
-            "compaction_count": sess.compaction_count,
-            "memory_summary_text": summary_text,
-            "memory_tokens": mem_tokens,
-            "persistence_backend": backend_label,
-            "memory_lookup_latency_ms": round((time.perf_counter() - t0) * 1000.0, 3),
-        }
+        return self._build_recalled_context(sess, backend_label=backend_label, started_at=t0)
 
     def record_turn(
         self,
@@ -497,6 +560,7 @@ class ConversationMemoryManager:
         answer_markdown: str = "",
         recalled_prior_memory: bool | None = None,
         topic_epoch: int | None = None,
+        gics_sub_industry: str | None = None,
     ) -> dict[str, Any]:
         """Persist a completed turn into durable session memory and compact if over token threshold.
 
@@ -556,12 +620,15 @@ class ConversationMemoryManager:
                 )
                 # Active scope is mutually exclusive: switching to a sector or corpus-wide turn
                 # clears stale tickers so later follow-ups do not snap back to an old company.
+                norm_sub = (gics_sub_industry or "").strip() or None
                 if norm_tickers:
                     sess.remembered_tickers = norm_tickers
                     sess.last_gics_sector = "ALL"
+                    sess.last_gics_sub_industry = norm_sub
                 else:
                     sess.remembered_tickers = []
                     sess.last_gics_sector = norm_sector
+                    sess.last_gics_sub_industry = None
                 sess.last_start_year = start_year
                 sess.last_end_year = end_year
                 sess.updated_at = now_iso

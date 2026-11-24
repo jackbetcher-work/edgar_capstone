@@ -425,7 +425,9 @@ def test_subject_change_isolates_adk_session_and_omits_stale_memory_prompt(
         query="Analyze NVIDIA's revenue from 2024 to 2026",
         session_id="topic-iso-sess",
         user_id="analyst@fde-workspace.corp",
-        reasoning_llm=_CapturingLlm(headline="NVDA revenue summary.", intent="longitudinal_single_company"),
+        reasoning_llm=_CapturingLlm(
+            headline="NVDA revenue summary.", intent="longitudinal_single_company"
+        ),
         skip_background_judge=True,
     )
     assert t1["status"] == "success"
@@ -439,7 +441,9 @@ def test_subject_change_isolates_adk_session_and_omits_stale_memory_prompt(
         query="Analyze Apple's revenue from 2024 to 2026",
         session_id="topic-iso-sess",
         user_id="analyst@fde-workspace.corp",
-        reasoning_llm=_CapturingLlm(headline="AAPL revenue summary.", intent="longitudinal_single_company"),
+        reasoning_llm=_CapturingLlm(
+            headline="AAPL revenue summary.", intent="longitudinal_single_company"
+        ),
         skip_background_judge=True,
     )
     assert t2["status"] == "success"
@@ -466,7 +470,9 @@ def test_subject_change_isolates_adk_session_and_omits_stale_memory_prompt(
         query="How are tech sector companies discussing AI risks?",
         session_id="topic-iso-sess",
         user_id="analyst@fde-workspace.corp",
-        reasoning_llm=_CapturingLlm(headline="Tech sector AI risk summary.", intent="thematic_trend_tracking"),
+        reasoning_llm=_CapturingLlm(
+            headline="Tech sector AI risk summary.", intent="thematic_trend_tracking"
+        ),
         skip_background_judge=True,
     )
     assert t3["status"] == "success"
@@ -481,7 +487,9 @@ def test_subject_change_isolates_adk_session_and_omits_stale_memory_prompt(
         query="What about export control risks?",
         session_id="topic-iso-sess",
         user_id="analyst@fde-workspace.corp",
-        reasoning_llm=_CapturingLlm(headline="Tech sector export risk summary.", intent="thematic_trend_tracking"),
+        reasoning_llm=_CapturingLlm(
+            headline="Tech sector export risk summary.", intent="thematic_trend_tracking"
+        ),
         skip_background_judge=True,
     )
     assert t4["status"] == "success"

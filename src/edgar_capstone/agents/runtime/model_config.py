@@ -38,11 +38,13 @@ EPHEMERAL_AGENT_NAMES: frozenset[str] = frozenset(
     {
         "NarrativeEvaluatorAgent",
         "SectorMapSummarizerAgent",
+        "ScopeContinuityAgent",
     }
 )
 EPHEMERAL_SESSION_PREFIXES: tuple[str, ...] = (
     "eval-",
     "sector-map-",
+    "scope-resolve-",
     "adk-sess-",
 )
 
@@ -168,7 +170,21 @@ AGENT_DEFAULT_TASK_CATEGORY: dict[str, ModelTaskCategory] = {
     "ContextCacheManager": "context_cache_warmup",
     "NarrativeEvaluatorAgent": "evaluation",
     "SectorMapSummarizerAgent": "context_compaction",
+    "ScopeContinuityAgent": "context_compaction",
 }
+
+
+def minimal_thinking_config_for_model(
+    model: str | BaseLlm,
+) -> genai_types.ThinkingConfig | None:
+    """Minimal/zero thinking for ultra-low-latency structured classification (scope/continuity)."""
+    name = (model.model if isinstance(model, BaseLlm) else str(model or "")).lower()
+    short = name.rsplit("/", maxsplit=1)[-1]
+    if short.startswith("gemini-3"):
+        return genai_types.ThinkingConfig(thinking_level=genai_types.ThinkingLevel.MINIMAL)
+    if short.startswith("gemini-2.5"):
+        return genai_types.ThinkingConfig(thinking_budget=0)
+    return None
 
 
 def low_thinking_config_for_model(

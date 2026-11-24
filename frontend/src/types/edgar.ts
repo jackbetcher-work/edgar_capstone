@@ -226,12 +226,14 @@ export interface ResolvedQueryScope {
   tickers: string[]
   tickers_csv?: string
   gics_sector: string
+  gics_sub_industry?: string | null
   section_id: string
   start_year: number
   end_year: number
   memory_inherited?: boolean
   subject_changed?: boolean
   topic_epoch?: number
+  scope_resolution_source?: string
 }
 
 export interface ReActStepMetadata {

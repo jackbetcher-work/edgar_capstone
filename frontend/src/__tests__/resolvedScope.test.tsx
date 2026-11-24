@@ -55,6 +55,21 @@ describe('summarizeResolvedScope', () => {
       })
     ).toMatchObject({ issuers: 'A, B, C, D +2', issuersFull: 'A, B, C, D, E, F', carriedOver: true })
 
+    expect(
+      summarizeResolvedScope({
+        tickers: ['GD', 'LMT', 'NOC', 'RTX'],
+        gics_sector: 'ALL',
+        gics_sub_industry: 'Aerospace & Defense',
+        section_id: 'ALL',
+        start_year: 2024,
+        end_year: 2026,
+      })
+    ).toMatchObject({
+      issuers: 'Aerospace & Defense (4)',
+      issuersFull: 'Aerospace & Defense: GD, LMT, NOC, RTX',
+      carriedOver: false,
+    })
+
     expect(summarizeResolvedScope(null)).toBeNull()
   })
 })

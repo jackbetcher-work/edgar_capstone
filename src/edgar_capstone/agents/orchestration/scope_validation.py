@@ -87,6 +87,10 @@ _COMMON_BRAND_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\bapplied\s+materials\b|\bamat\b", re.IGNORECASE), "AMAT"),
     (re.compile(r"\blam\s+research\b|\blrcx\b", re.IGNORECASE), "LRCX"),
     (re.compile(r"\blockheed\s+martin\b|\blmt\b", re.IGNORECASE), "LMT"),
+    (re.compile(r"\braytheon\b|\brtx\b", re.IGNORECASE), "RTX"),
+    (re.compile(r"\bnorthrop\s+grumman\b|\bnorthrop\b|\bnoc\b", re.IGNORECASE), "NOC"),
+    (re.compile(r"\bgeneral\s+dynamics\b", re.IGNORECASE), "GD"),
+    (re.compile(r"\bl3\s*harris\b|\blhx\b", re.IGNORECASE), "LHX"),
     (re.compile(r"\bgeneral\s+electric\b|\bge\s+aerospace\b", re.IGNORECASE), "GE"),
     (re.compile(r"\bhoneywell\b|\bhon\b", re.IGNORECASE), "HON"),
     (re.compile(r"\bverizon\b|\bvz\b", re.IGNORECASE), "VZ"),
@@ -154,6 +158,99 @@ SECTOR_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
             r"\bmaterials\s+sector\b|\bmaterials\s+companies\b|\bbasic\s+materials\b", re.IGNORECASE
         ),
         "Materials",
+    ),
+)
+
+# High-precision colloquial aliases for S&P 500 GICS sub-industries (only activated when the
+# target sub-industry exists in the loaded EntityCatalog).
+SUB_INDUSTRY_ALIASES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"\baerospace\s*(?:&|and)\s*defense\b|\bdefense\s*(?:&|and)\s*aerospace\b|"
+            r"\bdefense\s+(?:industry|sector|companies|contractors?|stocks?|firms?|makers?|prime\s+contractors?)\b|"
+            r"\baerospace\s+(?:industry|sector|companies|contractors?|stocks?|firms?)\b",
+            re.IGNORECASE,
+        ),
+        "Aerospace & Defense",
+    ),
+    (
+        re.compile(
+            r"\b(?:passenger\s+)?airlines?\b|\bairline\s+(?:industry|sector|companies|stocks?|carriers?)\b",
+            re.IGNORECASE,
+        ),
+        "Passenger Airlines",
+    ),
+    (
+        re.compile(
+            r"\bautomakers?\b|\bauto(?:mobile)?\s+(?:industry|manufacturers?|makers?|sector|companies)\b|"
+            r"\bcar\s*makers?\b",
+            re.IGNORECASE,
+        ),
+        "Automobile Manufacturers",
+    ),
+    (
+        re.compile(
+            r"\bhomebuilders?\b|\bhomebuilding\s+(?:industry|sector|companies|stocks?)\b",
+            re.IGNORECASE,
+        ),
+        "Homebuilding",
+    ),
+    (
+        re.compile(
+            r"\brailroads?\b|\brail\s+(?:transportation|industry|freight|sector|companies)\b",
+            re.IGNORECASE,
+        ),
+        "Rail Transportation",
+    ),
+    (
+        re.compile(r"\bregional\s+banks?\b|\bregional\s+banking\b", re.IGNORECASE),
+        "Regional Banks",
+    ),
+    (
+        re.compile(r"\binvestment\s+banks?\b|\binvestment\s+banking\b", re.IGNORECASE),
+        "Investment Banking & Brokerage",
+    ),
+    (
+        re.compile(
+            r"\bmanaged\s+(?:health\s*)?care\b|\bhealth\s+insurers?\b|\bhealth\s+insurance\s+(?:industry|companies)\b",
+            re.IGNORECASE,
+        ),
+        "Managed Health Care",
+    ),
+    (
+        re.compile(r"\bdrug\s*makers?\b|\bbig\s+pharma\b", re.IGNORECASE),
+        "Pharmaceuticals",
+    ),
+    (
+        re.compile(
+            r"\bpayment\s+processors?\b|\bcredit\s+card\s+(?:companies|networks?|issuers?)\b",
+            re.IGNORECASE,
+        ),
+        "Transaction & Payment Processing Services",
+    ),
+    (
+        re.compile(r"\boil\s+refiners?\b|\boil\s*(?:&|and)\s*gas\s+refining\b", re.IGNORECASE),
+        "Oil & Gas Refining & Marketing",
+    ),
+    (
+        re.compile(
+            r"\boilfield\s+services?\b|\boil\s*(?:&|and)\s*gas\s+equipment\b", re.IGNORECASE
+        ),
+        "Oil & Gas Equipment & Services",
+    ),
+    (
+        re.compile(
+            r"\bcruise\s+(?:lines?|operators?|industry|companies)\b|\bhotels?\s*(?:&|and)\s*resorts?\b",
+            re.IGNORECASE,
+        ),
+        "Hotels, Resorts & Cruise Lines",
+    ),
+    (
+        re.compile(
+            r"\bproperty\s*(?:&|and)\s*casualty\s+insur(?:ance|ers?)\b|\bp&c\s+insur(?:ance|ers?)\b",
+            re.IGNORECASE,
+        ),
+        "Property & Casualty Insurance",
     ),
 )
 
@@ -636,18 +733,24 @@ class EntityCatalog:
         self.tickers: set[str] = set()
         self.ticker_to_name: dict[str, str] = {}
         self.ticker_to_sector: dict[str, str] = {}
+        self.ticker_to_sub_industry: dict[str, str] = {}
         self.ticker_to_cik: dict[str, str] = {}
         self.ticker_years: dict[str, set[int]] = {}
         self.profiles_by_key: dict[tuple[str, int], Any] = {}
         # ticker -> fiscal_year -> fiscal period end date, used to map calendar event dates
         # ("the July 2024 outage") onto each issuer's own fiscal calendar.
         self.ticker_period_ends: dict[str, dict[int, date]] = {}
+        self.sub_industry_to_tickers: dict[str, list[str]] = {}
+        self.sub_industries: list[str] = []
+        self._sub_industry_lookup: dict[str, str] = {}
+        self._sub_industry_patterns: list[tuple[re.Pattern[str], str]] = []
         self._name_patterns: list[tuple[re.Pattern[str], str]] = []
         self._fuzzy_multi_targets: list[tuple[tuple[str, ...], str]] = []
         self._fuzzy_single_targets: list[tuple[str, str]] = []
         self._exact_single_words: set[str] = set()
 
         seen_norm_names: dict[str, str] = {}
+        raw_sub_tickers: dict[str, set[str]] = {}
         for p in profiles:
             tk = normalize_edgar_ticker(str(getattr(p, "ticker", "") or ""))
             if not tk:
@@ -655,10 +758,14 @@ class EntityCatalog:
             self.tickers.add(tk)
             cname = str(getattr(p, "company_name", "") or tk)
             sector = str(getattr(p, "gics_sector", "") or "Unknown")
+            sub_industry = str(getattr(p, "gics_sub_industry", "") or "").strip()
             cik = str(getattr(p, "cik", "") or "").strip().lstrip("0")
             fy = getattr(p, "fiscal_year", None)
             self.ticker_to_name[tk] = cname
             self.ticker_to_sector[tk] = sector
+            if sub_industry and sub_industry.lower() != "unknown":
+                self.ticker_to_sub_industry[tk] = sub_industry
+                raw_sub_tickers.setdefault(sub_industry, set()).add(tk)
             if cik:
                 self.ticker_to_cik[tk] = cik
             if fy is not None:
@@ -703,6 +810,36 @@ class EntityCatalog:
                     if skey not in seen_fuzzy_single:
                         seen_fuzzy_single.add(skey)
                         self._fuzzy_single_targets.append(skey)
+
+        # Index GICS sub-industries (deduplicating dual-class shares by CIK, longest names first).
+        for sub_name, raw_tks in sorted(raw_sub_tickers.items()):
+            deduped: list[str] = []
+            seen_ciks: set[str] = set()
+            for tk in sorted(raw_tks):
+                canonical_tk = _CANONICAL_DUAL_CLASS_PREFERENCE.get(tk, tk)
+                if canonical_tk in raw_tks:
+                    tk = canonical_tk
+                if tk in deduped:
+                    continue
+                tk_cik = self.ticker_to_cik.get(tk)
+                if tk_cik and tk_cik in seen_ciks:
+                    continue
+                deduped.append(tk)
+                if tk_cik:
+                    seen_ciks.add(tk_cik)
+            if deduped:
+                self.sub_industry_to_tickers[sub_name] = deduped
+                self._sub_industry_lookup[sub_name.lower()] = sub_name
+                self._sub_industry_lookup[sub_name.lower().replace("&", "and")] = sub_name
+        self.sub_industries = sorted(self.sub_industry_to_tickers.keys())
+        for sub_name in sorted(self.sub_industries, key=len, reverse=True):
+            # Require at least 6 chars so tiny tokens never false-positive; support '&' and 'and'.
+            if len(sub_name) < 6:
+                continue
+            escaped_sub = re.escape(sub_name).replace(r"\ ", r"\s+").replace(r"\&", r"(?:&|and)")
+            self._sub_industry_patterns.append(
+                (re.compile(rf"\b{escaped_sub}\b", re.IGNORECASE), sub_name)
+            )
 
     def _fuzzy_detect_company_names(
         self,
@@ -798,6 +935,30 @@ class EntityCatalog:
 
     def contains_ticker(self, ticker: str) -> bool:
         return normalize_edgar_ticker(ticker) in self.tickers
+
+    def tickers_for_sub_industry(self, sub_industry: str | None) -> tuple[str | None, list[str]]:
+        """Resolve a GICS sub-industry name (case-insensitive) to `(canonical_name, tickers)`."""
+        if not sub_industry:
+            return None, []
+        cleaned = " ".join(str(sub_industry).strip().split()).lower()
+        canonical = self._sub_industry_lookup.get(cleaned) or self._sub_industry_lookup.get(
+            cleaned.replace("&", "and")
+        )
+        if not canonical:
+            return None, []
+        return canonical, list(self.sub_industry_to_tickers.get(canonical) or [])
+
+    def detect_sub_industry_in_query(self, query: str) -> tuple[str | None, list[str]]:
+        """Match curated sub-industry aliases or exact catalog GICS sub-industry names."""
+        if not self.sub_industry_to_tickers or not (query or "").strip():
+            return None, []
+        for pattern, sub_name in SUB_INDUSTRY_ALIASES:
+            if sub_name in self.sub_industry_to_tickers and pattern.search(query):
+                return sub_name, list(self.sub_industry_to_tickers[sub_name])
+        for pattern, sub_name in self._sub_industry_patterns:
+            if pattern.search(query):
+                return sub_name, list(self.sub_industry_to_tickers[sub_name])
+        return None, []
 
     def get_profile(self, ticker: str, fiscal_year: int) -> Any | None:
         """Return the cached profile for `(ticker, fiscal_year)` in O(1), or `None` if absent."""
@@ -1167,7 +1328,7 @@ def validate_query_scope_and_coverage(
 
     has_tickers = bool(known_tickers)
     has_sector = scope.get("gics_sector", "ALL") not in ("ALL", "", None)
-    is_broad_corpus = bool(_BROAD_CORPUS_PHRASE_RE.search(query))
+    is_broad_corpus = bool(_BROAD_CORPUS_PHRASE_RE.search(query)) or bool(scope.get("broad_corpus"))
     memory_inherited = bool(scope.get("memory_inherited"))
     if not has_tickers and not has_sector and not is_broad_corpus and not memory_inherited:
         return _validation_result(

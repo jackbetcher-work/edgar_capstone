@@ -192,6 +192,26 @@ def test_llm_observability_dashboard_mosaic_geometry_and_panels() -> None:
         _tf("monitoring.tf"),
     )
 
+    # Readability & plotting accuracy contracts for the LLM observability dashboard:
+    # - Executive KPI scorecards sit above the fold.
+    assert len(re.findall(r"\bscorecard\s*=\s*\{", dash)) >= 8
+    # - Cloud Monitoring legend templates require singular `metric.label.` / `resource.label.`.
+    assert "${metric.labels." not in dash
+    assert "${resource.labels." not in dash
+    # - Explicit 2xx/4xx/5xx status series (regression: label_replace `${1}xx` emitted `xx`).
+    assert 'legendTemplate = "2xx"' in dash
+    assert 'legendTemplate = "4xx"' in dash
+    assert 'legendTemplate = "5xx"' in dash
+    assert "${1}xx" not in dash
+    # - Chat latency chart isolates `/api/v1/chat*` routes instead of mixing 4ms health checks.
+    assert 'http_route=~\\"/api/v1/chat(/stream)?\\"' in dash
+    # - Evaluation score chart plots exact mean (<= 1.0), not bucket-interpolated p50 (1.025).
+    eval_chart = dash[dash.index("evaluation_scores") :]
+    assert "REDUCE_MEAN" in eval_chart
+    assert "REDUCE_PERCENTILE_50" not in eval_chart
+    # - Security threshold chart filters strictly to denials/blocks.
+    assert 'status=monitoring.regex.full_match(\\"denied_40[13]|blocked.*\\")' in dash
+
 
 def test_chunk_health_dashboard_mosaic_geometry_and_accuracy_contracts() -> None:
     mon = _tf("monitoring.tf")
@@ -227,6 +247,7 @@ def test_chunk_health_dashboard_mosaic_geometry_and_accuracy_contracts() -> None
 
     # Regression guard: chunk health gauges must use ALIGN_NEXT_OLDER (never ALIGN_MAX on
     # anomalies, which previously surfaced stale historical 47-filing spikes after recovery).
+    assert "${metric.labels." not in dash
     assert "ALIGN_NEXT_OLDER" in dash
     assert "custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings" in dash
     assert 'metric.labels.anomaly_type!=\\"missing_section_filings\\"' in dash

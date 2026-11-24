@@ -251,7 +251,9 @@ def _citation_coverage_line(scope: dict[str, Any]) -> str | None:
     """Scope-specific citation-coverage requirement (no extra model call or re-prompt)."""
     tickers = [str(t) for t in (scope.get("tickers") or []) if t]
     years = _parse_scope_years(scope)
-    multi_company = len(tickers) > 1
+    # Require per-ticker coverage for peer comparisons (2-6 companies); larger sub-industry
+    # groups (e.g. 13 Aerospace & Defense issuers) exceed the 6-finding report budget.
+    multi_company = 2 <= len(tickers) <= 6
     multi_year = len(years) == 2 and years[0] != years[1]
     if not (multi_company or multi_year):
         return None
@@ -562,6 +564,11 @@ def build_financial_reasoning_prompt(
     verification_feedback: str | None = None,
 ) -> str:
     """Assemble the deterministic facts and retrieval brief for `FinancialAnalystAgent`."""
+    sub_industry_line = (
+        f"\n- GICS Sub-Industry: `{scope['gics_sub_industry']}`"
+        if scope.get("gics_sub_industry")
+        else ""
+    )
     sections: list[str] = [
         f"## Analyst Query\n{query.strip()}",
         (
@@ -569,7 +576,8 @@ def build_financial_reasoning_prompt(
             f"- Scope structure: {_scope_structure_label(scope)} (provisional routing "
             f"hint: `{intent}`; classify the final intent yourself in `AnalystReport.intent`)\n"
             f"- Tickers: `{scope.get('tickers_csv', 'ALL')}`\n"
-            f"- GICS Sector: `{scope.get('gics_sector', 'ALL')}`\n"
+            f"- GICS Sector: `{scope.get('gics_sector', 'ALL')}`"
+            f"{sub_industry_line}\n"
             f"- Section Filter: `{scope.get('section_id', 'ALL')}`\n"
             f"- Fiscal Period: `FY{scope.get('start_year')}–FY{scope.get('end_year')}`"
         ),

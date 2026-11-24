@@ -22,6 +22,12 @@ from edgar_capstone.agents.orchestration.intent import (
     resolve_turn_intent,
 )
 from edgar_capstone.agents.orchestration.react_loop import StructuredReActExecutor
+from edgar_capstone.agents.orchestration.scope_continuity import (
+    ScopeResolutionDecision,
+    classify_scope_and_continuity,
+    has_local_sensitive_pii,
+    is_scope_llm_enabled,
+)
 from edgar_capstone.agents.orchestration.scope_validation import (
     MAX_CORPUS_YEAR,
     MIN_CORPUS_YEAR,
@@ -393,6 +399,55 @@ def _resolve_year_window(
     return eff_start, eff_end
 
 
+def _memory_scope_fingerprint(
+    memory_context: dict[str, Any] | None,
+) -> tuple[bool, tuple[str, ...], str, str | None, int]:
+    """Snapshot key for checking whether L1 peek matches authoritative Firestore recall."""
+    if not isinstance(memory_context, dict) or not memory_context.get("has_prior_memory"):
+        return (False, (), "ALL", None, 0)
+    tickers = tuple(
+        str(t).strip() for t in (memory_context.get("remembered_tickers") or []) if str(t).strip()
+    )
+    raw_sec = str(memory_context.get("last_gics_sector") or "ALL").strip()
+    sector = raw_sec if raw_sec and raw_sec.upper() not in ("ALL", "*") else "ALL"
+    raw_sub = memory_context.get("last_gics_sub_industry")
+    sub = str(raw_sub).strip() if raw_sub else None
+    epoch = int(memory_context.get("topic_epoch") or 0)
+    return (True, tickers, sector, sub, epoch)
+
+
+def needs_semantic_scope_resolution(
+    *,
+    query: str,
+    tickers: str = "ALL",
+    gics_sector: str = "ALL",
+    catalog: EntityCatalog,
+    memory_context: dict[str, Any] | None = None,
+) -> bool:
+    """True when deterministic parsing found no explicit/detected company, sector, sub-industry,
+    non-S&P 500 entity, or broad-corpus phrase (the exact window where Flash-Lite helps)."""
+    if _parse_ticker_list(tickers):
+        return False
+    if gics_sector and gics_sector.strip().upper() not in ("ALL", "*"):
+        return False
+    if is_broad_corpus_query(query):
+        return False
+    has_prior_tickers = bool(
+        isinstance(memory_context, dict)
+        and memory_context.get("has_prior_memory")
+        and (memory_context.get("remembered_tickers") or [])
+    )
+    if has_prior_tickers and extract_removed_tickers(query, catalog):
+        return False
+    detected, unknown = catalog.detect_tickers_in_query(query)
+    if detected or unknown:
+        return False
+    if any(pat.search(query) for pat, _ in SECTOR_ALIASES):
+        return False
+    sub_name, sub_tickers = catalog.detect_sub_industry_in_query(query)
+    return not (sub_name and sub_tickers)
+
+
 @traced("chat.resolve_scope", record_args=("tickers", "gics_sector", "section_id"))
 def resolve_query_scope(
     query: str,
@@ -404,16 +459,22 @@ def resolve_query_scope(
     memory_context: dict[str, Any] | None = None,
     *,
     catalog: EntityCatalog | None = None,
+    scope_llm: BaseLlm | None = None,
+    reasoning_llm: BaseLlm | None = None,
+    precomputed_semantic_result: tuple[ScopeResolutionDecision, str] | None = None,
 ) -> dict[str, Any]:
-    """Combine explicit UI filter selections, full-catalog NL detection, and multi-turn memory."""
+    """Combine explicit UI filters, deterministic catalog/sub-industry detection, Flash-Lite
+    continuity resolution on ambiguous turns, and multi-turn memory."""
     if catalog is None:
         catalog, _ = _get_entity_catalog(allow_fetch=True)
 
     explicit_tickers = sorted(_parse_ticker_list(tickers))
     detected_tickers, unknown_entities = catalog.detect_tickers_in_query(query)
+    unknown_entities = list(unknown_entities)
 
     prior_tickers: list[str] = []
     prior_sector = "ALL"
+    prior_sub_industry: str | None = None
     prior_topic_epoch = 0
     has_prior_session = False
     if isinstance(memory_context, dict) and memory_context.get("has_prior_memory"):
@@ -423,12 +484,15 @@ def resolve_query_scope(
         raw_sector = str(memory_context.get("last_gics_sector") or "ALL").strip()
         if raw_sector and raw_sector.upper() not in ("ALL", "*"):
             prior_sector = raw_sector
+        raw_sub = memory_context.get("last_gics_sub_industry")
+        prior_sub_industry = str(raw_sub).strip() if raw_sub else None
         prior_topic_epoch = int(memory_context.get("topic_epoch") or 0)
     has_prior_tickers = bool(prior_tickers)
     has_prior_sector = prior_sector != "ALL"
-    has_prior_scope = has_prior_tickers or has_prior_sector
 
     memory_inherited = False
+    effective_sub_industry: str | None = None
+    scope_resolution_source = "deterministic"
     removed_tickers = extract_removed_tickers(query, catalog) if has_prior_tickers else []
 
     if explicit_tickers:
@@ -455,20 +519,57 @@ def resolve_query_scope(
                     effective_sector = sec_name
                     break
 
+    # Deterministic GICS sub-industry resolution (e.g. "defense industry" -> Aerospace & Defense)
+    if not effective_tickers and effective_sector == "ALL" and not unknown_entities:
+        matched_sub, sub_tickers = catalog.detect_sub_industry_in_query(query)
+        if matched_sub and sub_tickers:
+            effective_tickers = sub_tickers
+            effective_sub_industry = matched_sub
+            scope_resolution_source = "sub_industry"
+
     broad_corpus_query = is_broad_corpus_query(query)
     if (
         not effective_tickers
         and effective_sector == "ALL"
         and not broad_corpus_query
         and not unknown_entities
-        and has_prior_scope
     ):
-        if has_prior_tickers:
-            effective_tickers = list(prior_tickers)
-            memory_inherited = True
-        elif has_prior_sector:
-            effective_sector = prior_sector
-            memory_inherited = True
+        if precomputed_semantic_result is not None:
+            decision, sem_source = precomputed_semantic_result
+        else:
+            decision, sem_source = classify_scope_and_continuity(
+                query=query,
+                memory_context=memory_context,
+                catalog=catalog,
+                scope_llm=scope_llm,
+                reasoning_llm=reasoning_llm,
+                parallel_prepass=False,
+            )
+        scope_resolution_source = sem_source
+        if decision.action == "continue_prior":
+            if has_prior_tickers:
+                effective_tickers = list(prior_tickers)
+                effective_sub_industry = prior_sub_industry
+                memory_inherited = True
+            elif has_prior_sector:
+                effective_sector = prior_sector
+                memory_inherited = True
+        elif decision.action == "new_tickers":
+            effective_tickers = list(decision.tickers)
+            for u in decision.unknown_entities:
+                if u not in unknown_entities:
+                    unknown_entities.append(u)
+        elif decision.action == "new_sub_industry":
+            effective_tickers = list(decision.tickers)
+            effective_sub_industry = decision.gics_sub_industry
+        elif decision.action == "new_sector" and decision.gics_sector:
+            effective_sector = decision.gics_sector
+        elif decision.action == "broad_corpus":
+            broad_corpus_query = True
+        elif decision.action == "unknown_entity":
+            for u in decision.unknown_entities:
+                if u not in unknown_entities:
+                    unknown_entities.append(u)
 
     valid_tickers = (
         [t for t in effective_tickers if catalog.contains_ticker(t)]
@@ -509,12 +610,15 @@ def resolve_query_scope(
         "tickers": valid_tickers,
         "tickers_csv": ",".join(valid_tickers) if valid_tickers else "ALL",
         "gics_sector": effective_sector,
+        "gics_sub_industry": effective_sub_industry,
         "section_id": effective_section,
         "start_year": eff_start,
         "end_year": eff_end,
         "memory_inherited": memory_inherited,
         "subject_changed": subject_changed,
         "topic_epoch": topic_epoch,
+        "scope_resolution_source": scope_resolution_source,
+        "broad_corpus": broad_corpus_query,
         "explicit_tickers": explicit_tickers,
         "unknown_entities": unknown_entities,
     }
@@ -1264,8 +1368,51 @@ def _run_parallel_prepass(
     session_id: str | None,
     user_id: str,
     query: str,
-) -> tuple[dict[str, Any], tuple[GuardrailDecision, float], tuple[EntityCatalog, list[Any]]]:
-    """Overlap independent Firestore memory recall, Model Armor prompt check, and catalog fetch."""
+    tickers: str = "ALL",
+    gics_sector: str = "ALL",
+    scope_llm: BaseLlm | None = None,
+    reasoning_llm: BaseLlm | None = None,
+) -> tuple[
+    dict[str, Any],
+    tuple[GuardrailDecision, float],
+    tuple[EntityCatalog, list[Any]],
+    tuple[tuple[ScopeResolutionDecision, str], tuple[bool, tuple[str, ...], str, str | None, int]]
+    | None,
+]:
+    """Overlap independent Firestore memory recall, Model Armor prompt check, catalog fetch,
+    and—when L1 memory & catalog are warm and deterministic scope is unresolved—speculative
+    `gemini-3.5-flash-lite` scope/continuity classification."""
+    warm_catalog = EntityCatalog([])
+    warm_mem_ctx: dict[str, Any] | None = None
+    run_speculative_scope = False
+    if (
+        is_scope_llm_enabled(scope_llm=scope_llm, reasoning_llm=reasoning_llm)
+        and not _parse_ticker_list(tickers)
+        and (not gics_sector or gics_sector.strip().upper() in ("ALL", "*"))
+        and not has_local_sensitive_pii(query)
+    ):
+        warm_catalog, _ = _ENTITY_CATALOG_CACHE.get_catalog_and_profiles(
+            allow_fetch=False, raise_on_error=False
+        )
+        mem_warm, warm_mem_ctx = (
+            memory_mgr.peek_warm_session_context(session_id, user_id=user_id)
+            if hasattr(memory_mgr, "peek_warm_session_context")
+            else (False, None)
+        )
+        run_speculative_scope = (
+            mem_warm
+            and bool(warm_catalog.tickers)
+            and needs_semantic_scope_resolution(
+                query=query,
+                tickers=tickers,
+                gics_sector=gics_sector,
+                catalog=warm_catalog,
+                memory_context=warm_mem_ctx,
+            )
+        )
+    branches = ["memory", "guardrail", "catalog"]
+    if run_speculative_scope:
+        branches.append("scope_llm")
 
     def _run_branch(branch: str) -> Any:
         if branch == "memory":
@@ -1277,11 +1424,21 @@ def _run_parallel_prepass(
                 caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
             )
             return dec, (time.perf_counter() - t_g) * 1000.0
-        return _get_entity_catalog(allow_fetch=True)
+        if branch == "catalog":
+            return _get_entity_catalog(allow_fetch=True)
+        res = classify_scope_and_continuity(
+            query=query,
+            memory_context=warm_mem_ctx,
+            catalog=warm_catalog,
+            scope_llm=scope_llm,
+            reasoning_llm=reasoning_llm,
+            parallel_prepass=True,
+        )
+        return res, _memory_scope_fingerprint(warm_mem_ctx)
 
-    return tuple(  # type: ignore[return-value]
-        run_parallel_with_context(["memory", "guardrail", "catalog"], _run_branch, max_workers=3)
-    )
+    results = run_parallel_with_context(branches, _run_branch, max_workers=len(branches))
+    speculative_scope = results[3] if run_speculative_scope else None
+    return results[0], results[1], results[2], speculative_scope
 
 
 def _resolve_and_validate_scope(
@@ -1295,6 +1452,9 @@ def _resolve_and_validate_scope(
     end_year: int,
     catalog: EntityCatalog,
     prompt_decision: GuardrailDecision,
+    scope_llm: BaseLlm | None = None,
+    reasoning_llm: BaseLlm | None = None,
+    precomputed_semantic_result: tuple[ScopeResolutionDecision, str] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict[str, Any] | None]:
     """Resolve scope, run coverage/clarification gates, and return `(public_scope, pre_notices, provisional_intent, early_resp)`."""
     t1 = time.perf_counter()
@@ -1313,6 +1473,9 @@ def _resolve_and_validate_scope(
         end_year=end_year,
         memory_context=ctx.memory_ctx,
         catalog=catalog,
+        scope_llm=scope_llm,
+        reasoning_llm=reasoning_llm,
+        precomputed_semantic_result=precomputed_semantic_result,
     )
     validation = validate_query_scope_and_coverage(
         query=query,
@@ -1324,7 +1487,9 @@ def _resolve_and_validate_scope(
     )
     pre_notices: list[dict[str, Any]] = list(validation.get("pre_notices") or [])
     public_scope = {
-        k: v for k, v in scope.items() if k not in ("explicit_tickers", "unknown_entities")
+        k: v
+        for k, v in scope.items()
+        if k not in ("explicit_tickers", "unknown_entities", "broad_corpus")
     }
 
     if validation["action"] in ("clarification", "out_of_corpus"):
@@ -1506,6 +1671,7 @@ def _verify_and_finalize_success(
         intent=intent,
         tickers=public_scope["tickers"],
         gics_sector=public_scope["gics_sector"],
+        gics_sub_industry=public_scope.get("gics_sub_industry"),
         start_year=public_scope["start_year"],
         end_year=public_scope["end_year"],
         variance_highlights=variance_highlights,
@@ -1591,6 +1757,7 @@ def run_conversational_rag_turn(
     reasoning_llm: BaseLlm | None = None,
     judge_llm: BaseLlm | None = None,
     map_llm: BaseLlm | None = None,
+    scope_llm: BaseLlm | None = None,
     run_judge_sync: bool = False,
     skip_background_judge: bool = False,
     on_progress: ProgressCallback | None = None,
@@ -1605,15 +1772,23 @@ def run_conversational_rag_turn(
     )
     ctx.emit("starting", "Checking safety guardrails and session memory...", None)
 
-    # Step 0: Parallel pre-pass (Firestore memory recall, Model Armor prompt check, entity catalog)
+    # Step 0: Parallel pre-pass (Firestore memory recall, Model Armor prompt check, entity catalog,
+    # plus speculative Flash-Lite scope/continuity classification when L1 memory & catalog are warm).
     memory_mgr = get_conversation_memory_manager()
-    memory_ctx, (raw_prompt_decision, raw_guard_ms), (catalog, all_profiles) = (
-        _run_parallel_prepass(
-            memory_mgr=memory_mgr,
-            session_id=session_id,
-            user_id=user_id,
-            query=query,
-        )
+    (
+        memory_ctx,
+        (raw_prompt_decision, raw_guard_ms),
+        (catalog, all_profiles),
+        speculative_scope,
+    ) = _run_parallel_prepass(
+        memory_mgr=memory_mgr,
+        session_id=session_id,
+        user_id=user_id,
+        query=query,
+        tickers=tickers,
+        gics_sector=gics_sector,
+        scope_llm=scope_llm,
+        reasoning_llm=reasoning_llm,
     )
     ctx.memory_ctx = memory_ctx
 
@@ -1630,6 +1805,14 @@ def run_conversational_rag_turn(
     if blocked_prompt_resp is not None:
         return blocked_prompt_resp
 
+    # Discard the speculative Flash-Lite result if SDP altered the query or if Firestore
+    # refreshed a newer prior scope than the L1 cache peek saw.
+    precomputed_semantic_result: tuple[ScopeResolutionDecision, str] | None = None
+    if speculative_scope is not None and not prompt_decision.sdp_redacted:
+        spec_result, spec_fingerprint = speculative_scope
+        if spec_fingerprint == _memory_scope_fingerprint(memory_ctx):
+            precomputed_semantic_result = spec_result
+
     # Step 1: Scope resolution, S&P 500 catalog validation, and clarification / out-of-corpus gate
     public_scope, pre_notices, provisional_intent, early_resp = _resolve_and_validate_scope(
         ctx,
@@ -1641,6 +1824,9 @@ def run_conversational_rag_turn(
         end_year=end_year,
         catalog=catalog,
         prompt_decision=prompt_decision,
+        scope_llm=scope_llm,
+        reasoning_llm=reasoning_llm,
+        precomputed_semantic_result=precomputed_semantic_result,
     )
     if early_resp is not None:
         return early_resp

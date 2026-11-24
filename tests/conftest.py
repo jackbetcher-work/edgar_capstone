@@ -42,6 +42,9 @@ os.environ["EDGAR_FEEDBACK_BACKEND"] = "local"
 # silently fire live Model Armor / Cloud DLP REST calls. Tests that explicitly exercise live
 # Model Armor request the `live_model_armor` fixture (or set mode="gcp"/"auto").
 os.environ.setdefault("EDGAR_MODEL_ARMOR_MODE", "emulator")
+# Default semantic scope/continuity classification to deterministic fallback in offline tests
+# (tests that exercise Flash-Lite pass an explicit `scope_llm` or opt in with `live`).
+os.environ.setdefault("EDGAR_SCOPE_LLM_MODE", "deterministic")
 
 
 @pytest.fixture(scope="session", autouse=True)

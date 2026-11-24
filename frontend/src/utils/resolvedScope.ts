@@ -25,10 +25,14 @@ export function summarizeResolvedScope(
   if (!scope) return null
   const tickers = (scope.tickers ?? []).filter(Boolean)
   const sector = scope.gics_sector && scope.gics_sector.toUpperCase() !== 'ALL' ? scope.gics_sector : null
+  const subIndustry = scope.gics_sub_industry ? scope.gics_sub_industry.trim() : ''
 
   let issuers: string
   let issuersFull: string
-  if (tickers.length > 0) {
+  if (subIndustry && tickers.length > 0) {
+    issuers = `${subIndustry} (${tickers.length})`
+    issuersFull = `${subIndustry}: ${tickers.join(', ')}`
+  } else if (tickers.length > 0) {
     const shown = tickers.slice(0, MAX_TICKERS_SHOWN).join(', ')
     const extra = tickers.length - MAX_TICKERS_SHOWN
     issuers = extra > 0 ? `${shown} +${extra}` : shown
