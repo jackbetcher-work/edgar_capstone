@@ -32,6 +32,7 @@ from edgar_capstone.agents.evaluation.structured_report import (
     render_analyst_report_markdown,
     verify_analyst_report,
 )
+from edgar_capstone.agents.runtime.context_memory import logical_session_id
 from edgar_capstone.agents.runtime.latency_tracker import (
     extract_llm_request_context_breakdown,
     get_context_latency_tracker,
@@ -426,7 +427,7 @@ def _resolve_session_and_user_ids(
         or state.get("user_id")
     )
     return (
-        str(cb_session_id) if cb_session_id else None,
+        logical_session_id(str(cb_session_id)) if cb_session_id else None,
         str(cb_user_id) if cb_user_id else None,
     )
 

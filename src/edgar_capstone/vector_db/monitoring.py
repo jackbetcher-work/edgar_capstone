@@ -14,7 +14,12 @@ import numpy as np
 
 from edgar_capstone.common.formatting import utc_now_iso
 from edgar_capstone.dataset.models import FinancialDataProfile
-from edgar_capstone.gcp.defaults import DEFAULT_BIGQUERY_DATASET_ID, DEFAULT_PROJECT_ID
+from edgar_capstone.gcp.bigquery import BigQueryRestClient
+from edgar_capstone.gcp.defaults import (
+    DEFAULT_BIGQUERY_DATASET_ID,
+    DEFAULT_LOCATION,
+    DEFAULT_PROJECT_ID,
+)
 from edgar_capstone.gcp.rest_client import GcpRestClient
 from edgar_capstone.vector_db.models import (
     ChunkAnomalyCounts,
@@ -426,7 +431,7 @@ def build_cloud_monitoring_timeseries(
             {"gics_sector": "all", "section_id": sec_id},
         )
 
-    # 5. Anomaly counts by anomaly_type
+    # 5. Anomaly counts by anomaly_type (chunk-level + legacy missing_section_filings label)
     anomaly_map = {
         "missing_embedding": report.anomalies.missing_embedding,
         "dimension_mismatch": report.anomalies.dimension_mismatch,
@@ -444,16 +449,29 @@ def build_cloud_monitoring_timeseries(
             {"anomaly_type": anomaly_type},
         )
 
+    # 6. Dedicated filing-level gauge (unit={filings}) for missing-section company-years
+    _add_gauge(
+        "missing_section_filings",
+        "INT64",
+        report.anomalies.missing_section_filings,
+    )
+
     return series
 
 
-def format_structured_health_log(report: ChunkHealthReport) -> dict[str, Any]:
+def format_structured_health_log(
+    report: ChunkHealthReport,
+    *,
+    max_profile_ids: int = 50,
+) -> dict[str, Any]:
     """Build a Cloud Logging structured JSON log record for the chunk health report."""
     severity_map = {
         "HEALTHY": "INFO",
         "DEGRADED": "WARNING",
         "UNHEALTHY": "ERROR",
     }
+    missing_ids = list(report.missing_profile_ids[:max_profile_ids])
+    incomplete_ids = list(report.incomplete_section_profile_ids[:max_profile_ids])
     return {
         "severity": severity_map.get(report.health_status, "INFO"),
         "event_type": "sec_edgar_chunk_health_evaluation",
@@ -461,7 +479,8 @@ def format_structured_health_log(report: ChunkHealthReport) -> dict[str, Any]:
             f"SEC EDGAR RAG Vector DB Health: {report.health_status} "
             f"(score={report.health_score:.1f}/100, chunks={report.total_chunks}, "
             f"embedding_coverage={report.embedding_coverage_ratio * 100:.1f}%, "
-            f"filing_coverage={report.full_section_coverage_ratio * 100:.1f}%)"
+            f"filing_coverage={report.full_section_coverage_ratio * 100:.1f}%, "
+            f"missing_section_filings={report.anomalies.missing_section_filings})"
         ),
         "project_id": report.project_id,
         "dataset_id": report.dataset_id,
@@ -473,7 +492,15 @@ def format_structured_health_log(report: ChunkHealthReport) -> dict[str, Any]:
         "embedding_coverage_ratio": report.embedding_coverage_ratio,
         "total_profiles_expected": report.total_profiles_expected,
         "total_profiles_indexed": report.total_profiles_indexed,
+        "profiles_with_both_sections": report.profiles_with_both_sections,
         "full_section_coverage_ratio": report.full_section_coverage_ratio,
+        "missing_section_filings": report.anomalies.missing_section_filings,
+        "missing_profile_ids": missing_ids,
+        "missing_profile_ids_truncated": max(0, len(report.missing_profile_ids) - len(missing_ids)),
+        "incomplete_section_profile_ids": incomplete_ids,
+        "incomplete_section_profile_ids_truncated": max(
+            0, len(report.incomplete_section_profile_ids) - len(incomplete_ids)
+        ),
         "avg_token_estimate": report.avg_token_estimate,
         "p95_token_estimate": report.p95_token_estimate,
         "anomalies": report.anomalies.model_dump(mode="json"),
@@ -481,8 +508,229 @@ def format_structured_health_log(report: ChunkHealthReport) -> dict[str, Any]:
     }
 
 
+def _breakdown_from_bq_row(group_key: str, row: dict[str, Any]) -> SectionHealthBreakdown:
+    """Convert a BigQuery `v_chunk_health_metrics` row into a `SectionHealthBreakdown`."""
+    return SectionHealthBreakdown(
+        group_key=group_key,
+        total_chunks=int(row.get("total_chunks") or 0),
+        distinct_profiles=int(row.get("distinct_profiles") or 0),
+        distinct_tickers=int(row.get("distinct_tickers") or 0),
+        valid_embedding_count=int(row.get("valid_embedding_count") or 0),
+        embedding_coverage_ratio=round(float(row.get("embedding_coverage_ratio") or 0.0), 4),
+        avg_char_count=round(float(row.get("avg_char_count") or 0.0), 2),
+        avg_token_estimate=round(float(row.get("avg_token_estimate") or 0.0), 2),
+        min_token_estimate=int(row.get("min_token_estimate") or 0),
+        max_token_estimate=int(row.get("max_token_estimate") or 0),
+        p50_token_estimate=round(float(row.get("p50_token_estimate") or 0.0), 2),
+        p95_token_estimate=round(float(row.get("p95_token_estimate") or 0.0), 2),
+        undersized_chunk_count=int(row.get("undersized_chunk_count") or 0),
+        oversized_chunk_count=int(row.get("oversized_chunk_count") or 0),
+        missing_metadata_count=int(row.get("missing_metadata_count") or 0),
+    )
+
+
+def _rollup_section_rows(
+    sec_id: str,
+    cells: list[dict[str, Any]],
+) -> SectionHealthBreakdown:
+    """Fallback rollup for legacy `ROLLUP`-based views that omit `(ALL_SECTORS, section_id)`."""
+    tot_chunks = sum(int(c.get("total_chunks") or 0) for c in cells)
+    valid_embs = sum(int(c.get("valid_embedding_count") or 0) for c in cells)
+    weighted_chars = sum(
+        float(c.get("avg_char_count") or 0.0) * int(c.get("total_chunks") or 0) for c in cells
+    )
+    weighted_tokens = sum(
+        float(c.get("avg_token_estimate") or 0.0) * int(c.get("total_chunks") or 0) for c in cells
+    )
+    return SectionHealthBreakdown(
+        group_key=sec_id,
+        total_chunks=tot_chunks,
+        distinct_profiles=sum(int(c.get("distinct_profiles") or 0) for c in cells),
+        distinct_tickers=sum(int(c.get("distinct_tickers") or 0) for c in cells),
+        valid_embedding_count=valid_embs,
+        embedding_coverage_ratio=round(valid_embs / tot_chunks, 4) if tot_chunks > 0 else 0.0,
+        avg_char_count=round(weighted_chars / tot_chunks, 2) if tot_chunks > 0 else 0.0,
+        avg_token_estimate=round(weighted_tokens / tot_chunks, 2) if tot_chunks > 0 else 0.0,
+        min_token_estimate=min((int(c.get("min_token_estimate") or 0) for c in cells), default=0),
+        max_token_estimate=max((int(c.get("max_token_estimate") or 0) for c in cells), default=0),
+        undersized_chunk_count=sum(int(c.get("undersized_chunk_count") or 0) for c in cells),
+        oversized_chunk_count=sum(int(c.get("oversized_chunk_count") or 0) for c in cells),
+        missing_metadata_count=sum(int(c.get("missing_metadata_count") or 0) for c in cells),
+    )
+
+
+def evaluate_chunk_health_from_bigquery(
+    *,
+    project_id: str = DEFAULT_PROJECT_ID,
+    dataset_id: str = DEFAULT_BIGQUERY_DATASET_ID,
+    table_id: str = "filing_chunks",
+    location: str = DEFAULT_LOCATION,
+    chunk_health_view: str = "v_chunk_health_metrics",
+    filing_coverage_view: str = "v_filing_chunk_coverage",
+    expected_embedding_dim: int = 768,
+    embedding_model: str = "text-embedding-005",
+    bq_client: BigQueryRestClient | None = None,
+    http_client: httpx.Client | None = None,
+    credentials: Any | None = None,
+) -> ChunkHealthReport:
+    """Evaluate a live `ChunkHealthReport` directly from BigQuery health & coverage views."""
+    owns_client = bq_client is None
+    client = bq_client or BigQueryRestClient(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        location=location,
+        http_client=http_client,
+        credentials=credentials,
+        default_timeout=60.0,
+        quota_project_id=project_id,
+    )
+    try:
+        health_rows = client.run_query(
+            f"SELECT * FROM {client.table_ref(chunk_health_view)} "
+            "ORDER BY gics_sector ASC, section_id ASC",
+            timeout_ms=60000,
+        )
+        coverage_rows = client.run_query(
+            f"SELECT profile_id, filing_chunk_status "
+            f"FROM {client.table_ref(filing_coverage_view)} "
+            "WHERE filing_chunk_status IN ('UNINDEXED', 'PARTIAL_SECTIONS') "
+            "ORDER BY profile_id ASC",
+            timeout_ms=60000,
+        )
+    finally:
+        if owns_client:
+            client.close()
+
+    if not health_rows:
+        raise RuntimeError(
+            f"BigQuery view {project_id}.{dataset_id}.{chunk_health_view} returned 0 rows."
+        )
+
+    overall: dict[str, Any] = {}
+    by_sector: dict[str, SectionHealthBreakdown] = {}
+    by_section: dict[str, SectionHealthBreakdown] = {}
+    section_cells: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+    for row in health_rows:
+        sector = str(row.get("gics_sector") or "")
+        sec_id = str(row.get("section_id") or "")
+        if sector == "ALL_SECTORS" and sec_id == "ALL_SECTIONS":
+            overall = row
+        elif sector != "ALL_SECTORS" and sec_id == "ALL_SECTIONS":
+            by_sector[sector] = _breakdown_from_bq_row(sector, row)
+        elif sector == "ALL_SECTORS" and sec_id != "ALL_SECTIONS":
+            by_section[sec_id] = _breakdown_from_bq_row(sec_id, row)
+        elif sector != "ALL_SECTORS" and sec_id != "ALL_SECTIONS":
+            section_cells[sec_id].append(row)
+
+    if not by_section and section_cells:
+        for sec_id, cells in sorted(section_cells.items()):
+            by_section[sec_id] = _rollup_section_rows(sec_id, cells)
+
+    if not overall:
+        overall = health_rows[0]
+
+    missing_profile_ids = sorted(
+        str(r["profile_id"])
+        for r in coverage_rows
+        if str(r.get("filing_chunk_status") or "") == "UNINDEXED" and r.get("profile_id")
+    )
+    incomplete_section_profile_ids = sorted(
+        str(r["profile_id"])
+        for r in coverage_rows
+        if str(r.get("filing_chunk_status") or "") == "PARTIAL_SECTIONS" and r.get("profile_id")
+    )
+
+    total_profiles_expected = int(overall.get("expected_profiles") or 0)
+    total_profiles_indexed = int(overall.get("distinct_profiles") or 0)
+    missing_section_count = len(missing_profile_ids) + len(incomplete_section_profile_ids)
+    profiles_with_both_sections = (
+        int(overall["profiles_with_both_sections"])
+        if overall.get("profiles_with_both_sections") is not None
+        else max(0, total_profiles_expected - missing_section_count)
+    )
+    filing_coverage_ratio = (
+        round(total_profiles_indexed / total_profiles_expected, 4)
+        if total_profiles_expected > 0
+        else 0.0
+    )
+    full_section_coverage_ratio = (
+        round(profiles_with_both_sections / total_profiles_expected, 4)
+        if total_profiles_expected > 0
+        else 0.0
+    )
+
+    total_chunks = int(overall.get("total_chunks") or 0)
+    valid_embedding_count = int(overall.get("valid_embedding_count") or 0)
+    embedding_coverage_ratio = (
+        round(valid_embedding_count / total_chunks, 4) if total_chunks > 0 else 0.0
+    )
+
+    anomalies = ChunkAnomalyCounts(
+        missing_embedding=int(overall.get("missing_embedding_count") or 0),
+        dimension_mismatch=int(overall.get("dimension_mismatch_count") or 0),
+        non_finite_embedding=0,
+        undersized_chunk=int(overall.get("undersized_chunk_count") or 0),
+        oversized_chunk=int(overall.get("oversized_chunk_count") or 0),
+        missing_metadata=int(overall.get("missing_metadata_count") or 0),
+        missing_section_filings=missing_section_count,
+    )
+
+    if total_chunks == 0:
+        health_score = 0.0
+    else:
+        size_anomaly_ratio = min(
+            1.0, (anomalies.undersized_chunk + anomalies.oversized_chunk) / total_chunks
+        )
+        meta_anomaly_ratio = min(1.0, anomalies.missing_metadata / total_chunks)
+        raw_score = (
+            45.0 * embedding_coverage_ratio
+            + 15.0 * filing_coverage_ratio
+            + 15.0 * full_section_coverage_ratio
+            + 15.0 * (1.0 - size_anomaly_ratio)
+            + 10.0 * (1.0 - meta_anomaly_ratio)
+        )
+        health_score = round(max(0.0, min(100.0, raw_score)), 2)
+
+    if health_score >= 95.0 and embedding_coverage_ratio >= 0.99:
+        health_status = "HEALTHY"
+    elif health_score >= 80.0 and embedding_coverage_ratio >= 0.90:
+        health_status = "DEGRADED"
+    else:
+        health_status = "UNHEALTHY"
+
+    return ChunkHealthReport(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        table_id=table_id,
+        expected_embedding_dim=expected_embedding_dim,
+        embedding_model=embedding_model,
+        total_profiles_expected=total_profiles_expected,
+        total_profiles_indexed=total_profiles_indexed,
+        profiles_with_both_sections=profiles_with_both_sections,
+        filing_coverage_ratio=filing_coverage_ratio,
+        full_section_coverage_ratio=full_section_coverage_ratio,
+        missing_profile_ids=missing_profile_ids,
+        incomplete_section_profile_ids=incomplete_section_profile_ids,
+        total_chunks=total_chunks,
+        valid_embedding_count=valid_embedding_count,
+        embedding_coverage_ratio=embedding_coverage_ratio,
+        avg_char_count=round(float(overall.get("avg_char_count") or 0.0), 2),
+        avg_token_estimate=round(float(overall.get("avg_token_estimate") or 0.0), 2),
+        min_token_estimate=int(overall.get("min_token_estimate") or 0),
+        max_token_estimate=int(overall.get("max_token_estimate") or 0),
+        p50_token_estimate=round(float(overall.get("p50_token_estimate") or 0.0), 2),
+        p95_token_estimate=round(float(overall.get("p95_token_estimate") or 0.0), 2),
+        anomalies=anomalies,
+        by_section=by_section,
+        by_sector=by_sector,
+        health_score=health_score,
+        health_status=health_status,
+    )
+
+
 class CloudMonitoringHealthPublisher(GcpRestClient):
-    """Publishes chunk health time-series metrics to Google Cloud Monitoring v3 API."""
+    """Publishes chunk health time-series metrics to Cloud Monitoring v3 & logs to Cloud Logging."""
 
     def __init__(
         self,
@@ -490,6 +738,8 @@ class CloudMonitoringHealthPublisher(GcpRestClient):
         project_id: str = DEFAULT_PROJECT_ID,
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
+        write_cloud_logging: bool = False,
+        log_id: str = "sec-edgar-chunk-health",
     ) -> None:
         super().__init__(
             http_client=http_client,
@@ -497,9 +747,33 @@ class CloudMonitoringHealthPublisher(GcpRestClient):
             default_timeout=30.0,
         )
         self.project_id = project_id
+        self.write_cloud_logging = write_cloud_logging
+        self.log_id = log_id
 
     def _get_access_token(self) -> str:
         return self._get_bearer_token()
+
+    def _write_cloud_log_entry(self, structured_log: dict[str, Any]) -> None:
+        """Write a structured evaluation log directly to Cloud Logging REST v2 API."""
+        url = "https://logging.googleapis.com/v2/entries:write"
+        payload = {
+            "logName": f"projects/{self.project_id}/logs/{self.log_id}",
+            "resource": {
+                "type": "global",
+                "labels": {"project_id": self.project_id},
+            },
+            "entries": [
+                {
+                    "severity": structured_log.get("severity", "INFO"),
+                    "jsonPayload": structured_log,
+                }
+            ],
+        }
+        resp = self._raw_request("POST", url, json_body=payload)
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Cloud Logging entries:write failed (HTTP {resp.status_code}): {resp.text[:400]}"
+            )
 
     def publish_report(self, report: ChunkHealthReport) -> int:
         """Write custom chunk health time series to Cloud Monitoring and emit structured log."""
@@ -520,6 +794,9 @@ class CloudMonitoringHealthPublisher(GcpRestClient):
                     f"Cloud Monitoring createTimeSeries failed (HTTP {resp.status_code}): "
                     f"{resp.text[:400]}"
                 )
+
+        if self.write_cloud_logging:
+            self._write_cloud_log_entry(structured_log)
 
         report.published_to_cloud_monitoring = True
         report.published_timeseries_count = len(all_series)

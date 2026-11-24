@@ -15,7 +15,54 @@ import {
 
 export { BackendUnavailableError }
 
-const CLIENT_SESSION_ID = `edgar-session-${Date.now().toString(36)}`
+let clientSessionSeq = 0
+
+function createClientSessionId(): string {
+  clientSessionSeq += 1
+  const nonce = Math.random().toString(36).slice(2, 8)
+  return `edgar-session-${Date.now().toString(36)}-${clientSessionSeq}-${nonce}`
+}
+
+let activeClientSessionId = createClientSessionId()
+
+export function getClientSessionId(): string {
+  return activeClientSessionId
+}
+
+/**
+ * Rotate to a fresh client session ID so subsequent turns start with a clean
+ * backend conversation memory, returning the previous session ID for cleanup.
+ */
+export function resetClientSession(): string {
+  const previousSessionId = activeClientSessionId
+  activeClientSessionId = createClientSessionId()
+  return previousSessionId
+}
+
+export async function deleteChatSession(sessionId: string): Promise<boolean> {
+  const trimmed = sessionId.trim()
+  if (!trimmed) return false
+  try {
+    const res = await fetchWithAuthErrorHandling(
+      `/api/v1/sessions/${encodeURIComponent(trimmed)}`,
+      {
+        method: 'DELETE',
+        headers: buildAuthorizedHeaders(),
+      },
+      {
+        onUnauthorized: clearStoredBearerToken,
+        wrapNetworkError: false,
+        throwOnHttpError: false,
+      }
+    )
+    return res.ok
+  } catch (err) {
+    if (err instanceof ApiAuthError) {
+      throw err
+    }
+    return false
+  }
+}
 
 export interface ChatQueryPayload {
   query: string
@@ -49,7 +96,7 @@ export function buildChatQueryPayload(query: string): ChatQueryPayload {
   return {
     query,
     ...NATURAL_LANGUAGE_SCOPE,
-    session_id: CLIENT_SESSION_ID,
+    session_id: activeClientSessionId,
   }
 }
 
@@ -197,7 +244,7 @@ export async function postAnalystFeedback(
         headers: buildAuthorizedHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           message_id: messageId,
-          session_id: CLIENT_SESSION_ID,
+          session_id: activeClientSessionId,
           rating,
           comment,
           query,

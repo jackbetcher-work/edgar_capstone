@@ -221,6 +221,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip publishing custom chunk health time series to Google Cloud Monitoring.",
     )
+    parser.add_argument(
+        "--min-section-coverage",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional quality gate (0.0-1.0): exit non-zero if dual-section (Item 1A + Item 7) "
+            "coverage falls below this threshold."
+        ),
+    )
     add_logging_args(parser, use_verbose=True)
 
     return parser.parse_args(argv)
@@ -322,10 +331,15 @@ def main(argv: list[str] | None = None) -> int:
         f"Anomalies         : {health.anomalies.total_anomalies} "
         f"(missing_emb={health.anomalies.missing_embedding}, "
         f"dim_mismatch={health.anomalies.dimension_mismatch}, "
+        f"non_finite={health.anomalies.non_finite_embedding}, "
         f"undersized={health.anomalies.undersized_chunk}, "
         f"oversized={health.anomalies.oversized_chunk}, "
-        f"missing_meta={health.anomalies.missing_metadata})"
+        f"missing_meta={health.anomalies.missing_metadata}, "
+        f"missing_section_filings={health.anomalies.missing_section_filings})"
     )
+    if health.missing_profile_ids or health.incomplete_section_profile_ids:
+        sample = (health.missing_profile_ids + health.incomplete_section_profile_ids)[:10]
+        print(f"Missing Sections  : {', '.join(sample)}")
     print(f"DB Health Status  : {health.health_status} (Score: {health.health_score:.2f} / 100.0)")
     print(f"BQ Manifest       : {summary.bigquery_manifest_path}")
     print(f"Vertex AI Manifest: {summary.vertex_vector_manifest_path}")
@@ -336,6 +350,18 @@ def main(argv: list[str] | None = None) -> int:
         f"CloudMonitoring={'YES' if summary.published_monitoring_metrics else 'NO'}"
     )
     print("=" * 78)
+    if (
+        args.min_section_coverage > 0.0
+        and health.full_section_coverage_ratio < args.min_section_coverage
+    ):
+        logging.error(
+            "Dual-section filing coverage %.4f is below --min-section-coverage %.4f "
+            "(missing_section_filings=%d).",
+            health.full_section_coverage_ratio,
+            args.min_section_coverage,
+            health.anomalies.missing_section_filings,
+        )
+        return 3
     return 0
 
 

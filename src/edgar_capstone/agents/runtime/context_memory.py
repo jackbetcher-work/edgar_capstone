@@ -89,23 +89,63 @@ class BoundedInMemoryMemoryService(InMemoryMemoryService):
                         self._session_events.pop(old_user_key, None)
 
     def drop_session(self, session_id: str, candidate_users: set[str]) -> bool:
-        """Drop all cached memory events for `session_id` owned by any user in `candidate_users`."""
+        """Drop all cached memory events for `session_id` (and topic epochs) owned by `candidate_users`."""
         removed = False
+        topic_prefix = f"{session_id}::topic-"
         with self._lock:
             for user_key in list(self._session_events.keys()):
                 if user_key[1] in candidate_users:
                     user_map = self._session_events.get(user_key)
-                    if user_map is not None and session_id in user_map:
-                        user_map.pop(session_id, None)
-                        self._insertion_order.pop((user_key, session_id), None)
+                    if user_map is None:
+                        continue
+                    matching_sids = [
+                        sid
+                        for sid in list(user_map.keys())
+                        if sid == session_id or (isinstance(sid, str) and sid.startswith(topic_prefix))
+                    ]
+                    for sid in matching_sids:
+                        user_map.pop(sid, None)
+                        self._insertion_order.pop((user_key, sid), None)
                         removed = True
-                        if not user_map:
-                            self._session_events.pop(user_key, None)
+                    if not user_map:
+                        self._session_events.pop(user_key, None)
         return removed
 
     def tracked_session_count(self) -> int:
         with self._lock:
             return len(self._insertion_order)
+
+
+def adk_session_id_for_topic(session_id: str | None, topic_epoch: int) -> str | None:
+    """Return the ADK session key for `(session_id, topic_epoch)` isolating subject changes.
+
+    Epoch 0 reuses `session_id` directly for backward compatibility; subsequent subject changes
+    get a fresh ADK session (`<session_id>::topic-<epoch>`) so prior-subject tool calls and 10-K
+    passages do not leak into the new subject's LLM event history.
+    """
+    cleaned = (session_id or "").strip()
+    if not cleaned:
+        return None
+    epoch = max(0, int(topic_epoch))
+    return cleaned if epoch == 0 else f"{cleaned}::topic-{epoch}"
+
+
+def logical_session_id(session_id: str | None) -> str | None:
+    """Strip any `::topic-<epoch>` isolation suffix so telemetry joins stay on the logical session."""
+    if not session_id:
+        return None
+    cleaned = str(session_id).strip()
+    if not cleaned:
+        return None
+    base, sep, _ = cleaned.partition("::topic-")
+    return base if sep else cleaned
+
+
+def _normalize_sector_value(gics_sector: str | None) -> str:
+    cleaned = (gics_sector or "").strip()
+    if not cleaned or cleaned.upper() in ("ALL", "*"):
+        return "ALL"
+    return cleaned
 
 
 @dataclass
@@ -124,6 +164,7 @@ class TurnMemoryEntry:
     cited_chunk_ids: list[str] = field(default_factory=list)
     cached_10k_keys: list[str] = field(default_factory=list)
     token_estimate: int = 0
+    topic_epoch: int = 0
 
 
 @dataclass
@@ -139,6 +180,7 @@ class SessionMemoryState:
     last_start_year: int = 2024
     last_end_year: int = 2026
     last_gics_sector: str = "ALL"
+    topic_epoch: int = 0
     updated_at: str = field(default_factory=utc_now_iso)
 
     def to_firestore_dict(self) -> dict[str, Any]:
@@ -151,6 +193,7 @@ class SessionMemoryState:
             "last_start_year": int(self.last_start_year),
             "last_end_year": int(self.last_end_year),
             "last_gics_sector": self.last_gics_sector,
+            "topic_epoch": int(self.topic_epoch),
             "turn_count": len(self.turns),
             "turns_json": json.dumps([asdict(t) for t in self.turns]),
             "updated_at": self.updated_at,
@@ -186,6 +229,7 @@ class SessionMemoryState:
                     cited_chunk_ids=[str(x) for x in (t.get("cited_chunk_ids") or [])],
                     cached_10k_keys=[str(x) for x in (t.get("cached_10k_keys") or [])],
                     token_estimate=int(t.get("token_estimate") or 0),
+                    topic_epoch=int(t.get("topic_epoch") or 0),
                 )
             )
         return cls(
@@ -198,6 +242,7 @@ class SessionMemoryState:
             last_start_year=int(doc.get("last_start_year") or 2024),
             last_end_year=int(doc.get("last_end_year") or 2026),
             last_gics_sector=str(doc.get("last_gics_sector") or "ALL"),
+            topic_epoch=int(doc.get("topic_epoch") or 0),
             updated_at=str(doc.get("updated_at") or utc_now_iso()),
         )
 
@@ -219,6 +264,8 @@ def _compact_session_turns(
     sess.turns = sess.turns[-retention_turns:]
     digest_parts: list[str] = [sess.compacted_summary] if sess.compacted_summary else []
     for old in older_turns:
+        if old.topic_epoch != sess.topic_epoch:
+            continue
         tk_str = ",".join(old.tickers) if old.tickers else old.gics_sector
         hl_str = "; ".join(old.variance_highlights[:1]) if old.variance_highlights else old.intent
         digest_parts.append(
@@ -299,9 +346,10 @@ class ConversationMemoryManager:
             self._session_locks.pop(old_key, None)
 
     def _evict_adk_session_state(self, session_id: str, user_id: str) -> bool:
-        """Delete matching `(user_id, session_id)` entries from in-memory ADK session & memory services."""
+        """Delete matching `(user_id, session_id)` and topic-epoch entries from in-memory ADK services."""
         norm_user = (user_id or "analyst").strip().lower() or "analyst"
         candidate_users = {user_id.strip(), norm_user}
+        topic_prefix = f"{session_id}::topic-"
         removed_session = False
         sessions_by_app = getattr(self.adk_session_service, "sessions", None)
         if isinstance(sessions_by_app, dict):
@@ -310,8 +358,15 @@ class ConversationMemoryManager:
                     continue
                 for uid in candidate_users:
                     user_sessions = app_sessions.get(uid)
-                    if isinstance(user_sessions, dict) and session_id in user_sessions:
-                        del user_sessions[session_id]
+                    if not isinstance(user_sessions, dict):
+                        continue
+                    matching_sids = [
+                        sid
+                        for sid in list(user_sessions.keys())
+                        if sid == session_id or (isinstance(sid, str) and sid.startswith(topic_prefix))
+                    ]
+                    for sid in matching_sids:
+                        del user_sessions[sid]
                         removed_session = True
         removed_memory = self.adk_memory_service.drop_session(session_id, candidate_users)
         return removed_session or removed_memory
@@ -362,6 +417,7 @@ class ConversationMemoryManager:
             "last_start_year": None,
             "last_end_year": None,
             "last_gics_sector": "ALL",
+            "topic_epoch": 0,
             "compaction_count": 0,
             "memory_summary_text": "",
             "memory_tokens": 0,
@@ -398,7 +454,8 @@ class ConversationMemoryManager:
         lines: list[str] = []
         if sess.compacted_summary:
             lines.append(f"[Compacted Prior Context]: {sess.compacted_summary}")
-        for t in sess.turns[-self.retention_turns :]:
+        active_turns = [t for t in sess.turns if t.topic_epoch == sess.topic_epoch]
+        for t in active_turns[-self.retention_turns :]:
             highlights = "; ".join(t.variance_highlights[:2]) if t.variance_highlights else "N/A"
             lines.append(
                 f"[Turn {t.turn_index} | {','.join(t.tickers) or t.gics_sector} FY{t.start_year}-FY{t.end_year}]: "
@@ -415,6 +472,7 @@ class ConversationMemoryManager:
             "last_start_year": sess.last_start_year,
             "last_end_year": sess.last_end_year,
             "last_gics_sector": sess.last_gics_sector,
+            "topic_epoch": sess.topic_epoch,
             "compaction_count": sess.compaction_count,
             "memory_summary_text": summary_text,
             "memory_tokens": mem_tokens,
@@ -438,6 +496,7 @@ class ConversationMemoryManager:
         cached_10k_keys: list[str] | None = None,
         answer_markdown: str = "",
         recalled_prior_memory: bool | None = None,
+        topic_epoch: int | None = None,
     ) -> dict[str, Any]:
         """Persist a completed turn into durable session memory and compact if over token threshold.
 
@@ -471,28 +530,40 @@ class ConversationMemoryManager:
 
                 now_iso = utc_now_iso()
                 turn_text = f"{query}\n{answer_markdown}"
+                norm_tickers = [str(t).strip() for t in tickers if str(t).strip()]
+                norm_sector = _normalize_sector_value(gics_sector)
+                if topic_epoch is not None and int(topic_epoch) > sess.topic_epoch:
+                    sess.topic_epoch = int(topic_epoch)
+                    sess.compacted_summary = ""
+                eff_epoch = sess.topic_epoch
+
                 sess.turns.append(
                     TurnMemoryEntry(
                         turn_index=len(sess.turns) + 1,
                         timestamp=now_iso,
                         query=query,
                         intent=intent,
-                        tickers=list(tickers),
-                        gics_sector=gics_sector,
+                        tickers=norm_tickers,
+                        gics_sector=norm_sector,
                         start_year=start_year,
                         end_year=end_year,
                         variance_highlights=list(variance_highlights or []),
                         cited_chunk_ids=list(cited_chunk_ids or []),
                         cached_10k_keys=list(cached_10k_keys or []),
                         token_estimate=estimate_token_count(turn_text),
+                        topic_epoch=eff_epoch,
                     )
                 )
-                if tickers:
-                    sess.remembered_tickers = list(tickers)
+                # Active scope is mutually exclusive: switching to a sector or corpus-wide turn
+                # clears stale tickers so later follow-ups do not snap back to an old company.
+                if norm_tickers:
+                    sess.remembered_tickers = norm_tickers
+                    sess.last_gics_sector = "ALL"
+                else:
+                    sess.remembered_tickers = []
+                    sess.last_gics_sector = norm_sector
                 sess.last_start_year = start_year
                 sess.last_end_year = end_year
-                if gics_sector and gics_sector != "ALL":
-                    sess.last_gics_sector = gics_sector
                 sess.updated_at = now_iso
 
                 compaction_triggered = _compact_session_turns(
@@ -517,6 +588,7 @@ class ConversationMemoryManager:
             "session_id": key[1],
             "user_id": key[0],
             "turn_count": turn_count,
+            "topic_epoch": eff_epoch,
             "compaction_triggered": compaction_triggered,
             "compaction_method": "deterministic_digest" if compaction_triggered else None,
             "compaction_count": compaction_count,

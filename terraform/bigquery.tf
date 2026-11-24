@@ -383,7 +383,7 @@ resource "google_bigquery_table" "v_chunk_health_metrics" {
   project             = var.project_id
   dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
   table_id            = "v_chunk_health_metrics"
-  description         = "Chunk health monitoring view reporting embedding coverage, dimension consistency, token distributions, section completeness, and composite health score across the RAG vector database."
+  description         = "Chunk health monitoring view reporting embedding coverage, dimension consistency, token distributions, dual-section completeness, and composite health score across the RAG vector database."
   deletion_protection = var.deletion_protection
   labels              = var.labels
 
@@ -420,6 +420,26 @@ resource "google_bigquery_table" "v_chunk_health_metrics" {
           ingested_at
         FROM `${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.filing_chunks.table_id}`
       ),
+      profile_dual_sections AS (
+        SELECT
+          gics_sector,
+          profile_id,
+          (COUNTIF(section_id = 'item_1a') > 0 AND COUNTIF(section_id = 'item_7') > 0) AS has_both_sections
+        FROM chunk_base
+        GROUP BY gics_sector, profile_id
+      ),
+      dual_section_by_sector AS (
+        SELECT
+          gics_sector,
+          COUNTIF(has_both_sections) AS profiles_with_both_sections
+        FROM profile_dual_sections
+        GROUP BY gics_sector
+      ),
+      total_dual_sections AS (
+        SELECT
+          COUNTIF(has_both_sections) AS total_profiles_with_both_sections
+        FROM profile_dual_sections
+      ),
       grouped_metrics AS (
         SELECT
           IF(GROUPING(cb.gics_sector) = 1, 'ALL_SECTORS', cb.gics_sector) AS gics_sector,
@@ -445,66 +465,74 @@ resource "google_bigquery_table" "v_chunk_health_metrics" {
           ) AS missing_metadata_count,
           MAX(cb.ingested_at) AS latest_ingested_at
         FROM chunk_base AS cb
-        GROUP BY ROLLUP(cb.gics_sector, cb.section_id)
+        GROUP BY GROUPING SETS (
+          (cb.gics_sector, cb.section_id),
+          (cb.gics_sector),
+          (cb.section_id),
+          ()
+        )
+      ),
+      enriched AS (
+        SELECT
+          g.*,
+          IF(g.gics_sector = 'ALL_SECTORS', te.total_expected_profiles, ef.expected_profiles) AS expected_profiles,
+          CASE
+            WHEN g.section_id != 'ALL_SECTIONS' THEN g.distinct_profiles
+            WHEN g.gics_sector = 'ALL_SECTORS' THEN COALESCE(td.total_profiles_with_both_sections, 0)
+            ELSE COALESCE(ds.profiles_with_both_sections, 0)
+          END AS profiles_with_both_sections
+        FROM grouped_metrics AS g
+        CROSS JOIN total_expected AS te
+        CROSS JOIN total_dual_sections AS td
+        LEFT JOIN expected_filings AS ef
+          ON g.gics_sector = ef.gics_sector
+        LEFT JOIN dual_section_by_sector AS ds
+          ON g.gics_sector = ds.gics_sector
       )
       SELECT
-        g.gics_sector,
-        g.section_id,
-        g.total_chunks,
-        g.distinct_profiles,
-        g.distinct_tickers,
-        IF(g.gics_sector = 'ALL_SECTORS', te.total_expected_profiles, ef.expected_profiles) AS expected_profiles,
-        GREATEST(
-          0,
-          COALESCE(IF(g.gics_sector = 'ALL_SECTORS', te.total_expected_profiles, ef.expected_profiles), 0) - g.distinct_profiles
-        ) AS missing_profiles_count,
+        e.gics_sector,
+        e.section_id,
+        e.total_chunks,
+        e.distinct_profiles,
+        e.distinct_tickers,
+        e.expected_profiles,
+        e.profiles_with_both_sections,
+        GREATEST(0, COALESCE(e.expected_profiles, 0) - e.distinct_profiles) AS missing_profiles_count,
+        GREATEST(0, COALESCE(e.expected_profiles, 0) - e.profiles_with_both_sections) AS missing_section_filings,
+        ROUND(SAFE_DIVIDE(e.distinct_profiles, e.expected_profiles), 4) AS filing_coverage_ratio,
+        ROUND(SAFE_DIVIDE(e.profiles_with_both_sections, e.expected_profiles), 4) AS full_section_coverage_ratio,
+        e.valid_embedding_count,
+        e.missing_embedding_count,
+        e.dimension_mismatch_count,
+        e.embedding_coverage_ratio,
+        e.avg_char_count,
+        e.avg_token_estimate,
+        e.min_token_estimate,
+        e.max_token_estimate,
+        e.p50_token_estimate,
+        e.p95_token_estimate,
+        e.undersized_chunk_count,
+        e.oversized_chunk_count,
+        e.missing_metadata_count,
+        e.latest_ingested_at,
         ROUND(
-          SAFE_DIVIDE(
-            g.distinct_profiles,
-            IF(g.gics_sector = 'ALL_SECTORS', te.total_expected_profiles, ef.expected_profiles)
-          ),
-          4
-        ) AS filing_coverage_ratio,
-        g.valid_embedding_count,
-        g.missing_embedding_count,
-        g.dimension_mismatch_count,
-        g.embedding_coverage_ratio,
-        g.avg_char_count,
-        g.avg_token_estimate,
-        g.min_token_estimate,
-        g.max_token_estimate,
-        g.p50_token_estimate,
-        g.p95_token_estimate,
-        g.undersized_chunk_count,
-        g.oversized_chunk_count,
-        g.missing_metadata_count,
-        g.latest_ingested_at,
-        ROUND(
-          45.0 * COALESCE(g.embedding_coverage_ratio, 0.0)
-          + 30.0 * COALESCE(
-              SAFE_DIVIDE(
-                g.distinct_profiles,
-                IF(g.gics_sector = 'ALL_SECTORS', te.total_expected_profiles, ef.expected_profiles)
-              ),
-              0.0
-            )
-          + 15.0 * (1.0 - LEAST(1.0, SAFE_DIVIDE(g.undersized_chunk_count + g.oversized_chunk_count, g.total_chunks)))
-          + 10.0 * (1.0 - LEAST(1.0, SAFE_DIVIDE(g.missing_metadata_count, g.total_chunks))),
+          45.0 * COALESCE(e.embedding_coverage_ratio, 0.0)
+          + 15.0 * COALESCE(SAFE_DIVIDE(e.distinct_profiles, e.expected_profiles), 0.0)
+          + 15.0 * COALESCE(SAFE_DIVIDE(e.profiles_with_both_sections, e.expected_profiles), 0.0)
+          + 15.0 * (1.0 - LEAST(1.0, SAFE_DIVIDE(e.undersized_chunk_count + e.oversized_chunk_count, e.total_chunks)))
+          + 10.0 * (1.0 - LEAST(1.0, SAFE_DIVIDE(e.missing_metadata_count, e.total_chunks))),
           2
         ) AS health_score,
         CASE
-          WHEN g.total_chunks = 0 THEN 'UNHEALTHY'
-          WHEN g.embedding_coverage_ratio >= 0.99
-               AND SAFE_DIVIDE(g.distinct_profiles, IF(g.gics_sector = 'ALL_SECTORS', te.total_expected_profiles, ef.expected_profiles)) >= 0.95
-               AND (g.undersized_chunk_count + g.oversized_chunk_count + g.missing_metadata_count) = 0
+          WHEN e.total_chunks = 0 THEN 'UNHEALTHY'
+          WHEN e.embedding_coverage_ratio >= 0.99
+               AND SAFE_DIVIDE(e.profiles_with_both_sections, e.expected_profiles) >= 0.95
+               AND (e.undersized_chunk_count + e.oversized_chunk_count + e.missing_metadata_count) = 0
             THEN 'HEALTHY'
-          WHEN g.embedding_coverage_ratio >= 0.90 THEN 'DEGRADED'
+          WHEN e.embedding_coverage_ratio >= 0.90 THEN 'DEGRADED'
           ELSE 'UNHEALTHY'
         END AS health_status
-      FROM grouped_metrics AS g
-      CROSS JOIN total_expected AS te
-      LEFT JOIN expected_filings AS ef
-        ON g.gics_sector = ef.gics_sector
+      FROM enriched AS e
     SQL
   }
 }

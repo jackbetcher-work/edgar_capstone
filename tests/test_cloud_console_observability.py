@@ -193,6 +193,57 @@ def test_llm_observability_dashboard_mosaic_geometry_and_panels() -> None:
     )
 
 
+def test_chunk_health_dashboard_mosaic_geometry_and_accuracy_contracts() -> None:
+    mon = _tf("monitoring.tf")
+    bq = _tf("bigquery.tf")
+
+    # Dedicated filing-level metric descriptor keeps unit `{filings}` distinct from chunks.
+    filing_desc = _resource_block(
+        mon, r'resource\s+"google_monitoring_metric_descriptor"\s+"missing_section_filings"'
+    )
+    assert (
+        'type         = "custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings"'
+        in filing_desc
+    )
+    assert 'unit         = "{filings}"' in filing_desc
+
+    # Chunk health dashboard tiles fit the 12-column mosaic with zero overlap.
+    dash = _resource_block(
+        mon, r'resource\s+"google_monitoring_dashboard"\s+"chunk_health_dashboard"'
+    )
+    tiles = [
+        tuple(int(v) for v in m)
+        for m in re.findall(
+            r"xPos\s*=\s*(\d+)\s*yPos\s*=\s*(\d+)\s*width\s*=\s*(\d+)\s*height\s*=\s*(\d+)", dash
+        )
+    ]
+    assert len(tiles) >= 11
+    cells: set[tuple[int, int]] = set()
+    for x, y, w, h in tiles:
+        assert w > 0 and h > 0 and x + w <= 12, (x, y, w, h)
+        tile_cells = {(cx, cy) for cx in range(x, x + w) for cy in range(y, y + h)}
+        assert not (cells & tile_cells), f"Overlapping chunk health dashboard tile {(x, y, w, h)}"
+        cells |= tile_cells
+
+    # Regression guard: chunk health gauges must use ALIGN_NEXT_OLDER (never ALIGN_MAX on
+    # anomalies, which previously surfaced stale historical 47-filing spikes after recovery).
+    assert "ALIGN_NEXT_OLDER" in dash
+    assert "custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings" in dash
+    assert 'metric.labels.anomaly_type!=\\"missing_section_filings\\"' in dash
+    anomaly_section = dash[dash.index("anomaly_chunk_count") : dash.index("token_count_mean")]
+    assert "ALIGN_MAX" not in anomaly_section
+    assert '"LINE"' in anomaly_section
+
+    # BigQuery `v_chunk_health_metrics` tracks dual-section completeness and all grouping sets.
+    view_block = _resource_block(
+        bq, r'resource\s+"google_bigquery_table"\s+"v_chunk_health_metrics"'
+    )
+    assert "GROUP BY GROUPING SETS" in view_block
+    assert "profiles_with_both_sections" in view_block
+    assert "missing_section_filings" in view_block
+    assert "full_section_coverage_ratio" in view_block
+
+
 # ---------------------------------------------------------------------------
 # 4. Isolated ops_logs BigQuery dataset & least-privilege IAM prohibition
 # ---------------------------------------------------------------------------

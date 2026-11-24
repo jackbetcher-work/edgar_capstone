@@ -20,10 +20,12 @@ import {
   logoutAuthenticatedSession,
 } from './services/authService'
 import {
+  deleteChatSession,
   executeConversationalRagQueryStream,
   fetchCached10kSection,
   fetchCompaniesCatalog,
   postAnalystFeedback,
+  resetClientSession,
 } from './services/edgarApi'
 import type {
   AuthDiscoveryConfig,
@@ -279,6 +281,7 @@ export function App() {
       return
     }
     await logoutAuthenticatedSession()
+    resetClientSession()
     setAuthenticatedUser(null)
     setTurns([])
     setActiveCitations([])
@@ -493,6 +496,15 @@ export function App() {
   }
 
   const handleResetConversation = () => {
+    const hadTurns = turns.length > 0
+    const previousSessionId = resetClientSession()
+    if (hadTurns) {
+      void deleteChatSession(previousSessionId).catch((err) => {
+        if (err instanceof ApiAuthError) {
+          handleApiAuthFailure(err)
+        }
+      })
+    }
     setTurns([])
     setActiveCitations([])
     setActiveChunkId(null)

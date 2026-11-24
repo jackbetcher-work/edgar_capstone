@@ -316,3 +316,177 @@ def test_chat_turn_issues_only_one_firestore_get_and_one_patch_even_past_refresh
         assert resp["status"] == "success"
         assert resp["context_and_memory"]["session_memory"]["persistence"]["turn_count"] == turn_num
         assert [m for m, _ in calls] == ["GET", "PATCH"]
+
+
+def test_session_memory_clears_tickers_on_sector_switch_and_isolates_topic_epochs() -> None:
+    """Switching from tickers to a sector clears stale tickers, advances topic_epoch, and isolates memory."""
+    transport, _docs, _calls = _mock_firestore_transport()
+    cfg = TelemetryConfig(
+        telemetry_backend="local",
+        feedback_backend="gcp",
+        project_id="iron-radio-514217-q7",
+    )
+    store_1 = FirestoreSessionStore(
+        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
+    )
+    store_2 = FirestoreSessionStore(
+        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
+    )
+    mgr_1 = ConversationMemoryManager(session_store=store_1, refresh_ttl_seconds=0.0)
+    mgr_2 = ConversationMemoryManager(session_store=store_2, refresh_ttl_seconds=0.0)
+
+    # Turn 1: Single-company Eli Lilly turn (epoch 0)
+    mgr_1.record_turn(
+        session_id="subject-switch-sess",
+        user_id="alice@corp",
+        query="Analyze Eli Lilly revenue FY2024-FY2026",
+        intent="longitudinal_single_company",
+        tickers=["LLY"],
+        gics_sector="Health Care",
+        start_year=2024,
+        end_year=2026,
+        variance_highlights=["LLY revenue +40%"],
+        topic_epoch=0,
+    )
+    rec1 = mgr_2.recall_session_context("subject-switch-sess", user_id="alice@corp")
+    assert rec1["remembered_tickers"] == ["LLY"]
+    assert rec1["last_gics_sector"] == "ALL"
+    assert rec1["topic_epoch"] == 0
+    assert "LLY" in rec1["memory_summary_text"]
+
+    # Turn 2: Switch to Industrials sector (epoch 1) -> stale LLY ticker is cleared and excluded from summary
+    mgr_1.record_turn(
+        session_id="subject-switch-sess",
+        user_id="alice@corp",
+        query="How are Industrials companies discussing supply chain risks?",
+        intent="thematic_trend_tracking",
+        tickers=[],
+        gics_sector="Industrials",
+        start_year=2024,
+        end_year=2026,
+        variance_highlights=["Industrials supply chain risk increased"],
+        topic_epoch=1,
+    )
+    rec2 = mgr_2.recall_session_context("subject-switch-sess", user_id="alice@corp")
+    assert rec2["remembered_tickers"] == []
+    assert rec2["last_gics_sector"] == "Industrials"
+    assert rec2["topic_epoch"] == 1
+    assert "Industrials" in rec2["memory_summary_text"]
+    assert "LLY" not in rec2["memory_summary_text"]
+
+    # Deleting the logical session evicts both epoch 0 and topic-suffixed ADK sessions
+    mgr_1.adk_session_service.sessions["edgar_chat_app"] = {
+        "alice@corp": {
+            "subject-switch-sess": object(),
+            "subject-switch-sess::topic-1": object(),
+            "other-session": object(),
+        }
+    }
+    assert mgr_1.delete_session("subject-switch-sess", user_id="alice@corp") is True
+    remaining = mgr_1.adk_session_service.sessions["edgar_chat_app"]["alice@corp"]
+    assert "subject-switch-sess" not in remaining
+    assert "subject-switch-sess::topic-1" not in remaining
+    assert "other-session" in remaining
+
+
+def test_subject_change_isolates_adk_session_and_omits_stale_memory_prompt(
+    fake_gcp_adapters: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end subject switch isolates ADK session epoch, omits old memory from prompt, and carries new sector."""
+    from edgar_capstone.agents.orchestration import chat_engine
+    from edgar_capstone.agents.runtime import live_runtime
+    from tests.structured_report_helpers import ScriptedAnalystLlm
+
+    mgr = ConversationMemoryManager(
+        session_store=FirestoreSessionStore(
+            TelemetryConfig(telemetry_backend="local", feedback_backend="local")
+        )
+    )
+    monkeypatch.setattr(chat_engine, "get_conversation_memory_manager", lambda: mgr)
+    monkeypatch.setattr(live_runtime, "get_conversation_memory_manager", lambda: mgr)
+
+    seen_prompts: list[str] = []
+
+    class _CapturingLlm(ScriptedAnalystLlm):
+        async def generate_content_async(self, llm_request: Any, stream: bool = False):
+            prompt_chunks = [
+                getattr(p, "text", "")
+                for c in (llm_request.contents or [])
+                for p in (getattr(c, "parts", None) or [])
+                if getattr(p, "text", None)
+            ]
+            seen_prompts.append("\n".join(prompt_chunks))
+            async for item in super().generate_content_async(llm_request, stream=stream):
+                yield item
+
+    # Turn 1: NVDA (epoch 0)
+    t1 = chat_engine.run_conversational_rag_turn(
+        query="Analyze NVIDIA's revenue from 2024 to 2026",
+        session_id="topic-iso-sess",
+        user_id="analyst@fde-workspace.corp",
+        reasoning_llm=_CapturingLlm(headline="NVDA revenue summary.", intent="longitudinal_single_company"),
+        skip_background_judge=True,
+    )
+    assert t1["status"] == "success"
+    assert t1["resolved_scope"]["tickers"] == ["NVDA"]
+    assert t1["resolved_scope"]["subject_changed"] is False
+    assert t1["resolved_scope"]["topic_epoch"] == 0
+
+    # Turn 2: Switch to AAPL (disjoint ticker -> subject_changed=True, topic_epoch=1)
+    seen_prompts.clear()
+    t2 = chat_engine.run_conversational_rag_turn(
+        query="Analyze Apple's revenue from 2024 to 2026",
+        session_id="topic-iso-sess",
+        user_id="analyst@fde-workspace.corp",
+        reasoning_llm=_CapturingLlm(headline="AAPL revenue summary.", intent="longitudinal_single_company"),
+        skip_background_judge=True,
+    )
+    assert t2["status"] == "success"
+    assert t2["resolved_scope"]["tickers"] == ["AAPL"]
+    assert t2["resolved_scope"]["subject_changed"] is True
+    assert t2["resolved_scope"]["topic_epoch"] == 1
+    assert seen_prompts
+    assert "## Recalled Conversational Session Memory" not in seen_prompts[0]
+    assert "NVIDIA" not in seen_prompts[0]
+
+    # Verify ADK created a separate epoch-1 session instead of reusing epoch-0 NVDA history,
+    # while LLM telemetry records still carry the logical session_id for BigQuery joins.
+    adk_user_sessions = mgr.adk_session_service.sessions["edgar_chat_app"][
+        "analyst@fde-workspace.corp"
+    ]
+    assert "topic-iso-sess" in adk_user_sessions
+    assert "topic-iso-sess::topic-1" in adk_user_sessions
+    t2_llm_records = t2["context_and_memory"]["model_call_records"]
+    assert t2_llm_records and all(r["session_id"] == "topic-iso-sess" for r in t2_llm_records)
+
+    # Turn 3: Switch to Information Technology sector (clears remembered_tickers, epoch 2)
+    seen_prompts.clear()
+    t3 = chat_engine.run_conversational_rag_turn(
+        query="How are tech sector companies discussing AI risks?",
+        session_id="topic-iso-sess",
+        user_id="analyst@fde-workspace.corp",
+        reasoning_llm=_CapturingLlm(headline="Tech sector AI risk summary.", intent="thematic_trend_tracking"),
+        skip_background_judge=True,
+    )
+    assert t3["status"] == "success"
+    assert t3["resolved_scope"]["tickers"] == []
+    assert t3["resolved_scope"]["gics_sector"] == "Information Technology"
+    assert t3["resolved_scope"]["subject_changed"] is True
+    assert t3["resolved_scope"]["topic_epoch"] == 2
+    assert "## Recalled Conversational Session Memory" not in seen_prompts[0]
+
+    # Turn 4: Follow-up inherits Information Technology sector (never snaps back to AAPL or NVDA!)
+    t4 = chat_engine.run_conversational_rag_turn(
+        query="What about export control risks?",
+        session_id="topic-iso-sess",
+        user_id="analyst@fde-workspace.corp",
+        reasoning_llm=_CapturingLlm(headline="Tech sector export risk summary.", intent="thematic_trend_tracking"),
+        skip_background_judge=True,
+    )
+    assert t4["status"] == "success"
+    assert t4["resolved_scope"]["tickers"] == []
+    assert t4["resolved_scope"]["gics_sector"] == "Information Technology"
+    assert t4["resolved_scope"]["memory_inherited"] is True
+    assert t4["resolved_scope"]["subject_changed"] is False
+    assert t4["resolved_scope"]["topic_epoch"] == 2

@@ -1168,12 +1168,8 @@ def validate_query_scope_and_coverage(
     has_tickers = bool(known_tickers)
     has_sector = scope.get("gics_sector", "ALL") not in ("ALL", "", None)
     is_broad_corpus = bool(_BROAD_CORPUS_PHRASE_RE.search(query))
-    has_memory = bool(
-        isinstance(memory_context, dict)
-        and memory_context.get("has_prior_memory")
-        and memory_context.get("remembered_tickers")
-    )
-    if not has_tickers and not has_sector and not is_broad_corpus and not has_memory:
+    memory_inherited = bool(scope.get("memory_inherited"))
+    if not has_tickers and not has_sector and not is_broad_corpus and not memory_inherited:
         return _validation_result(
             action="clarification",
             reason="ambiguous_scope",

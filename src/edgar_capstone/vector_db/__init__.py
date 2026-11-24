@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         CloudMonitoringHealthPublisher,
         build_cloud_monitoring_timeseries,
         evaluate_chunk_health,
+        evaluate_chunk_health_from_bigquery,
         format_structured_health_log,
     )
     from edgar_capstone.vector_db.pipeline import (
@@ -66,6 +67,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "chunk_filing_document": ("edgar_capstone.vector_db.chunker", "chunk_filing_document"),
     "estimate_token_count": ("edgar_capstone.vector_db.chunker", "estimate_token_count"),
     "evaluate_chunk_health": ("edgar_capstone.vector_db.monitoring", "evaluate_chunk_health"),
+    "evaluate_chunk_health_from_bigquery": (
+        "edgar_capstone.vector_db.monitoring",
+        "evaluate_chunk_health_from_bigquery",
+    ),
     "extract_sections_from_combined_markdown": (
         "edgar_capstone.vector_db.chunker",
         "extract_sections_from_combined_markdown",
@@ -105,6 +110,7 @@ __all__ = [
     "chunk_filing_document",
     "estimate_token_count",
     "evaluate_chunk_health",
+    "evaluate_chunk_health_from_bigquery",
     "extract_sections_from_combined_markdown",
     "format_structured_health_log",
     "populate_chunk_embeddings",

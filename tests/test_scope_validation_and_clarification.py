@@ -566,3 +566,105 @@ def test_fuzzy_company_name_resolution_handles_typos_without_false_positives() -
     assert found_oos == []
     assert any("rivian" in u.lower() for u in unknown_oos)
     assert any("snowflake" in u.lower() for u in unknown_oos)
+
+
+def test_subject_change_detection_sector_inheritance_and_clarification_gate() -> None:
+    """Layer 1 scope transitions track subject_changed/topic_epoch, inherit sectors, and honor clarification."""
+    catalog = EntityCatalog(_sample_profiles())
+    nvda_mem = {
+        "has_prior_memory": True,
+        "remembered_tickers": ["NVDA"],
+        "last_start_year": 2024,
+        "last_end_year": 2026,
+        "last_gics_sector": "ALL",
+        "topic_epoch": 0,
+    }
+
+    # Same ticker or overlapping peer comparison keeps topic epoch
+    same = resolve_query_scope(
+        query="What drove NVIDIA's R&D spend in FY2025?",
+        memory_context=nvda_mem,
+        catalog=catalog,
+    )
+    assert same["tickers"] == ["NVDA"]
+    assert same["subject_changed"] is False
+    assert same["topic_epoch"] == 0
+
+    peer = resolve_query_scope(
+        query="Compare NVIDIA and Apple revenue growth",
+        memory_context=nvda_mem,
+        catalog=catalog,
+    )
+    assert set(peer["tickers"]) == {"NVDA", "AAPL"}
+    assert peer["subject_changed"] is False
+    assert peer["topic_epoch"] == 0
+
+    # Disjoint company, sector switch, or broad corpus switch marks subject_changed and increments epoch
+    disjoint = resolve_query_scope(
+        query="Analyze Costco revenue growth from 2024 to 2025",
+        memory_context=nvda_mem,
+        catalog=catalog,
+    )
+    assert disjoint["tickers"] == ["COST"]
+    assert disjoint["subject_changed"] is True
+    assert disjoint["topic_epoch"] == 1
+
+    sector_switch = resolve_query_scope(
+        query="How did risk factors evolve across utilities companies?",
+        memory_context=nvda_mem,
+        catalog=catalog,
+    )
+    assert sector_switch["tickers"] == []
+    assert sector_switch["gics_sector"] == "Utilities"
+    assert sector_switch["subject_changed"] is True
+    assert sector_switch["topic_epoch"] == 1
+
+    corpus_switch = resolve_query_scope(
+        query="Across all S&P 500 companies, how did tariff wording change?",
+        memory_context=nvda_mem,
+        catalog=catalog,
+    )
+    assert corpus_switch["tickers"] == []
+    assert corpus_switch["gics_sector"] == "ALL"
+    assert corpus_switch["subject_changed"] is True
+    assert corpus_switch["topic_epoch"] == 1
+
+    # Sector-scoped memory is inherited on follow-up when remembered_tickers is empty
+    sector_mem = {
+        "has_prior_memory": True,
+        "remembered_tickers": [],
+        "last_start_year": 2024,
+        "last_end_year": 2025,
+        "last_gics_sector": "Utilities",
+        "topic_epoch": 1,
+    }
+    sector_followup = resolve_query_scope(
+        query="Which companies saw the largest risk factor expansion?",
+        memory_context=sector_mem,
+        catalog=catalog,
+    )
+    assert sector_followup["tickers"] == []
+    assert sector_followup["gics_sector"] == "Utilities"
+    assert sector_followup["memory_inherited"] is True
+    assert sector_followup["subject_changed"] is False
+    assert sector_followup["topic_epoch"] == 1
+
+    # Clarification gate MUST NOT be bypassed by stale prior memory when memory_inherited is False
+    unresolved_scope = {
+        "tickers": [],
+        "gics_sector": "ALL",
+        "section_id": "ALL",
+        "start_year": 2024,
+        "end_year": 2026,
+        "memory_inherited": False,
+    }
+    val = validate_query_scope_and_coverage(
+        query="What about the defense industry?",
+        scope=unresolved_scope,
+        explicit_tickers=[],
+        unknown_entities=[],
+        catalog=catalog,
+        memory_context=nvda_mem,
+    )
+    assert val["action"] == "clarification"
+    assert val["reason"] == "ambiguous_scope"

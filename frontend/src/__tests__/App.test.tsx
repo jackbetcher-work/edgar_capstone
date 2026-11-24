@@ -634,4 +634,50 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
     expect(await screen.findByText(/SEC XBRL NUMERIC PROVENANCE/i)).toBeTruthy()
     expect(screen.getByText('0001045810-26-000021')).toBeTruthy()
   })
+
+  it('rotates session_id and deletes the prior backend session when clicking Clear', async () => {
+    const seenChatSessionIds: string[] = []
+    const deletedSessionPaths: string[] = []
+
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (url.includes('/api/v1/auth/config')) return json(AUTH_CONFIG_OPEN)
+      if (url.includes('/api/v1/companies')) return json(COMPANIES_CATALOG)
+      if (url.includes('/api/v1/chat/stream')) {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { session_id?: string }
+        if (body.session_id) seenChatSessionIds.push(body.session_id)
+        return json(CHAT_RESPONSE)
+      }
+      if (url.includes('/api/v1/sessions/') && method === 'DELETE') {
+        deletedSessionPaths.push(url)
+        return json({ status: 'deleted' })
+      }
+      return json({}, 404)
+    })
+
+    render(<App />)
+
+    const cmdInput = await screen.findByLabelText(
+      /Ask a natural language financial or SEC 10-K question/i
+    )
+    fireEvent.change(cmdInput, { target: { value: 'Analyze Eli Lilly revenue' } })
+    fireEvent.click(screen.getByRole('button', { name: /^<GO>$/ }))
+    expect(await screen.findByText('Peer Comparison')).toBeTruthy()
+    expect(seenChatSessionIds).toHaveLength(1)
+
+    fireEvent.click(screen.getByTitle('Clear current terminal blotter'))
+
+    await waitFor(() => {
+      expect(deletedSessionPaths).toEqual([
+        `/api/v1/sessions/${encodeURIComponent(seenChatSessionIds[0])}`,
+      ])
+    })
+
+    fireEvent.change(cmdInput, { target: { value: 'Analyze Lockheed Martin revenue' } })
+    fireEvent.click(screen.getByRole('button', { name: /^<GO>$/ }))
+    expect(await screen.findByText('Peer Comparison')).toBeTruthy()
+    expect(seenChatSessionIds).toHaveLength(2)
+    expect(seenChatSessionIds[1]).not.toBe(seenChatSessionIds[0])
+  })
 })

@@ -593,3 +593,18 @@ variable "ops_logs_retention_days" {
     error_message = "ops_logs_retention_days must be >= 0."
   }
 }
+
+# ------------------------------------------------------------------------------
+# Periodic Chunk Health Publishing (monitoring.tf)
+# ------------------------------------------------------------------------------
+variable "enable_chunk_health_scheduler" {
+  description = "Provision a Cloud Run Job + Cloud Scheduler trigger that periodically evaluates BigQuery chunk health views and publishes fresh gauges to Cloud Monitoring and structured logs to Cloud Logging. Enable once the container image includes `publish-chunk-health`."
+  type        = bool
+  default     = false
+}
+
+variable "chunk_health_publish_schedule" {
+  description = "Cron schedule (UTC) for periodic BigQuery -> Cloud Monitoring chunk health metric publishing."
+  type        = string
+  default     = "0 */6 * * *"
+}

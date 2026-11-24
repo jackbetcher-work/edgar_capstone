@@ -148,7 +148,7 @@ resource "google_monitoring_metric_descriptor" "anomaly_chunk_count" {
   value_type   = "INT64"
   unit         = "{anomalies}"
   display_name = "SEC EDGAR Vector DB Chunk Anomaly Count"
-  description  = "Count of anomalous chunks by anomaly_type (missing_embedding, dimension_mismatch, undersized_chunk, oversized_chunk, missing_metadata)."
+  description  = "Count of anomalous chunks by anomaly_type (missing_embedding, dimension_mismatch, non_finite_embedding, undersized_chunk, oversized_chunk, missing_metadata)."
 
   labels {
     key         = "dataset_id"
@@ -169,6 +169,29 @@ resource "google_monitoring_metric_descriptor" "anomaly_chunk_count" {
   depends_on = [google_project_service.required_apis]
 }
 
+resource "google_monitoring_metric_descriptor" "missing_section_filings" {
+  project      = var.project_id
+  type         = "custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings"
+  metric_kind  = "GAUGE"
+  value_type   = "INT64"
+  unit         = "{filings}"
+  display_name = "SEC EDGAR Missing-Section 10-K Filings"
+  description  = "Number of curated 10-K filings (company-years) missing Item 1A, Item 7, or both in filing_chunks."
+
+  labels {
+    key         = "dataset_id"
+    value_type  = "STRING"
+    description = "BigQuery dataset ID"
+  }
+  labels {
+    key         = "table_id"
+    value_type  = "STRING"
+    description = "BigQuery chunks table ID"
+  }
+
+  depends_on = [google_project_service.required_apis]
+}
+
 # ------------------------------------------------------------------------------
 # Google Cloud Monitoring Dashboard — RAG Vector Database Chunk Health View
 # ------------------------------------------------------------------------------
@@ -180,11 +203,11 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
     mosaicLayout = {
       columns = 12
       tiles = [
-        # Row 1: KPI Scorecards (4 columns each)
+        # Row 1: KPI Scorecards (4 columns x 3 width each, using ALIGN_NEXT_OLDER for latest gauge value)
         {
           xPos   = 0
           yPos   = 0
-          width  = 4
+          width  = 3
           height = 4
           widget = {
             title = "Overall Chunk DB Health Score (0-100)"
@@ -194,7 +217,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
                   filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/health_score\" resource.type=\"global\""
                   aggregation = {
                     alignmentPeriod  = "300s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    perSeriesAligner = "ALIGN_NEXT_OLDER"
                   }
                 }
               }
@@ -220,9 +243,9 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
           }
         },
         {
-          xPos   = 4
+          xPos   = 3
           yPos   = 0
-          width  = 4
+          width  = 3
           height = 4
           widget = {
             title = "Embedding Coverage Ratio (768-d Valid)"
@@ -232,7 +255,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
                   filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/embedding_coverage_ratio\" resource.type=\"global\""
                   aggregation = {
                     alignmentPeriod  = "300s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    perSeriesAligner = "ALIGN_NEXT_OLDER"
                   }
                 }
               }
@@ -257,9 +280,9 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
           }
         },
         {
-          xPos   = 8
+          xPos   = 6
           yPos   = 0
-          width  = 4
+          width  = 3
           height = 4
           widget = {
             title = "10-K Dual-Section Filing Coverage (Item 1A + Item 7)"
@@ -269,7 +292,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
                   filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/filing_coverage_ratio\" resource.type=\"global\""
                   aggregation = {
                     alignmentPeriod  = "300s"
-                    perSeriesAligner = "ALIGN_MEAN"
+                    perSeriesAligner = "ALIGN_NEXT_OLDER"
                   }
                 }
               }
@@ -282,6 +305,43 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
                   value     = 0.95
                   color     = "YELLOW"
                   direction = "BELOW"
+                }
+              ]
+            }
+          }
+        },
+        {
+          xPos   = 9
+          yPos   = 0
+          width  = 3
+          height = 4
+          widget = {
+            title = "Missing-Section Filings (Company-Years)"
+            scorecard = {
+              timeSeriesQuery = {
+                timeSeriesFilter = {
+                  filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings\" resource.type=\"global\""
+                  aggregation = {
+                    alignmentPeriod  = "300s"
+                    perSeriesAligner = "ALIGN_NEXT_OLDER"
+                  }
+                }
+              }
+              sparkChartView = {
+                sparkChartType = "SPARK_LINE"
+              }
+              thresholds = [
+                {
+                  label     = "Missing Sections"
+                  value     = 0.0
+                  color     = "YELLOW"
+                  direction = "ABOVE"
+                },
+                {
+                  label     = "Elevated Missing Sections"
+                  value     = 10.0
+                  color     = "RED"
+                  direction = "ABOVE"
                 }
               ]
             }
@@ -306,7 +366,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
                       filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/total_chunks\" resource.type=\"global\" metric.labels.section_id=\"all\""
                       aggregation = {
                         alignmentPeriod    = "300s"
-                        perSeriesAligner   = "ALIGN_MAX"
+                        perSeriesAligner   = "ALIGN_NEXT_OLDER"
                         crossSeriesReducer = "REDUCE_SUM"
                         groupByFields      = ["metric.label.gics_sector"]
                       }
@@ -338,7 +398,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
                       filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/total_chunks\" resource.type=\"global\" metric.labels.gics_sector=\"all\""
                       aggregation = {
                         alignmentPeriod    = "300s"
-                        perSeriesAligner   = "ALIGN_MAX"
+                        perSeriesAligner   = "ALIGN_NEXT_OLDER"
                         crossSeriesReducer = "REDUCE_SUM"
                         groupByFields      = ["metric.label.section_id"]
                       }
@@ -354,7 +414,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
           }
         },
 
-        # Row 3: Chunk Anomaly Breakdown & Mean Token Size by Section
+        # Row 3: Chunk-Level Anomalies (excluding filing-level metric) & Mean Token Size by Section
         {
           xPos   = 0
           yPos   = 8
@@ -365,14 +425,14 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
             xyChart = {
               dataSets = [
                 {
-                  plotType       = "STACKED_BAR"
+                  plotType       = "LINE"
                   legendTemplate = "$${metric.labels.anomaly_type}"
                   timeSeriesQuery = {
                     timeSeriesFilter = {
-                      filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/anomaly_chunk_count\" resource.type=\"global\""
+                      filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/anomaly_chunk_count\" resource.type=\"global\" metric.labels.anomaly_type!=\"missing_section_filings\""
                       aggregation = {
                         alignmentPeriod    = "300s"
-                        perSeriesAligner   = "ALIGN_MAX"
+                        perSeriesAligner   = "ALIGN_NEXT_OLDER"
                         crossSeriesReducer = "REDUCE_SUM"
                         groupByFields      = ["metric.label.anomaly_type"]
                       }
@@ -404,7 +464,7 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
                       filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/token_count_mean\" resource.type=\"global\""
                       aggregation = {
                         alignmentPeriod    = "300s"
-                        perSeriesAligner   = "ALIGN_MEAN"
+                        perSeriesAligner   = "ALIGN_NEXT_OLDER"
                         crossSeriesReducer = "REDUCE_MEAN"
                         groupByFields      = ["metric.label.section_id"]
                       }
@@ -420,11 +480,58 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
           }
         },
 
-        # Row 4: BigQuery Vector Search Query Volume & Structured Health Logs
+        # Row 4: Missing-Section Filings Trend (filing-level unit) & Structured Health Evaluation Logs
         {
           xPos   = 0
           yPos   = 12
           width  = 6
+          height = 4
+          widget = {
+            title = "Missing-Section 10-K Filings Over Time (Company-Years)"
+            xyChart = {
+              dataSets = [
+                {
+                  plotType       = "LINE"
+                  legendTemplate = "missing_section_filings"
+                  timeSeriesQuery = {
+                    timeSeriesFilter = {
+                      filter = "metric.type=\"custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings\" resource.type=\"global\""
+                      aggregation = {
+                        alignmentPeriod  = "300s"
+                        perSeriesAligner = "ALIGN_NEXT_OLDER"
+                      }
+                    }
+                  }
+                }
+              ]
+              yAxis = {
+                label = "Missing-Section Filings"
+                scale = "LINEAR"
+              }
+            }
+          }
+        },
+        {
+          xPos   = 6
+          yPos   = 12
+          width  = 6
+          height = 4
+          widget = {
+            title = "Vector Database Chunk Health Evaluation Logs"
+            logsPanel = {
+              filter = "jsonPayload.event_type=\"sec_edgar_chunk_health_evaluation\""
+              resourceNames = [
+                "projects/${var.project_id}"
+              ]
+            }
+          }
+        },
+
+        # Row 5: BigQuery Vector Search Query Volume
+        {
+          xPos   = 0
+          yPos   = 16
+          width  = 12
           height = 4
           widget = {
             title = "BigQuery Dataset Query Execution Count (sec_edgar)"
@@ -450,26 +557,11 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
             }
           }
         },
-        {
-          xPos   = 6
-          yPos   = 12
-          width  = 6
-          height = 4
-          widget = {
-            title = "Vector Database Chunk Health Evaluation Logs"
-            logsPanel = {
-              filter = "jsonPayload.event_type=\"sec_edgar_chunk_health_evaluation\""
-              resourceNames = [
-                "projects/${var.project_id}"
-              ]
-            }
-          }
-        },
 
-        # Row 5: API Request Latency (p50 / p95 / p99 from structured access logs)
+        # Row 6: API Request Latency (p50 / p95 / p99 from structured access logs)
         {
           xPos   = 0
-          yPos   = 16
+          yPos   = 20
           width  = 12
           height = 4
           widget = {
@@ -540,6 +632,105 @@ resource "google_monitoring_dashboard" "chunk_health_dashboard" {
     google_monitoring_metric_descriptor.total_chunks,
     google_monitoring_metric_descriptor.token_count_mean,
     google_monitoring_metric_descriptor.anomaly_chunk_count,
+    google_monitoring_metric_descriptor.missing_section_filings,
     google_logging_metric.api_request_latencies,
+  ]
+}
+
+# ------------------------------------------------------------------------------
+# Periodic Chunk Health Publisher (Cloud Run Job + Cloud Scheduler)
+# ------------------------------------------------------------------------------
+# Evaluates live BigQuery views (`v_chunk_health_metrics` and `v_filing_chunk_coverage`)
+# on a schedule and writes fresh Cloud Monitoring gauges + Cloud Logging entries so the
+# chunk health dashboard stays populated across short (1h / 6h / 1d) windows.
+resource "google_cloud_run_v2_job" "chunk_health_publisher" {
+  count = var.enable_chunk_health_scheduler ? 1 : 0
+
+  project             = var.project_id
+  name                = "${var.cloud_run_service_name}-chunk-health-publisher"
+  location            = var.region
+  deletion_protection = false
+  labels              = var.labels
+
+  template {
+    template {
+      service_account = local.runtime_service_account_email
+      max_retries     = 1
+      timeout         = "300s"
+
+      containers {
+        image   = var.cloud_run_initial_image
+        command = ["publish-chunk-health"]
+
+        resources {
+          limits = {
+            cpu    = "1"
+            memory = "512Mi"
+          }
+        }
+
+        env {
+          name  = "GCP_PROJECT_ID"
+          value = var.project_id
+        }
+        env {
+          name  = "GOOGLE_CLOUD_PROJECT"
+          value = var.project_id
+        }
+        env {
+          name  = "GCP_REGION"
+          value = var.region
+        }
+        env {
+          name  = "BIGQUERY_DATASET_ID"
+          value = var.dataset_id
+        }
+      }
+    }
+  }
+
+  lifecycle {
+    ignore_changes = [
+      template[0].template[0].containers[0].image,
+      labels["commit_sha"],
+      labels["deployed_by"],
+    ]
+  }
+
+  depends_on = [google_project_service.required_apis]
+}
+
+resource "google_cloud_run_v2_job_iam_member" "chunk_health_scheduler_invoker" {
+  count = var.enable_chunk_health_scheduler ? 1 : 0
+
+  project  = var.project_id
+  location = var.region
+  name     = google_cloud_run_v2_job.chunk_health_publisher[0].name
+  role     = "roles/run.invoker"
+  member   = "serviceAccount:${local.runtime_service_account_email}"
+}
+
+resource "google_cloud_scheduler_job" "chunk_health_publisher" {
+  count = var.enable_chunk_health_scheduler ? 1 : 0
+
+  project     = var.project_id
+  region      = var.region
+  name        = "${var.cloud_run_service_name}-chunk-health-heartbeat"
+  description = "Periodically evaluates BigQuery chunk health views and publishes fresh Cloud Monitoring gauges + Cloud Logging telemetry."
+  schedule    = var.chunk_health_publish_schedule
+  time_zone   = "Etc/UTC"
+
+  http_target {
+    http_method = "POST"
+    uri         = "https://${var.region}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${var.project_id}/jobs/${google_cloud_run_v2_job.chunk_health_publisher[0].name}:run"
+
+    oauth_token {
+      service_account_email = local.runtime_service_account_email
+    }
+  }
+
+  depends_on = [
+    google_project_service.required_apis,
+    google_cloud_run_v2_job_iam_member.chunk_health_scheduler_invoker,
   ]
 }

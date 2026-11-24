@@ -467,6 +467,7 @@ def run_vector_db_pipeline(
             publisher = monitoring_publisher or CloudMonitoringHealthPublisher(
                 project_id=config.project_id,
                 http_client=http_client,
+                write_cloud_logging=True,
             )
             try:
                 publisher.publish_report(health_report)

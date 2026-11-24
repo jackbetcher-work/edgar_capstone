@@ -14,6 +14,7 @@ locals {
     "bigquerystorage.googleapis.com",
     "cloudbuild.googleapis.com",
     "cloudidentity.googleapis.com",
+    "cloudscheduler.googleapis.com",
     "cloudtrace.googleapis.com",
     "compute.googleapis.com",
     "discoveryengine.googleapis.com",

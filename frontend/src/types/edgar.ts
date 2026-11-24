@@ -230,6 +230,8 @@ export interface ResolvedQueryScope {
   start_year: number
   end_year: number
   memory_inherited?: boolean
+  subject_changed?: boolean
+  topic_epoch?: number
 }
 
 export interface ReActStepMetadata {

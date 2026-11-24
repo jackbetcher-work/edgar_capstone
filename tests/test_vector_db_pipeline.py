@@ -283,10 +283,19 @@ def test_chunk_health_evaluation_and_cloud_monitoring_export() -> None:
     assert "custom.googleapis.com/sec_edgar/chunk_health/total_chunks" in metric_types
     assert "custom.googleapis.com/sec_edgar/chunk_health/token_count_mean" in metric_types
     assert "custom.googleapis.com/sec_edgar/chunk_health/anomaly_chunk_count" in metric_types
+    assert "custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings" in metric_types
 
     structured_log = format_structured_health_log(healthy_report)
     assert structured_log["event_type"] == "sec_edgar_chunk_health_evaluation"
     assert structured_log["severity"] == "INFO"
+    assert structured_log["missing_section_filings"] == 0
+    assert structured_log["missing_profile_ids"] == []
+    assert structured_log["incomplete_section_profile_ids"] == []
+
+    anomaly_log = format_structured_health_log(anomaly_report, max_profile_ids=1)
+    assert anomaly_log["missing_section_filings"] == 1
+    assert anomaly_log["missing_profile_ids"] == ["MSFT_2026"]
+    assert anomaly_log["missing_profile_ids_truncated"] == 0
 
     captured_requests: list[dict] = []
 
@@ -697,3 +706,135 @@ def test_monitoring_edge_cases_embedder_retries_and_lazy_package_exports(
     )
     with pytest.raises(RuntimeError, match="returned 0 embeddings"):
         bad_count_emb.embed_texts(["one"])
+
+
+def test_evaluate_chunk_health_from_bigquery_and_cloud_logging_publish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies BigQuery-backed chunk health evaluation, Cloud Logging export, and CLI."""
+    from edgar_capstone.vector_db.monitoring import evaluate_chunk_health_from_bigquery
+    from scripts import publish_chunk_health
+
+    class _FakeBQClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        def table_ref(self, table_id: str) -> str:
+            return f"`iron-radio-514217-q7.sec_edgar.{table_id}`"
+
+        def run_query(self, sql: str, **_kwargs: object) -> list[dict[str, object]]:
+            self.queries.append(sql)
+            if "v_chunk_health_metrics" in sql:
+                return [
+                    {
+                        "gics_sector": "ALL_SECTORS",
+                        "section_id": "ALL_SECTIONS",
+                        "total_chunks": 200,
+                        "distinct_profiles": 9,
+                        "distinct_tickers": 5,
+                        "expected_profiles": 10,
+                        "profiles_with_both_sections": 8,
+                        "valid_embedding_count": 200,
+                        "missing_embedding_count": 0,
+                        "dimension_mismatch_count": 0,
+                        "embedding_coverage_ratio": 1.0,
+                        "avg_char_count": 1700.0,
+                        "avg_token_estimate": 395.0,
+                        "min_token_estimate": 50,
+                        "max_token_estimate": 900,
+                        "p50_token_estimate": 400.0,
+                        "p95_token_estimate": 550.0,
+                        "undersized_chunk_count": 0,
+                        "oversized_chunk_count": 0,
+                        "missing_metadata_count": 0,
+                    },
+                    {
+                        "gics_sector": "ALL_SECTORS",
+                        "section_id": "item_1a",
+                        "total_chunks": 90,
+                        "distinct_profiles": 9,
+                        "distinct_tickers": 5,
+                        "valid_embedding_count": 90,
+                        "embedding_coverage_ratio": 1.0,
+                        "avg_char_count": 1750.0,
+                        "avg_token_estimate": 400.0,
+                        "min_token_estimate": 60,
+                        "max_token_estimate": 850,
+                        "p50_token_estimate": 410.0,
+                        "p95_token_estimate": 540.0,
+                        "undersized_chunk_count": 0,
+                        "oversized_chunk_count": 0,
+                        "missing_metadata_count": 0,
+                    },
+                    {
+                        "gics_sector": "Information Technology",
+                        "section_id": "ALL_SECTIONS",
+                        "total_chunks": 200,
+                        "distinct_profiles": 9,
+                        "distinct_tickers": 5,
+                        "valid_embedding_count": 200,
+                        "embedding_coverage_ratio": 1.0,
+                        "avg_char_count": 1700.0,
+                        "avg_token_estimate": 395.0,
+                        "min_token_estimate": 50,
+                        "max_token_estimate": 900,
+                        "p50_token_estimate": 400.0,
+                        "p95_token_estimate": 550.0,
+                        "undersized_chunk_count": 0,
+                        "oversized_chunk_count": 0,
+                        "missing_metadata_count": 0,
+                    },
+                ]
+            return [
+                {"profile_id": "FDX_2020", "filing_chunk_status": "UNINDEXED"},
+                {"profile_id": "IBM_2025", "filing_chunk_status": "PARTIAL_SECTIONS"},
+            ]
+
+    report = evaluate_chunk_health_from_bigquery(
+        project_id="iron-radio-514217-q7",
+        bq_client=_FakeBQClient(),  # type: ignore[arg-type]
+    )
+    assert report.total_profiles_expected == 10
+    assert report.total_profiles_indexed == 9
+    assert report.profiles_with_both_sections == 8
+    assert report.full_section_coverage_ratio == 0.8
+    assert report.anomalies.missing_section_filings == 2
+    assert report.missing_profile_ids == ["FDX_2020"]
+    assert report.incomplete_section_profile_ids == ["IBM_2025"]
+    assert "item_1a" in report.by_section
+    assert "Information Technology" in report.by_sector
+
+    # Publisher with write_cloud_logging=True calls both Monitoring and Cloud Logging APIs.
+    requests_made: list[tuple[str, dict]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_made.append((str(request.url), json.loads(request.content.decode("utf-8"))))
+        return httpx.Response(200, json={})
+
+    creds = MagicMock()
+    creds.valid = True
+    creds.token = "tok"
+    pub = CloudMonitoringHealthPublisher(
+        project_id="iron-radio-514217-q7",
+        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
+        credentials=creds,
+        write_cloud_logging=True,
+    )
+    written = pub.publish_report(report)
+    assert written == len(build_cloud_monitoring_timeseries(report))
+    assert len(requests_made) == 2
+    assert "monitoring.googleapis.com" in requests_made[0][0]
+    assert "logging.googleapis.com/v2/entries:write" in requests_made[1][0]
+    log_entry = requests_made[1][1]["entries"][0]["jsonPayload"]
+    assert log_entry["event_type"] == "sec_edgar_chunk_health_evaluation"
+    assert log_entry["missing_section_filings"] == 2
+    assert log_entry["missing_profile_ids"] == ["FDX_2020"]
+
+    # CLI dry-run + coverage gate
+    monkeypatch.setattr(
+        publish_chunk_health,
+        "evaluate_chunk_health_from_bigquery",
+        lambda **_kwargs: report,
+    )
+    assert publish_chunk_health.main(["--dry-run", "--json"]) == 0
+    assert publish_chunk_health.main(["--dry-run", "--min-section-coverage", "0.95"]) == 3

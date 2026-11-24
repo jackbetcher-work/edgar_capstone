@@ -35,7 +35,10 @@ from edgar_capstone.agents.orchestration.scope_validation import (
 )
 from edgar_capstone.agents.prompts.store import get_prompt_store_status_metadata
 from edgar_capstone.agents.runtime.callbacks import verify_narrative_against_calculations
-from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
+from edgar_capstone.agents.runtime.context_memory import (
+    adk_session_id_for_topic,
+    get_conversation_memory_manager,
+)
 from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
 from edgar_capstone.agents.runtime.live_runtime import get_live_runtime_status_metadata
 from edgar_capstone.agents.runtime.model_config import (
@@ -410,13 +413,23 @@ def resolve_query_scope(
     detected_tickers, unknown_entities = catalog.detect_tickers_in_query(query)
 
     prior_tickers: list[str] = []
+    prior_sector = "ALL"
+    prior_topic_epoch = 0
+    has_prior_session = False
     if isinstance(memory_context, dict) and memory_context.get("has_prior_memory"):
+        has_prior_session = True
         raw_prior = memory_context.get("remembered_tickers") or []
-        prior_tickers = [str(t) for t in raw_prior]
-    has_prior_mem = bool(prior_tickers)
+        prior_tickers = [str(t) for t in raw_prior if str(t).strip()]
+        raw_sector = str(memory_context.get("last_gics_sector") or "ALL").strip()
+        if raw_sector and raw_sector.upper() not in ("ALL", "*"):
+            prior_sector = raw_sector
+        prior_topic_epoch = int(memory_context.get("topic_epoch") or 0)
+    has_prior_tickers = bool(prior_tickers)
+    has_prior_sector = prior_sector != "ALL"
+    has_prior_scope = has_prior_tickers or has_prior_sector
 
     memory_inherited = False
-    removed_tickers = extract_removed_tickers(query, catalog) if has_prior_mem else []
+    removed_tickers = extract_removed_tickers(query, catalog) if has_prior_tickers else []
 
     if explicit_tickers:
         effective_tickers = explicit_tickers
@@ -448,10 +461,14 @@ def resolve_query_scope(
         and effective_sector == "ALL"
         and not broad_corpus_query
         and not unknown_entities
-        and has_prior_mem
+        and has_prior_scope
     ):
-        effective_tickers = list(prior_tickers)
-        memory_inherited = True
+        if has_prior_tickers:
+            effective_tickers = list(prior_tickers)
+            memory_inherited = True
+        elif has_prior_sector:
+            effective_sector = prior_sector
+            memory_inherited = True
 
     valid_tickers = (
         [t for t in effective_tickers if catalog.contains_ticker(t)]
@@ -469,6 +486,25 @@ def resolve_query_scope(
         catalog=catalog,
     )
 
+    new_ticker_set = set(valid_tickers)
+    prior_ticker_set = set(prior_tickers)
+    if not has_prior_session or memory_inherited:
+        subject_changed = False
+    elif new_ticker_set and prior_ticker_set:
+        subject_changed = new_ticker_set.isdisjoint(prior_ticker_set)
+    elif (
+        effective_sector != "ALL"
+        and prior_sector != "ALL"
+        and not new_ticker_set
+        and not prior_ticker_set
+    ):
+        subject_changed = effective_sector.lower() != prior_sector.lower()
+    else:
+        subject_changed = (new_ticker_set != prior_ticker_set) or (
+            effective_sector.lower() != prior_sector.lower()
+        )
+    topic_epoch = prior_topic_epoch + 1 if subject_changed else prior_topic_epoch
+
     return {
         "tickers": valid_tickers,
         "tickers_csv": ",".join(valid_tickers) if valid_tickers else "ALL",
@@ -477,6 +513,8 @@ def resolve_query_scope(
         "start_year": eff_start,
         "end_year": eff_end,
         "memory_inherited": memory_inherited,
+        "subject_changed": subject_changed,
+        "topic_epoch": topic_epoch,
         "explicit_tickers": explicit_tickers,
         "unknown_entities": unknown_entities,
     }
@@ -1329,7 +1367,15 @@ def _resolve_and_validate_scope(
     provisional_intent = infer_intent_from_tool_calls(public_scope, [])
     sector_wide_scope = is_sector_wide_scope(public_scope)
     orchestrator_model = resolve_model_for_task("orchestration")
-    mem_suffix = " (recalled from session memory)" if public_scope.get("memory_inherited") else ""
+    mem_suffix = (
+        " (recalled from session memory)"
+        if public_scope.get("memory_inherited")
+        else (
+            " (subject changed; isolated topic context)"
+            if public_scope.get("subject_changed")
+            else ""
+        )
+    )
     ctx.append_trace(
         agent=_S2S_ROUTER_IDENTITY_NAME,
         claims=route_claims,
@@ -1467,6 +1513,7 @@ def _verify_and_finalize_success(
         cached_10k_keys=[e.cache_key for e in cached_explanations],
         answer_markdown=answer_markdown,
         recalled_prior_memory=bool(ctx.memory_ctx.get("has_prior_memory")),
+        topic_epoch=int(public_scope.get("topic_epoch") or 0),
     )
 
     analyzed_tickers = sorted(
@@ -1627,7 +1674,17 @@ def run_conversational_rag_turn(
         end_year=int(public_scope["end_year"]),
     )
 
-    # Step 3 & Step 4: Structured ReAct loop; the agent invokes deterministic tools as needed
+    # Step 3 & Step 4: Structured ReAct loop; the agent invokes deterministic tools as needed.
+    # On a subject change, isolate the ADK session epoch and omit unrelated prior-subject memory
+    # from the prompt so old company tool traces/passages do not leak into the new subject.
+    active_topic_epoch = int(public_scope.get("topic_epoch") or 0)
+    subject_changed = bool(public_scope.get("subject_changed"))
+    adk_session_id = adk_session_id_for_topic(session_id, active_topic_epoch)
+    prompt_memory_ctx = (
+        {**memory_ctx, "memory_summary_text": "", "memory_tokens": 0}
+        if subject_changed
+        else memory_ctx
+    )
     with tool_turn_context(
         on_progress=on_progress,
         map_llm=map_llm,
@@ -1641,10 +1698,10 @@ def run_conversational_rag_turn(
             intent=provisional_intent,
             scope=public_scope,
             citations=prepass_citations,
-            memory_tokens=int(memory_ctx.get("memory_tokens", 0) or 0),
+            memory_tokens=int(prompt_memory_ctx.get("memory_tokens", 0) or 0),
             memory_prep_latency_ms=float(memory_ctx.get("memory_lookup_latency_ms", 0.0) or 0.0),
-            memory_context=memory_ctx,
-            session_id=session_id,
+            memory_context=prompt_memory_ctx,
+            session_id=adk_session_id,
             telemetry_session_id=ctx.telemetry_session_id,
             user_id=user_id,
             coverage_notices=base_coverage_notices,

@@ -13,10 +13,13 @@ import {
 import {
   BackendUnavailableError,
   buildChatQueryPayload,
+  deleteChatSession,
+  getClientSessionId,
   NATURAL_LANGUAGE_SCOPE,
   executeConversationalRagQueryStream,
   fetchCached10kSection,
   postAnalystFeedback,
+  resetClientSession,
 } from '../services/edgarApi'
 import {
   ApiAuthError,
@@ -331,5 +334,28 @@ describe('authService helpers', () => {
     expect(await fetchAuthDiscoveryConfig()).toEqual({ backendReachable: false, config: null })
     vi.spyOn(globalThis, 'fetch').mockRejectedValueOnce(new Error('down'))
     expect(await fetchAuthDiscoveryConfig()).toEqual({ backendReachable: false, config: null })
+  })
+
+  it('resetClientSession rotates the session ID and deleteChatSession calls DELETE /api/v1/sessions/:id', async () => {
+    const initialId = getClientSessionId()
+    expect(buildChatQueryPayload('Q1').session_id).toBe(initialId)
+
+    const prevId = resetClientSession()
+    const nextId = getClientSessionId()
+    expect(prevId).toBe(initialId)
+    expect(nextId).not.toBe(initialId)
+    expect(buildChatQueryPayload('Q2').session_id).toBe(nextId)
+
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({ status: 'deleted' }), { status: 200 }))
+    expect(await deleteChatSession(prevId)).toBe(true)
+    expect(fetchSpy).toHaveBeenCalledWith(
+      `/api/v1/sessions/${encodeURIComponent(prevId)}`,
+      expect.objectContaining({ method: 'DELETE' })
+    )
+
+    fetchSpy.mockRejectedValueOnce(new Error('offline'))
+    expect(await deleteChatSession(nextId)).toBe(false)
   })
 })
