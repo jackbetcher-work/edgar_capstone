@@ -444,3 +444,34 @@ def test_guardrail_block_audit_events_carry_request_principal_and_trace_id() -> 
         reset_audit_principal(token)
     assert row["user_email"] == "unauthenticated"
     clear_security_audit_events()
+
+
+def test_genai_otel_inputs_outputs_deployment_config_consistency() -> None:
+    """Ensures Terraform, Cloud Build, GitHub Actions, and Dockerfile wire GenAI OTel env vars."""
+    assert '"telemetry.googleapis.com"' in _tf("apis.tf")
+    assert '"roles/telemetry.writer"' in _tf("iam.tf")
+
+    cicd_tf = _tf("cicd_and_secrets.tf")
+    cloudbuild = (REPO_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
+    deploy = (REPO_ROOT / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    required_env_pairs = (
+        ("OTEL_SEMCONV_STABILITY_OPT_IN", "gen_ai_latest_experimental"),
+        ("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_AND_EVENT"),
+        ("OTEL_INSTRUMENTATION_GENAI_EMIT_EVENT", "true"),
+        ("ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS", "true"),
+        ("GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY", "true"),
+        ("EDGAR_TRACE_CAPTURE_CONTENT", "true"),
+    )
+    for key, val in required_env_pairs:
+        assert key in cicd_tf and f'value = "{val}"' in cicd_tf, (key, "cicd_and_secrets.tf")
+        assert f"{key}={val}" in cloudbuild, (key, "cloudbuild.yaml")
+        assert f"{key}={val}" in deploy, (key, "deploy.yml")
+        assert f'{key}="{val}"' in dockerfile, (key, "Dockerfile")
+
+    assert "google-adk[otel]" in pyproject
+    assert "opentelemetry-exporter-otlp-proto-http" in pyproject
+    assert "opentelemetry-instrumentation-google-genai" in pyproject
+    assert "google-cloud-agentplatform" in pyproject

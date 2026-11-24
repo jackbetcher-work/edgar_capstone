@@ -8,7 +8,7 @@ Code lives in [`src/edgar_capstone/observability/`](../src/edgar_capstone/observ
 
 | Module | Responsibility |
 | :-- | :-- |
-| `tracing.py` | `TracerProvider` + `CloudTraceSpanExporter`, GCP resource detection, sampling, propagators (`traceparent` + `X-Cloud-Trace-Context`), FastAPI/httpx auto-instrumentation, `@traced` / `start_span` helpers |
+| `tracing.py` | `TracerProvider` + `LoggerProvider` exporting over OTLP/HTTP to `telemetry.googleapis.com` via ADK's `google_cloud.get_gcp_exporters(...)` (with Vertex AI Agent Engine auto-configuration and legacy `CloudTraceSpanExporter` fallback), GCP resource detection, sampling, propagators (`traceparent` + `X-Cloud-Trace-Context`), FastAPI / Google GenAI SDK / httpx auto-instrumentation, `@traced` / `start_span` helpers |
 | `structured_logging.py` | `CloudLoggingJsonFormatter` (Cloud Logging special fields + Error Reporting), local trace-aware text formatter, uvicorn log routing |
 | `middleware.py` | `RequestTelemetryMiddleware`: request log context, `X-Trace-Id` / `X-Request-Id` / `Server-Timing` response headers, one `http_request_completed` access log per request |
 
@@ -20,6 +20,7 @@ flowchart TD
     S --> A["auth.verify_jwt"]
     S --> T["chat.rag_turn"]
     T --> G["guardrail.inspect_user_prompt (+ Model Armor / SDP HTTP spans)"]
+    T --> SC["chat.scope_continuity_llm (parallel with Model Armor on warm unresolved turns)"]
     T --> R["chat.resolve_scope / orchestrator.infer_intent_from_tools"]
     T --> V["tool.calculate_period_variances"]
     T --> AN["anomaly.attach_explanations"]
@@ -35,7 +36,7 @@ flowchart TD
 ```
 
 - **Server span:** `opentelemetry-instrumentation-fastapi`. It continues the upstream W3C `traceparent` (or the legacy `X-Cloud-Trace-Context`), so Cloud Run's own request span and the app spans share one trace. Health probes and static assets are excluded (`EDGAR_TRACE_EXCLUDED_URLS`).
-- **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.retrieve_citations`), intent fallback (`orchestrator.infer_intent_from_tools`; the analyst emits intent in `AnalystReport.intent`), anomaly explanation linker (`anomaly.attach_explanations`), ReAct steps (`react.execute`, `react.evaluate_variances`, `react.query_cached_10k`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and narrative evaluator. `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls (such as `agents/prompts/store.py`).
+- **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.scope_continuity_llm`, `chat.retrieve_citations`), intent fallback (`orchestrator.infer_intent_from_tools`; the analyst emits intent in `AnalystReport.intent`), anomaly explanation linker (`anomaly.attach_explanations`), ReAct steps (`react.execute`, `react.evaluate_variances`, `react.query_cached_10k`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and narrative evaluator. `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls (such as `agents/prompts/store.py`).
 - **Model calls:** ADK's built-in `gcp.vertex.agent` spans (`invoke_agent`, `call_llm`, `execute_tool`) attach to the same global provider. Every recorded model call also adds an `llm.call` span event with `gen_ai.request.model`, input/output/cached/thinking tokens, `edgar.ttft_ms`, latency, and cost.
 - **Outbound HTTP:** `opentelemetry-instrumentation-httpx` creates client spans for Vertex AI (google-genai), BigQuery, Firestore, Model Armor, SDP, Secret Manager, and IAM Credentials, and propagates context on them.
 - **Thread hops:** `_run_coro_sync` (persistent background ADK `asyncio` event loop), `POST /api/v1/chat/stream` SSE worker threads, `sector.map_reduce` batch pools, and the off-critical-path background Flash judge pool all copy `contextvars` (`contextvars.copy_context().run` / `loop.create_task(coro, context=ctx)`), so live ADK runs, map-reduce batches, and background evaluations stay correlated under the parent request trace.

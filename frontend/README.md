@@ -39,7 +39,7 @@ src/
 ├── services/
 │   ├── httpClient.ts            # Shared authenticated fetch, `ApiAuthError` (401/403), and FastAPI/GCP JSON error extraction
 │   ├── authService.ts           # Bearer token storage, /api/v1/auth/* calls, OIDC fragment handling
-│   └── edgarApi.ts              # SSE streaming (/api/v1/chat/stream), /companies, /section, /feedback
+│   └── edgarApi.ts              # SSE streaming (/api/v1/chat/stream), /companies, /section, /sessions (reset/delete), /feedback
 ├── types/edgar.ts               # API response, SSE progress, NumericCitation, CoverageNotice & XBRL types
 └── utils/
     ├── citationDedup.ts         # Collapses repeated / cross-year duplicate passages and maps aliases to the kept card
@@ -47,7 +47,7 @@ src/
     ├── deterministicEvidence.ts # Render predicates for variance, anomaly-flag, and disclosure-delta cards
     ├── filingMarkdown.ts        # Parses corpus chunk Markdown (strips header/escapes/footers, repairs SEC tables)
     ├── formatters.ts            # USD / percent / bps / period-end date formatting, combined text+XBRL citation parser & status badges
-    ├── resolvedScope.ts         # Formats the backend's `resolved_scope` for the per-answer scope echo
+    ├── resolvedScope.ts         # Formats the backend's `resolved_scope` (tickers, sector, or GICS sub-industry) for the per-answer scope echo
     ├── xbrlLabels.ts            # Human labels for XBRL concepts and 10-K section breadcrumbs (citation chips)
     └── xbrlFactSelection.ts     # Maps variance rows, anomaly flags, and inline XBRL chips to `XbrlFactSelection` records
 ```

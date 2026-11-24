@@ -15,9 +15,9 @@ Answers are written by Gemini through the Google Agent Development Kit (ADK). Ev
 flowchart TD
     UI["React Terminal UI"] -->|"POST /api/v1/chat/stream"| API["FastAPI"]
     API --> AUTH["Auth and RBAC: IAP or OIDC JWT"]
-    AUTH --> PG["Prompt guardrails: Model Armor, Sensitive Data Protection, projection filter"]
-    PG -->|blocked| OUT
-    PG --> SCOPE["Scope resolution: tickers, sector, fiscal years, section"]
+    AUTH --> PRE["Parallel pre-pass: Model Armor/SDP guardrails, Firestore session recall, catalog, optional ScopeContinuityAgent (Flash-Lite)"]
+    PRE -->|blocked| OUT
+    PRE --> SCOPE["Scope & subject-continuity resolution: tickers, sector, sub-industry, fiscal years, topic isolation"]
     SCOPE -->|"needs clarification or out of corpus"| OUT
     SCOPE --> RAG["Hybrid RAG evidence pre-pass"]
     RAG --> AGENT["FinancialAnalystAgent: Gemini via ADK Runner"]
@@ -35,7 +35,8 @@ flowchart TD
         TEL[("BigQuery telemetry and audit tables")]
     end
 
-    SCOPE -.-> FS
+    PRE -.-> FS
+    PRE -.-> BQ
     SCOPE -.-> BQ
     RAG -.-> BQ
     RAG -.-> VAS
@@ -49,8 +50,8 @@ flowchart TD
 Each turn runs through [`run_conversational_rag_turn`](src/edgar_capstone/agents/orchestration/chat_engine.py):
 
 1. **Authenticate.** All `/api/v1/*` routes require an identity (IAP assertion, Workspace/Okta OIDC JWT, or a local dev token). Access is controlled by Cloud Identity group RBAC.
-2. **Prompt guardrails.** Model Armor, Cloud Sensitive Data Protection, and an SEC projection filter can block the request before any model call.
-3. **Resolve scope.** [`scope_validation.py`](src/edgar_capstone/agents/orchestration/scope_validation.py) maps the query to tickers, GICS sector, fiscal years, and 10-K section using the live S&P 500 catalog in BigQuery and prior turns from Firestore session memory. Ambiguous or out-of-corpus questions end here with a clarification or coverage notice.
+2. **Parallel pre-pass & prompt guardrails.** Model Armor, Cloud Sensitive Data Protection, and an SEC projection filter run concurrently with Firestore session recall and S&P 500 catalog loading. When L1 session memory and the catalog are warm, no local PII spans are present, and deterministic scope parsing finds no explicit entity, `ScopeContinuityAgent` (`gemini-3.5-flash-lite`) runs speculatively in parallel with Model Armor (discarded if Model Armor blocks, SDP redacts the prompt, or Firestore refreshes a newer scope). Guardrails still block unsafe or projection requests before synthesis.
+3. **Resolve scope & isolate subject changes.** [`scope_validation.py`](src/edgar_capstone/agents/orchestration/scope_validation.py) and [`scope_continuity.py`](src/edgar_capstone/agents/orchestration/scope_continuity.py) map the query to tickers, GICS sector, GICS sub-industry (all 126 catalog sub-industries expanded to constituent tickers), fiscal years, and 10-K section. On unresolved or ambiguous turns, `ScopeContinuityAgent` classifies continuation vs. subject switch (`continue_prior`, `new_tickers`, `new_sector`, `new_sub_industry`, `broad_corpus`, `unknown_entity`, `clarify`) with strict `EntityCatalog` validation and a conservative deterministic fallback. Subject switches advance `topic_epoch` to isolate ADK session history (`<session_id>::topic-<epoch>`) and omit unrelated prior-company memory from the prompt, while sector or corpus-wide turns clear `remembered_tickers`. Ambiguous or out-of-corpus questions end here with a clarification or coverage notice.
 4. **Retrieve evidence.** [`hybrid_rag.py`](src/edgar_capstone/agents/tools/hybrid_rag.py) queries BigQuery `VECTOR_SEARCH` over `filing_chunks` and Vertex AI Search in parallel (with per-company-year coverage slices), then balances hits across the tickers in scope.
 5. **Reason.** [`react_loop.py`](src/edgar_capstone/agents/orchestration/react_loop.py) runs `FinancialAnalystAgent` via the ADK streaming runner ([`live_runtime.py`](src/edgar_capstone/agents/runtime/live_runtime.py)) and returns constrained `AnalystReport` JSON. The agent calls deterministic tools on demand based on the query.
 6. **Verify.** [`structured_report.py`](src/edgar_capstone/agents/evaluation/structured_report.py) checks every finding against the retrieved passages and hydrated tool outputs before rendering Markdown. If every finding fails, one guided regeneration runs with the rejection reasons; if that also fails, the answer is withheld (`answer_verified: false`).
@@ -66,6 +67,7 @@ Every request reads live GCP data and calls live Gemini; upstream failures retur
 | `FinancialAnalystAgent` | [`runtime/factories.py`](src/edgar_capstone/agents/runtime/factories.py) | Primary ADK agent (`gemini-3.8-flash`, native thinking). Output is constrained to the `AnalystReport` schema. |
 | `NarrativeEvaluatorAgent` | [`evaluation/judge.py`](src/edgar_capstone/agents/evaluation/judge.py) | LLM-as-a-Judge (`gemini-3.8-flash`, `ThinkingLevel.LOW`). Scores faithfulness, citation precision, and explanation quality. |
 | `SectorMapSummarizerAgent` | [`tools/sector_map_reduce.py`](src/edgar_capstone/agents/tools/sector_map_reduce.py) | Parallel batch summarizer (`gemini-3.5-flash-lite`) for the map phase of sector-wide thematic reviews. |
+| `ScopeContinuityAgent` | [`orchestration/scope_continuity.py`](src/edgar_capstone/agents/orchestration/scope_continuity.py) | Fast structured scope & subject-continuity classifier (`gemini-3.5-flash-lite`, `ThinkingLevel.MINIMAL`) invoked only on unresolved/ambiguous turns (overlapped with Model Armor when warm) and strictly validated against `EntityCatalog`. |
 | `calculate_period_variances` · `fetch_financial_metrics` | [`tools/sec_tools.py`](src/edgar_capstone/agents/tools/sec_tools.py), [`tools/variance_engine.py`](src/edgar_capstone/agents/tools/variance_engine.py) | Deterministic multi-period and YoY variance engine over BigQuery `financial_metrics`. |
 | `flag_material_variances` | [`tools/material_variances.py`](src/edgar_capstone/agents/tools/material_variances.py) | Rule-based XBRL anomaly flags paired with MD&A explanations and filing provenance. |
 | `compare_disclosures_across_years` | [`tools/disclosure_deltas.py`](src/edgar_capstone/agents/tools/disclosure_deltas.py) | Deterministic YoY wording deltas (added, removed, modified) using word-trigram alignment with citations from both years. |
@@ -89,7 +91,7 @@ core ──▶ adapters, prompts ──▶ tools ──▶ runtime, evaluation �
 - **`tools/`** — ADK `FunctionTool` wrappers, deterministic analytical engines, and turn-scoped tool plumbing (`runtime.py`).
 - **`runtime/`** — ADK `Runner` and persistent SSE event loop (`live_runtime.py`), agent factories (`factories.py`), lifecycle callbacks for Model Armor/identity/budgets/telemetry (`callbacks.py`), and model routing, latency tracking, and session memory (`context_memory.py`).
 - **`evaluation/`** — Claim-level `AnalystReport` verification and deterministic Markdown rendering (`structured_report.py`), plus the Flash LLM-as-a-Judge (`judge.py`).
-- **`orchestration/`** — Conversational turn entry point and S&P 500 catalog cache (`chat_engine.py`), ReAct loop and background judge pool (`react_loop.py`), scope/coverage validation (`scope_validation.py`), and non-lexical intent resolution (`intent.py`).
+- **`orchestration/`** — Conversational turn entry point and S&P 500 catalog cache (`chat_engine.py`), ReAct loop and background judge pool (`react_loop.py`), scope/sub-industry/coverage validation (`scope_validation.py`), Flash-Lite subject-continuity classification (`scope_continuity.py`), and non-lexical intent resolution (`intent.py`).
 
 Two conventions are worth knowing before editing `agents/`:
 
@@ -147,7 +149,8 @@ CORPUS_PROJECT_ID=<other-project> make dev   # point at another project
 | :--- | :--- | :--- |
 | `EDGAR_ANALYST_MODEL` | `gemini-3.8-flash` | Reasoning model for `FinancialAnalystAgent` |
 | `EDGAR_FLASH_MODEL` | `gemini-3.8-flash` | LLM-as-a-Judge (`NarrativeEvaluatorAgent`, `ThinkingLevel.LOW`) |
-| `EDGAR_LITE_MODEL` | `gemini-3.5-flash-lite` | Sector map-reduce (`SectorMapSummarizerAgent`) and event compaction (`LlmEventSummarizer`) |
+| `EDGAR_LITE_MODEL` | `gemini-3.5-flash-lite` | Sector map-reduce (`SectorMapSummarizerAgent`), scope/continuity classification (`ScopeContinuityAgent`), and event compaction (`LlmEventSummarizer`) |
+| `EDGAR_SCOPE_LLM_MODE` | `auto` | Controls `ScopeContinuityAgent`: `auto` (live Flash-Lite in production, deterministic fallback when scripted/offline), `live`, or `deterministic` |
 | `EDGAR_GEMINI_LOCATION` | `global` | Vertex AI endpoint for Gemini. BigQuery, GCS, and embeddings use `GOOGLE_CLOUD_LOCATION`. |
 | `GEMINI_API_KEY` | unset | Uses the Gemini API instead of Vertex AI when `GOOGLE_GENAI_USE_VERTEXAI` is unset |
 | `IAP_STRICT_MODE` | `false` | When `false` (local), the UI can mint an ES256 dev JWT via `POST /api/v1/auth/sso/dev-token`. Always disabled on Cloud Run. |
@@ -264,7 +267,7 @@ See [`evals/README.md`](evals/README.md) for the record schema and gate definiti
 │   │   ├── tools/           # ADK tools, turn-scoped runtime, variance/delta/RAG/sector engines
 │   │   ├── runtime/         # ADK Runner/streaming, agent factories, callbacks, context/memory
 │   │   ├── evaluation/      # Structured report claim verification/rendering and Flash judge
-│   │   └── orchestration/   # Conversational RAG chat engine, intent, scope validation, ReAct loop
+│   │   └── orchestration/   # Conversational RAG chat engine, intent, scope validation & continuity, ReAct loop
 │   ├── security/            # IAP/OIDC auth, RBAC, per-agent identities, Secret Manager, Model Armor
 │   ├── observability/       # OpenTelemetry tracing, structured logging, request middleware
 │   ├── telemetry.py         # BigQuery telemetry/audit sinks, Firestore session and feedback stores

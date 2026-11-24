@@ -226,6 +226,14 @@ resource "google_project_iam_member" "sec_analyst_trace_agent" {
   member  = "serviceAccount:${google_service_account.sec_analyst[0].email}"
 }
 
+resource "google_project_iam_member" "sec_analyst_telemetry_writer" {
+  count = var.create_analyst_service_account ? 1 : 0
+
+  project = var.project_id
+  role    = "roles/telemetry.writer"
+  member  = "serviceAccount:${google_service_account.sec_analyst[0].email}"
+}
+
 resource "google_project_iam_member" "sec_analyst_modelarmor_user" {
   count = var.create_analyst_service_account ? 1 : 0
 

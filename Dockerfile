@@ -56,7 +56,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     GCP_REGION="us-central1" \
     RUNTIME_SERVICE_ACCOUNT_ID="sec-analyst-sa" \
     COMMIT_SHA="${COMMIT_SHA}" \
-    SEC_CORPUS_BUCKET="fde-sec-edgar-sandbox-dev-sec-corpus"
+    SEC_CORPUS_BUCKET="fde-sec-edgar-sandbox-dev-sec-corpus" \
+    OTEL_SERVICE_NAME="sec-edgar-analyst" \
+    OTEL_SEMCONV_STABILITY_OPT_IN="gen_ai_latest_experimental" \
+    OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT="SPAN_AND_EVENT" \
+    OTEL_INSTRUMENTATION_GENAI_EMIT_EVENT="true" \
+    ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS="true" \
+    GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY="true" \
+    EDGAR_TRACE_CAPTURE_CONTENT="true"
 
 RUN groupadd --gid 10001 appgroup && \
     useradd --uid 10001 --gid appgroup --shell /sbin/nologin --create-home appuser

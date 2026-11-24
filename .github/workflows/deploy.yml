@@ -368,6 +368,13 @@ jobs:
             SEC_CORPUS_BUCKET=fde-sec-edgar-sandbox-dev-sec-corpus
             EDGAR_TELEMETRY_BACKEND=gcp
             EDGAR_FEEDBACK_BACKEND=gcp
+            OTEL_SERVICE_NAME=${{ env.SERVICE_NAME }}
+            OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental
+            OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=SPAN_AND_EVENT
+            OTEL_INSTRUMENTATION_GENAI_EMIT_EVENT=true
+            ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=true
+            GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true
+            EDGAR_TRACE_CAPTURE_CONTENT=true
             FIRESTORE_DATABASE_ID=(default)
             FIRESTORE_FEEDBACK_COLLECTION=analyst_feedback
             IAP_STRICT_MODE=true

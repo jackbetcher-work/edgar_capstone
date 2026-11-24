@@ -322,6 +322,41 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "OTEL_SERVICE_NAME"
+        value = var.cloud_run_service_name
+      }
+
+      env {
+        name  = "OTEL_SEMCONV_STABILITY_OPT_IN"
+        value = "gen_ai_latest_experimental"
+      }
+
+      env {
+        name  = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
+        value = "SPAN_AND_EVENT"
+      }
+
+      env {
+        name  = "OTEL_INSTRUMENTATION_GENAI_EMIT_EVENT"
+        value = "true"
+      }
+
+      env {
+        name  = "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"
+        value = "true"
+      }
+
+      env {
+        name  = "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY"
+        value = "true"
+      }
+
+      env {
+        name  = "EDGAR_TRACE_CAPTURE_CONTENT"
+        value = "true"
+      }
+
+      env {
         name  = "EDGAR_FEEDBACK_BACKEND"
         value = "gcp"
       }

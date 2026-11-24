@@ -1,27 +1,46 @@
 """End-to-end OpenTelemetry distributed tracing exported to Google Cloud Trace.
 
 A single request flows through these layers, and each one becomes a span in the
-same trace, so Cloud Trace shows where the latency goes:
+same trace, so Cloud Trace shows where the latency goes and populates the
+**Inputs/Outputs** tab for LLM generations:
 
     Cloud Run / HTTPS LB front end (`traceparent` / `X-Cloud-Trace-Context`)
       -> FastAPI server span            (opentelemetry-instrumentation-fastapi)
         -> app spans                    (`@traced` / `start_span`: guardrails, scope
                                          resolution, RAG retrieval, ReAct loop, tools)
           -> Google ADK agent/LLM/tool spans (`gcp.vertex.agent` tracer, global provider)
+          -> Google GenAI SDK spans & events (opentelemetry-instrumentation-google-genai:
+                                              `gen_ai.input.messages`, `gen_ai.output.messages`,
+                                              `gen_ai.client.inference.operation.details`)
           -> outbound HTTP client spans (opentelemetry-instrumentation-httpx: Vertex AI
                                          Gemini, BigQuery, Firestore, Model Armor, ...)
+
+On Cloud Run (or when `EDGAR_TRACE_EXPORTER=gcp`), spans and GenAI OTel log events
+are exported over OTLP/HTTP to Google's Telemetry API (`telemetry.googleapis.com/v1/traces`
+and `telemetry.googleapis.com/v1/logs`) via ADK's `google_cloud.get_gcp_exporters(...)`
+with Vertex AI Agent Engine auto-configuration (`GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY`),
+avoiding Cloud Trace v2's 256-byte attribute truncation so Cloud Trace Explorer's
+**Inputs/Outputs** tab renders full prompts, system instructions, tool calls, and outputs.
 
 Runtime configuration (all optional):
 
 * `EDGAR_TRACING_ENABLED` (default `true`; `OTEL_SDK_DISABLED=true` also turns it off).
 * `EDGAR_TRACE_EXPORTER` = `auto` | `gcp` | `console` | `otlp` | `none`. `auto` exports to
-  Cloud Trace on Cloud Run (`K_SERVICE` is set) and keeps spans in-process locally, so
-  trace IDs still show up in logs and response headers without needing credentials.
+  Google Cloud (`telemetry.googleapis.com`) on Cloud Run (`K_SERVICE` is set) and keeps spans
+  in-process locally, so trace IDs still show up in logs and response headers without needing
+  credentials.
 * `EDGAR_TRACE_SAMPLE_RATIO` (default `1.0`). A sampled upstream parent (e.g. the Cloud
   Run front end) is always honoured; otherwise this ratio decides.
-* `EDGAR_TRACE_CAPTURE_CONTENT` (default `false`). Sets the default for ADK's
-  `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS` so prompts, 10-K excerpts, and model output are
-  kept out of Cloud Trace unless you opt in.
+* `OTEL_SEMCONV_STABILITY_OPT_IN` (default `gen_ai_latest_experimental`). Enables OTel GenAI
+  experimental semantic conventions (`gen_ai.input.messages` / `gen_ai.output.messages`).
+* `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` (default `SPAN_AND_EVENT`, or
+  `NO_CONTENT` when `EDGAR_TRACE_CAPTURE_CONTENT=false`). Controls prompt/response capture
+  for Cloud Trace Explorer's Inputs/Outputs tab.
+* `OTEL_INSTRUMENTATION_GENAI_EMIT_EVENT` (default `true` when content capture is enabled).
+  Emits `gen_ai.client.inference.operation.details` OTel log events.
+* `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS` (default `true` when content capture is enabled).
+* `GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY` (default `true`). Enables Vertex AI Agent
+  Engine OTel telemetry headers and auto-configuration.
 * `EDGAR_TRACE_EXCLUDED_URLS`: comma-separated regexes of URLs that get no server span
   (health probes and static assets by default).
 """
@@ -40,13 +59,14 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, TypeVar
 
-from opentelemetry import trace
+from opentelemetry import _logs, trace
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
 from opentelemetry.propagate import set_global_textmap
 from opentelemetry.propagators.composite import CompositePropagator
 from opentelemetry.propagators.textmap import TextMapPropagator
+from opentelemetry.sdk._logs import LoggerProvider, LogRecordProcessor
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import SpanProcessor, TracerProvider
 from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
     ConsoleSpanExporter,
@@ -69,9 +89,18 @@ DEFAULT_EXCLUDED_URLS = r"/health$,/healthz$,/assets/,/favicon\.ico$,/vite\.svg$
 # Fallback alias retained for backward compatibility; canonical default lives in gcp.defaults.
 DEFAULT_TRACE_PROJECT_ID = DEFAULT_PROJECT_ID
 ADK_CAPTURE_CONTENT_ENV = "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"
+OTEL_SEMCONV_STABILITY_OPT_IN_ENV = "OTEL_SEMCONV_STABILITY_OPT_IN"
+OTEL_GENAI_CAPTURE_CONTENT_ENV = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
+OTEL_GENAI_EMIT_EVENT_ENV = "OTEL_INSTRUMENTATION_GENAI_EMIT_EVENT"
+AGENT_ENGINE_ENABLE_TELEMETRY_ENV = "GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY"
+DEFAULT_SEMCONV_STABILITY_OPT_IN = "gen_ai_latest_experimental"
+DEFAULT_CAPTURE_CONTENT_MODE = "SPAN_AND_EVENT"
 
 TraceExporterMode = Literal["auto", "gcp", "console", "otlp", "none"]
 _VALID_EXPORTERS: frozenset[str] = frozenset({"auto", "gcp", "console", "otlp", "none"})
+_VALID_CAPTURE_MODES: frozenset[str] = frozenset(
+    {"NO_CONTENT", "EVENT_ONLY", "SPAN_ONLY", "SPAN_AND_EVENT"}
+)
 _MAX_ATTR_STR_LEN = 512
 
 _TRACEPARENT_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
@@ -96,6 +125,23 @@ def running_on_cloud_run() -> bool:
     return bool(os.environ.get("K_SERVICE", "").strip())
 
 
+def _resolve_capture_content_mode() -> str:
+    raw = os.environ.get(OTEL_GENAI_CAPTURE_CONTENT_ENV, "").strip().upper()
+    if raw:
+        if raw in _VALID_CAPTURE_MODES:
+            return raw
+        logger.warning(
+            "Ignoring invalid %s=%r (valid: %s); falling back to %s",
+            OTEL_GENAI_CAPTURE_CONTENT_ENV,
+            raw,
+            ", ".join(sorted(_VALID_CAPTURE_MODES)),
+            DEFAULT_CAPTURE_CONTENT_MODE,
+        )
+    if not env_bool("EDGAR_TRACE_CAPTURE_CONTENT", True):
+        return "NO_CONTENT"
+    return DEFAULT_CAPTURE_CONTENT_MODE
+
+
 @dataclass(frozen=True, slots=True)
 class TracingConfig:
     """Resolved OpenTelemetry tracing settings."""
@@ -108,9 +154,14 @@ class TracingConfig:
     service_version: str = "unknown"
     project_id: str = DEFAULT_TRACE_PROJECT_ID
     environment: str = "local"
-    capture_message_content: bool = False
+    capture_message_content: bool = True
+    capture_message_content_mode: str = DEFAULT_CAPTURE_CONTENT_MODE
+    semconv_stability_opt_in: str = DEFAULT_SEMCONV_STABILITY_OPT_IN
+    emit_genai_events: bool = True
+    agent_engine_telemetry_enabled: bool = True
     excluded_urls: str = DEFAULT_EXCLUDED_URLS
     instrument_httpx: bool = True
+    instrument_genai: bool = True
 
     @classmethod
     def from_env(cls) -> TracingConfig:
@@ -126,6 +177,14 @@ class TracingConfig:
         on_cloud_run = running_on_cloud_run()
         if exporter == "auto":
             resolved = "gcp" if on_cloud_run else "none"
+
+        capture_mode = _resolve_capture_content_mode()
+        capture_enabled = capture_mode != "NO_CONTENT"
+        semconv_opt_in = (
+            os.environ.get(OTEL_SEMCONV_STABILITY_OPT_IN_ENV, "").strip()
+            or DEFAULT_SEMCONV_STABILITY_OPT_IN
+        )
+        emit_events_default = capture_mode in ("EVENT_ONLY", "SPAN_AND_EVENT")
 
         return cls(
             enabled=enabled,
@@ -144,9 +203,14 @@ class TracingConfig:
             environment=(
                 os.environ.get("EDGAR_ENVIRONMENT") or ("cloud_run" if on_cloud_run else "local")
             ).strip(),
-            capture_message_content=env_bool("EDGAR_TRACE_CAPTURE_CONTENT", False),
+            capture_message_content=capture_enabled,
+            capture_message_content_mode=capture_mode,
+            semconv_stability_opt_in=semconv_opt_in,
+            emit_genai_events=env_bool(OTEL_GENAI_EMIT_EVENT_ENV, emit_events_default),
+            agent_engine_telemetry_enabled=env_bool(AGENT_ENGINE_ENABLE_TELEMETRY_ENV, True),
             excluded_urls=os.environ.get("EDGAR_TRACE_EXCLUDED_URLS", DEFAULT_EXCLUDED_URLS),
             instrument_httpx=env_bool("EDGAR_TRACE_INSTRUMENT_HTTPX", True),
+            instrument_genai=env_bool("EDGAR_TRACE_INSTRUMENT_GENAI", True),
         )
 
 
@@ -167,9 +231,12 @@ class _TracingState:
         self.lock = threading.RLock()
         self.config: TracingConfig | None = None
         self.provider: TracerProvider | None = None
+        self.logger_provider: LoggerProvider | None = None
         self.exporter_name: str = "none"
+        self.otel_logging_enabled: bool = False
         self.fastapi_instrumented: bool = False
         self.httpx_instrumented: bool = False
+        self.genai_instrumented: bool = False
         self.propagators: tuple[str, ...] = ()
         self.last_error: str | None = None
 
@@ -185,6 +252,25 @@ _FALLBACK_TRACE: contextvars.ContextVar[TraceCorrelation | None] = contextvars.C
 # ---------------------------------------------------------------------------
 
 
+def _apply_genai_otel_env_defaults(config: TracingConfig) -> None:
+    """Apply OTel GenAI & Vertex AI Agent Engine defaults without overriding explicit env vars."""
+    os.environ.setdefault("OTEL_SERVICE_NAME", config.service_name)
+    os.environ.setdefault(OTEL_SEMCONV_STABILITY_OPT_IN_ENV, config.semconv_stability_opt_in)
+    os.environ.setdefault(OTEL_GENAI_CAPTURE_CONTENT_ENV, config.capture_message_content_mode)
+    os.environ.setdefault(
+        OTEL_GENAI_EMIT_EVENT_ENV,
+        "true" if config.emit_genai_events else "false",
+    )
+    os.environ.setdefault(
+        ADK_CAPTURE_CONTENT_ENV,
+        "true" if config.capture_message_content else "false",
+    )
+    os.environ.setdefault(
+        AGENT_ENGINE_ENABLE_TELEMETRY_ENV,
+        "true" if config.agent_engine_telemetry_enabled else "false",
+    )
+
+
 def _build_resource(config: TracingConfig) -> Resource:
     base = Resource.create(
         {
@@ -193,8 +279,16 @@ def _build_resource(config: TracingConfig) -> Resource:
             "service.version": config.service_version,
             "deployment.environment": config.environment,
             "gcp.project_id": config.project_id,
+            "cloud.account.id": config.project_id,
         }
     )
+    if config.resolved_exporter == "gcp":
+        try:
+            from google.adk.telemetry.google_cloud import get_gcp_resource
+
+            base = base.merge(get_gcp_resource(config.project_id))
+        except Exception as exc:  # pragma: no cover - optional ADK helper
+            logger.debug("ADK get_gcp_resource unavailable; using static GCP resource: %s", exc)
     if not running_on_cloud_run():
         # The GCP detector probes the metadata server; skip it off-GCP to avoid startup stalls.
         return base
@@ -207,6 +301,40 @@ def _build_resource(config: TracingConfig) -> Resource:
     except Exception as exc:  # pragma: no cover - depends on the GCP metadata server
         logger.warning("GCP resource detection failed; using static resource: %s", exc)
         return base
+
+
+def _build_gcp_otlp_hooks(
+    config: TracingConfig,
+) -> tuple[list[SpanProcessor], list[LogRecordProcessor], str]:
+    """Build ADK's native OTLP processors for `telemetry.googleapis.com` (traces + GenAI logs).
+
+    Uses `google.adk.telemetry.google_cloud.get_gcp_exporters(...)` so traces and OTel log events
+    (`gen_ai.client.inference.operation.details`) go over OTLP/HTTP to `telemetry.googleapis.com`
+    with Vertex AI Agent Engine headers when `GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true`.
+    """
+    try:
+        import google.auth
+        from google.adk.telemetry.google_cloud import (
+            _CLOUD_PLATFORM_SCOPE,
+            get_gcp_exporters,
+        )
+    except ImportError as exc:
+        logger.debug("ADK GCP OTLP telemetry helper unavailable: %s", exc)
+        return [], [], "none"
+
+    credentials, detected_project = google.auth.default(scopes=[_CLOUD_PLATFORM_SCOPE])
+    project_id = config.project_id or detected_project
+    hooks = get_gcp_exporters(
+        enable_cloud_tracing=True,
+        enable_cloud_metrics=False,
+        enable_cloud_logging=True,
+        google_auth=(credentials, project_id),
+    )
+    span_processors = list(hooks.span_processors)
+    log_processors = list(hooks.log_record_processors)
+    if not span_processors and not log_processors:
+        return [], [], "none"
+    return span_processors, log_processors, "gcp_otlp"
 
 
 def _build_exporter(config: TracingConfig) -> tuple[SpanExporter | None, str]:
@@ -228,7 +356,7 @@ def _build_exporter(config: TracingConfig) -> tuple[SpanExporter | None, str]:
             return None, "none"
         return OTLPSpanExporter(), "otlp"
 
-    # Default remaining mode exports spans to Google Cloud Trace.
+    # Legacy Cloud Trace v2 fallback when OTLP exporter is unavailable.
     try:
         from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
     except ImportError:
@@ -273,15 +401,39 @@ def _instrument_httpx(provider: TracerProvider) -> bool:
     return True
 
 
+def _instrument_google_genai(
+    provider: TracerProvider,
+    logger_provider: LoggerProvider | None,
+) -> bool:
+    """Instrument the Google GenAI SDK so LLM calls emit GenAI semconv spans and events."""
+    try:
+        from opentelemetry.instrumentation.google_genai import GoogleGenAiSdkInstrumentor
+    except ImportError:
+        logger.warning(
+            "opentelemetry-instrumentation-google-genai unavailable; install google-adk[otel] "
+            "to populate the Cloud Trace Explorer Inputs/Outputs tab for Gemini generations."
+        )
+        return False
+    instrumentor = GoogleGenAiSdkInstrumentor()
+    if not instrumentor.is_instrumented_by_opentelemetry:
+        kwargs: dict[str, Any] = {"tracer_provider": provider}
+        if logger_provider is not None:
+            kwargs["logger_provider"] = logger_provider
+        instrumentor.instrument(**kwargs)
+    return True
+
+
 def configure_tracing(
     config: TracingConfig | None = None,
     *,
     extra_span_exporters: Sequence[SpanExporter] = (),
+    extra_log_record_processors: Sequence[LogRecordProcessor] = (),
 ) -> TracerProvider | None:
-    """Install the global OpenTelemetry tracer provider (idempotent).
+    """Install the global OpenTelemetry tracer & logger providers (idempotent).
 
     Returns the active SDK `TracerProvider`, or `None` when tracing is disabled.
-    `extra_span_exporters` are attached with a synchronous processor (useful in tests).
+    `extra_span_exporters` and `extra_log_record_processors` are attached synchronously
+    (useful in tests).
     """
     with _STATE.lock:
         cfg = config or TracingConfig.from_env()
@@ -289,6 +441,9 @@ def configure_tracing(
         if _STATE.provider is not None:
             for extra in extra_span_exporters:
                 _STATE.provider.add_span_processor(SimpleSpanProcessor(extra))
+            if _STATE.logger_provider is not None:
+                for extra_log_proc in extra_log_record_processors:
+                    _STATE.logger_provider.add_log_record_processor(extra_log_proc)
             return _STATE.provider
 
         _STATE.config = cfg
@@ -296,18 +451,16 @@ def configure_tracing(
             logger.info("OpenTelemetry tracing disabled (EDGAR_TRACING_ENABLED/OTEL_SDK_DISABLED)")
             return None
 
-        # Keep raw prompts / 10-K passages / model output out of exported ADK spans by default.
-        os.environ.setdefault(
-            ADK_CAPTURE_CONTENT_ENV, "true" if cfg.capture_message_content else "false"
-        )
+        _apply_genai_otel_env_defaults(cfg)
 
+        resource = _build_resource(cfg)
         existing = trace.get_tracer_provider()
         if isinstance(existing, TracerProvider):
             provider = existing
         else:
             ratio_sampler = TraceIdRatioBased(cfg.sample_ratio)
             provider = TracerProvider(
-                resource=_build_resource(cfg),
+                resource=resource,
                 sampler=ParentBased(
                     root=ratio_sampler,
                     remote_parent_not_sampled=ratio_sampler,
@@ -315,29 +468,77 @@ def configure_tracing(
             )
             trace.set_tracer_provider(provider)
 
-        try:
-            exporter, exporter_name = _build_exporter(cfg)
-        except Exception as exc:  # pragma: no cover - credential / environment specific
-            _STATE.last_error = f"{type(exc).__name__}: {exc}"
-            logger.warning("Cloud Trace exporter unavailable; spans stay local: %s", exc)
-            exporter, exporter_name = None, "none"
-        if exporter is not None:
-            provider.add_span_processor(BatchSpanProcessor(exporter))
+        # Attach ADK's Agent Engine TopSpanProcessor for supportID / traceparent attribution.
+        if cfg.agent_engine_telemetry_enabled:
+            try:
+                from google.adk.telemetry._agent_engine import TopSpanProcessor
+
+                provider.add_span_processor(TopSpanProcessor())
+            except Exception as exc:  # pragma: no cover - optional ADK helper
+                logger.debug("Skipping ADK TopSpanProcessor: %s", exc)
+
+        existing_logger = _logs.get_logger_provider()
+        if isinstance(existing_logger, LoggerProvider):
+            logger_provider = existing_logger
+        else:
+            logger_provider = LoggerProvider(resource=resource)
+            _logs.set_logger_provider(logger_provider)
+
+        span_processors: list[SpanProcessor] = []
+        log_processors: list[LogRecordProcessor] = []
+        exporter_name = "none"
+
+        if cfg.resolved_exporter == "gcp":
+            try:
+                span_processors, log_processors, exporter_name = _build_gcp_otlp_hooks(cfg)
+            except Exception as exc:  # pragma: no cover - credential / environment specific
+                _STATE.last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "GCP OTLP telemetry exporter unavailable; falling back to Cloud Trace v2: %s",
+                    exc,
+                )
+
+        if not span_processors and cfg.resolved_exporter != "none":
+            try:
+                exporter, exporter_name = _build_exporter(cfg)
+            except Exception as exc:  # pragma: no cover - credential / environment specific
+                _STATE.last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning("Cloud Trace exporter unavailable; spans stay local: %s", exc)
+                exporter, exporter_name = None, "none"
+            if exporter is not None:
+                span_processors.append(BatchSpanProcessor(exporter))
+
+        for proc in span_processors:
+            provider.add_span_processor(proc)
         for extra in extra_span_exporters:
             provider.add_span_processor(SimpleSpanProcessor(extra))
+
+        for log_proc in log_processors:
+            logger_provider.add_log_record_processor(log_proc)
+        for extra_log_proc in extra_log_record_processors:
+            logger_provider.add_log_record_processor(extra_log_proc)
 
         _STATE.propagators = _configure_propagators()
         if cfg.instrument_httpx:
             _STATE.httpx_instrumented = _instrument_httpx(provider)
+        if cfg.instrument_genai:
+            _STATE.genai_instrumented = _instrument_google_genai(provider, logger_provider)
 
         _STATE.provider = provider
+        _STATE.logger_provider = logger_provider
         _STATE.exporter_name = exporter_name
+        _STATE.otel_logging_enabled = bool(log_processors or extra_log_record_processors)
         logger.info(
             "OpenTelemetry tracing configured",
             extra={
                 "json_fields": {
                     "event": "tracing_configured",
                     "trace_exporter": exporter_name,
+                    "otel_logging_enabled": _STATE.otel_logging_enabled,
+                    "genai_instrumented": _STATE.genai_instrumented,
+                    "capture_message_content_mode": cfg.capture_message_content_mode,
+                    "semconv_stability_opt_in": cfg.semconv_stability_opt_in,
+                    "agent_engine_telemetry_enabled": cfg.agent_engine_telemetry_enabled,
                     "trace_sample_ratio": cfg.sample_ratio,
                     "service_name": cfg.service_name,
                     "service_version": cfg.service_version,
@@ -374,16 +575,24 @@ def instrument_fastapi_app(app: Any) -> bool:
 
 
 def flush_tracing(timeout_millis: int = 5000) -> bool:
-    """Flush buffered spans (call on shutdown; Cloud Run may freeze CPU between requests)."""
+    """Flush buffered spans and OTel log records (call on shutdown)."""
     with _STATE.lock:
         provider = _STATE.provider
-    if provider is None:
-        return True
-    try:
-        return bool(provider.force_flush(timeout_millis=timeout_millis))
-    except Exception as exc:  # pragma: no cover - exporter specific
-        logger.warning("Failed to flush OpenTelemetry spans: %s", exc)
-        return False
+        logger_provider = _STATE.logger_provider
+    ok = True
+    if provider is not None:
+        try:
+            ok = bool(provider.force_flush(timeout_millis=timeout_millis)) and ok
+        except Exception as exc:  # pragma: no cover - exporter specific
+            logger.warning("Failed to flush OpenTelemetry spans: %s", exc)
+            ok = False
+    if logger_provider is not None:
+        try:
+            ok = bool(logger_provider.force_flush(timeout_millis=timeout_millis)) and ok
+        except Exception as exc:  # pragma: no cover - exporter specific
+            logger.warning("Failed to flush OpenTelemetry log records: %s", exc)
+            ok = False
+    return ok
 
 
 def get_tracer(name: str = TRACER_NAME) -> trace.Tracer:
@@ -395,21 +604,29 @@ def tracing_status_metadata() -> dict[str, Any]:
         cfg = _STATE.config or TracingConfig.from_env()
         provider_ready = _STATE.provider is not None
         exporter_name = _STATE.exporter_name
+        otel_logging_enabled = _STATE.otel_logging_enabled
         fastapi_instrumented = _STATE.fastapi_instrumented
         httpx_instrumented = _STATE.httpx_instrumented
+        genai_instrumented = _STATE.genai_instrumented
         propagators = list(_STATE.propagators)
         last_error = _STATE.last_error
     return {
         "enabled": cfg.enabled and provider_ready,
         "exporter": exporter_name,
         "configured_exporter": cfg.exporter,
+        "otel_logging_enabled": otel_logging_enabled,
         "sample_ratio": cfg.sample_ratio,
         "service_name": cfg.service_name,
         "service_version": cfg.service_version,
         "project_id": cfg.project_id,
         "fastapi_instrumented": fastapi_instrumented,
         "httpx_instrumented": httpx_instrumented,
+        "genai_instrumented": genai_instrumented,
         "capture_message_content": cfg.capture_message_content,
+        "capture_message_content_mode": cfg.capture_message_content_mode,
+        "semconv_stability_opt_in": cfg.semconv_stability_opt_in,
+        "emit_genai_events": cfg.emit_genai_events,
+        "agent_engine_telemetry_enabled": cfg.agent_engine_telemetry_enabled,
         "propagators": propagators,
         "last_error": last_error,
     }

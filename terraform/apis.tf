@@ -32,6 +32,7 @@ locals {
     "serviceusage.googleapis.com",
     "storage.googleapis.com",
     "sts.googleapis.com",
+    "telemetry.googleapis.com",
   ])
 }
 

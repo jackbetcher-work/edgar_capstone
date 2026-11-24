@@ -567,3 +567,202 @@ def test_new_trace_started_without_upstream_context(spans: InMemorySpanExporter)
     assert len(trace_id) == 32 and trace_id != UPSTREAM_TRACE_ID
     assert resp.headers["X-Request-Id"] == trace_id
     assert "x-trace-id" in resp.headers["access-control-expose-headers"].lower()
+
+
+def test_genai_otel_env_and_gcp_otlp_exporter_auto_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies GenAI OTel env defaults, opt-outs, and ADK `get_gcp_exporters` OTLP hooks."""
+    from edgar_capstone.observability.tracing import (
+        ADK_CAPTURE_CONTENT_ENV,
+        AGENT_ENGINE_ENABLE_TELEMETRY_ENV,
+        OTEL_GENAI_CAPTURE_CONTENT_ENV,
+        OTEL_GENAI_EMIT_EVENT_ENV,
+        OTEL_SEMCONV_STABILITY_OPT_IN_ENV,
+        _build_gcp_otlp_hooks,
+        flush_tracing,
+        tracing_status_metadata,
+    )
+
+    # Active app startup config populates GenAI Inputs/Outputs env vars and instruments GenAI SDK.
+    status = tracing_status_metadata()
+    assert status["genai_instrumented"] is True
+    assert status["capture_message_content"] is True
+    assert status["capture_message_content_mode"] == "SPAN_AND_EVENT"
+    assert status["semconv_stability_opt_in"] == "gen_ai_latest_experimental"
+    assert status["emit_genai_events"] is True
+    assert status["agent_engine_telemetry_enabled"] is True
+    assert flush_tracing() is True
+
+    # Explicit opt-out via EDGAR_TRACE_CAPTURE_CONTENT=false or NO_CONTENT
+    monkeypatch.delenv(OTEL_GENAI_CAPTURE_CONTENT_ENV, raising=False)
+    monkeypatch.delenv(OTEL_GENAI_EMIT_EVENT_ENV, raising=False)
+    monkeypatch.setenv("EDGAR_TRACE_CAPTURE_CONTENT", "false")
+    opt_out = TracingConfig.from_env()
+    assert opt_out.capture_message_content is False
+    assert opt_out.capture_message_content_mode == "NO_CONTENT"
+    assert opt_out.emit_genai_events is False
+
+    # Explicit OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT takes precedence
+    monkeypatch.setenv(OTEL_GENAI_CAPTURE_CONTENT_ENV, "SPAN_ONLY")
+    span_only = TracingConfig.from_env()
+    assert span_only.capture_message_content is True
+    assert span_only.capture_message_content_mode == "SPAN_ONLY"
+    assert span_only.emit_genai_events is False
+
+    # ADK's get_gcp_exporters wires both OTLP span and OTLP log processors to telemetry.googleapis.com
+    captured_kwargs: dict[str, Any] = {}
+    fake_span_proc = SimpleNamespace(name="otlp_span_proc")
+    fake_log_proc = SimpleNamespace(name="otlp_log_proc")
+
+    def fake_get_gcp_exporters(**kwargs: Any) -> Any:
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(
+            span_processors=[fake_span_proc],
+            log_record_processors=[fake_log_proc],
+        )
+
+    import google.adk.telemetry.google_cloud as adk_gcp
+    import google.auth
+
+    monkeypatch.setattr(google.auth, "default", lambda scopes=None: (SimpleNamespace(), "proj-1"))
+    monkeypatch.setattr(adk_gcp, "get_gcp_exporters", fake_get_gcp_exporters)
+    span_procs, log_procs, exp_name = _build_gcp_otlp_hooks(
+        TracingConfig(resolved_exporter="gcp", project_id="proj-1")
+    )
+    assert exp_name == "gcp_otlp"
+    assert span_procs == [fake_span_proc]
+    assert log_procs == [fake_log_proc]
+    assert captured_kwargs["enable_cloud_tracing"] is True
+    assert captured_kwargs["enable_cloud_logging"] is True
+    assert captured_kwargs["enable_cloud_metrics"] is False
+
+    # Verify canonical env vars are exported in process environment for ADK & util-genai
+    import os
+
+    assert os.environ.get(OTEL_SEMCONV_STABILITY_OPT_IN_ENV) == "gen_ai_latest_experimental"
+    assert os.environ.get(ADK_CAPTURE_CONTENT_ENV) == "true"
+    assert os.environ.get(AGENT_ENGINE_ENABLE_TELEMETRY_ENV) == "true"
+
+
+def test_genai_sdk_and_adk_populate_cloud_trace_inputs_and_outputs(
+    spans: InMemorySpanExporter,
+    fake_gcp_adapters: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verifies GenAI SDK spans/events and ADK tool spans carry Cloud Trace Inputs/Outputs attrs."""
+    import httpx
+    from google import genai
+    from google.genai import types as genai_types
+    from opentelemetry.sdk._logs.export import InMemoryLogRecordExporter, SimpleLogRecordProcessor
+
+    log_exporter = InMemoryLogRecordExporter()
+    configure_tracing(extra_log_record_processors=[SimpleLogRecordProcessor(log_exporter)])
+
+    # 1. Mocked google.genai.Client exercises GoogleGenAiSdkInstrumentor end-to-end (offline).
+    def _mock_gemini_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {
+                            "role": "model",
+                            "parts": [{"text": "NVDA revenue rose sharply in FY2026."}],
+                        },
+                        "finishReason": "STOP",
+                    }
+                ],
+                "usageMetadata": {
+                    "promptTokenCount": 24,
+                    "candidatesTokenCount": 9,
+                    "totalTokenCount": 33,
+                },
+                "modelVersion": "gemini-3.8-flash",
+                "responseId": "resp-test-1",
+            },
+        )
+
+    mock_http = httpx.Client(transport=httpx.MockTransport(_mock_gemini_handler))
+    genai_client = genai.Client(
+        api_key="test-key",
+        http_options=genai_types.HttpOptions(httpx_client=mock_http),
+    )
+    with start_span("unit.genai_parent") as parent_span:
+        parent_trace_id = format(parent_span.get_span_context().trace_id, "032x")
+        reply = genai_client.models.generate_content(
+            model="gemini-3.8-flash",
+            contents="Summarize NVIDIA FY2026 revenue growth.",
+            config=genai_types.GenerateContentConfig(
+                system_instruction="You are a financial analyst.",
+                max_output_tokens=64,
+            ),
+        )
+    assert "NVDA revenue rose sharply" in (reply.text or "")
+
+    genai_spans = [
+        s
+        for s in spans.get_finished_spans()
+        if format(s.context.trace_id, "032x") == parent_trace_id
+        and s.attributes
+        and s.attributes.get("gen_ai.operation.name") == "generate_content"
+    ]
+    assert len(genai_spans) == 1
+    g_attrs = genai_spans[0].attributes or {}
+    assert "Summarize NVIDIA FY2026 revenue growth." in str(g_attrs.get("gen_ai.input.messages"))
+    assert "NVDA revenue rose sharply" in str(g_attrs.get("gen_ai.output.messages"))
+    assert "You are a financial analyst." in str(g_attrs.get("gen_ai.system_instructions"))
+
+    completion_events = [
+        rec
+        for rec in log_exporter.get_finished_logs()
+        if rec.log_record.event_name == "gen_ai.client.inference.operation.details"
+        and format(rec.log_record.trace_id, "032x") == parent_trace_id
+    ]
+    assert len(completion_events) == 1
+    ev_attrs = completion_events[0].log_record.attributes or {}
+    assert "gen_ai.input.messages" in ev_attrs
+    assert "gen_ai.output.messages" in ev_attrs
+    assert "gen_ai.system_instructions" in ev_attrs
+
+    # 2. ADK tool execution spans also carry tool call arguments & results for Cloud Trace.
+    patch_http_chat_llms(
+        monkeypatch,
+        reasoning_llm=ScriptedAnalystLlm(
+            tool_calls=[
+                (
+                    "calculate_period_variances",
+                    {"tickers": "NVDA", "start_year": 2024, "end_year": 2026},
+                )
+            ],
+            headline="NVDA revenue expanded sharply from FY2024 to FY2026.",
+            intent="longitudinal_single_company",
+            key_metrics=[("NVDA", "revenue")],
+        ),
+        skip_background_judge=True,
+    )
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/chat",
+        headers={
+            **_bearer_headers(),
+            "traceparent": f"00-{UPSTREAM_TRACE_ID}-{UPSTREAM_SPAN_ID}-01",
+        },
+        json={
+            "query": "Analyze NVIDIA revenue growth from 2024 to 2026",
+            "tickers": "NVDA",
+            "start_year": 2024,
+            "end_year": 2026,
+        },
+    )
+    assert resp.status_code == 200
+    tool_spans = [
+        s
+        for s in spans.get_finished_spans()
+        if format(s.context.trace_id, "032x") == UPSTREAM_TRACE_ID
+        and s.attributes
+        and s.attributes.get("gen_ai.operation.name") == "execute_tool"
+    ]
+    assert tool_spans
+    assert "gen_ai.tool.call.arguments" in (tool_spans[0].attributes or {})
+    assert "gen_ai.tool.call.result" in (tool_spans[0].attributes or {})
