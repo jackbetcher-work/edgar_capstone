@@ -212,7 +212,7 @@ def test_lazy_imports_avoid_heavy_sdks_on_cold_start() -> None:
         ),
         (
             "security",
-            "import edgar_capstone.security; from edgar_capstone.security.secrets import SecretManagerClient",
+            "import edgar_capstone.security; from edgar_capstone.security.secrets import scan_text_for_exposed_secrets",
             ["fastapi", "google.adk", "edgar_capstone.telemetry"],
         ),
         (

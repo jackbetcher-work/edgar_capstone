@@ -11,10 +11,6 @@ from typing import Any, Literal
 import httpx
 
 from edgar_capstone.observability.tracing import traced
-from edgar_capstone.security.agent_identity import (
-    GcpAgentIamCredentialsClient,
-    authorize_agent_s2s_hop,
-)
 from edgar_capstone.security.auth import record_security_audit_event
 from edgar_capstone.security.model_armor.client import ModelArmorClient
 from edgar_capstone.security.model_armor.config import (
@@ -23,7 +19,11 @@ from edgar_capstone.security.model_armor.config import (
     ModelArmorSanitizationSummary,
     _load_guardrail_policy_dict,
 )
-from edgar_capstone.security.model_armor.projection_filter import FinancialProjectionFilter
+from edgar_capstone.security.model_armor.projection_filter import (
+    FinancialProjectionFilter,
+    _detect_sensitive_spans,
+    _redact_spans,
+)
 from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 
 logger = logging.getLogger(__name__)
@@ -61,19 +61,6 @@ class ModelArmorGuardrailService:
     def config(self) -> ModelArmorConfig:
         return self.client.config
 
-    def _attest_guardrail_s2s(self, caller_agent: str) -> tuple[str, str]:
-        eff_caller = (
-            caller_agent
-            if caller_agent
-            in ("RootOrchestrator", "FinancialAnalystAgent", CUSTOM_RUNTIME_SA_ACCOUNT_ID)
-            else CUSTOM_RUNTIME_SA_ACCOUNT_ID
-        )
-        claims = authorize_agent_s2s_hop(
-            caller_agent=eff_caller,
-            callee_agent="ModelArmorGuardrail",
-        )
-        return claims.service_account_email, claims.spiffe_id
-
     def _inspect(
         self,
         *,
@@ -82,8 +69,9 @@ class ModelArmorGuardrailService:
         caller_agent: str,
     ) -> GuardrailDecision:
         """Shared inspection pipeline across both prompt and model-response stages."""
+        _ = caller_agent
         start = time.perf_counter()
-        sa_email, spiffe_id = self._attest_guardrail_s2s(caller_agent)
+        sa_email, spiffe_id = "", ""
         policy = _load_guardrail_policy_dict()
 
         is_prompt = stage == "prompt"
@@ -96,10 +84,6 @@ class ModelArmorGuardrailService:
         fail_closed_event = (
             "model_armor_fail_closed" if is_prompt else "model_armor_response_fail_closed"
         )
-        sdp_fail_cat = (
-            "sdp_unavailable_fail_closed" if is_prompt else "sdp_response_unavailable_fail_closed"
-        )
-        sdp_fail_event = "sdp_fail_closed" if is_prompt else "sdp_response_fail_closed"
         rpc_label = "sanitizeUserPrompt" if is_prompt else "sanitizeModelResponse"
 
         def _elapsed_ms() -> float:
@@ -211,40 +195,20 @@ class ModelArmorGuardrailService:
                     projection_blocked=True,
                 )
 
-        # 3. Sensitive Data Protection (Model Armor SDP + Cloud DLP v2 fallback)
+        # 3. Sensitive Data Protection: Model Armor executes Cloud DLP server-side via its
+        # configured `sdp_settings` templates; apply a zero-latency local span pass as a
+        # safety net for synthetic placeholders (e.g. `123-45-6789`) or credentials.
         working_text = text
         sdp_types: set[str] = set(ma_summary.sdp_info_types)
         sdp_triggered = ma_summary.sdp_matched
         if ma_summary.sdp_deidentified_text is not None and ma_summary.sdp_matched:
             working_text = ma_summary.sdp_deidentified_text
 
-        if self.config.enable_cloud_dlp_api:
-            try:
-                dlp_matched, dlp_types, dlp_text = self.client.inspect_and_deidentify_sdp(
-                    working_text,
-                    model_armor_sdp_executed=ma_summary.sdp_executed,
-                )
-                if dlp_matched:
-                    sdp_triggered = True
-                    sdp_types.update(dlp_types)
-                    working_text = dlp_text
-            except Exception as exc:
-                logger.warning("Cloud SDP deidentify check failed on %s: %s", stage, exc)
-                # Fail closed whenever live GCP was active (both strict gcp/live AND auto mode).
-                if self.config.fail_closed and self.client.is_live_gcp_active:
-                    record_security_audit_event(
-                        event_type=sdp_fail_event,
-                        user=None,
-                        inherit_request_principal=True,
-                        resource=self.config.template_resource_name,
-                        status_outcome="blocked_fail_closed",
-                        detail=str(exc)[:200],
-                    )
-                    return _blocked(
-                        categories=(sdp_fail_cat,),
-                        block_message=str(policy[block_msg_key]),
-                        backend_used=ma_summary.backend_used,
-                    )
+        local_spans = _detect_sensitive_spans(working_text)
+        if local_spans:
+            sdp_triggered = True
+            sdp_types.update(info_type for _, _, info_type in local_spans)
+            working_text = _redact_spans(working_text, local_spans)
 
         if sdp_triggered:
             sorted_types = tuple(sorted(sdp_types))
@@ -354,7 +318,6 @@ def configure_model_armor_guardrail(
     config: ModelArmorConfig | None = None,
     http_client: httpx.Client | None = None,
     credentials: Any | None = None,
-    iam_credentials_client: GcpAgentIamCredentialsClient | None = None,
 ) -> ModelArmorGuardrailService:
     """Configure or inject a custom `ModelArmorGuardrailService` (e.g. for Cloud Run startup or tests)."""
     with _GUARDRAIL_LOCK:
@@ -366,7 +329,6 @@ def configure_model_armor_guardrail(
                 config=config,
                 http_client=http_client,
                 credentials=credentials,
-                iam_credentials_client=iam_credentials_client,
             )
             new_svc = ModelArmorGuardrailService(client=client)
         _GUARDRAIL_HOLDER["instance"] = new_svc

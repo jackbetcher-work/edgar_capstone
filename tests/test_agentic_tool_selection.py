@@ -283,10 +283,9 @@ def test_prompt_carries_tool_selection_policy_and_no_precomputed_payloads() -> N
         sector_benchmarks=[],
         chunk_health=None,
     )
-    assert "## Deterministic Tool Selection" in prompt
+    assert "## Turn Scope & Tool Parameters" in prompt
     assert "Authoritative Deterministic Period-over-Period Variance Calculations" not in prompt
     assert "Authoritative Material Variance Flags" not in prompt
-    assert "sector_thematic_map_reduce(" in prompt
     assert "key_metrics" in prompt
     assert "`intent`" in prompt
 
@@ -373,7 +372,7 @@ def test_quantitative_peer_turn_computes_variances_and_only_requested_key_metric
     assert turn["adk_runtime"]["agent_invoked_tools"] == ["calculate_period_variances"]
     assert turn["adk_runtime"]["key_metric_backfill_tickers"] == []
     step = next(s for s in turn["agent_trace"] if s["tool"] == "calculate_period_variances")
-    assert step["s2s_verified"] is True and "Agent-invoked" in step["summary"]
+    assert "Agent-invoked" in step["summary"]
     assert "agent_tool" in progress
     # Fiscal calendar notice is preserved (AAPL Sep vs MSFT Jun year-ends)
     assert any(n["code"] == "fiscal_calendar_misalignment" for n in turn["coverage_notices"])

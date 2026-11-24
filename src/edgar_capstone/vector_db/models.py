@@ -68,47 +68,6 @@ class FilingChunk(FilingMetadataBase):
         """Serialize chunk to a dict matching `terraform/schemas/filing_chunks.json`."""
         return self.model_dump(mode="json")
 
-    def to_vertex_vector_search_record(self) -> dict[str, Any]:
-        """Serialize chunk to Vertex AI Vector Search (Matching Engine) JSONL format.
-
-        Includes metadata `restricts` for pre-filtered semantic retrieval by ticker,
-        CIK, GICS sector, GICS sub-industry, section ID, form type, and profile ID,
-        plus `numeric_restricts` for fiscal year range queries and `crowding_tag`
-        to ensure multi-company diversity in top-k results.
-        """
-        restricts: list[dict[str, Any]] = [
-            {"namespace": "ticker", "allow": [self.ticker]},
-            {"namespace": "cik", "allow": [self.cik]},
-            {"namespace": "gics_sector", "allow": [self.gics_sector]},
-            {"namespace": "gics_sub_industry", "allow": [self.gics_sub_industry]},
-            {"namespace": "section_id", "allow": [self.section_id]},
-            {"namespace": "form_type", "allow": [self.form_type]},
-            {"namespace": "profile_id", "allow": [self.profile_id]},
-        ]
-        numeric_restricts: list[dict[str, Any]] = [
-            {"namespace": "fiscal_year", "value_int": int(self.fiscal_year)},
-        ]
-        return {
-            "id": self.chunk_id,
-            "embedding": self.embedding,
-            "restricts": restricts,
-            "numeric_restricts": numeric_restricts,
-            "crowding_tag": self.ticker,
-            "embedding_metadata": {
-                "profile_id": self.profile_id,
-                "ticker": self.ticker,
-                "company_name": self.company_name,
-                "fiscal_year": self.fiscal_year,
-                "section_id": self.section_id,
-                "section_title": self.section_title,
-                "chunk_index": self.chunk_index,
-                "char_count": self.char_count,
-                "token_estimate": self.token_estimate,
-                "sec_filing_url": self.sec_filing_url,
-                "unstructured_gcs_uri": self.unstructured_gcs_uri,
-            },
-        }
-
 
 class ChunkAnomalyCounts(BaseModel):
     """Counts of chunk quality and indexing anomalies detected across the vector DB."""
@@ -238,7 +197,6 @@ class VectorDBBuildSummary(BaseModel):
     item_1a_chunks: int
     item_7_chunks: int
     bigquery_manifest_path: str
-    vertex_vector_manifest_path: str
     health_report_path: str
     uploaded_to_gcs: bool = False
     loaded_to_bigquery: bool = False

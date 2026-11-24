@@ -235,7 +235,6 @@ describe('ChatTurnItem decluttering', () => {
         thresholds: {},
       },
       citations: [GROSS_MARGIN, GROSS_MARGIN, RISK_2024, RISK_2023_DUP],
-      context_cache: null,
       fact_check: {
         passed: true,
         checked_metrics_count: 1,
@@ -244,7 +243,7 @@ describe('ChatTurnItem decluttering', () => {
         discrepancies: [],
         model_latency_ms: 3,
       },
-      react_execution: { strategy: 'react', iterations: 4, steps: [] },
+      react_execution: { strategy: 'react', iterations: 4 },
       context_and_memory: {
         models: { financial_reasoning_model: 'gemini-pro', coding_and_evaluation_model: 'gemini-flash' },
         turn_context_latency: {

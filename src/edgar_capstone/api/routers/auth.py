@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -16,11 +16,6 @@ from edgar_capstone.api.dependencies import (
 from edgar_capstone.api.schemas import (
     DevWorkspaceSsoLoginRequest,
     SsoTokenExchangeRequest,
-)
-from edgar_capstone.gcp.defaults import resolve_gcp_project_id
-from edgar_capstone.security.agent_identity import (
-    PER_AGENT_IDENTITIES,
-    S2S_AGENT_ASSERTION_HEADER,
 )
 from edgar_capstone.security.auth import (
     GOOGLE_IAP_ISSUER,
@@ -37,7 +32,8 @@ from edgar_capstone.security.auth import (
     revoke_bearer_token,
 )
 from edgar_capstone.security.rbac import Permission, RuntimeServiceAccountConfig
-from edgar_capstone.security.secrets import MANAGED_SECRETS
+
+_ = logging
 
 router = APIRouter(tags=["Authentication & RBAC"])
 
@@ -54,12 +50,10 @@ def auth_discovery_config(
         "auth_required": True,
         "access_pattern": "iap_jwt_bearer",
         "identity_provider": {
-            "name": "Google Workspace (Okta SSO)",
-            "protocol": "OIDC / SAML-Federated Workspace + IAP",
+            "name": "Google Workspace / Cloud IAP",
+            "protocol": "Google Workspace OIDC + Direct Cloud Run IAP",
             "google_issuer": "https://accounts.google.com",
             "iap_issuer": GOOGLE_IAP_ISSUER,
-            "okta_issuer": settings.okta_issuer_uri,
-            "okta_client_id": settings.okta_client_id,
             "google_client_id": settings.google_oauth_client_id,
             "authorization_endpoint": settings.authorization_endpoint(),
             "allowed_workspace_domains": list(settings.allowed_workspace_domains),
@@ -71,7 +65,6 @@ def auth_discovery_config(
             "strict_production_mode": settings.strict_production_mode,
             "bearer_header": "Authorization",
             "assertion_header": "X-Goog-IAP-JWT-Assertion",
-            "agent_s2s_assertion_header": S2S_AGENT_ASSERTION_HEADER,
             "audience_configured": bool(settings.audiences),
             # In Cloud Run the browser can sign in through the IAP session alone; the
             # frontend probes /api/v1/auth/me without a Bearer token when this is true.
@@ -80,9 +73,6 @@ def auth_discovery_config(
         },
         "rbac": settings.rbac_policy().to_public_dict(),
         "service_account": runtime_sa.to_public_dict(),
-        "agent_identities": [
-            spec.to_public_dict(runtime_sa.project_id) for spec in PER_AGENT_IDENTITIES.values()
-        ],
     }
 
 
@@ -233,39 +223,4 @@ def admin_rbac_governance_policies(
         "cloud_identity_groups": list(user.cloud_identity_groups),
         "rbac_policy": verifier.settings.rbac_policy().to_public_dict(),
         "runtime_service_account": runtime_sa.to_public_dict(),
-        "agent_identities": {
-            name: spec.to_public_dict(runtime_sa.project_id)
-            for name, spec in PER_AGENT_IDENTITIES.items()
-        },
-    }
-
-
-@router.get("/api/v1/secrets/status")
-def secrets_status(
-    _user: AuthenticatedUser = Depends(
-        audited_permissions(
-            Permission.SECRETS_INSPECT.value,
-            event_type="secrets_metadata_inspected",
-        )
-    ),
-) -> dict[str, Any]:
-    """Report Secret Manager binding metadata without ever exposing secret values."""
-    project_id = resolve_gcp_project_id()
-    bindings = [
-        {
-            "env_var": spec.env_var,
-            "secret_id": spec.secret_id,
-            "resource_name": spec.resource_name(project_id),
-            "cloud_run_mount": spec.cloud_run_mount_spec(),
-            "required": spec.required,
-            "mounted_in_env": bool(os.environ.get(spec.env_var)),
-            "value": "***REDACTED***",
-        }
-        for spec in MANAGED_SECRETS
-    ]
-    return {
-        "status": "ok",
-        "project_id": project_id,
-        "secret_manager_enabled": True,
-        "secrets": bindings,
     }

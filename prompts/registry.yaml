@@ -1,8 +1,8 @@
 schema_version: "1.0"
-default_version: "v1"
+default_version: "latest"
 description: >
-  Versioned prompt registry for SEC EDGAR Natural Language Analyst ADK agents
-  and Model Armor safety/projection policy specifications.
+  Local Git-versioned prompt registry for SEC EDGAR Natural Language Analyst ADK agents
+  and Model Armor compliance policy.
 
 prompts:
   financial_analyst:
@@ -10,28 +10,7 @@ prompts:
     model: "gemini-3.8-flash"
     latest: "v7"
     versions:
-      v1:
-        semver: "1.0.0"
-        path: "v1/financial_analyst.yaml"
-      "1.0.0":
-        semver: "1.0.0"
-        path: "v1/financial_analyst.yaml"
-      v5:
-        semver: "5.0.0"
-        path: "v5/financial_analyst.yaml"
-      "5.0.0":
-        semver: "5.0.0"
-        path: "v5/financial_analyst.yaml"
-      v6:
-        semver: "6.0.0"
-        path: "v6/financial_analyst.yaml"
-      "6.0.0":
-        semver: "6.0.0"
-        path: "v6/financial_analyst.yaml"
       v7:
-        semver: "7.0.0"
-        path: "v7/financial_analyst.yaml"
-      "7.0.0":
         semver: "7.0.0"
         path: "v7/financial_analyst.yaml"
 
@@ -43,9 +22,6 @@ prompts:
       v1:
         semver: "1.0.0"
         path: "v1/narrative_evaluator.yaml"
-      "1.0.0":
-        semver: "1.0.0"
-        path: "v1/narrative_evaluator.yaml"
 
   model_armor_policy:
     agent_name: "ModelArmorGuardrail"
@@ -53,8 +29,5 @@ prompts:
     latest: "v1"
     versions:
       v1:
-        semver: "1.0.0"
-        path: "v1/model_armor_policy.yaml"
-      "1.0.0":
         semver: "1.0.0"
         path: "v1/model_armor_policy.yaml"

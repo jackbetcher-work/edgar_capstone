@@ -43,7 +43,6 @@ from edgar_capstone.agents.runtime.model_config import (
     resolve_model_for_task,
 )
 from edgar_capstone.common.formatting import utc_now_iso
-from edgar_capstone.security.model_armor import ModelArmorSafetyPlugin
 from edgar_capstone.telemetry import FirestoreSessionStore
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
@@ -796,7 +795,7 @@ def create_edgar_adk_app(
     enable_context_cache: bool = True,
     plugins: list[BasePlugin] | None = None,
 ) -> App:
-    """Create the production ADK `App` with Model Armor safety plugin, Context Caching & Compaction."""
+    """Create the production ADK `App` with Context Caching & Compaction."""
     flash_model = resolve_model_for_task("context_compaction")
     cache_cfg = (
         ContextCacheConfig(
@@ -807,9 +806,7 @@ def create_edgar_adk_app(
         if enable_context_cache
         else None
     )
-    resolved_plugins: list[BasePlugin] = (
-        list(plugins) if plugins is not None else [ModelArmorSafetyPlugin()]
-    )
+    resolved_plugins: list[BasePlugin] = list(plugins) if plugins is not None else []
     return App(
         name=app_name,
         root_agent=root_agent,

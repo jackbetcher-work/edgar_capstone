@@ -24,6 +24,7 @@ import difflib
 import functools
 import itertools
 import re
+import threading
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -84,6 +85,7 @@ _NON_WORD_RE = re.compile(r"[^\w]")
 _TERM_SPLIT_RE = re.compile(r"[,;\n]+")
 _MAX_THEME_TERMS = 20
 _MAX_TERM_CHARS = 80
+_STATE_MERGE_LOCK = threading.Lock()
 
 # Minimal stopword filter used only as a fallback when the caller omits explicit `theme_terms`.
 _FALLBACK_STOPWORDS: frozenset[str] = frozenset(
@@ -1056,13 +1058,16 @@ def compare_disclosures_across_years(
         "citations": citations,
     }
     if tool_context is not None and hasattr(tool_context, "state"):
-        existing = list(tool_context.state.get(STATE_RETRIEVED_CITATIONS) or [])
-        tool_context.state[STATE_RETRIEVED_CITATIONS] = merge_citations(existing, citations)
-        # Full payload (not just the summary) so the turn's DisclosureDeltaCard is hydrated
-        # from session_state; repeated calls in one turn merge by ticker.
-        merged = merge_disclosure_deltas(tool_context.state.get(STATE_DISCLOSURE_DELTAS), result)
-        tool_context.state[STATE_DISCLOSURE_DELTAS] = merged
-        tool_context.state[STATE_DISCLOSURE_DELTA_SUMMARY] = (merged or result)["summary"]
+        with _STATE_MERGE_LOCK:
+            existing = list(tool_context.state.get(STATE_RETRIEVED_CITATIONS) or [])
+            tool_context.state[STATE_RETRIEVED_CITATIONS] = merge_citations(existing, citations)
+            # Full payload (not just the summary) so the turn's DisclosureDeltaCard is hydrated
+            # from session_state; repeated calls in one turn merge per ticker and year pair.
+            merged = merge_disclosure_deltas(
+                tool_context.state.get(STATE_DISCLOSURE_DELTAS), result
+            )
+            tool_context.state[STATE_DISCLOSURE_DELTAS] = merged
+            tool_context.state[STATE_DISCLOSURE_DELTA_SUMMARY] = (merged or result)["summary"]
     services_hit = ["vertex_ai_search", "bigquery"]
     if used_gcs_fallback:
         services_hit.append("gcs")

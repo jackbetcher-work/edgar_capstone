@@ -7,7 +7,6 @@ public and internal exports for backward compatibility (zero regex imports).
 
 from __future__ import annotations
 
-from edgar_capstone.security.model_armor.adk_plugin import ModelArmorSafetyPlugin
 from edgar_capstone.security.model_armor.client import ModelArmorClient
 from edgar_capstone.security.model_armor.config import (
     DEFAULT_MODEL_ARMOR_LOCATION,
@@ -63,7 +62,6 @@ __all__ = [
     "ModelArmorConfig",
     "ModelArmorGuardrailService",
     "ModelArmorMode",
-    "ModelArmorSafetyPlugin",
     "ModelArmorSanitizationSummary",
     "ProjectionFilterResult",
     "SdpActionMode",

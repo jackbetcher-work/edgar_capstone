@@ -1,169 +1,11 @@
-"""Security, Cloud Identity RBAC, Custom Service Account, Agent Identities, and Secret Hygiene.
-
-Uses PEP 562 lazy module attribute loading so ``import edgar_capstone.security`` and
-submodule imports (e.g. ``from edgar_capstone.security.secrets import ...``) do not
-eagerly pull in ``auth``, ``model_armor``, ADK/FastAPI dependencies, or generate
-ephemeral ECDSA keys.
-"""
+"""Security package: IAP/Workspace auth, RBAC, Model Armor guardrails, and secret scanning."""
 
 from __future__ import annotations
 
 import importlib
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from edgar_capstone.security.agent_identity import (
-        AGENT_IDENTITY_ISSUER,
-        AGENT_NAME_ALIASES,
-        AGENT_TARGET_SERVICE_IDS,
-        MAX_AGENT_S2S_TTL_SECONDS,
-        PER_AGENT_IDENTITIES,
-        S2S_AGENT_ASSERTION_HEADER,
-        SERVICE_ACCOUNT_ID_TO_AGENT,
-        TOOL_TARGET_SERVICE_MAP,
-        AgentAuthorizationError,
-        AgentIdentitySpec,
-        AgentS2STokenBroker,
-        GcpAgentIamCredentialsClient,
-        VerifiedAgentS2SClaims,
-        authorize_agent_s2s_hop,
-        authorize_agent_tool_invocation,
-        get_agent_s2s_broker,
-        resolve_agent_by_service_account_id,
-        resolve_agent_identity,
-    )
-    from edgar_capstone.security.auth import (
-        DEFAULT_LOCAL_IAP_AUDIENCE,
-        GOOGLE_IAP_ISSUER,
-        GOOGLE_IAP_JWKS_URI,
-        GOOGLE_WORKSPACE_ISSUERS,
-        GOOGLE_WORKSPACE_JWKS_URI,
-        LOCAL_DEV_SSO_ISSUER,
-        AuthenticatedUser,
-        AuthenticationError,
-        AuthorizationError,
-        AuthSettings,
-        IAPJwtVerifier,
-        JwksKeyStore,
-        clear_security_audit_events,
-        compute_token_fingerprint,
-        extract_bearer_token_from_request,
-        get_auth_verifier,
-        get_security_audit_events,
-        is_bearer_token_revoked,
-        is_production_iap_mode,
-        issue_local_dev_workspace_sso_token,
-        record_security_audit_event,
-        require_authenticated_user,
-        require_permissions,
-        revoke_bearer_token,
-    )
-    from edgar_capstone.security.jwt_codec import (
-        b64url_decode,
-        b64url_encode,
-        ec_public_key_to_jwk,
-        jwk_to_public_key,
-        rsa_public_key_to_jwk,
-        sign_jwt_es256,
-        sign_jwt_rs256,
-    )
-    from edgar_capstone.security.model_armor import (
-        DEFAULT_MODEL_ARMOR_LOCATION,
-        DEFAULT_MODEL_ARMOR_TEMPLATE_ID,
-        FinancialProjectionFilter,
-        GuardrailDecision,
-        LocalModelArmorEmulatorTransport,
-        ModelArmorClient,
-        ModelArmorConfig,
-        ModelArmorGuardrailService,
-        ModelArmorSafetyPlugin,
-        ModelArmorSanitizationSummary,
-        ProjectionFilterResult,
-        configure_model_armor_guardrail,
-        get_model_armor_guardrail,
-        get_model_armor_status_metadata,
-        parse_model_armor_response,
-        reset_model_armor_guardrail,
-        schema_safe_block_text,
-    )
-    from edgar_capstone.security.rbac import (
-        ADMIN_PERMISSIONS,
-        ANALYST_PERMISSIONS,
-        CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-        DEFAULT_CLOUD_IDENTITY_DOMAIN,
-        DEFAULT_PROJECT_NAME,
-        VIEWER_PERMISSIONS,
-        CloudIdentityRBACPolicy,
-        CloudIdentityRoleDefinition,
-        Permission,
-        RuntimeServiceAccountConfig,
-        build_custom_service_account_email,
-        format_cloud_identity_group_principal,
-        is_default_gcp_service_account,
-        parse_cloud_identity_group,
-        validate_custom_service_account_email,
-    )
-    from edgar_capstone.security.secrets import (
-        DEFAULT_PROJECT_ID,
-        MANAGED_SECRETS,
-        RedactedSecret,
-        SecretFinding,
-        SecretManagerClient,
-        SecretSpec,
-        scan_repository_for_exposed_secrets,
-        scan_text_for_exposed_secrets,
-    )
+from typing import Any
 
 _EXPORTS: dict[str, tuple[str, str]] = {
-    # agent_identity
-    "AGENT_IDENTITY_ISSUER": ("edgar_capstone.security.agent_identity", "AGENT_IDENTITY_ISSUER"),
-    "AGENT_NAME_ALIASES": ("edgar_capstone.security.agent_identity", "AGENT_NAME_ALIASES"),
-    "AGENT_TARGET_SERVICE_IDS": (
-        "edgar_capstone.security.agent_identity",
-        "AGENT_TARGET_SERVICE_IDS",
-    ),
-    "MAX_AGENT_S2S_TTL_SECONDS": (
-        "edgar_capstone.security.agent_identity",
-        "MAX_AGENT_S2S_TTL_SECONDS",
-    ),
-    "PER_AGENT_IDENTITIES": ("edgar_capstone.security.agent_identity", "PER_AGENT_IDENTITIES"),
-    "S2S_AGENT_ASSERTION_HEADER": (
-        "edgar_capstone.security.agent_identity",
-        "S2S_AGENT_ASSERTION_HEADER",
-    ),
-    "SERVICE_ACCOUNT_ID_TO_AGENT": (
-        "edgar_capstone.security.agent_identity",
-        "SERVICE_ACCOUNT_ID_TO_AGENT",
-    ),
-    "TOOL_TARGET_SERVICE_MAP": (
-        "edgar_capstone.security.agent_identity",
-        "TOOL_TARGET_SERVICE_MAP",
-    ),
-    "AgentAuthorizationError": (
-        "edgar_capstone.security.agent_identity",
-        "AgentAuthorizationError",
-    ),
-    "AgentIdentitySpec": ("edgar_capstone.security.agent_identity", "AgentIdentitySpec"),
-    "AgentS2STokenBroker": ("edgar_capstone.security.agent_identity", "AgentS2STokenBroker"),
-    "GcpAgentIamCredentialsClient": (
-        "edgar_capstone.security.agent_identity",
-        "GcpAgentIamCredentialsClient",
-    ),
-    "VerifiedAgentS2SClaims": ("edgar_capstone.security.agent_identity", "VerifiedAgentS2SClaims"),
-    "authorize_agent_s2s_hop": (
-        "edgar_capstone.security.agent_identity",
-        "authorize_agent_s2s_hop",
-    ),
-    "authorize_agent_tool_invocation": (
-        "edgar_capstone.security.agent_identity",
-        "authorize_agent_tool_invocation",
-    ),
-    "get_agent_s2s_broker": ("edgar_capstone.security.agent_identity", "get_agent_s2s_broker"),
-    "resolve_agent_by_service_account_id": (
-        "edgar_capstone.security.agent_identity",
-        "resolve_agent_by_service_account_id",
-    ),
-    "resolve_agent_identity": ("edgar_capstone.security.agent_identity", "resolve_agent_identity"),
     # auth
     "DEFAULT_LOCAL_IAP_AUDIENCE": ("edgar_capstone.security.auth", "DEFAULT_LOCAL_IAP_AUDIENCE"),
     "GOOGLE_IAP_ISSUER": ("edgar_capstone.security.auth", "GOOGLE_IAP_ISSUER"),
@@ -227,7 +69,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "edgar_capstone.security.model_armor",
         "ModelArmorGuardrailService",
     ),
-    "ModelArmorSafetyPlugin": ("edgar_capstone.security.model_armor", "ModelArmorSafetyPlugin"),
     "ModelArmorSanitizationSummary": (
         "edgar_capstone.security.model_armor",
         "ModelArmorSanitizationSummary",
@@ -289,12 +130,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "validate_custom_service_account_email",
     ),
     # secrets
-    "DEFAULT_PROJECT_ID": ("edgar_capstone.security.secrets", "DEFAULT_PROJECT_ID"),
-    "MANAGED_SECRETS": ("edgar_capstone.security.secrets", "MANAGED_SECRETS"),
-    "RedactedSecret": ("edgar_capstone.security.secrets", "RedactedSecret"),
     "SecretFinding": ("edgar_capstone.security.secrets", "SecretFinding"),
-    "SecretManagerClient": ("edgar_capstone.security.secrets", "SecretManagerClient"),
-    "SecretSpec": ("edgar_capstone.security.secrets", "SecretSpec"),
     "scan_repository_for_exposed_secrets": (
         "edgar_capstone.security.secrets",
         "scan_repository_for_exposed_secrets",
@@ -305,97 +141,7 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     ),
 }
 
-__all__ = [
-    "ADMIN_PERMISSIONS",
-    "AGENT_IDENTITY_ISSUER",
-    "AGENT_NAME_ALIASES",
-    "AGENT_TARGET_SERVICE_IDS",
-    "ANALYST_PERMISSIONS",
-    "CUSTOM_RUNTIME_SA_ACCOUNT_ID",
-    "DEFAULT_CLOUD_IDENTITY_DOMAIN",
-    "DEFAULT_LOCAL_IAP_AUDIENCE",
-    "DEFAULT_MODEL_ARMOR_LOCATION",
-    "DEFAULT_MODEL_ARMOR_TEMPLATE_ID",
-    "DEFAULT_PROJECT_ID",
-    "DEFAULT_PROJECT_NAME",
-    "GOOGLE_IAP_ISSUER",
-    "GOOGLE_IAP_JWKS_URI",
-    "GOOGLE_WORKSPACE_ISSUERS",
-    "GOOGLE_WORKSPACE_JWKS_URI",
-    "LOCAL_DEV_SSO_ISSUER",
-    "MANAGED_SECRETS",
-    "MAX_AGENT_S2S_TTL_SECONDS",
-    "PER_AGENT_IDENTITIES",
-    "S2S_AGENT_ASSERTION_HEADER",
-    "SERVICE_ACCOUNT_ID_TO_AGENT",
-    "TOOL_TARGET_SERVICE_MAP",
-    "VIEWER_PERMISSIONS",
-    "AgentAuthorizationError",
-    "AgentIdentitySpec",
-    "AgentS2STokenBroker",
-    "AuthSettings",
-    "AuthenticatedUser",
-    "AuthenticationError",
-    "AuthorizationError",
-    "CloudIdentityRBACPolicy",
-    "CloudIdentityRoleDefinition",
-    "FinancialProjectionFilter",
-    "GcpAgentIamCredentialsClient",
-    "GuardrailDecision",
-    "IAPJwtVerifier",
-    "JwksKeyStore",
-    "LocalModelArmorEmulatorTransport",
-    "ModelArmorClient",
-    "ModelArmorConfig",
-    "ModelArmorGuardrailService",
-    "ModelArmorSafetyPlugin",
-    "ModelArmorSanitizationSummary",
-    "Permission",
-    "ProjectionFilterResult",
-    "RedactedSecret",
-    "RuntimeServiceAccountConfig",
-    "SecretFinding",
-    "SecretManagerClient",
-    "SecretSpec",
-    "VerifiedAgentS2SClaims",
-    "authorize_agent_s2s_hop",
-    "authorize_agent_tool_invocation",
-    "b64url_decode",
-    "b64url_encode",
-    "build_custom_service_account_email",
-    "clear_security_audit_events",
-    "compute_token_fingerprint",
-    "configure_model_armor_guardrail",
-    "ec_public_key_to_jwk",
-    "extract_bearer_token_from_request",
-    "format_cloud_identity_group_principal",
-    "get_agent_s2s_broker",
-    "get_auth_verifier",
-    "get_model_armor_guardrail",
-    "get_model_armor_status_metadata",
-    "get_security_audit_events",
-    "is_bearer_token_revoked",
-    "is_default_gcp_service_account",
-    "is_production_iap_mode",
-    "issue_local_dev_workspace_sso_token",
-    "jwk_to_public_key",
-    "parse_cloud_identity_group",
-    "parse_model_armor_response",
-    "record_security_audit_event",
-    "require_authenticated_user",
-    "require_permissions",
-    "reset_model_armor_guardrail",
-    "resolve_agent_by_service_account_id",
-    "resolve_agent_identity",
-    "revoke_bearer_token",
-    "rsa_public_key_to_jwk",
-    "scan_repository_for_exposed_secrets",
-    "scan_text_for_exposed_secrets",
-    "schema_safe_block_text",
-    "sign_jwt_es256",
-    "sign_jwt_rs256",
-    "validate_custom_service_account_email",
-]
+__all__ = sorted(_EXPORTS)
 
 
 def __getattr__(name: str) -> Any:
@@ -406,7 +152,3 @@ def __getattr__(name: str) -> Any:
     value = getattr(importlib.import_module(module_name), attr_name)
     globals()[name] = value
     return value
-
-
-def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(__all__))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from edgar_capstone.common.domain import CORE_METRICS
@@ -12,6 +13,11 @@ from edgar_capstone.common.domain import CORE_METRICS
 # prompt prefill lean for sub-3s TTFT.
 _EVIDENCE_LEAD_EXCERPT_CHARS = 650
 _MAX_EVIDENCE_LEADS = 12
+_REPAIR_EVIDENCE_LEAD_EXCERPT_CHARS = 1400
+_REPAIR_MAX_EVIDENCE_LEADS = 18
+_FEEDBACK_CHUNK_ID_RE = re.compile(
+    r"\b[A-Z][A-Z0-9.\-]{0,6}_\d{4}_(?:item_1a|item_7)_(?:vais_)?\d+\b"
+)
 _MAX_PROMPT_FLAGS = 8
 _MAX_PROMPT_DELTAS_PER_PAIR = 4
 
@@ -126,12 +132,16 @@ def compact_evidence_leads(
     citations: list[dict[str, Any]],
     *,
     scope: dict[str, Any] | None = None,
+    priority_chunk_ids: set[str] | None = None,
+    max_leads: int = _MAX_EVIDENCE_LEADS,
+    excerpt_chars: int = _EVIDENCE_LEAD_EXCERPT_CHARS,
 ) -> list[dict[str, Any]]:
     """Citable passages already retrieved during the deterministic pre-pass.
 
     Uses boundary-first round-robin selection so every `(ticker, start_year)` and
     `(ticker, end_year)` present in `citations` is guaranteed representation before filling
-    remaining lead slots in retrieval score order.
+    remaining lead slots in retrieval score order. When `priority_chunk_ids` is given (e.g.
+    during a tool-less verification repair pass), those chunks are included first.
     """
     unique = _deduplicate_citations(citations)
     boundary_years = _parse_scope_years(scope)
@@ -142,9 +152,17 @@ def compact_evidence_leads(
 
     def _pick(c: dict[str, Any]) -> None:
         cid = str(c.get("chunk_id") or "").strip()
-        if cid and cid not in chosen_ids and len(ordered) < _MAX_EVIDENCE_LEADS:
+        if cid and cid not in chosen_ids and len(ordered) < max_leads:
             chosen_ids.add(cid)
             ordered.append(c)
+
+    # Pass 0: Guarantee chunks explicitly referenced by a verification-repair pass
+    if priority_chunk_ids:
+        for c in unique:
+            if len(ordered) >= max_leads:
+                break
+            if str(c.get("chunk_id") or "").strip() in priority_chunk_ids:
+                _pick(c)
 
     # Pass 1: Guarantee at least 1 boundary-year passage per (ticker, start_yr) & (ticker, end_yr)
     for tk in ticker_order:
@@ -156,7 +174,7 @@ def compact_evidence_leads(
 
     # Pass 2: One passage from any remaining (ticker, fiscal_year) bucket (round-robin)
     for bucket in grouped.values():
-        if len(ordered) >= _MAX_EVIDENCE_LEADS:
+        if len(ordered) >= max_leads:
             break
         first_unpicked = next(
             (c for c in bucket if str(c.get("chunk_id") or "").strip() not in chosen_ids),
@@ -165,9 +183,9 @@ def compact_evidence_leads(
         if first_unpicked is not None:
             _pick(first_unpicked)
 
-    # Pass 3: Fill remaining slots up to _MAX_EVIDENCE_LEADS in original retrieval order
+    # Pass 3: Fill remaining slots up to max_leads in original retrieval order
     for c in unique:
-        if len(ordered) >= _MAX_EVIDENCE_LEADS:
+        if len(ordered) >= max_leads:
             break
         _pick(c)
 
@@ -179,7 +197,7 @@ def compact_evidence_leads(
             "period_of_report": c.get("period_of_report"),
             "section_id": c.get("section_id"),
             "section_title": c.get("section_title"),
-            "excerpt": " ".join(str(c.get("excerpt") or "").split())[:_EVIDENCE_LEAD_EXCERPT_CHARS],
+            "excerpt": " ".join(str(c.get("excerpt") or "").split())[:excerpt_chars],
         }
         for c in ordered
     ]
@@ -204,45 +222,21 @@ def _scope_structure_label(scope: dict[str, Any]) -> str:
 
 
 def build_tool_selection_policy(scope: dict[str, Any], *, has_prior_outputs: bool = False) -> str:
-    """Agent-driven deterministic tool policy: invoke engines ONLY when the question needs them."""
+    """Turn-specific scope parameters for the tool-selection policy defined in the system prompt."""
     tickers_csv = scope.get("tickers_csv", "ALL")
     years = f"start_year={scope.get('start_year')}, end_year={scope.get('end_year')}"
-    preamble = (
-        "The deterministic outputs you already produced this turn are included above; do NOT "
-        "re-invoke those tools. Invoke another engine only if the question needs it."
+    status_line = (
+        "Deterministic outputs already produced this turn are included above; do not re-invoke those tools."
         if has_prior_outputs
-        else "No variance tables, anomaly flags, or disclosure deltas were computed for this "
-        "request. Invoke a deterministic engine ONLY when the question needs its output; "
-        "whatever you invoke is shown to the user as a table or card next to your answer, "
-        "so do not invoke engines the question does not ask about."
+        else "No deterministic outputs were pre-computed; invoke only the engines this question requires."
     )
     return "\n".join(
         [
-            "## Deterministic Tool Selection (you decide; nothing is pre-computed)",
-            preamble,
-            "- `calculate_period_variances(tickers, start_year, end_year)`: call when the question "
-            "asks about reported financial figures (revenue, operating income, net income, R&D "
-            "spend, margins, growth, CAGR) or compares companies on them. Do NOT call it for "
-            "purely qualitative questions (risk-factor wording, disclosure themes, strategy). "
-            f"Scope: `tickers={tickers_csv}`, `{years}`.",
-            "- `flag_material_variances(tickers, start_year, end_year, explain_top_flags)`: call "
-            "ONLY when the question asks about anomalies: unusual swings, inflections, a profit "
-            "turning into a loss (or back), margin shifts, or why a figure spiked or collapsed. "
-            "Usually pair it with `calculate_period_variances`. Keep `explain_top_flags=true` so "
-            "the top flags arrive with MD&A passages (`explanation.chunk_id`).",
-            "- `compare_disclosures_across_years(theme, tickers, gics_sector, section_id, "
-            "start_year, end_year, theme_terms)`: call when the question asks how specific "
-            "companies' 10-K wording on a theme changed across fiscal years. Populate "
-            "`theme_terms` with comma-separated key phrases and domain synonyms to count.",
-            "- `sector_thematic_map_reduce(theme, gics_sector, section_id, start_year, end_year, "
-            "theme_terms)`: call for sector-wide thematic questions (no companies named, a GICS "
-            "sector in scope); it scans every issuer in the sector. Populate `theme_terms` with "
-            "comma-separated key phrases and synonyms. Do not also call "
-            "`compare_disclosures_across_years` for the same sector theme.",
-            "- `query_analytics_view(explore_name, ...)`: `sector_benchmarks` / "
-            "`peer_comparison` for sector-level financial benchmarks, `chunk_health` for vector "
-            "index / corpus health questions.",
+            "## Turn Scope & Tool Parameters",
+            status_line,
             f"- Scope structure: {_scope_structure_label(scope)}.",
+            f"- Default tool scope: `tickers={tickers_csv}`, `gics_sector={scope.get('gics_sector', 'ALL')}`, "
+            f"`section_id={scope.get('section_id', 'ALL')}`, `{years}`.",
         ]
     )
 
@@ -251,8 +245,6 @@ def _citation_coverage_line(scope: dict[str, Any]) -> str | None:
     """Scope-specific citation-coverage requirement (no extra model call or re-prompt)."""
     tickers = [str(t) for t in (scope.get("tickers") or []) if t]
     years = _parse_scope_years(scope)
-    # Require per-ticker coverage for peer comparisons (2-6 companies); larger sub-industry
-    # groups (e.g. 13 Aerospace & Defense issuers) exceed the 6-finding report budget.
     multi_company = 2 <= len(tickers) <= 6
     multi_year = len(years) == 2 and years[0] != years[1]
     if not (multi_company or multi_year):
@@ -273,7 +265,7 @@ def build_retrieval_instructions(
     scope: dict[str, Any],
     variance_evaluations: list[dict[str, Any]],
 ) -> str:
-    """Build retrieval guidance advising the analyst to synthesize first when leads suffice."""
+    """Concise turn-specific retrieval & citation-coverage guidance (rules live in system prompt)."""
     suggested: list[dict[str, Any]] = [
         {
             "ticker": tq.get("ticker"),
@@ -285,34 +277,16 @@ def build_retrieval_instructions(
         for tq in (ev.get("targeted_10k_queries") or [])
     ]
     lines = [
-        "## 10-K Retrieval Guidance (Synthesize First When Leads Suffice)",
-        "Full 10-K sections are NOT in this request. The **10-K Evidence Leads** above (and any "
-        "tool output you request: flag explanations, disclosure deltas, sector map-reduce "
-        "summaries) include verbatim filing passages with canonical `chunk_id`s. If they already "
-        "cover every ticker and fiscal year needed to answer the user's question accurately, "
-        "synthesize your `AnalystReport` directly WITHOUT calling extra retrieval tools.",
-        "Call retrieval tools ONLY to fill a specific missing gap (e.g. a missing start/end fiscal "
-        "year or an unretrieved ticker/section):",
-        "- `query_cached_10k_context(ticker, fiscal_year, section_id, variance_query, max_passages)`: "
-        "ranked passages (with `chunk_id`) from one company-year's `item_7` or `item_1a`, for "
-        "explaining a specific variance driver.",
-        "- `search_10k_chunks_rag(query, tickers, gics_sector, section_id, start_year, end_year, "
-        "top_k)`: hybrid search across filings, for peer comparisons, thematic questions, and "
-        "changes across fiscal years.",
-        f"- Scope: tickers `{scope.get('tickers_csv', 'ALL')}`, sector "
-        f"`{scope.get('gics_sector', 'ALL')}`, sections `{scope.get('section_id', 'ALL')}`, "
-        f"fiscal years `FY{scope.get('start_year')}`–`FY{scope.get('end_year')}`.",
-        "- If you do call tools, keep result sets small (`max_passages` <= 4, `top_k` <= 8), "
-        "issue independent calls in parallel in one step, and never re-fetch evidence already "
-        "present in the prompt (at most 6 retrieval calls).",
+        "## Evidence Coverage",
+        "Synthesize directly from the Evidence Leads and tool outputs above if they cover the question; "
+        "call retrieval tools only for missing company-year or section gaps.",
     ]
     coverage_line = _citation_coverage_line(scope)
     if coverage_line:
         lines.append(coverage_line)
     if suggested:
         lines.append(
-            "- Suggested retrieval targets from the variance evaluation:\n"
-            f"```json\n{_compact_json(suggested[:8])}\n```"
+            "- Suggested retrieval targets:\n" f"```json\n{_compact_json(suggested[:8])}\n```"
         )
     return "\n".join(lines)
 
@@ -635,7 +609,18 @@ def build_financial_reasoning_prompt(
         if deltas_section:
             sections.append(deltas_section)
 
-    leads = compact_evidence_leads(cached_explanations, citations, scope=scope)
+    if verification_feedback:
+        feedback_chunk_ids = set(_FEEDBACK_CHUNK_ID_RE.findall(verification_feedback))
+        leads = compact_evidence_leads(
+            cached_explanations,
+            citations,
+            scope=scope,
+            priority_chunk_ids=feedback_chunk_ids or None,
+            max_leads=_REPAIR_MAX_EVIDENCE_LEADS,
+            excerpt_chars=_REPAIR_EVIDENCE_LEAD_EXCERPT_CHARS,
+        )
+    else:
+        leads = compact_evidence_leads(cached_explanations, citations, scope=scope)
     if leads:
         sections.append(
             "## 10-K Evidence Leads (pre-retrieved passages — cite directly or extend with tools)\n"
@@ -667,24 +652,11 @@ def build_financial_reasoning_prompt(
         )
         sections.append(build_retrieval_instructions(scope, variance_evaluations))
     sections.append(
-        "## Answer Format\n"
-        "Answer with a concise `AnalystReport` JSON (`intent`, `headline`, `key_metrics`, "
-        "`findings`). `intent` is one of `thematic_trend_tracking` (wording / disclosure or "
-        "theme change across years or a sector; takes precedence), "
-        "`multi_company_peer_comparison`, `longitudinal_single_company`, or "
-        "`chunk_health_monitoring`. "
-        "There is NO `notes` field: every qualitative claim must be a verified finding in `findings` "
-        "with `chunk_ids` from your tools or the evidence leads plus a verbatim `evidence_quote` "
-        "(10-40 words) copied exactly from one of those chunks. For multi-year or peer queries, "
-        "include at least one verified finding citing EACH in-scope company's start fiscal year "
-        f"(`FY{scope.get('start_year')}`) AND end fiscal year (`FY{scope.get('end_year')}`) "
-        "when passages for those years appear in the evidence leads. Figures in a finding "
-        "must appear in its quote or in the deterministic payload / flags. Findings that fail "
-        "verification are dropped. `key_metrics` are references only (`ticker` + `metric`); exact "
-        "values, `period_of_report` dates, and XBRL provenance citations are rendered automatically "
-        "from `calculate_period_variances`. List ONLY the metrics the question asks about (e.g. "
-        "only `research_and_development` for an R&D question) and leave `key_metrics` EMPTY for "
-        "qualitative, risk-factor, or wording-change questions."
+        "## Output Reminder\n"
+        "Return a valid `AnalystReport` JSON (`intent`, `headline`, `key_metrics`, `findings`) "
+        f"citing both `FY{scope.get('start_year')}` and `FY{scope.get('end_year')}` when available "
+        "in multi-year or peer queries, with verbatim `evidence_quote` snippets and only requested "
+        "`key_metrics`."
     )
     return "\n\n".join(sections)
 

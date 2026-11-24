@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import logging
 import random
-import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -88,9 +87,6 @@ class VertexAIEmbedder(GcpRestClient):
         self.max_retries = max_retries
         self.max_batch_chars = max(1, max_batch_chars)
         self.max_workers = workers
-        self._query_cache_lock = threading.Lock()
-        self._query_cache: dict[tuple[str, str], list[float]] = {}
-        self._query_cache_max = 512
 
     def _get_access_token(self) -> str:
         """Obtain a valid OAuth2 bearer token from Application Default Credentials."""
@@ -230,28 +226,6 @@ class VertexAIEmbedder(GcpRestClient):
         (from the calling thread), which lets callers checkpoint progress.
         Thread-safe for concurrent callers: never mutates `self._http_client`.
         """
-        # Cache live single/repeated query embeddings (bypassed when a custom http_client is
-        # injected so unit tests always exercise their mock transport).
-        if (
-            self._http_client is None
-            and task_type == "RETRIEVAL_QUERY"
-            and len(texts) == 1
-            and titles is None
-            and on_batch_complete is None
-        ):
-            cache_key = (task_type, texts[0])
-            with self._query_cache_lock:
-                hit = self._query_cache.get(cache_key)
-            if hit is not None:
-                return [list(hit)]
-            vecs = self._embed_batch_adaptive(texts, task_type=task_type, titles=None)
-            with self._query_cache_lock:
-                if len(self._query_cache) >= self._query_cache_max:
-                    # Evict oldest inserted key
-                    self._query_cache.pop(next(iter(self._query_cache)), None)
-                self._query_cache[cache_key] = list(vecs[0])
-            return vecs
-
         batches = self._plan_batches(texts)
         results: list[list[float] | None] = [None] * len(texts)
 

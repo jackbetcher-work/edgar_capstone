@@ -266,32 +266,16 @@ def test_chunk_health_dashboard_mosaic_geometry_and_accuracy_contracts() -> None
 
 
 # ---------------------------------------------------------------------------
-# 4. Isolated ops_logs BigQuery dataset & least-privilege IAM prohibition
+# 4. Least-privilege BigQuery IAM prohibition (append-only telemetry, no duplicate sink)
 # ---------------------------------------------------------------------------
 
 
-def test_logging_sink_targets_isolated_ops_dataset_with_scoped_data_editor() -> None:
+def test_bigquery_telemetry_iam_is_append_only_with_no_duplicate_log_sink() -> None:
     telem = _tf("telemetry.tf")
-    sink = _resource_block(
-        telem, r'resource\s+"google_logging_project_sink"\s+"telemetry_and_audit_to_bigquery"'
-    )
-    assert "google_bigquery_dataset.sec_edgar_ops_logs" in sink
-    assert "google_bigquery_dataset.sec_edgar.dataset_id" not in sink
-    assert re.search(r"use_partitioned_tables\s*=\s*true", sink)
-
-    writer = _resource_block(
-        telem, r'resource\s+"google_bigquery_dataset_iam_member"\s+"logging_sink_ops_logs_writer"'
-    )
-    assert re.search(r'role\s*=\s*"roles/bigquery\.dataEditor"', writer)
-    assert "google_bigquery_dataset.sec_edgar_ops_logs" in writer
-
-    # Authoritative check: `roles/bigquery.dataEditor` is NEVER bound to curated `sec_edgar`
-    for block in re.findall(
-        r'resource\s+"google_bigquery_(?:dataset|table)_iam_member".*?\n\}\n', telem, re.S
-    ):
-        if "roles/bigquery.dataEditor" in block:
-            assert "sec_edgar_ops_logs" in block
-    for name in ("iam.tf", "bigquery.tf"):
+    # Duplicate sec_edgar_ops_logs / Cloud Logging->BQ sink removed; direct insertAll is authoritative
+    assert "sec_edgar_ops_logs" not in telem
+    assert "google_logging_project_sink" not in telem
+    for name in ("telemetry.tf", "iam.tf", "bigquery.tf"):
         assert "roles/bigquery.dataEditor" not in _tf(name), name
     # Runtime SA keeps append-only access without table-creation privilege.
     assert '"bigquery.tables.create"' not in telem
@@ -334,11 +318,8 @@ def test_cloud_run_labels_never_collide_after_sink_normalization() -> None:
     assert 'replace(k, "-", "_")' in labels_block
 
     deploy = (REPO_ROOT / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
-    assert "skip_default_labels: true" in deploy
-    assert "--remove-labels=managed-by,commit-sha" in deploy
-
-    cloudbuild = (REPO_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
-    assert '--remove-labels="managed-by,commit-sha"' in cloudbuild
+    assert '--remove-labels "managed-by,commit-sha"' in deploy
+    assert '--update-labels "commit_sha=${{ github.sha }},deployed_by=github-actions"' in deploy
 
     effective = default_keys + ["commit_sha", "deployed_by"]
     normalized = [k.replace("-", "_") for k in effective]
@@ -447,13 +428,11 @@ def test_guardrail_block_audit_events_carry_request_principal_and_trace_id() -> 
 
 
 def test_genai_otel_inputs_outputs_deployment_config_consistency() -> None:
-    """Ensures Terraform, Cloud Build, GitHub Actions, and Dockerfile wire GenAI OTel env vars."""
+    """Ensures Terraform and Dockerfile wire GenAI OTel env vars (CI updates image only)."""
     assert '"telemetry.googleapis.com"' in _tf("apis.tf")
     assert '"roles/telemetry.writer"' in _tf("iam.tf")
 
     cicd_tf = _tf("cicd_and_secrets.tf")
-    cloudbuild = (REPO_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
-    deploy = (REPO_ROOT / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
     dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
@@ -467,8 +446,6 @@ def test_genai_otel_inputs_outputs_deployment_config_consistency() -> None:
     )
     for key, val in required_env_pairs:
         assert key in cicd_tf and f'value = "{val}"' in cicd_tf, (key, "cicd_and_secrets.tf")
-        assert f"{key}={val}" in cloudbuild, (key, "cloudbuild.yaml")
-        assert f"{key}={val}" in deploy, (key, "deploy.yml")
         assert f'{key}="{val}"' in dockerfile, (key, "Dockerfile")
 
     assert "google-adk[otel]" in pyproject

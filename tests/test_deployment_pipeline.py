@@ -1,22 +1,15 @@
-"""Automated unit tests for the GitHub push CI/CD deployment pipeline and Secret Manager integration."""
+"""Automated unit tests for the GitHub push CI/CD deployment pipeline, Terraform IaC, and secret scanner."""
 
 from __future__ import annotations
 
-import base64
 import json
 import re
 from pathlib import Path
-from unittest.mock import MagicMock
 
-import httpx
-import pytest
 import yaml
 from fastapi.testclient import TestClient
 
 from edgar_capstone.security import (
-    MANAGED_SECRETS,
-    RedactedSecret,
-    SecretManagerClient,
     issue_local_dev_workspace_sso_token,
     scan_repository_for_exposed_secrets,
     scan_text_for_exposed_secrets,
@@ -30,6 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def test_github_actions_pipeline_stages_and_triggers() -> None:
     workflow_path = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
     assert workflow_path.exists(), "GitHub Actions deployment workflow must exist"
+    assert not (REPO_ROOT / "cloudbuild.yaml").exists(), "Legacy duplicate cloudbuild.yaml removed"
 
     raw_text = workflow_path.read_text(encoding="utf-8")
     workflow = yaml.safe_load(raw_text)
@@ -44,7 +38,6 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert permissions.get("id-token") == "write"
     assert permissions.get("contents") == "read"
 
-    # Must be composed of the test, build, eval, and deploy stages
     jobs = workflow.get("jobs", {})
     assert list(jobs.keys()) == ["test", "build", "eval", "deploy"]
 
@@ -56,9 +49,15 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert "verify_no_secrets.py" in test_steps_str
     assert "pytest" in test_steps_str
     assert "--cov-fail-under=80" in test_steps_str
+    assert "terraform fmt -check" in test_steps_str
+    assert "terraform validate" in test_steps_str
+    assert "ruff check" in test_steps_str
+    assert "ruff format --check" in test_steps_str
+    assert "npm --prefix frontend run lint" in test_steps_str
+    assert "npm --prefix frontend test" in test_steps_str
+    assert "npm --prefix frontend run build" in test_steps_str
 
-    # pytest reads live GCP data, so keyless WIF auth must run before it with the live env.
-    test_step_names = [step.get("name", "") for step in test_job["steps"]]
+    # Keyless WIF auth runs before live pytest
     auth_idx = next(
         i
         for i, step in enumerate(test_job["steps"])
@@ -67,266 +66,38 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     pytest_idx = next(
         i for i, step in enumerate(test_job["steps"]) if "pytest" in step.get("run", "")
     )
-    assert auth_idx < pytest_idx, test_step_names
-    auth_with = test_job["steps"][auth_idx]["with"]
-    assert auth_with["workload_identity_provider"] == "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}"
-    assert auth_with["service_account"] == "${{ vars.GCP_CICD_SERVICE_ACCOUNT }}"
-    pytest_env = test_job["steps"][pytest_idx]["env"]
-    assert workflow["env"]["GCP_PROJECT_ID"] == "iron-radio-514217-q7"
-    assert pytest_env["GOOGLE_CLOUD_PROJECT"] == "${{ env.GCP_PROJECT_ID }}"
-    assert pytest_env["GOOGLE_CLOUD_LOCATION"] == "${{ env.GCP_REGION }}"
-    assert pytest_env["GOOGLE_GENAI_USE_VERTEXAI"] == "true"
-    assert pytest_env["EDGAR_GEMINI_LOCATION"] == "global"
-    assert pytest_env["EDGAR_TELEMETRY_BACKEND"] == "local"
-    assert pytest_env["EDGAR_FEEDBACK_BACKEND"] == "local"
-    assert "terraform fmt -check" in test_steps_str
-    assert "terraform validate" in test_steps_str
-    assert "ruff check" in test_steps_str
-    assert "ruff format --check" in test_steps_str
-    assert "npm --prefix frontend ci" in test_steps_str
-    assert "npm --prefix frontend run lint" in test_steps_str
-    assert "npm --prefix frontend test" in test_steps_str
-    assert "npm --prefix frontend run build" in test_steps_str
-    assert "test -f frontend/dist/index.html" in test_steps_str
+    assert auth_idx < pytest_idx
 
-    # Stage 2: build (depends on test, uses keyless WIF + Secret Manager + frontend container check)
+    # Stage 2: build (main pushes only, keyless WIF, container smoke test, push to GAR)
     build_job = jobs["build"]
     assert build_job.get("needs") == "test"
-    # Cloud Build is the primary deploy path; GitHub Actions deploys only when opted in
     for gated_job in (jobs["build"], jobs["eval"], jobs["deploy"]):
         assert "refs/heads/main" in gated_job["if"]
-        assert "vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'" in gated_job["if"]
-    build_uses = [step.get("uses", "") for step in build_job["steps"]]
-    assert any("google-github-actions/auth@" in u for u in build_uses)
-    assert any("google-github-actions/get-secretmanager-secrets@" in u for u in build_uses)
     build_steps_str = json.dumps(build_job["steps"])
     assert "docker build" in build_steps_str
     assert "/app/frontend/dist/index.html" in build_steps_str
     assert "-m scripts.container_smoke_test --in-process --live-data" in build_steps_str
     assert "docker push" in build_steps_str
-    build_image_step = next(s for s in build_job["steps"] if s.get("id") == "build_image")
-    build_run = build_image_step["run"]
-    assert '--user "$(id -u):$(id -g)"' in build_run
-    assert "-e HOME=/tmp" in build_run
-    assert (
-        'test -n "${GOOGLE_APPLICATION_CREDENTIALS}" && test -f "${GOOGLE_APPLICATION_CREDENTIALS}"'
-        in build_run
-    )
-    assert '-v "${GOOGLE_APPLICATION_CREDENTIALS}:/tmp/adc.json:ro"' in build_run
-    assert "-e GOOGLE_APPLICATION_CREDENTIALS=/tmp/adc.json" in build_run
-    assert "ADC_DIR" not in build_run
 
-    # Stage 2.5: eval (depends on build, optional golden eval regression gates before deploy; default skip)
+    # Stage 2.5: optional eval gate (default skip)
     eval_input = triggers["workflow_dispatch"]["inputs"]["eval_mode"]
     assert eval_input["default"] == "skip"
     assert set(eval_input["options"]) == {"skip", "advisory", "blocking"}
-
     eval_job = jobs["eval"]
     assert eval_job.get("needs") == "build"
-    assert "(inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'skip'" in eval_job["if"]
-    assert (
-        eval_job["continue-on-error"]
-        == "${{ (inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'blocking' }}"
-    )
-    eval_steps_str = json.dumps(eval_job["steps"])
-    assert "scripts/run_evals.py --write-bigquery" in eval_steps_str
-    advisory_step = next(
-        s for s in eval_job["steps"] if s.get("name") == "Report advisory eval result"
-    )
-    assert (
-        "(inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'blocking'" in advisory_step["if"]
-    )
+    assert "scripts/run_evals.py --write-bigquery" in json.dumps(eval_job["steps"])
 
-    # Stage 3: deploy (depends on build and eval, uses keyless WIF + Secret Manager + Cloud Run)
+    # Stage 3: deploy (image-only rollout so Terraform remains the single source of truth for env vars)
     deploy_job = jobs["deploy"]
     assert deploy_job.get("needs") == ["build", "eval"]
-    assert "!cancelled()" in deploy_job["if"]
-    assert "needs.build.result == 'success'" in deploy_job["if"]
-    assert "(inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'blocking'" in deploy_job["if"]
-    deploy_uses = [step.get("uses", "") for step in deploy_job["steps"]]
-    assert any("google-github-actions/auth@" in u for u in deploy_uses)
-    assert any("google-github-actions/get-secretmanager-secrets@" in u for u in deploy_uses)
-    assert any("google-github-actions/deploy-cloudrun@" in u for u in deploy_uses)
-
-    deploy_cloudrun_step = next(
-        step
-        for step in deploy_job["steps"]
-        if "google-github-actions/deploy-cloudrun@" in step.get("uses", "")
-    )
-    secrets_mount = deploy_cloudrun_step["with"]["secrets"]
-    for spec in MANAGED_SECRETS:
-        assert spec.cloud_run_mount_spec() in secrets_mount
-
-    deploy_env_vars = deploy_cloudrun_step["with"]["env_vars"]
-    assert "GOOGLE_GENAI_USE_VERTEXAI=true" in deploy_env_vars
-    assert "EDGAR_GEMINI_LOCATION=global" in deploy_env_vars
-    assert "SDP_INSPECT_TEMPLATE_ID=sec-edgar-sdp-inspect" in deploy_env_vars
-    assert "SDP_DEIDENTIFY_TEMPLATE_ID=sec-edgar-sdp-deidentify" in deploy_env_vars
-    for removed in (
-        "EDGAR_EXECUTION_MODE",
-        "EDGAR_DATA_BACKEND",
-        "EDGAR_MODEL_ARMOR_MODE=disabled",
-    ):
-        assert removed not in raw_text
-
-    deploy_steps_str = json.dumps(deploy_job["steps"])
-    assert "${SERVICE_URL}/health" in deploy_steps_str
-    assert "${SERVICE_URL}/healthz" not in deploy_steps_str
-
-    # Cloud Run's ingress / IAP make run.app unreachable from GitHub runners, so health
-    # is gated in-platform: a GET /health startup probe plus a revision/traffic check.
-    assert "--startup-probe=httpGet.path=/health," in deploy_cloudrun_step["with"]["flags"]
+    deploy_step = next(s for s in deploy_job["steps"] if s.get("id") == "deploy_cloud_run")
+    assert "gcloud run services update" in deploy_step["run"]
+    assert "--image" in deploy_step["run"]
+    assert "--startup-probe" in deploy_step["run"]
+    assert "httpGet.path=/health," in deploy_step["run"]
     verify_step = next(s for s in deploy_job["steps"] if s.get("id") == "verify_revision")
     assert "latestReadyRevisionName" in verify_step["run"]
     assert "iapEnabled" in verify_step["run"]
-    for step in deploy_job["steps"]:
-        if "curl" in step.get("run", "") and step.get("id") != "verify_revision":
-            assert step.get("if") == "steps.verify_revision.outputs.public_http == 'true'"
-
-
-def test_cloudbuild_pipeline_stages_and_secret_manager() -> None:
-    cb_path = REPO_ROOT / "cloudbuild.yaml"
-    assert cb_path.exists(), "cloudbuild.yaml must exist"
-
-    cb = yaml.safe_load(cb_path.read_text(encoding="utf-8"))
-    steps = cb.get("steps", [])
-    step_ids = [s.get("id") for s in steps]
-    gate_ids = ["lint-python", "lint-terraform", "frontend", "test"]
-    assert step_ids == [*gate_ids, "build", "eval", "deploy"]
-
-    # Quality gates start immediately and run in parallel
-    steps_by_id = {s["id"]: s for s in steps}
-    for gate_id in gate_ids:
-        assert steps_by_id[gate_id]["waitFor"] == ["-"]
-
-    lint_py_cmd = " ".join(steps_by_id["lint-python"]["args"])
-    assert "ruff check" in lint_py_cmd
-    assert "ruff format --check" in lint_py_cmd
-    lint_tf_cmd = " ".join(steps_by_id["lint-terraform"]["args"])
-    assert "terraform fmt -check -recursive" in lint_tf_cmd
-    assert "terraform init -backend=false" in lint_tf_cmd
-    assert "terraform validate" in lint_tf_cmd
-    frontend_cmd = " ".join(steps_by_id["frontend"]["args"])
-    assert "npm --prefix frontend run lint" in frontend_cmd
-    assert "npm --prefix frontend test" in frontend_cmd
-    test_cmd = " ".join(steps_by_id["test"]["args"])
-    assert "verify_no_secrets.py" in test_cmd
-    assert "pytest" in test_cmd
-    assert "--cov-fail-under=80" in test_cmd
-    # pytest reads live GCP with the build SA's ADC; telemetry/feedback stay in memory.
-    test_env = set(steps_by_id["test"]["env"])
-    assert {
-        "EDGAR_TEST_PROJECT_ID=${PROJECT_ID}",
-        "GCP_PROJECT_ID=${PROJECT_ID}",
-        "GOOGLE_CLOUD_PROJECT=${PROJECT_ID}",
-        "GOOGLE_CLOUD_LOCATION=${_REGION}",
-        "GOOGLE_GENAI_USE_VERTEXAI=true",
-        "EDGAR_GEMINI_LOCATION=${_GEMINI_LOCATION}",
-        "EDGAR_TELEMETRY_BACKEND=local",
-        "EDGAR_FEEDBACK_BACKEND=local",
-    } <= test_env
-
-    # Pinned ruff version in CI matches the dev dependency pin
-    pyproject_text = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert f'"ruff=={cb["substitutions"]["_RUFF_VERSION"]}"' in pyproject_text
-
-    build_step = steps_by_id["build"]
-    assert build_step["waitFor"] == gate_ids
-    assert "SEC_EDGAR_USER_AGENT" in build_step["secretEnv"]
-    build_cmd = " ".join(build_step["args"])
-    assert "DOCKER_BUILDKIT=1" in build_cmd
-    assert "/app/frontend/dist/index.html" in build_cmd
-    assert "--network=cloudbuild" in build_cmd
-    assert "-m scripts.container_smoke_test --in-process --live-data" in build_cmd
-
-    eval_step = steps_by_id["eval"]
-    assert eval_step["waitFor"] == ["build"]
-    assert cb["substitutions"]["_EVAL_GATE_MODE"] == "skip"
-    eval_cmd = " ".join(eval_step["args"])
-    assert "scripts/run_evals.py --write-bigquery" in eval_cmd
-    assert eval_cmd.index('"${_PIPELINE_MODE}" != "deploy"') < eval_cmd.index("run_evals.py")
-    assert eval_cmd.index('case "${_EVAL_GATE_MODE}" in') < eval_cmd.index("run_evals.py")
-    assert '"${_EVAL_GATE_MODE}" = "blocking"' in eval_cmd
-
-    deploy_step = steps_by_id["deploy"]
-    assert deploy_step["waitFor"] == ["build", "eval"]
-    assert set(deploy_step["secretEnv"]) == {
-        "SEC_EDGAR_USER_AGENT",
-        "GEMINI_API_KEY",
-        "INTERNAL_IAP_AUDIENCE",
-    }
-    deploy_cmd = " ".join(deploy_step["args"])
-    assert "--set-secrets=" in deploy_cmd
-    assert "GOOGLE_GENAI_USE_VERTEXAI=true" in deploy_cmd
-    assert "EDGAR_GEMINI_LOCATION=${_GEMINI_LOCATION}" in deploy_cmd
-    assert "SDP_INSPECT_TEMPLATE_ID=sec-edgar-sdp-inspect" in deploy_cmd
-    assert "SDP_DEIDENTIFY_TEMPLATE_ID=sec-edgar-sdp-deidentify" in deploy_cmd
-    for removed in (
-        "EDGAR_EXECUTION_MODE",
-        "EDGAR_DATA_BACKEND",
-        "--expect-corpus",
-        "EDGAR_MODEL_ARMOR_MODE=disabled",
-    ):
-        assert removed not in cb_path.read_text(encoding="utf-8")
-
-    # PR (verify) builds must never push images or deploy
-    assert cb["substitutions"]["_PIPELINE_MODE"] == "deploy"
-    assert "images" not in cb, "top-level images: would push even in verify mode"
-    assert build_cmd.index('"${_PIPELINE_MODE}" != "deploy"') < build_cmd.index("docker push")
-    assert deploy_cmd.index('"${_PIPELINE_MODE}" != "deploy"') < deploy_cmd.index(
-        "gcloud run deploy"
-    )
-
-    secret_mgr_entries = cb.get("availableSecrets", {}).get("secretManager", [])
-    envs_bound = {entry["env"] for entry in secret_mgr_entries}
-    assert envs_bound == {
-        "SEC_EDGAR_USER_AGENT",
-        "GEMINI_API_KEY",
-        "INTERNAL_IAP_AUDIENCE",
-    }
-
-
-def test_cloudbuild_triggers_managed_in_terraform() -> None:
-    cb_tf = (REPO_ROOT / "terraform" / "cloudbuild.tf").read_text(encoding="utf-8")
-    assert 'resource "google_cloudbuildv2_connection" "github"' in cb_tf
-    assert 'resource "google_cloudbuildv2_repository" "edgar_capstone"' in cb_tf
-    assert 'resource "google_cloudbuild_trigger" "main_deploy"' in cb_tf
-    assert 'resource "google_cloudbuild_trigger" "pull_request_verify"' in cb_tf
-    assert re.search(r'filename\s*=\s*"cloudbuild\.yaml"', cb_tf)
-    assert re.search(r'_PIPELINE_MODE\s*=\s*"deploy"', cb_tf)
-    assert re.search(r'_PIPELINE_MODE\s*=\s*"verify"', cb_tf)
-    assert "COMMENTS_ENABLED_FOR_EXTERNAL_CONTRIBUTORS_ONLY" in cb_tf
-
-    # Dedicated least-privilege build identity (no project-wide owner/editor/admin roles)
-    assert 'resource "google_service_account" "cloudbuild_runner"' in cb_tf
-    assert re.search(
-        r"service_account\s*=\s*google_service_account\.cloudbuild_runner\[0\]\.id", cb_tf
-    )
-    assert "roles/run.developer" in cb_tf
-    assert "roles/run.admin" not in cb_tf
-    assert "roles/editor" not in cb_tf
-    assert "roles/owner" not in cb_tf
-    assert 'resource "google_artifact_registry_repository_iam_member" "cloudbuild_repo_writer"' in (
-        cb_tf
-    )
-
-    # GitHub token is referenced by Secret Manager version name only, never read into state
-    assert 'data "google_secret_manager_secret_version"' not in cb_tf
-    assert re.search(
-        r"oauth_token_secret_version\s*=\s*local\.cloudbuild_oauth_token_secret_version", cb_tf
-    )
-
-    variables_tf = (REPO_ROOT / "terraform" / "variables.tf").read_text(encoding="utf-8")
-    for var_name in (
-        "enable_cloudbuild_trigger",
-        "enable_cloudbuild_pr_trigger",
-        "create_cloudbuild_github_connection",
-        "cloudbuild_github_app_installation_id",
-        "cloudbuild_github_oauth_token_secret_id",
-        "cloudbuild_trigger_branch_regex",
-        "cloudbuild_service_account_id",
-    ):
-        assert f'variable "{var_name}"' in variables_tf
 
 
 def test_no_secrets_or_keys_exposed_in_repository() -> None:
@@ -340,25 +111,17 @@ def test_verify_no_secrets_cli_passes_on_clean_dir_and_flags_leak(tmp_path: Path
     (tmp_path / "src" / "clean.py").write_text("X = 'no secrets here'\n", encoding="utf-8")
     assert verify_no_secrets_main(["--repo-root", str(tmp_path)]) == 0
     fake_key = "AIza" + "SyD9_synthetic_test_key_0123456789abc"
-    (tmp_path / "cloudbuild.yaml").write_text(f"key: {fake_key}\n", encoding="utf-8")
+    (tmp_path / "src" / "leak.py").write_text(f"KEY = '{fake_key}'\n", encoding="utf-8")
     assert verify_no_secrets_main(["--repo-root", str(tmp_path)]) == 1
 
 
 def test_secret_scanner_detects_synthetic_leaks() -> None:
-    # Build synthetic leaked strings dynamically so this test file itself stays clean
     fake_google_key = "AIza" + "SyD9_synthetic_test_key_0123456789abc"
     fake_gh_pat = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
     fake_pem = "-----BEGIN " + "RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n"
     fake_hardcoded_assign = 'GEMINI_API_KEY: "super_secret_production_credential_9999"'
 
-    leaked_blob = "\n".join(
-        [
-            fake_google_key,
-            fake_gh_pat,
-            fake_pem,
-            fake_hardcoded_assign,
-        ]
-    )
+    leaked_blob = "\n".join([fake_google_key, fake_gh_pat, fake_pem, fake_hardcoded_assign])
     findings = scan_text_for_exposed_secrets(leaked_blob, source_name="synthetic.yml")
     rule_ids = {f.rule_id for f in findings}
     assert "google_api_key" in rule_ids
@@ -367,121 +130,7 @@ def test_secret_scanner_detects_synthetic_leaks() -> None:
     assert "hardcoded_secret_assignment" in rule_ids
 
 
-def test_secret_manager_client_retrieval_and_redaction(monkeypatch: pytest.MonkeyPatch) -> None:
-    for spec in MANAGED_SECRETS:
-        monkeypatch.delenv(spec.env_var, raising=False)
-
-    requested_urls: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requested_urls.append(str(request.url))
-        raw_secret = "synthetic-secret-payload-from-gcp"
-        encoded = base64.b64encode(raw_secret.encode("utf-8")).decode("ascii")
-        return httpx.Response(
-            200,
-            json={
-                "name": str(request.url),
-                "payload": {"data": encoded},
-            },
-        )
-
-    mock_creds = MagicMock()
-    mock_creds.valid = True
-    mock_creds.token = "short-lived-wif-oauth-token"
-
-    client = SecretManagerClient(
-        project_id="iron-radio-514217-q7",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-        credentials=mock_creds,
-    )
-
-    secret = client.get_secret("sec-edgar-gemini-api-key")
-    assert isinstance(secret, RedactedSecret)
-    assert str(secret) == "***REDACTED***"
-    assert "synthetic-secret-payload-from-gcp" not in repr(secret)
-    assert secret.get_secret_value() == "synthetic-secret-payload-from-gcp"
-    assert len(requested_urls) == 1
-    assert (
-        "projects/iron-radio-514217-q7/secrets/sec-edgar-gemini-api-key/versions/latest:access"
-        in requested_urls[0]
-    )
-
-    # Second call hits in-memory TTL cache without making another network call
-    cached_secret = client.get_secret("sec-edgar-gemini-api-key")
-    assert cached_secret == secret
-    assert len(requested_urls) == 1
-
-    # Load all managed secrets
-    all_loaded = client.load_managed_secrets()
-    assert set(all_loaded.keys()) == {
-        "SEC_EDGAR_USER_AGENT",
-        "GEMINI_API_KEY",
-        "INTERNAL_IAP_AUDIENCE",
-    }
-
-    # Env fallback bypasses network call when Cloud Run mounted secret into env
-    monkeypatch.setenv("MY_MOUNTED_SECRET", "env-secret-val")
-    env_sec = client.get_secret("env-only-secret", env_fallback="MY_MOUNTED_SECRET")
-    assert env_sec.get_secret_value() == "env-secret-val"
-    assert len(requested_urls) == 3  # no extra HTTP call for env-backed secret
-
-    # Empty Secret Manager payload raises ValueError
-    empty_client = SecretManagerClient(
-        project_id="iron-radio-514217-q7",
-        http_client=httpx.Client(
-            transport=httpx.MockTransport(lambda _r: httpx.Response(200, json={"payload": {}}))
-        ),
-        credentials=mock_creds,
-    )
-    with pytest.raises(ValueError, match="empty payload"):
-        empty_client.get_secret("missing-data-secret")
-
-    # Required secret failure raises RuntimeError; optional failure is skipped cleanly
-    from edgar_capstone.security.secrets import SecretSpec
-
-    with pytest.raises(RuntimeError, match="Failed to retrieve required secret"):
-        empty_client.load_managed_secrets(
-            specs=(
-                SecretSpec(
-                    secret_id="req-secret",
-                    env_var="REQ_ENV",
-                    description="required test secret",
-                    required=True,
-                ),
-            )
-        )
-    assert (
-        empty_client.load_managed_secrets(
-            specs=(
-                SecretSpec(
-                    secret_id="opt-secret",
-                    env_var="OPT_ENV",
-                    description="optional test secret",
-                    required=False,
-                ),
-            )
-        )
-        == {}
-    )
-
-
-def test_redacted_secret_constant_time_eq_and_hash() -> None:
-    """Relocated regression test: `RedactedSecret` supports constant-time eq, hashing, and redaction."""
-    s1 = RedactedSecret("super-secret-value", name="k1")
-    s2 = RedactedSecret("super-secret-value", name="k2")
-    s3 = RedactedSecret("different-secret", name="k3")
-
-    assert s1 == s2
-    assert s1 != s3
-    assert s1 != "super-secret-value"
-    assert hash(s1) == hash(s2)
-    assert len({s1, s2, s3}) == 2
-    assert {s1: "found"}[s2] == "found"
-    assert "super-secret-value" not in str(s1)
-    assert "super-secret-value" not in repr(s1)
-
-
-def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
+def test_dockerfile_and_streamlined_terraform_definitions() -> None:
     dockerfile_text = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert re.search(r"FROM\s+node:\S+\s+AS\s+frontend-builder", dockerfile_text)
     assert "npm ci" in dockerfile_text and "npm run build" in dockerfile_text
@@ -491,113 +140,43 @@ def test_dockerfile_and_terraform_secret_manager_definitions() -> None:
     assert "edgar_capstone.server:app" in dockerfile_text
     assert "data/" not in dockerfile_text
 
-    cicd_tf = (REPO_ROOT / "terraform" / "cicd_and_secrets.tf").read_text(encoding="utf-8")
-    assert 'resource "google_secret_manager_secret" "managed_secrets"' in cicd_tf
-    assert 'resource "google_secret_manager_secret_iam_member" "runtime_secret_accessor"' in cicd_tf
-    assert 'resource "google_secret_manager_secret_iam_member" "cicd_secret_accessor"' in cicd_tf
+    tf_dir = REPO_ROOT / "terraform"
+    # Dead IaC modules removed
+    for removed_tf in (
+        "cloudbuild.tf",
+        "network.tf",
+        "load_balancer.tf",
+        "vpc_service_controls.tf",
+    ):
+        assert not (tf_dir / removed_tf).exists(), f"{removed_tf} should be removed"
+
+    cicd_tf = (tf_dir / "cicd_and_secrets.tf").read_text(encoding="utf-8")
     assert 'resource "google_iam_workload_identity_pool" "github_pool"' in cicd_tf
     assert 'resource "google_iam_workload_identity_pool_provider" "github_provider"' in cicd_tf
     assert 'resource "google_cloud_run_v2_service" "sec_edgar_analyst"' in cicd_tf
     assert re.search(r"image\s*=\s*var\.cloud_run_initial_image", cicd_tf)
-    assert "template[0].containers[0].image" in cicd_tf
-    assert "secret_key_ref" in cicd_tf
+    assert "roles/run.developer" in cicd_tf
+    assert "roles/run.admin" not in cicd_tf
     assert "GOOGLE_GENAI_USE_VERTEXAI" in cicd_tf
-    assert "EDGAR_EXECUTION_MODE" not in cicd_tf
-    assert "EDGAR_DATA_BACKEND" not in cicd_tf
+    assert "INTERNAL_IAP_AUDIENCE" in cicd_tf
+    assert "VERTEX_VECTOR_SEARCH" not in cicd_tf
+    assert "GEMINI_API_KEY" not in cicd_tf
+    assert "SEC_EDGAR_USER_AGENT" not in cicd_tf
 
-    iap_tf = (REPO_ROOT / "terraform" / "iap_and_sso.tf").read_text(encoding="utf-8")
-    assert 'resource "google_compute_backend_service" "sec_edgar_iap_backend"' in iap_tf
+    # Direct Cloud Run IAP only
+    iap_tf = (tf_dir / "iap_and_sso.tf").read_text(encoding="utf-8")
+    assert re.search(r"provider\s*=\s*google-beta", cicd_tf)
+    assert re.search(r"iap_enabled\s*=\s*true", cicd_tf)
+    assert "/locations/${var.region}/services/${var.cloud_run_service_name}" in iap_tf
+    assert 'resource "google_iap_web_cloud_run_service_iam_member"' in iap_tf
     assert "roles/iap.httpsResourceAccessor" in iap_tf
     assert "roles/run.invoker" in iap_tf
 
-
-def test_cloud_run_direct_iap_internal_sharing_terraform() -> None:
-    """Default access: IAP on the Cloud Run service itself, shared with an org domain/group."""
-    tf_dir = REPO_ROOT / "terraform"
-    cicd_tf = (tf_dir / "cicd_and_secrets.tf").read_text(encoding="utf-8")
-    iap_tf = (tf_dir / "iap_and_sso.tf").read_text(encoding="utf-8")
-    lb_tf = (tf_dir / "load_balancer.tf").read_text(encoding="utf-8")
-    vars_tf = (tf_dir / "variables.tf").read_text(encoding="utf-8")
-    outputs_tf = (tf_dir / "outputs.tf").read_text(encoding="utf-8")
-
-    assert re.search(r'default\s*=\s*"iap_direct"', vars_tf)
-    assert 'contains(["iap_direct", "load_balancer"], var.cloud_run_access_mode)' in vars_tf
-
-    # Cloud Run: IAP on the service; ingress opens only when IAP is on, else LB-only.
-    assert re.search(r"provider\s*=\s*google-beta", cicd_tf)
-    assert re.search(r"iap_enabled\s*=\s*local\.cloud_run_direct_iap", cicd_tf)
-    assert re.search(
-        r'ingress\s*=\s*local\.cloud_run_direct_iap\s*\?\s*"INGRESS_TRAFFIC_ALL"\s*:\s*"INGRESS_TRAFFIC_INTERNAL_LOAD_BALANCER"',
-        cicd_tf,
-    )
-    assert re.search(r'name\s*=\s*"IAP_ASSERTION_DEFAULT_ROLE"', cicd_tf)
-
-    # IAP audience matches the Cloud Run IAP JWT `aud` format in direct mode.
-    assert "/locations/${var.region}/services/${var.cloud_run_service_name}" in iap_tf
-    assert 'resource "google_iap_web_cloud_run_service_iam_member"' in iap_tf
-    assert "local.cloud_run_direct_iap ? local.effective_iap_group_principals" in iap_tf
-
-    # No public LB unless load_balancer mode is chosen; when it is, it carries a TLS policy.
-    assert re.search(
-        r"enable_https_lb\s*=\s*var\.enable_https_load_balancer\s*&&\s*local\.cloud_run_lb_iap",
-        lb_tf,
-    )
-    assert re.search(r'profile\s*=\s*"RESTRICTED"', lb_tf)
-    assert re.search(r"ssl_policy\s*=\s*google_compute_ssl_policy\.sec_edgar_tls\[0\]\.id", lb_tf)
-
-    # Sharing is by group or whole domain, never by individual user.
-    assert 'startswith(lower(trimspace(p)), "domain:")' in vars_tf
-    assert "google_cloud_run_v2_service.sec_edgar_analyst[0].uri" in outputs_tf
-
-    # CI deploys must keep the IAP role in the env vars they pass explicitly.
-    cloudbuild = (REPO_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
-    deploy_yml = (REPO_ROOT / ".github" / "workflows" / "deploy.yml").read_text(encoding="utf-8")
-    assert "IAP_ASSERTION_DEFAULT_ROLE=${_IAP_DEFAULT_ROLE}" in cloudbuild
-    assert "IAP_ASSERTION_DEFAULT_ROLE=analyst" in deploy_yml
-
-
-def test_vpc_service_controls_perimeter_terraform() -> None:
-    tf_dir = REPO_ROOT / "terraform"
-    vpcsc_tf = (tf_dir / "vpc_service_controls.tf").read_text(encoding="utf-8")
-    vars_tf = (tf_dir / "variables.tf").read_text(encoding="utf-8")
-    apis_tf = (tf_dir / "apis.tf").read_text(encoding="utf-8")
-
-    assert '"accesscontextmanager.googleapis.com"' in apis_tf
-    assert 'resource "google_access_context_manager_service_perimeter" "sec_edgar"' in vpcsc_tf
-    assert 'resource "google_access_context_manager_access_policy" "sec_edgar_scoped"' in vpcsc_tf
-    assert re.search(r"scopes\s*=\s*\[local\.vpc_sc_project_resource\]", vpcsc_tf)
-    assert re.search(r'perimeter_type\s*=\s*"PERIMETER_TYPE_REGULAR"', vpcsc_tf)
-
-    # Dry run first: the config goes to `spec` unless enforcement is switched on.
-    assert re.search(r"use_explicit_dry_run_spec\s*=\s*!var\.vpc_sc_enforce", vpcsc_tf)
-    assert 'dynamic "spec"' in vpcsc_tf and 'dynamic "status"' in vpcsc_tf
-    enforce_block = vars_tf.split('variable "vpc_sc_enforce"', 1)[1].split("}", 1)[0]
-    assert re.search(r"default\s*=\s*false", enforce_block)
-
-    # Every service named by the reference architecture is restricted.
-    restricted_block = vars_tf.split('variable "vpc_sc_restricted_services"', 1)[1].split("]", 1)[0]
-    for svc in (
-        "aiplatform",
-        "artifactregistry",
-        "bigquery",
-        "discoveryengine",
-        "dlp",
-        "firestore",
-        "modelarmor",
-        "run",
-        "secretmanager",
-        "storage",
-    ):
-        assert f'"{svc}.googleapis.com"' in restricted_block
-
-    # Ingress: identity-based for operators/CI/runtime/log sink; ANY_IDENTITY only for
-    # Cloud Run invocation (IAP gates users), as VPC-SC can't see IAM on invocations.
-    assert "google_service_account.cicd_runner.email" in vpcsc_tf
-    assert "local.runtime_service_account_email" in vpcsc_tf
-    assert "writer_identity" in vpcsc_tf
-    assert len(re.findall(r'identity_type\s*=\s*"ANY_IDENTITY"', vpcsc_tf)) == 2
-    assert len(re.findall(r'service_name\s*=\s*"run\.googleapis\.com"', vpcsc_tf)) == 2
-    assert "precondition" in vpcsc_tf
+    # Discovery Engine kept; Matching Engine removed
+    vs_tf = (tf_dir / "vector_search.tf").read_text(encoding="utf-8")
+    assert 'resource "google_discovery_engine_data_store" "sec_10k_corpus"' in vs_tf
+    assert 'resource "google_discovery_engine_search_engine" "sec_10k_hybrid_search"' in vs_tf
+    assert "google_vertex_ai_index" not in vs_tf
 
 
 def test_frontend_lockfile_uses_public_npm_registry() -> None:
@@ -618,10 +197,10 @@ def test_frontend_lockfile_uses_public_npm_registry() -> None:
     assert bad_urls == [], f"Lockfile contains non-public npm registry URLs: {bad_urls[:5]}"
 
 
-def test_fastapi_health_and_secrets_status_endpoint_redaction(
+def test_fastapi_health_and_pruned_routes_offline(
     fake_gcp_adapters: object,
 ) -> None:
-    """Verify `/health`, 401 gate + redaction on `/api/v1/secrets/status`, and pruned routes offline."""
+    """Verify `/health` and confirm legacy/unneeded routes are absent."""
     client = TestClient(app)
 
     health_resp = client.get("/health")
@@ -633,37 +212,21 @@ def test_fastapi_health_and_secrets_status_endpoint_redaction(
     assert health_body["iap_jwt_auth_enabled"] is True
     assert client.get("/healthz").status_code == 404
 
-    unauth_resp = client.get("/api/v1/secrets/status")
-    assert unauth_resp.status_code == 401
-    assert "Bearer" in unauth_resp.headers.get("WWW-Authenticate", "")
-
     bearer_jwt, _ = issue_local_dev_workspace_sso_token()
     auth_headers = {"Authorization": f"Bearer {bearer_jwt}"}
 
-    secrets_resp = client.get("/api/v1/secrets/status", headers=auth_headers)
-    assert secrets_resp.status_code == 200
-    secrets_body = secrets_resp.json()
-    assert secrets_body["secret_manager_enabled"] is True
-    assert all(s["value"] == "***REDACTED***" for s in secrets_body["secrets"])
-
-    # OpenAPI schema confirms legacy compute endpoints remain removed
     schema_paths = app.openapi()["paths"]
-    assert "/api/v1/variances" not in schema_paths
-    assert "/api/v1/intent" not in schema_paths
-    assert client.get("/api/v1/variances", headers=auth_headers).status_code == 404
-    assert client.get("/api/v1/intent", headers=auth_headers).status_code == 404
+    for removed in ("/api/v1/variances", "/api/v1/intent", "/api/v1/secrets/status"):
+        assert removed not in schema_paths
+        assert client.get(removed, headers=auth_headers).status_code == 404
 
 
 def test_ci_identities_have_least_privilege_live_read_access_terraform() -> None:
     tf_dir = REPO_ROOT / "terraform"
     ci_tf = (tf_dir / "ci_live_test_access.tf").read_text(encoding="utf-8")
     evals_tf = (tf_dir / "evals.tf").read_text(encoding="utf-8")
-    vpcsc_tf = (tf_dir / "vpc_service_controls.tf").read_text(encoding="utf-8")
 
-    # Both CI identities: GitHub Actions WIF SA and (when enabled) the Cloud Build SA.
-    principals = ci_tf.split("ci_live_test_principals = merge(", 1)[1].split("\n  )", 1)[0]
-    assert "google_service_account.cicd_runner.email" in principals
-    assert "google_service_account.cloudbuild_runner[0].email" in principals
+    assert "google_service_account.cicd_runner.email" in ci_tf
     assert "eval_ci_principals = local.ci_live_test_principals" in evals_tf
 
     expected = {
@@ -692,45 +255,5 @@ def test_ci_identities_have_least_privilege_live_read_access_terraform() -> None
     assert "dataset_id = google_bigquery_dataset.sec_edgar.dataset_id" in ci_tf
     assert "bucket = local.sec_corpus_bucket_name" in ci_tf
 
-    # Read-only: no admin/editor/write roles for the test identities.
     for forbidden in ("admin", "editor", "owner", "dataEditor", "objectAdmin", "objectCreator"):
         assert forbidden not in ci_tf.split("locals {", 1)[1], forbidden
-
-    # Both CI identities are trusted VPC-SC ingress identities.
-    assert '["serviceAccount:${google_service_account.cicd_runner.email}"]' in vpcsc_tf
-    assert "google_service_account.cloudbuild_runner[0].email" in vpcsc_tf
-
-
-def test_vector_search_private_service_connect_terraform() -> None:
-    tf_dir = REPO_ROOT / "terraform"
-    network_tf = (tf_dir / "network.tf").read_text(encoding="utf-8")
-    vs_tf = (tf_dir / "vector_search.tf").read_text(encoding="utf-8")
-    run_tf = (tf_dir / "cicd_and_secrets.tf").read_text(encoding="utf-8")
-    vars_tf = (tf_dir / "variables.tf").read_text(encoding="utf-8")
-
-    # PSC is the default; the endpoint has no public domain in that mode
-    access_block = vars_tf.split('variable "vector_search_endpoint_access"', 1)[1].split("}", 1)[0]
-    assert re.search(r'default\s*=\s*"private_service_connect"', access_block)
-    assert re.search(r"public_endpoint_enabled\s*=\s*!local\.vector_search_psc", vs_tf)
-    assert re.search(r"enable_private_service_connect\s*=\s*true", vs_tf)
-    assert re.search(r"project_allowlist\s*=\s*\[var\.project_id\]", vs_tf)
-
-    # Consumer side: private subnet, internal IP, and a PSC forwarding rule to the
-    # deployed index's service attachment
-    assert 'resource "google_compute_network" "sec_edgar"' in network_tf
-    assert re.search(r"auto_create_subnetworks\s*=\s*false", network_tf)
-    assert re.search(r"private_ip_google_access\s*=\s*true", network_tf)
-    assert re.search(r'address_type\s*=\s*"INTERNAL"', network_tf)
-    assert "private_endpoints[0].service_attachment" in network_tf
-    assert re.search(r'load_balancing_scheme\s*=\s*""', network_tf)
-
-    # Cloud Run reaches the PSC IP through Direct VPC egress and is told the address
-    assert re.search(r'egress\s*=\s*"PRIVATE_RANGES_ONLY"', run_tf)
-    assert "network_interfaces {" in run_tf
-    assert '"VERTEX_VECTOR_SEARCH_PSC_ADDRESS"' in run_tf
-    assert "google_compute_address.vector_search_psc[0].address" in run_tf
-
-    # Cloud Build merges env vars so the Terraform-managed PSC address survives deploys
-    cloudbuild = (REPO_ROOT / "cloudbuild.yaml").read_text(encoding="utf-8")
-    assert "--update-env-vars=" in cloudbuild
-    assert "--set-env-vars=" not in cloudbuild

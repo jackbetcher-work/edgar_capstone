@@ -30,7 +30,6 @@ if TYPE_CHECKING:
         VectorDBBuildSummary,
     )
     from edgar_capstone.vector_db.monitoring import (
-        CloudMonitoringHealthPublisher,
         build_cloud_monitoring_timeseries,
         evaluate_chunk_health,
         evaluate_chunk_health_from_bigquery,
@@ -51,10 +50,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DEFAULT_EMBEDDING_MODEL": ("edgar_capstone.vector_db.embedder", "DEFAULT_EMBEDDING_MODEL"),
     "ChunkAnomalyCounts": ("edgar_capstone.vector_db.models", "ChunkAnomalyCounts"),
     "ChunkHealthReport": ("edgar_capstone.vector_db.models", "ChunkHealthReport"),
-    "CloudMonitoringHealthPublisher": (
-        "edgar_capstone.vector_db.monitoring",
-        "CloudMonitoringHealthPublisher",
-    ),
     "FilingChunk": ("edgar_capstone.vector_db.models", "FilingChunk"),
     "SectionHealthBreakdown": ("edgar_capstone.vector_db.models", "SectionHealthBreakdown"),
     "VectorDBBuildConfig": ("edgar_capstone.vector_db.pipeline", "VectorDBBuildConfig"),
@@ -100,7 +95,6 @@ __all__ = [
     "DEFAULT_EMBEDDING_MODEL",
     "ChunkAnomalyCounts",
     "ChunkHealthReport",
-    "CloudMonitoringHealthPublisher",
     "FilingChunk",
     "SectionHealthBreakdown",
     "VectorDBBuildConfig",

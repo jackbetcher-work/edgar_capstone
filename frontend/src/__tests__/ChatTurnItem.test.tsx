@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { ChatTurnItem } from '../components/ChatTurnItem'
 import type {
   ChatTurnResponse,
@@ -179,7 +179,6 @@ function buildResponse(overrides: Partial<ChatTurnResponse> = {}): ChatTurnRespo
     material_variance_summary: null,
     disclosure_deltas: null,
     citations: [citation('NVDA_2026_item_1a_0001', 2026, 'item_1a')],
-    context_cache: null,
     fact_check: {
       passed: true,
       checked_metrics_count: 0,
@@ -359,5 +358,113 @@ describe('ChatTurnItem — agent-invoked deterministic evidence', () => {
       })
     )
     expect(screen.getByText('Agent invoked calculate_period_variances')).toBeTruthy()
+  })
+
+  it('renders live sector_map_progress percentage and canonical sector_coverage badge', () => {
+    const { rerender } = render(
+      <ChatTurnItem
+        turn={buildTurn(null, {
+          isLoading: true,
+          progressStage: 'sector_map_progress',
+          progressMessage: '38/76 Information Technology companies analyzed (batch 3/6)',
+          progressMeta: {
+            analyzed: 38,
+            total: 76,
+            issuers_in_sector: 76,
+            batch_completed: 3,
+            total_batches: 6,
+          },
+        })}
+        activeChunkId={null}
+        onSelectInlineCitation={vi.fn()}
+        onFocusTurnCitations={vi.fn()}
+        onInspectFilingSection={vi.fn()}
+        onSubmitFeedback={vi.fn()}
+      />
+    )
+    expect(screen.getByText('50%')).toBeTruthy()
+
+    rerender(
+      <ChatTurnItem
+        turn={buildTurn(
+          buildResponse({
+            sector_coverage: {
+              gics_sector: 'Information Technology',
+              issuers_in_sector: 76,
+              issuers_analyzed: 74,
+              issuers_with_theme_matches: 58,
+              batches_processed: 6,
+            },
+          })
+        )}
+        activeChunkId={null}
+        onSelectInlineCitation={vi.fn()}
+        onFocusTurnCitations={vi.fn()}
+        onInspectFilingSection={vi.fn()}
+        onSubmitFeedback={vi.fn()}
+      />
+    )
+    const badge = screen.getByText(/74\/76 Information Technology ISSUERS · 58 MATCHED/i)
+    expect(badge).toBeTruthy()
+    expect(badge.getAttribute('title')).toContain('6 parallel batches')
+  })
+
+  it('renders verified structured_report JSON directly with XBRL chips, citation chips, and collapsible quotes', () => {
+    const onSelectInlineCitation = vi.fn()
+    const onInspectXbrlFact = vi.fn()
+    const cit = citation('NVDA_2026_item_7_0001', 2026, 'item_7')
+    render(
+      <ChatTurnItem
+        turn={buildTurn(
+          buildResponse({
+            answer_markdown: 'Fallback markdown that should NOT be rendered when structured_report is present.',
+            variance_reports: [VARIANCE_REPORT],
+            citations: [cit],
+            structured_report: {
+              intent: 'longitudinal_single_company',
+              headline: 'NVIDIA revenue surged on Blackwell data center demand.',
+              key_metrics: [{ ticker: 'NVDA', metric: 'revenue' }],
+              findings: [
+                {
+                  statement: 'Data center compute shipments drove FY2026 top-line expansion.',
+                  ticker: 'NVDA',
+                  fiscal_year: 2026,
+                  chunk_ids: [cit.chunk_id],
+                  evidence_quote: 'Data center demand drove revenue growth.',
+                },
+              ],
+            },
+          })
+        )}
+        activeChunkId={null}
+        onSelectInlineCitation={onSelectInlineCitation}
+        onInspectXbrlFact={onInspectXbrlFact}
+        onFocusTurnCitations={vi.fn()}
+        onInspectFilingSection={vi.fn()}
+        onSubmitFeedback={vi.fn()}
+      />
+    )
+
+    expect(
+      screen.getByText('NVIDIA revenue surged on Blackwell data center demand.')
+    ).toBeTruthy()
+    expect(screen.queryByText(/Fallback markdown/)).toBeNull()
+    expect(
+      screen.getByText('Data center compute shipments drove FY2026 top-line expansion.')
+    ).toBeTruthy()
+
+    // Clicking the deterministic XBRL chip inspects the XBRL fact
+    fireEvent.click(screen.getByRole('button', { name: /NVDA FY26 · Revenue/i }))
+    expect(onInspectXbrlFact).toHaveBeenCalledTimes(1)
+
+    // Clicking the finding citation chip focuses the cited 10-K chunk
+    fireEvent.click(screen.getByRole('button', { name: /NVDA FY26 · MD&A/i }))
+    expect(onSelectInlineCitation).toHaveBeenCalledTimes(1)
+    expect(onSelectInlineCitation.mock.calls[0][0].chunkId).toBe(cit.chunk_id)
+
+    // Evidence quote starts collapsed and expands on click
+    expect(screen.queryByText(/Data center demand drove revenue growth/)).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: /Supporting quote/i }))
+    expect(screen.getByText(/Data center demand drove revenue growth/)).toBeTruthy()
   })
 })

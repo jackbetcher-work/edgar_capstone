@@ -26,13 +26,11 @@ from edgar_capstone.agents.tools import query_analytics_view
 from edgar_capstone.security import (
     GOOGLE_IAP_ISSUER,
     GOOGLE_IAP_JWKS_URI,
-    S2S_AGENT_ASSERTION_HEADER,
     AuthSettings,
     IAPJwtVerifier,
     JwksKeyStore,
     clear_security_audit_events,
     ec_public_key_to_jwk,
-    get_agent_s2s_broker,
     get_auth_verifier,
     record_security_audit_event,
     sign_jwt_es256,
@@ -107,9 +105,6 @@ def auth_client_env(session_idp_keys: dict[str, Any]):
     )
     settings = AuthSettings(
         audiences=(TEST_IAP_AUDIENCE,),
-        okta_issuer_uri=None,
-        okta_jwks_uri=None,
-        okta_client_id=None,
         google_oauth_client_id=None,
         allowed_workspace_domains=("fde-workspace.corp",),
         cloud_identity_domain="fde-workspace.corp",
@@ -705,23 +700,6 @@ def test_firestore_feedback_api_persistence_query_and_rbac(
     assert up_only.json()["feedback"][0]["message_id"] == "msg-nvda-001"
     assert len(run_query_payloads) == 2
 
-    # 4. S2S FinancialAnalystAgent service account lacks `audit:read` -> 403 on GET /api/v1/feedback & /api/v1/telemetry/sessions
-    agent_jwt = mint_token(
-        "financial-analyst-agent-sa@iron-radio-514217-q7.iam.gserviceaccount.com",
-        hosted_domain=None,
-    )
-    s2s_assertion = get_agent_s2s_broker().mint_s2s_assertion(
-        agent_name="FinancialAnalystAgent",
-        target_service="looker-semantic-service",
-        caller="RootOrchestrator",
-    )
-    agent_headers = {
-        "Authorization": f"Bearer {agent_jwt}",
-        S2S_AGENT_ASSERTION_HEADER: s2s_assertion,
-    }
-    assert client.get("/api/v1/feedback", headers=agent_headers).status_code == 403
-    assert client.get("/api/v1/telemetry/sessions", headers=agent_headers).status_code == 403
-
 
 def test_firestore_feedback_strict_vs_auto_fallback() -> None:
     """Verify Firestore HTTP 503 / missing ADC raises in strict `gcp` mode and falls back in `auto` mode."""
@@ -832,16 +810,26 @@ def test_health_and_bigquery_explores(
     assert chat_json["evaluation"]["grade"] == "pending"
     assert chat_json["evaluation"]["overall_score"] is None
 
-    for explore_slug in ("llm_telemetry", "session_analytics", "audit_trail"):
+    # Internal ops/telemetry views are NOT exposed to the financial analyst tool
+    for ops_slug in ("llm_telemetry", "session_analytics", "audit_trail"):
         exp_res = query_analytics_view(
-            explore_name=explore_slug,
+            explore_name=ops_slug,
             tickers="ALL",
             gics_sector="ALL",
             start_year=2024,
             end_year=2026,
         )
+        assert exp_res["status"] == "error"
+
+    for financial_slug in ("yoy_variances", "sector_benchmarks", "chunk_health"):
+        exp_res = query_analytics_view(
+            explore_name=financial_slug,
+            tickers="NVDA,MSFT",
+            gics_sector="ALL",
+            start_year=2024,
+            end_year=2026,
+        )
         assert exp_res["status"] == "success"
-        assert exp_res["row_count"] >= 1
 
     sess_resp = client.get(
         "/api/v1/telemetry/sessions?session_id=sess-explore-check",

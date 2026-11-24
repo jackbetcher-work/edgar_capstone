@@ -356,20 +356,7 @@ def _build_exporter(config: TracingConfig) -> tuple[SpanExporter | None, str]:
             return None, "none"
         return OTLPSpanExporter(), "otlp"
 
-    # Legacy Cloud Trace v2 fallback when OTLP exporter is unavailable.
-    try:
-        from opentelemetry.exporter.cloud_trace import CloudTraceSpanExporter
-    except ImportError:
-        logger.warning(
-            "opentelemetry-exporter-gcp-trace is not installed; spans will not reach Cloud Trace."
-        )
-        return None, "none"
-    exporter = CloudTraceSpanExporter(
-        project_id=config.project_id,
-        # Promote service/cloud/faas resource attributes to Cloud Trace span labels.
-        resource_regex=r"^(service|cloud|faas|deployment|gcp)\..*",
-    )
-    return exporter, "gcp"
+    return None, "none"
 
 
 def _configure_propagators() -> tuple[str, ...]:
@@ -468,15 +455,6 @@ def configure_tracing(
             )
             trace.set_tracer_provider(provider)
 
-        # Attach ADK's Agent Engine TopSpanProcessor for supportID / traceparent attribution.
-        if cfg.agent_engine_telemetry_enabled:
-            try:
-                from google.adk.telemetry._agent_engine import TopSpanProcessor
-
-                provider.add_span_processor(TopSpanProcessor())
-            except Exception as exc:  # pragma: no cover - optional ADK helper
-                logger.debug("Skipping ADK TopSpanProcessor: %s", exc)
-
         existing_logger = _logs.get_logger_provider()
         if isinstance(existing_logger, LoggerProvider):
             logger_provider = existing_logger
@@ -493,17 +471,13 @@ def configure_tracing(
                 span_processors, log_processors, exporter_name = _build_gcp_otlp_hooks(cfg)
             except Exception as exc:  # pragma: no cover - credential / environment specific
                 _STATE.last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning(
-                    "GCP OTLP telemetry exporter unavailable; falling back to Cloud Trace v2: %s",
-                    exc,
-                )
-
-        if not span_processors and cfg.resolved_exporter != "none":
+                logger.warning("GCP OTLP telemetry exporter unavailable; spans stay local: %s", exc)
+        elif cfg.resolved_exporter != "none":
             try:
                 exporter, exporter_name = _build_exporter(cfg)
             except Exception as exc:  # pragma: no cover - credential / environment specific
                 _STATE.last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("Cloud Trace exporter unavailable; spans stay local: %s", exc)
+                logger.warning("Trace exporter unavailable; spans stay local: %s", exc)
                 exporter, exporter_name = None, "none"
             if exporter is not None:
                 span_processors.append(BatchSpanProcessor(exporter))

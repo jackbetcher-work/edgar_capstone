@@ -216,54 +216,7 @@ resource "google_bigquery_table_iam_member" "runtime_sa_telemetry_sink_append" {
   member     = "serviceAccount:${local.runtime_service_account_email}"
 }
 
-# 6. Cloud Logging Project Sink -> Dedicated Ops-Log BigQuery Dataset
-# The sink writes into its own dataset (not sec_edgar) so its writer identity can hold
-# roles/bigquery.dataEditor (incl. bigquery.tables.create, needed to auto-create the
-# partitioned log tables) without any write path to financial_metrics / filing_chunks,
-# which stay strictly read-only. The app's direct insertAll streaming into
-# sec_edgar.*_events / security_audit_logs remains the analytical source of truth; this
-# export is the durable, raw Cloud Logging copy (full LogEntry incl. trace + labels).
-resource "google_bigquery_dataset" "sec_edgar_ops_logs" {
-  count = var.enable_bigquery_logging_sink ? 1 : 0
-
-  project                         = var.project_id
-  dataset_id                      = var.ops_logs_dataset_id
-  friendly_name                   = "SEC EDGAR Operational Log Export"
-  description                     = "Cloud Logging sink destination (sec-edgar-telemetry-audit-bq-sink) for raw structured telemetry, session, and security audit LogEntries. Isolated from sec_edgar so the sink writer never gains write access to curated financial tables."
-  location                        = var.region
-  delete_contents_on_destroy      = !var.deletion_protection
-  default_partition_expiration_ms = var.ops_logs_retention_days > 0 ? var.ops_logs_retention_days * 86400000 : null
-  labels                          = var.labels
-
-  depends_on = [google_project_service.required_apis]
-}
-
-resource "google_logging_project_sink" "telemetry_and_audit_to_bigquery" {
-  count = var.enable_bigquery_logging_sink ? 1 : 0
-
-  project                = var.project_id
-  name                   = "sec-edgar-telemetry-audit-bq-sink"
-  description            = "Streams structured SEC EDGAR telemetry, session analytics, and 10-K security audit logs from Cloud Logging into partitioned tables in the dedicated sec_edgar_ops_logs dataset."
-  destination            = "bigquery.googleapis.com/projects/${var.project_id}/datasets/${google_bigquery_dataset.sec_edgar_ops_logs[0].dataset_id}"
-  filter                 = "jsonPayload.component=\"sec-edgar-telemetry-sink\""
-  unique_writer_identity = true
-
-  bigquery_options {
-    use_partitioned_tables = true
-  }
-}
-
-# Dataset-scoped (never project-level) dataEditor for the sink's writer identity.
-resource "google_bigquery_dataset_iam_member" "logging_sink_ops_logs_writer" {
-  count = var.enable_bigquery_logging_sink ? 1 : 0
-
-  project    = var.project_id
-  dataset_id = google_bigquery_dataset.sec_edgar_ops_logs[0].dataset_id
-  role       = "roles/bigquery.dataEditor"
-  member     = google_logging_project_sink.telemetry_and_audit_to_bigquery[0].writer_identity
-}
-
-# 7. Google Cloud Firestore Native Database for Persistent Analyst Feedback
+# 6. Google Cloud Firestore Native Database for Persistent Analyst Feedback & Sessions
 resource "google_firestore_database" "analyst_feedback_db" {
   count = var.enable_firestore_feedback ? 1 : 0
 

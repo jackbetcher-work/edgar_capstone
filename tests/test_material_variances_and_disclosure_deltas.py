@@ -35,7 +35,6 @@ from edgar_capstone.agents.tools.material_variances import (
 from edgar_capstone.agents.tools.sec_tools import calculate_period_variances
 from edgar_capstone.agents.tools.variance_engine import _build_variance_reports_from_profiles
 from edgar_capstone.dataset.models import FinancialDataProfile
-from edgar_capstone.security.agent_identity import authorize_agent_tool_invocation
 from tests.structured_report_helpers import ScriptedAnalystLlm
 
 _CITATION_RE = re.compile(r"\[[^\]|]+\|[^\]|]+\|\s*([^\]|]+?)\s*\]\(")
@@ -453,11 +452,6 @@ def test_analyst_agent_registers_new_tools_with_least_privilege() -> None:
     analyst = create_financial_analyst_agent()
     names = {getattr(t, "name", "") for t in analyst.tools}
     assert {"flag_material_variances", "compare_disclosures_across_years"} <= names
-    for tool in ("flag_material_variances", "compare_disclosures_across_years"):
-        claims = authorize_agent_tool_invocation(
-            agent_name="FinancialAnalystAgent", tool_name=tool, caller="RootOrchestrator"
-        )
-        assert claims.agent_name == "FinancialAnalystAgent"
 
 
 def test_prompt_carries_flags_and_disclosure_deltas() -> None:
@@ -783,3 +777,86 @@ def test_build_company_evolution_supplements_term_matched_chunks_and_preserves_c
         for cid in (d.prior_chunk_id, d.current_chunk_id):
             if cid:
                 assert cid in cited_ids
+
+
+def test_merge_disclosure_deltas_preserves_both_themes_for_same_ticker() -> None:
+    """Calling compare_disclosures_across_years twice for the same ticker merges year_pairs instead of overwriting."""
+    from edgar_capstone.agents.tools.runtime import merge_disclosure_deltas
+
+    pfas_call = {
+        "status": "success",
+        "theme": "PFAS",
+        "theme_terms": ["pfas"],
+        "start_year": 2021,
+        "end_year": 2025,
+        "summary": {"added": 0, "removed": 0, "modified": 1, "unchanged": 0, "year_pairs": 1},
+        "companies": [
+            {
+                "ticker": "MMM",
+                "fiscal_years_available": [2023, 2024],
+                "missing_fiscal_years": [],
+                "theme_mentions": {"2023": 40, "2024": 35},
+                "year_pairs": [
+                    {
+                        "prior_fiscal_year": 2023,
+                        "current_fiscal_year": 2024,
+                        "counts": {"added": 0, "removed": 0, "modified": 1, "unchanged": 0},
+                        "deltas": [
+                            {
+                                "section_id": "item_1a",
+                                "change_type": "modified",
+                                "prior_chunk_id": "MMM_2023_item_1a_0005",
+                                "current_chunk_id": "MMM_2024_item_1a_0005",
+                                "current_excerpt": "exit of all PFAS manufacturing",
+                                "theme_relevance": 0.45,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+        "citations": [{"chunk_id": "MMM_2024_item_1a_0005"}],
+    }
+    earplug_call = {
+        "status": "success",
+        "theme": "Combat Arms earplug",
+        "theme_terms": ["earplug"],
+        "start_year": 2021,
+        "end_year": 2025,
+        "summary": {"added": 1, "removed": 0, "modified": 0, "unchanged": 0, "year_pairs": 1},
+        "companies": [
+            {
+                "ticker": "MMM",
+                "fiscal_years_available": [2023, 2024],
+                "missing_fiscal_years": [],
+                "theme_mentions": {"2023": 12, "2024": 10},
+                "year_pairs": [
+                    {
+                        "prior_fiscal_year": 2023,
+                        "current_fiscal_year": 2024,
+                        "counts": {"added": 1, "removed": 0, "modified": 0, "unchanged": 0},
+                        "deltas": [
+                            {
+                                "section_id": "item_1a",
+                                "change_type": "added",
+                                "prior_chunk_id": None,
+                                "current_chunk_id": "MMM_2024_item_1a_0023",
+                                "current_excerpt": "Combat Arms Earplug Settlement",
+                                "theme_relevance": 0.92,
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+        "citations": [{"chunk_id": "MMM_2024_item_1a_0023"}],
+    }
+    merged = merge_disclosure_deltas(pfas_call, earplug_call)
+    assert merged is not None
+    assert len(merged["companies"]) == 1
+    pair = merged["companies"][0]["year_pairs"][0]
+    cids = {d["current_chunk_id"] for d in pair["deltas"]}
+    assert cids == {"MMM_2024_item_1a_0005", "MMM_2024_item_1a_0023"}
+    assert merged["summary"]["year_pairs"] == 1
+    assert merged["summary"]["modified"] == 1 and merged["summary"]["added"] == 1
+    assert merged["companies"][0]["theme_mentions"] == {"2023": 52, "2024": 45}

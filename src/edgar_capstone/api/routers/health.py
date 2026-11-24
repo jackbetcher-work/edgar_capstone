@@ -22,7 +22,6 @@ from edgar_capstone.observability import (
     logging_status_metadata,
     tracing_status_metadata,
 )
-from edgar_capstone.security.agent_identity import PER_AGENT_IDENTITIES
 from edgar_capstone.security.model_armor import get_model_armor_status_metadata
 from edgar_capstone.security.rbac import RuntimeServiceAccountConfig
 from edgar_capstone.telemetry import get_feedback_store, get_telemetry_sink
@@ -58,7 +57,6 @@ def health(
         "telemetry_sink": get_telemetry_sink().status_metadata(),
         "feedback_store": get_feedback_store().status_metadata(),
         "session_memory": get_conversation_memory_manager().persistence_status(),
-        "agent_identities": sorted(PER_AGENT_IDENTITIES.keys()),
         "iap_jwt_auth_enabled": True,
         "data_backend": get_gcp_adapters_status_metadata(),
         "observability": {

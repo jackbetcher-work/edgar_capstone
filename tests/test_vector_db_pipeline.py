@@ -30,7 +30,6 @@ from edgar_capstone.vector_db.embedder import (
     populate_chunk_embeddings,
 )
 from edgar_capstone.vector_db.monitoring import (
-    CloudMonitoringHealthPublisher,
     build_cloud_monitoring_timeseries,
     evaluate_chunk_health,
     format_structured_health_log,
@@ -170,28 +169,6 @@ def test_missing_section_placeholder_is_skipped() -> None:
     assert "item_7" in sections
 
 
-def test_vertex_vector_search_record_format() -> None:
-    prof = _sample_profile()
-    md = _sample_markdown(prof)
-    chunks = chunk_filing_document(prof, md)
-    embedder = _mock_vertex_embedder([])
-    chunks[0].embedding = embedder.embed_texts([chunks[0].chunk_text])[0]
-
-    vx_rec = chunks[0].to_vertex_vector_search_record()
-    assert vx_rec["id"] == chunks[0].chunk_id
-    assert len(vx_rec["embedding"]) == DEFAULT_EMBEDDING_DIMENSIONS
-    assert vx_rec["crowding_tag"] == "NVDA"
-
-    restrict_map = {r["namespace"]: r["allow"] for r in vx_rec["restricts"]}
-    assert restrict_map["ticker"] == ["NVDA"]
-    assert restrict_map["gics_sector"] == ["Information Technology"]
-    assert restrict_map["section_id"] == ["item_1a"]
-    assert restrict_map["profile_id"] == ["NVDA_2026"]
-
-    num_restricts = {r["namespace"]: r["value_int"] for r in vx_rec["numeric_restricts"]}
-    assert num_restricts["fiscal_year"] == 2026
-
-
 @pytest.mark.live
 def test_live_vertex_ai_embeddings_capture_semantic_similarity(
     live_embedder: VertexAIEmbedder,
@@ -297,25 +274,10 @@ def test_chunk_health_evaluation_and_cloud_monitoring_export() -> None:
     assert anomaly_log["missing_profile_ids"] == ["MSFT_2026"]
     assert anomaly_log["missing_profile_ids_truncated"] == 0
 
-    captured_requests: list[dict] = []
-
-    def monitoring_handler(request: httpx.Request) -> httpx.Response:
-        captured_requests.append(json.loads(request.content.decode("utf-8")))
-        return httpx.Response(200, json={})
-
-    mock_creds = MagicMock()
-    mock_creds.valid = True
-    mock_creds.token = "fake-monitoring-token"
-
-    publisher = CloudMonitoringHealthPublisher(
-        project_id="iron-radio-514217-q7",
-        http_client=httpx.Client(transport=httpx.MockTransport(monitoring_handler)),
-        credentials=mock_creds,
-    )
-    written_count = publisher.publish_report(healthy_report)
-    assert written_count == len(ts_list)
-    assert healthy_report.published_to_cloud_monitoring is True
-    assert len(captured_requests) == 1
+    assert len(ts_list) >= 10
+    structured_log = format_structured_health_log(healthy_report)
+    assert structured_log["event_type"] == "sec_edgar_chunk_health_evaluation"
+    assert structured_log["health_status"] == "HEALTHY"
 
 
 def test_end_to_end_vector_db_pipeline_staged_locally(tmp_path: Path) -> None:
@@ -351,17 +313,13 @@ def test_end_to_end_vector_db_pipeline_staged_locally(tmp_path: Path) -> None:
     assert report.health_score == 100.0
 
     bq_jsonl = Path(summary.bigquery_manifest_path)
-    vx_jsonl = Path(summary.vertex_vector_manifest_path)
     health_json = Path(summary.health_report_path)
 
     assert bq_jsonl.exists()
-    assert vx_jsonl.exists()
     assert health_json.exists()
 
     bq_lines = bq_jsonl.read_text(encoding="utf-8").strip().splitlines()
-    vx_lines = vx_jsonl.read_text(encoding="utf-8").strip().splitlines()
     assert len(bq_lines) == summary.total_chunks_generated
-    assert len(vx_lines) == summary.total_chunks_generated
 
     first_row = json.loads(bq_lines[0])
     assert len(first_row["embedding"]) == DEFAULT_EMBEDDING_DIMENSIONS
@@ -708,12 +666,9 @@ def test_monitoring_edge_cases_embedder_retries_and_lazy_package_exports(
         bad_count_emb.embed_texts(["one"])
 
 
-def test_evaluate_chunk_health_from_bigquery_and_cloud_logging_publish(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Verifies BigQuery-backed chunk health evaluation, Cloud Logging export, and CLI."""
+def test_evaluate_chunk_health_from_bigquery() -> None:
+    """Verifies BigQuery-backed chunk health evaluation and structured health log formatting."""
     from edgar_capstone.vector_db.monitoring import evaluate_chunk_health_from_bigquery
-    from scripts import publish_chunk_health
 
     class _FakeBQClient:
         def __init__(self) -> None:
@@ -804,37 +759,8 @@ def test_evaluate_chunk_health_from_bigquery_and_cloud_logging_publish(
     assert "item_1a" in report.by_section
     assert "Information Technology" in report.by_sector
 
-    # Publisher with write_cloud_logging=True calls both Monitoring and Cloud Logging APIs.
-    requests_made: list[tuple[str, dict]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests_made.append((str(request.url), json.loads(request.content.decode("utf-8"))))
-        return httpx.Response(200, json={})
-
-    creds = MagicMock()
-    creds.valid = True
-    creds.token = "tok"
-    pub = CloudMonitoringHealthPublisher(
-        project_id="iron-radio-514217-q7",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-        credentials=creds,
-        write_cloud_logging=True,
-    )
-    written = pub.publish_report(report)
-    assert written == len(build_cloud_monitoring_timeseries(report))
-    assert len(requests_made) == 2
-    assert "monitoring.googleapis.com" in requests_made[0][0]
-    assert "logging.googleapis.com/v2/entries:write" in requests_made[1][0]
-    log_entry = requests_made[1][1]["entries"][0]["jsonPayload"]
+    log_entry = format_structured_health_log(report)
     assert log_entry["event_type"] == "sec_edgar_chunk_health_evaluation"
     assert log_entry["missing_section_filings"] == 2
     assert log_entry["missing_profile_ids"] == ["FDX_2020"]
-
-    # CLI dry-run + coverage gate
-    monkeypatch.setattr(
-        publish_chunk_health,
-        "evaluate_chunk_health_from_bigquery",
-        lambda **_kwargs: report,
-    )
-    assert publish_chunk_health.main(["--dry-run", "--json"]) == 0
-    assert publish_chunk_health.main(["--dry-run", "--min-section-coverage", "0.95"]) == 3
+    assert len(build_cloud_monitoring_timeseries(report)) >= 10

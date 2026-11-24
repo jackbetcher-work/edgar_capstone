@@ -1,8 +1,7 @@
-"""Chunk health evaluation and Google Cloud Monitoring metric exporter for the RAG vector DB."""
+"""Chunk health evaluation and structured telemetry for the RAG vector DB."""
 
 from __future__ import annotations
 
-import json
 import logging
 from collections import defaultdict
 from collections.abc import Sequence
@@ -20,7 +19,6 @@ from edgar_capstone.gcp.defaults import (
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
 )
-from edgar_capstone.gcp.rest_client import GcpRestClient
 from edgar_capstone.vector_db.models import (
     ChunkAnomalyCounts,
     ChunkHealthReport,
@@ -142,6 +140,44 @@ def _compute_group_breakdown(
         oversized_chunk_count=oversized,
         missing_metadata_count=missing_meta,
     )
+
+
+def _score_chunk_health(
+    *,
+    total_chunks: int,
+    embedding_coverage_ratio: float,
+    filing_coverage_ratio: float,
+    full_section_coverage_ratio: float,
+    anomalies: ChunkAnomalyCounts,
+) -> tuple[float, str]:
+    """Compute the composite 0-100 chunk health score and status badge.
+
+    Weights: 45 pts embedding validity, 30 pts filing & dual-section completeness,
+    15 pts chunk size compliance, 10 pts metadata completeness.
+    """
+    if total_chunks == 0:
+        health_score = 0.0
+    else:
+        size_anomaly_ratio = min(
+            1.0, (anomalies.undersized_chunk + anomalies.oversized_chunk) / total_chunks
+        )
+        meta_anomaly_ratio = min(1.0, anomalies.missing_metadata / total_chunks)
+        raw_score = (
+            45.0 * embedding_coverage_ratio
+            + 15.0 * filing_coverage_ratio
+            + 15.0 * full_section_coverage_ratio
+            + 15.0 * (1.0 - size_anomaly_ratio)
+            + 10.0 * (1.0 - meta_anomaly_ratio)
+        )
+        health_score = round(max(0.0, min(100.0, raw_score)), 2)
+
+    if health_score >= 95.0 and embedding_coverage_ratio >= 0.99:
+        health_status = "HEALTHY"
+    elif health_score >= 80.0 and embedding_coverage_ratio >= 0.90:
+        health_status = "DEGRADED"
+    else:
+        health_status = "UNHEALTHY"
+    return health_score, health_status
 
 
 def evaluate_chunk_health(
@@ -273,33 +309,13 @@ def evaluate_chunk_health(
         for sector, sec_chunks in sorted(by_sector_chunks.items())
     }
 
-    # Composite 0-100 health score:
-    # - 45 pts: Embedding validity & dimension coverage
-    # - 30 pts: Filing & dual-section (Item 1A + Item 7) completeness
-    # - 15 pts: Chunk size compliance (neither undersized nor oversized)
-    # - 10 pts: Metadata completeness
-    if total_chunks == 0:
-        health_score = 0.0
-    else:
-        size_anomaly_ratio = min(
-            1.0, (anomalies.undersized_chunk + anomalies.oversized_chunk) / total_chunks
-        )
-        meta_anomaly_ratio = min(1.0, anomalies.missing_metadata / total_chunks)
-        raw_score = (
-            45.0 * embedding_coverage_ratio
-            + 15.0 * filing_coverage_ratio
-            + 15.0 * full_section_coverage_ratio
-            + 15.0 * (1.0 - size_anomaly_ratio)
-            + 10.0 * (1.0 - meta_anomaly_ratio)
-        )
-        health_score = round(max(0.0, min(100.0, raw_score)), 2)
-
-    if health_score >= 95.0 and embedding_coverage_ratio >= 0.99:
-        health_status = "HEALTHY"
-    elif health_score >= 80.0 and embedding_coverage_ratio >= 0.90:
-        health_status = "DEGRADED"
-    else:
-        health_status = "UNHEALTHY"
+    health_score, health_status = _score_chunk_health(
+        total_chunks=total_chunks,
+        embedding_coverage_ratio=embedding_coverage_ratio,
+        filing_coverage_ratio=filing_coverage_ratio,
+        full_section_coverage_ratio=full_section_coverage_ratio,
+        anomalies=anomalies,
+    )
 
     return ChunkHealthReport(
         project_id=project_id,
@@ -676,28 +692,13 @@ def evaluate_chunk_health_from_bigquery(
         missing_section_filings=missing_section_count,
     )
 
-    if total_chunks == 0:
-        health_score = 0.0
-    else:
-        size_anomaly_ratio = min(
-            1.0, (anomalies.undersized_chunk + anomalies.oversized_chunk) / total_chunks
-        )
-        meta_anomaly_ratio = min(1.0, anomalies.missing_metadata / total_chunks)
-        raw_score = (
-            45.0 * embedding_coverage_ratio
-            + 15.0 * filing_coverage_ratio
-            + 15.0 * full_section_coverage_ratio
-            + 15.0 * (1.0 - size_anomaly_ratio)
-            + 10.0 * (1.0 - meta_anomaly_ratio)
-        )
-        health_score = round(max(0.0, min(100.0, raw_score)), 2)
-
-    if health_score >= 95.0 and embedding_coverage_ratio >= 0.99:
-        health_status = "HEALTHY"
-    elif health_score >= 80.0 and embedding_coverage_ratio >= 0.90:
-        health_status = "DEGRADED"
-    else:
-        health_status = "UNHEALTHY"
+    health_score, health_status = _score_chunk_health(
+        total_chunks=total_chunks,
+        embedding_coverage_ratio=embedding_coverage_ratio,
+        filing_coverage_ratio=filing_coverage_ratio,
+        full_section_coverage_ratio=full_section_coverage_ratio,
+        anomalies=anomalies,
+    )
 
     return ChunkHealthReport(
         project_id=project_id,
@@ -727,77 +728,3 @@ def evaluate_chunk_health_from_bigquery(
         health_score=health_score,
         health_status=health_status,
     )
-
-
-class CloudMonitoringHealthPublisher(GcpRestClient):
-    """Publishes chunk health time-series metrics to Cloud Monitoring v3 & logs to Cloud Logging."""
-
-    def __init__(
-        self,
-        *,
-        project_id: str = DEFAULT_PROJECT_ID,
-        http_client: httpx.Client | None = None,
-        credentials: Any | None = None,
-        write_cloud_logging: bool = False,
-        log_id: str = "sec-edgar-chunk-health",
-    ) -> None:
-        super().__init__(
-            http_client=http_client,
-            credentials=credentials,
-            default_timeout=30.0,
-        )
-        self.project_id = project_id
-        self.write_cloud_logging = write_cloud_logging
-        self.log_id = log_id
-
-    def _get_access_token(self) -> str:
-        return self._get_bearer_token()
-
-    def _write_cloud_log_entry(self, structured_log: dict[str, Any]) -> None:
-        """Write a structured evaluation log directly to Cloud Logging REST v2 API."""
-        url = "https://logging.googleapis.com/v2/entries:write"
-        payload = {
-            "logName": f"projects/{self.project_id}/logs/{self.log_id}",
-            "resource": {
-                "type": "global",
-                "labels": {"project_id": self.project_id},
-            },
-            "entries": [
-                {
-                    "severity": structured_log.get("severity", "INFO"),
-                    "jsonPayload": structured_log,
-                }
-            ],
-        }
-        resp = self._raw_request("POST", url, json_body=payload)
-        if resp.status_code not in (200, 201):
-            raise RuntimeError(
-                f"Cloud Logging entries:write failed (HTTP {resp.status_code}): {resp.text[:400]}"
-            )
-
-    def publish_report(self, report: ChunkHealthReport) -> int:
-        """Write custom chunk health time series to Cloud Monitoring and emit structured log."""
-        structured_log = format_structured_health_log(report)
-        logger.info("Chunk Health Telemetry: %s", json.dumps(structured_log))
-
-        all_series = build_cloud_monitoring_timeseries(report)
-        if not all_series:
-            return 0
-
-        url = f"https://monitoring.googleapis.com/v3/projects/{self.project_id}/timeSeries"
-        # Cloud Monitoring allows up to 200 timeSeries per createTimeSeries request
-        for start in range(0, len(all_series), 200):
-            batch = all_series[start : start + 200]
-            resp = self._raw_request("POST", url, json_body={"timeSeries": batch})
-            if resp.status_code not in (200, 201):
-                raise RuntimeError(
-                    f"Cloud Monitoring createTimeSeries failed (HTTP {resp.status_code}): "
-                    f"{resp.text[:400]}"
-                )
-
-        if self.write_cloud_logging:
-            self._write_cloud_log_entry(structured_log)
-
-        report.published_to_cloud_monitoring = True
-        report.published_timeseries_count = len(all_series)
-        return len(all_series)

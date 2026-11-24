@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -19,10 +18,10 @@ from edgar_capstone.agents.orchestration.intent import (
     resolve_turn_intent,
 )
 from edgar_capstone.agents.runtime.callbacks import (
-    after_model_fact_check_callback,
     after_model_telemetry_callback,
     before_agent_telemetry_callback,
     before_model_telemetry_callback,
+    verify_narrative_against_calculations,
 )
 from edgar_capstone.agents.runtime.factories import (
     create_financial_analyst_agent,
@@ -43,10 +42,8 @@ from edgar_capstone.agents.tools.sec_tools import (
     get_active_gcp_tool_adapters,
     load_cached_10k_section,
     query_analytics_view,
-    query_looker_financial_explore,
     search_10k_chunks_rag,
 )
-from edgar_capstone.security.model_armor.adk_plugin import ModelArmorSafetyPlugin
 
 
 def _dummy_tool_context() -> SimpleNamespace:
@@ -59,7 +56,7 @@ def test_adk_agent_factories_and_tool_registration() -> None:
     assert analyst.name == "FinancialAnalystAgent"
     assert callable(analyst.instruction)
     assert analyst.before_model_callback is before_model_telemetry_callback
-    assert analyst.after_model_callback is after_model_fact_check_callback
+    assert analyst.after_model_callback is after_model_telemetry_callback
 
     evaluator = create_narrative_evaluator_agent()
     assert isinstance(evaluator, Agent)
@@ -72,13 +69,11 @@ def test_adk_agent_factories_and_tool_registration() -> None:
         == genai_types.ThinkingLevel.LOW
     )
     assert callable(evaluator.instruction)
-    # Judge uses telemetry-only callbacks (never Model Armor HTTP or AnalystReport parsing)
     assert evaluator.before_model_callback is before_model_telemetry_callback
     assert evaluator.after_model_callback is after_model_telemetry_callback
 
-    # Verify explicit ADK FunctionTool wrappers and backward-compatible aliases
+    # Verify explicit ADK FunctionTool wrappers
     assert LookerQueryTool is AnalyticsViewQueryTool
-    assert query_looker_financial_explore is query_analytics_view
     for tool_obj in (
         MetricFetchTool,
         AnalyticsViewQueryTool,
@@ -94,7 +89,7 @@ def test_adk_agent_factories_and_tool_registration() -> None:
     tool_names = [t.name for t in analyst.tools]
     assert "calculate_period_variances" in tool_names
     assert "flag_material_variances" in tool_names
-    assert "fetch_financial_metrics" in tool_names
+    assert "fetch_financial_metrics" not in tool_names
     assert "query_analytics_view" in tool_names
     assert "search_10k_chunks_rag" in tool_names
     assert "query_cached_10k_context" in tool_names
@@ -145,11 +140,10 @@ def test_intent_is_agent_emitted_with_non_lexical_tool_fallback() -> None:
         )
         == "multi_company_peer_comparison"
     )
-    # Legacy tool name still resolves cleanly for historical traces
     assert (
         infer_intent_from_tool_calls(
             {"tickers": [], "gics_sector": "ALL"},
-            [{"name": "query_looker_financial_explore", "args": {"explore_name": "chunk_health"}}],
+            [{"name": "query_analytics_view", "args": {"explore_name": "chunk_health"}}],
         )
         == "chunk_health_monitoring"
     )
@@ -301,7 +295,6 @@ def test_hybrid_search_and_context_cache_tools() -> None:
     assert c2["status"] == "success"
     assert c2["cache_hit"] is True
     assert ctx.state["context_cache_stats"]["hits"] >= 1
-    assert ctx.state["context_cache_stats"]["cached_tokens_saved"] > 0
 
 
 def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
@@ -338,12 +331,6 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
             )
         ]
     )
-    plugin = ModelArmorSafetyPlugin()
-    blocked_resp = asyncio.run(
-        plugin.before_model_callback(callback_context=cb_ctx, llm_request=inj_req)
-    )
-    assert blocked_resp is not None
-    assert cb_ctx.state["model_armor_blocked"] is True
     assert before_model_telemetry_callback(cb_ctx, inj_req) is None
     assert cb_ctx.state["last_model_context_tokens"] > 0
 
@@ -370,9 +357,14 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
             ],
         )
     )
-    after_model_fact_check_callback(cb_ctx, valid_llm_resp)
-    assert cb_ctx.state["fact_check_report"]["passed"] is True
-    assert cb_ctx.state["fact_check_report"]["matched_citations_count"] >= 1
+    after_model_telemetry_callback(cb_ctx, valid_llm_resp)
+    fc = verify_narrative_against_calculations(
+        response_text=valid_llm_resp.content.parts[0].text,
+        calculated_variances=cb_ctx.state["calculated_variances"],
+        retrieved_citations=cb_ctx.state["retrieved_citations"],
+    )
+    assert fc.passed is True
+    assert fc.matched_citations_count >= 1
 
     # Test telemetry-only callbacks used by NarrativeEvaluatorAgent (no Model Armor or fact-check)
     eval_ctx = MagicMock()

@@ -150,9 +150,7 @@ class ModelArmorConfig:
     sdp_inspect_template_id: str | None = None
     sdp_deidentify_template_id: str | None = None
     sdp_action: SdpActionMode = "deidentify"
-    enable_cloud_dlp_api: bool = True
     projection_filter_enabled: bool = True
-    inspect_tool_outputs: bool = False
     fail_closed: bool = True
     timeout_seconds: float = 10.0
 
@@ -198,9 +196,7 @@ class ModelArmorConfig:
             sdp_deidentify_template_id=os.environ.get("SDP_DEIDENTIFY_TEMPLATE_ID", "").strip()
             or None,
             sdp_action=sdp_action,
-            enable_cloud_dlp_api=env_bool("MODEL_ARMOR_ENABLE_DLP_API", True),
             projection_filter_enabled=env_bool("MODEL_ARMOR_PROJECTION_FILTER_ENABLED", True),
-            inspect_tool_outputs=env_bool("MODEL_ARMOR_INSPECT_TOOL_OUTPUTS", False),
             fail_closed=env_bool("MODEL_ARMOR_FAIL_CLOSED", True),
         )
 

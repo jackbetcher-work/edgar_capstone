@@ -50,9 +50,15 @@ MAX_CHUNK_IDS_PER_FINDING = 3
 MAX_HEADLINE_CHARS = 300
 MIN_QUOTE_CHARS = 20
 
-_CHUNK_SECTION_RE = re.compile(r"^(?P<key>.+_\d{4}_(?:item_1a|item_7))_\d+$")
+_CHUNK_SECTION_RE = re.compile(r"^(?P<key>.+_\d{4}_(?:item_1a|item_7))_(?:vais_)?\d+$")
 _JOIN_DOLLAR_RE = re.compile(r"\$\s*\|\s*")
 _JOIN_PCT_RE = re.compile(r"\s*\|\s*%")
+_HTML_INLINE_TAG_RE = re.compile(r"</?(?:u|b|i|em|strong|sup|sub|br)\b[^>]*>", re.IGNORECASE)
+_MD_TABLE_SEP_RE = re.compile(r"\|\s*:?-{2,}:?\s*(?=\|)")
+_MD_DECOR_RE = re.compile(r"[|•◦#]+")
+_DOLLAR_SPACE_RE = re.compile(r"\$\s+(?=\d)")
+_PCT_SPACE_RE = re.compile(r"(?<=\d)\s+%")
+_SHORT_MAGNITUDE_UNITS = frozenset({"b", "m", "k"})
 
 # Figures worth verifying: currency amounts, magnitudes, percentages, and basis points.
 # Bare integers (years, counts, list numbers) are ignored.
@@ -90,6 +96,8 @@ def extract_figures(text: str) -> list[Figure]:
         dollar, unit = m.group("dollar"), (m.group("unit") or "").lower()
         if not dollar and not unit:
             continue
+        if not dollar and unit in _SHORT_MAGNITUDE_UNITS:
+            continue  # identifiers / company names such as 3M, 4K, 10K, 2B
         start = m.start("num") if not dollar else m.start()
         if start > 0 and text[start - 1].isalpha():
             continue  # identifiers such as FY2026, Q1, H20, A800
@@ -235,8 +243,14 @@ def _payload_pct_matches(fig: Figure, payload: list[Figure]) -> bool:
 
 
 def _normalize(text: str) -> str:
-    cleaned = normalize_quote_text((text or "").replace("\\", ""))
-    return " ".join(cleaned.replace("*", "").replace("_", " ").split())
+    raw = _HTML_INLINE_TAG_RE.sub(" ", (text or "").replace("\\", ""))
+    raw = _MD_TABLE_SEP_RE.sub(" ", raw)
+    cleaned = normalize_quote_text(raw)
+    cleaned = cleaned.replace("*", "").replace("_", " ")
+    cleaned = _MD_DECOR_RE.sub(" ", cleaned)
+    cleaned = _DOLLAR_SPACE_RE.sub("$", cleaned)
+    cleaned = _PCT_SPACE_RE.sub("%", cleaned)
+    return " ".join(cleaned.split())
 
 
 # ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ EVAL_CONCURRENCY ?= 4
 EVAL_WRITE_BQ ?= false
 EVAL_ARGS ?=
 
-.PHONY: help install dev start backend frontend build lint format test check clean smoke docker-build docker-smoke publish-financials index-vertex-search backfill-rd eval-all load-golden-dataset refresh-golden-expectations publish-chunk-health
+.PHONY: help install dev start backend frontend build lint format test check clean smoke docker-build docker-smoke publish-financials index-vertex-search backfill-rd eval-all load-golden-dataset refresh-golden-expectations
 
 help: ## Show available commands
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage: make <target>\n\nTargets:\n"} /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2 } END {printf "\n"}' $(MAKEFILE_LIST)
@@ -113,9 +113,6 @@ backfill-rd: ## Backfill R&D expense onto staged profiles from SEC XBRL companyf
 
 publish-financials: ## Reload BigQuery sec_edgar.financial_metrics from the GCS manifests/bigquery_financials.jsonl
 	$(PYTHON) scripts/publish_corpus.py financial-metrics --project-id $(CORPUS_PROJECT_ID) --bucket $(SEC_CORPUS_BUCKET)
-
-publish-chunk-health: ## Evaluate live BigQuery chunk health views and publish gauges to Cloud Monitoring & Cloud Logging
-	$(PYTHON) scripts/publish_chunk_health.py --project-id $(CORPUS_PROJECT_ID) --location $(GCP_LOCATION)
 
 index-vertex-search: ## Import vertex_ai_search_metadata.jsonl into Vertex AI Search (documents:import) + smoke query
 	$(PYTHON) scripts/publish_corpus.py vertex-search --project-id $(CORPUS_PROJECT_ID) --bucket $(SEC_CORPUS_BUCKET) \

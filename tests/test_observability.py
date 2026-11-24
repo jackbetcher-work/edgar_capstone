@@ -325,11 +325,9 @@ def test_tracing_config_env_ratio_exporter_and_attribute_coercion(
     exp_otlp, name_otlp = _build_exporter(TracingConfig(resolved_exporter="otlp"))
     assert exp_otlp is None and name_otlp == "none"
 
-    # Simulate Cloud Trace exporter via stub module (avoids live GCP client creation)
-    fake_cloud_mod = SimpleNamespace(CloudTraceSpanExporter=lambda **kw: SimpleNamespace(kwargs=kw))
-    monkeypatch.setitem(sys.modules, "opentelemetry.exporter.cloud_trace", fake_cloud_mod)
+    # GCP mode uses ADK OTLP hooks in configure_tracing; _build_exporter handles console/otlp/none
     exp_gcp, name_gcp = _build_exporter(TracingConfig(resolved_exporter="gcp", project_id="p-1"))
-    assert name_gcp == "gcp" and exp_gcp is not None
+    assert name_gcp == "none" and exp_gcp is None
 
     long_str = "x" * 700
     clean = sanitize_attributes(

@@ -43,6 +43,97 @@ _REFUSAL_RESPONSE_MARKERS: tuple[str, ...] = (
     "restricted to verified historical",
 )
 
+# Soft future cues that also appear in legitimate questions asking what a historical 10-K
+# itself disclosed (e.g. "What revenue outlook did Apple disclose in its FY2025 10-K?" or
+# "What debt maturities are expected in 2027 per Meta's 2025 10-K?"). Hard projection verbs
+# ("forecast", "predict", "projection") and directional-call cues ("will", "higher", "lower",
+# "call", "bet", "beat", "miss", "outperform") remain blocked even on filing-anchored prompts.
+_DISCLOSURE_COMPATIBLE_CUES: frozenset[str] = frozenset(
+    {
+        "expect",
+        "expects",
+        "expected",
+        "outlook",
+        "guidance",
+        "estimate",
+        "estimates",
+        "estimated",
+    }
+)
+_HISTORICAL_FILING_ANCHORS: tuple[str, ...] = (
+    "10-k",
+    "10k",
+    "item 7",
+    "item 1a",
+    "md&a",
+    "risk factor",
+    "risk factors",
+    "sec filing",
+    "annual report",
+)
+_DISCLOSURE_ATTRIBUTION_TOKENS: frozenset[str] = frozenset(
+    {
+        "disclose",
+        "disclosed",
+        "disclosing",
+        "disclosure",
+        "disclosures",
+        "state",
+        "stated",
+        "report",
+        "reported",
+        "describe",
+        "described",
+        "discuss",
+        "discussed",
+        "mention",
+        "mentioned",
+        "note",
+        "noted",
+        "say",
+        "said",
+        "cite",
+        "cited",
+        "filing",
+        "filings",
+    }
+)
+_PAST_OR_HISTORICAL_TOKENS: frozenset[str] = frozenset(
+    {
+        "did",
+        "was",
+        "were",
+        "2020",
+        "2021",
+        "2022",
+        "2023",
+        "2024",
+        "2025",
+        "2026",
+        "fy2020",
+        "fy2021",
+        "fy2022",
+        "fy2023",
+        "fy2024",
+        "fy2025",
+        "fy2026",
+    }
+)
+_ASSISTANT_OPINION_VERBS: frozenset[str] = frozenset(
+    {
+        "expect",
+        "estimate",
+        "think",
+        "believe",
+        "see",
+        "project",
+        "forecast",
+        "predict",
+        "call",
+        "recommend",
+    }
+)
+
 
 # ---------------------------------------------------------------------------
 # Structural PII / Credential Inspection Helpers (Zero Regexes)
@@ -294,11 +385,36 @@ def _find_token_sequence_positions(words: list[str], phrase_tokens: list[str]) -
     ]
 
 
+def _is_historical_10k_disclosure_query(words: list[str], lowered: str) -> bool:
+    """True when a prompt explicitly asks what a historical 10-K disclosed (not an AI forecast)."""
+    word_set = set(words)
+    if "your" in word_set:
+        return False
+    for idx, tok in enumerate(words):
+        if tok == "you" and any(
+            words[j] in _ASSISTANT_OPINION_VERBS
+            for j in range(max(0, idx - 1), min(len(words), idx + 3))
+        ):
+            return False
+    has_filing_anchor = any(anchor in lowered for anchor in _HISTORICAL_FILING_ANCHORS)
+    has_disclosure_verb = bool(word_set & _DISCLOSURE_ATTRIBUTION_TOKENS)
+    has_past_marker = bool(word_set & _PAST_OR_HISTORICAL_TOKENS)
+    return has_filing_anchor or (has_disclosure_verb and has_past_marker)
+
+
+def _effective_prompt_cues(policy: dict[str, Any], *, historical_disclosure: bool) -> set[str]:
+    cues = {str(t).strip().lower() for t in policy.get("future_prompt_cues", [])}
+    if historical_disclosure:
+        cues -= _DISCLOSURE_COMPATIBLE_CUES
+    return cues
+
+
 def _find_future_projection_rule(
     words: list[str],
     policy: dict[str, Any],
     *,
     stage: Literal["prompt", "response"] = "prompt",
+    historical_disclosure: bool = False,
     window: int = 8,
     prompt_window: int = 14,
 ) -> str | None:
@@ -318,7 +434,7 @@ def _find_future_projection_rule(
                 return f"future_period_projection:FY{clean_yr}+{p_tok}"
 
     if stage == "prompt":
-        prompt_cues = {str(t).strip().lower() for t in policy.get("future_prompt_cues", [])}
+        prompt_cues = _effective_prompt_cues(policy, historical_disclosure=historical_disclosure)
         cue_positions = [(i, tok) for i, tok in enumerate(words) if tok in prompt_cues]
         for y_idx, y_tok in year_positions:
             for c_idx, c_tok in cue_positions:
@@ -332,6 +448,7 @@ def _find_relative_future_projection_rule(
     words: list[str],
     policy: dict[str, Any],
     *,
+    historical_disclosure: bool = False,
     window: int = 14,
 ) -> str | None:
     """Detect forward-looking financial calls over relative horizons (e.g. 'next fiscal year')."""
@@ -339,9 +456,9 @@ def _find_relative_future_projection_rule(
     if not phrases:
         return None
     metric_terms = {str(t).strip().lower() for t in policy.get("financial_metric_terms", [])}
-    spec_terms = {str(t).strip().lower() for t in policy.get("projection_verbs_and_nouns", [])} | {
-        str(t).strip().lower() for t in policy.get("future_prompt_cues", [])
-    }
+    spec_terms = {
+        str(t).strip().lower() for t in policy.get("projection_verbs_and_nouns", [])
+    } | _effective_prompt_cues(policy, historical_disclosure=historical_disclosure)
     if not metric_terms or not spec_terms:
         return None
 
@@ -457,11 +574,23 @@ class FinancialProjectionFilter:
             ref in lowered for ref in _REFUSAL_RESPONSE_MARKERS
         )
         if not is_refusal_response:
-            future_rule = _find_future_projection_rule(words, policy, stage=stage)
+            historical_disclosure = stage == "prompt" and _is_historical_10k_disclosure_query(
+                words, lowered
+            )
+            future_rule = _find_future_projection_rule(
+                words,
+                policy,
+                stage=stage,
+                historical_disclosure=historical_disclosure,
+            )
             if future_rule:
                 matched_rules.append(future_rule)
             if stage == "prompt":
-                relative_rule = _find_relative_future_projection_rule(words, policy)
+                relative_rule = _find_relative_future_projection_rule(
+                    words,
+                    policy,
+                    historical_disclosure=historical_disclosure,
+                )
                 if relative_rule:
                     matched_rules.append(relative_rule)
 

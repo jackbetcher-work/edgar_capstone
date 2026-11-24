@@ -217,11 +217,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Skip triggering a direct BigQuery load job after uploading manifests to GCS.",
     )
     parser.add_argument(
-        "--no-publish-metrics",
-        action="store_true",
-        help="Skip publishing custom chunk health time series to Google Cloud Monitoring.",
-    )
-    parser.add_argument(
         "--min-section-coverage",
         type=float,
         default=0.0,
@@ -290,7 +285,6 @@ def main(argv: list[str] | None = None) -> int:
         skip_existing_embeddings=not args.force_reembed,
         local_only=args.local_only,
         load_bigquery=not args.no_load_bigquery,
-        publish_monitoring_metrics=not args.no_publish_metrics,
     )
 
     try:
@@ -342,12 +336,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Missing Sections  : {', '.join(sample)}")
     print(f"DB Health Status  : {health.health_status} (Score: {health.health_score:.2f} / 100.0)")
     print(f"BQ Manifest       : {summary.bigquery_manifest_path}")
-    print(f"Vertex AI Manifest: {summary.vertex_vector_manifest_path}")
     print(f"Health Report     : {summary.health_report_path}")
     print(
         f"Cloud Sync        : GCS={'YES' if summary.uploaded_to_gcs else 'LOCAL_ONLY'} | "
-        f"BigQuery={'YES' if summary.loaded_to_bigquery else 'NO'} | "
-        f"CloudMonitoring={'YES' if summary.published_monitoring_metrics else 'NO'}"
+        f"BigQuery={'YES' if summary.loaded_to_bigquery else 'NO'}"
     )
     print("=" * 78)
     if (

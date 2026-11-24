@@ -12,7 +12,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
-from edgar_capstone.agents.orchestration.react_loop import flush_pending_evaluations
 from edgar_capstone.api.dependencies import (
     LiveRuntimeUnavailableError,
     register_exception_handlers,
@@ -37,7 +36,6 @@ from edgar_capstone.observability import (
     logging_status_metadata,
     tracing_status_metadata,
 )
-from edgar_capstone.security.agent_identity import S2S_AGENT_ASSERTION_HEADER
 from edgar_capstone.telemetry import get_telemetry_sink, reset_telemetry_stores
 
 # Structured JSON logs (Cloud Logging) + OpenTelemetry tracing (Cloud Trace) must be configured
@@ -79,18 +77,14 @@ async def _app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Drain async background LLM-as-a-Judge evaluations, flush/close BigQuery telemetry writes,
-        # and flush OpenTelemetry trace spans even if an earlier cleanup step raises.
+        # Flush/close BigQuery telemetry writes and OpenTelemetry trace spans even if an earlier step raises.
         try:
-            await asyncio.to_thread(flush_pending_evaluations, 10.0)
+            await asyncio.to_thread(get_telemetry_sink().flush_async_writes, 10.0)
         finally:
             try:
-                await asyncio.to_thread(get_telemetry_sink().flush_async_writes, 10.0)
+                await asyncio.to_thread(reset_telemetry_stores)
             finally:
-                try:
-                    await asyncio.to_thread(reset_telemetry_stores)
-                finally:
-                    await asyncio.to_thread(flush_tracing)
+                await asyncio.to_thread(flush_tracing)
 
 
 def create_app() -> FastAPI:
@@ -118,7 +112,6 @@ def create_app() -> FastAPI:
             "Authorization",
             "Content-Type",
             "X-Goog-IAP-JWT-Assertion",
-            S2S_AGENT_ASSERTION_HEADER,
             "traceparent",
             "tracestate",
             "X-Cloud-Trace-Context",

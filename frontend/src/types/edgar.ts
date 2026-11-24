@@ -64,18 +64,19 @@ export interface CoverageNotice {
 
 export interface SectorCoverageMetadata {
   gics_sector?: string
-  total_sector_companies?: number
-  companies_analyzed?: number
-  companies_with_matches?: number
-  chunks_analyzed?: number
-  batches_executed?: number
-  batches_succeeded?: number
+  issuers_in_sector?: number
+  issuers_with_filings?: number
+  issuers_analyzed?: number
+  issuers_with_theme_matches?: number
+  total_chunks_evaluated?: number
+  batches_processed?: number
   batch_size?: number
-  theme_terms?: string[]
-  section_id?: string
   start_year?: number
   end_year?: number
-  map_model?: string
+  filings_by_year?: Record<string, number>
+  missing_fy_counts?: Record<string, number>
+  theme_mentions_by_year?: Record<string, number>
+  mode?: string
 }
 
 export interface MetricVariance {
@@ -166,6 +167,15 @@ export interface SectorBenchmarkRow {
   total_sector_research_and_development?: number | null
 }
 
+export interface CitationDuplicateSource {
+  chunk_id: string
+  ticker: string
+  fiscal_year: number
+  section_id: 'item_1a' | 'item_7'
+  section_title: string
+  sec_filing_url: string
+}
+
 export interface GroundedCitation {
   chunk_id: string
   profile_id: string
@@ -182,6 +192,34 @@ export interface GroundedCitation {
   period_of_report?: string | null
   filing_date?: string | null
   accession_number?: string | null
+  duplicate_sources?: CitationDuplicateSource[]
+}
+
+export interface StructuredKeyMetric {
+  ticker: string
+  metric:
+    | 'revenue'
+    | 'operating_income'
+    | 'net_income'
+    | 'research_and_development'
+    | 'operating_margin'
+    | 'net_margin'
+    | 'rd_intensity'
+}
+
+export interface StructuredFinding {
+  statement: string
+  ticker: string
+  fiscal_year: number
+  chunk_ids: string[]
+  evidence_quote: string
+}
+
+export interface StructuredAnalystReport {
+  intent?: QueryIntentType | null
+  headline: string
+  key_metrics: StructuredKeyMetric[]
+  findings: StructuredFinding[]
 }
 
 export interface FactCheckVerification {
@@ -196,30 +234,10 @@ export interface FactCheckVerification {
 export interface AgentTraceStep {
   step: number
   agent: string
-  agent_service_account?: string
-  spiffe_id?: string
-  s2s_target_service?: string
-  s2s_verified?: boolean
   tool: string
   status: 'completed' | 'warning' | 'blocked'
   duration_ms: number
   summary: string
-}
-
-export interface AgentIdentitySummary {
-  agent_name: string
-  service_account_email: string
-  spiffe_id: string
-}
-
-export interface ContextCacheInfo {
-  cache_key: string
-  cache_hit: boolean
-  ticker: string
-  fiscal_year: number
-  section_id: 'item_1a' | 'item_7'
-  token_estimate: number
-  sec_filing_url: string
 }
 
 export interface ResolvedQueryScope {
@@ -234,36 +252,6 @@ export interface ResolvedQueryScope {
   subject_changed?: boolean
   topic_epoch?: number
   scope_resolution_source?: string
-}
-
-export interface ReActStepMetadata {
-  iteration: number
-  phase: string
-  thought: string
-  action: string
-  observation: string
-  agent: string
-  model_used?: string | null
-  context_tokens: number
-  cached_context_tokens: number
-  context_latency_ms: number
-  duration_ms: number
-  status?: string
-}
-
-export interface NarrativeEvaluationMetadata {
-  evaluator_model: string
-  task_category: string
-  grade: 'pass' | 'needs_revision' | 'fail'
-  overall_score: number
-  numeric_fidelity_score: number
-  citation_grounding_score: number
-  explanation_quality_score: number
-  thematic_consistency_score: number
-  rationale: string
-  context_tokens: number
-  context_latency_ms: number
-  total_latency_ms: number
 }
 
 export interface TurnContextLatencySummary {
@@ -431,7 +419,7 @@ export interface ChatTurnResponse {
   coverage_notices?: CoverageNotice[]
   sector_coverage?: SectorCoverageMetadata | null
   missing_tickers?: string[]
-  structured_report?: Record<string, unknown> | null
+  structured_report?: StructuredAnalystReport | null
   report_verification?: {
     passed?: boolean
     findings_verified?: number
@@ -451,15 +439,12 @@ export interface ChatTurnResponse {
   /** May be empty (e.g. turn-gate / pure-XBRL turns). */
   citations: GroundedCitation[]
   candidates_searched?: number
-  context_cache: ContextCacheInfo | null
   fact_check: FactCheckVerification
-  evaluation?: NarrativeEvaluationMetadata | null
   react_execution?: {
     strategy: string
     iterations: number
     judge_mode?: string
     observed_ttft_ms?: number | null
-    steps: ReActStepMetadata[]
   }
   context_and_memory?: {
     models: {
@@ -469,7 +454,6 @@ export interface ChatTurnResponse {
     turn_context_latency?: TurnContextLatencySummary | null
   }
   agent_trace: AgentTraceStep[]
-  agent_identities_used?: AgentIdentitySummary[]
   total_latency_ms: number
 }
 
@@ -571,8 +555,6 @@ export interface AuthDiscoveryConfig {
     protocol: string
     google_issuer: string
     iap_issuer: string
-    okta_issuer: string | null
-    okta_client_id: string | null
     google_client_id: string | null
     authorization_endpoint: string | null
     allowed_workspace_domains: string[]
@@ -584,7 +566,6 @@ export interface AuthDiscoveryConfig {
     strict_production_mode: boolean
     bearer_header: string
     assertion_header: string
-    agent_s2s_assertion_header?: string
     audience_configured: boolean
     session_auth_enabled?: boolean
     default_role?: string | null
@@ -605,17 +586,6 @@ export interface AuthDiscoveryConfig {
     project_name: string
     default_compute_sa_prohibited: boolean
   }
-  agent_identities?: Array<{
-    agent_name: string
-    service_account_id: string
-    service_account_email: string
-    spiffe_id: string
-    allowed_callers: string[]
-    allowed_target_services: string[]
-    allowed_tools: string[]
-    api_permissions: string[]
-    gcp_iam_roles: string[]
-  }>
 }
 
 export interface SsoSessionResponse {

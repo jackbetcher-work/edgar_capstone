@@ -26,6 +26,7 @@ import {
 import { DisclosureDeltaCard } from './DisclosureDeltaCard'
 import { GroundedMarkdown } from './GroundedMarkdown'
 import { MaterialFlagsCard } from './MaterialFlagsCard'
+import { StructuredReportView } from './StructuredReportView'
 import { VarianceTableCard } from './VarianceTableCard'
 import {
   getRenderableMaterialFlags,
@@ -67,18 +68,15 @@ function computeProgressPercent(meta: Record<string, unknown> | null | undefined
     const v = meta[k]
     return typeof v === 'number' && Number.isFinite(v) ? v : null
   }
-  const completed =
-    num('companies_analyzed') ??
-    num('completed_batches') ??
-    num('completed') ??
-    null
-  const total =
-    num('total_companies') ??
-    num('total_batches') ??
-    num('total') ??
-    null
-  if (completed !== null && total !== null && total > 0) {
-    return Math.max(0, Math.min(100, Math.round((completed / total) * 100)))
+  const pairs: Array<[number | null, number | null]> = [
+    [num('analyzed'), num('total') ?? num('issuers_in_sector')],
+    [num('batch_completed'), num('total_batches')],
+    [num('completed'), num('total')],
+  ]
+  for (const [completed, total] of pairs) {
+    if (completed !== null && total !== null && total > 0) {
+      return Math.max(0, Math.min(100, Math.round((completed / total) * 100)))
+    }
   }
   return null
 }
@@ -139,11 +137,26 @@ export function ChatTurnItem({
   const activePrimaryId = activeChunkId ? aliasOf[activeChunkId] ?? activeChunkId : null
   const isChunkActive = (chunkId: string) =>
     activePrimaryId !== null && (aliasOf[chunkId] ?? chunkId) === activePrimaryId
-  // The rendered report already embeds coverage notices as blockquotes; only
-  // show the standalone notice when the narrative does not repeat it.
+  const structuredReport =
+    resp?.status === 'success' &&
+    !resp.model_armor_blocked &&
+    resp.answer_verified !== false &&
+    resp.structured_report &&
+    typeof resp.structured_report.headline === 'string' &&
+    resp.structured_report.headline.trim().length > 0 &&
+    Array.isArray(resp.structured_report.findings) &&
+    (resp.structured_report.findings.length > 0 ||
+      (Array.isArray(resp.structured_report.key_metrics) &&
+        resp.structured_report.key_metrics.length > 0))
+      ? resp.structured_report
+      : null
+  // When rendering via GroundedMarkdown, coverage notices are embedded as blockquotes;
+  // when rendering directly from structured_report JSON, always display them cleanly above.
   const answerText = resp?.answer_markdown ?? ''
   const standaloneNotices = (resp?.coverage_notices ?? []).filter(
-    (notice) => notice.message && !answerText.includes(notice.message)
+    (notice) =>
+      Boolean(notice.message) &&
+      (structuredReport !== null || !answerText.includes(notice.message))
   )
   // Pipeline telemetry is useful for engineers, noise for analysts: keep it in a tooltip.
   const latency = resp?.context_and_memory?.turn_context_latency
@@ -323,18 +336,18 @@ export function ChatTurnItem({
               )}
 
               {resp.sector_coverage &&
-                typeof resp.sector_coverage.total_sector_companies === 'number' &&
-                resp.sector_coverage.total_sector_companies > 0 && (
+                typeof resp.sector_coverage.issuers_in_sector === 'number' &&
+                resp.sector_coverage.issuers_in_sector > 0 && (
                   <span
                     className="inline-flex items-center gap-1 px-1.5 py-0.2 text-[10px] uppercase font-semibold badge-accent"
-                    title={`Full-sector batched map-reduce: ${resp.sector_coverage.companies_analyzed ?? 0} of ${resp.sector_coverage.total_sector_companies} issuers analyzed across ${resp.sector_coverage.batches_executed ?? 0} parallel batches`}
+                    title={`Full-sector batched map-reduce: ${resp.sector_coverage.issuers_analyzed ?? 0} of ${resp.sector_coverage.issuers_in_sector} issuers analyzed across ${resp.sector_coverage.batches_processed ?? 0} parallel batches`}
                   >
                     <Layers className="w-3 h-3" />
-                    {resp.sector_coverage.companies_analyzed ?? 0}/
-                    {resp.sector_coverage.total_sector_companies}{' '}
+                    {resp.sector_coverage.issuers_analyzed ?? 0}/
+                    {resp.sector_coverage.issuers_in_sector}{' '}
                     {resp.sector_coverage.gics_sector || 'SECTOR'} ISSUERS
-                    {typeof resp.sector_coverage.companies_with_matches === 'number'
-                      ? ` · ${resp.sector_coverage.companies_with_matches} MATCHED`
+                    {typeof resp.sector_coverage.issuers_with_theme_matches === 'number'
+                      ? ` · ${resp.sector_coverage.issuers_with_theme_matches} MATCHED`
                       : ''}
                   </span>
                 )}
@@ -434,22 +447,36 @@ export function ChatTurnItem({
             </div>
           )}
 
-          {/* Grounded Markdown Narrative (direct answer) with Interactive Inline Citations */}
+          {/* Grounded Answer: direct JSON rendering for verified structured reports, Markdown fallback otherwise */}
           <div id={`grounded-answer-${turn.id}`} role="region" aria-label="Grounded Answer">
-            <GroundedMarkdown
-              turnId={turn.id}
-              markdown={resp.answer_markdown ?? ''}
-              activeChunkId={activeChunkId}
-              isChunkActive={isChunkActive}
-              onSelectCitation={(token) =>
-                onSelectInlineCitation(token, citations)
-              }
-              onSelectXbrlCitation={
-                onSelectXbrlCitation
-                  ? (token) => onSelectXbrlCitation(token, turn)
-                  : undefined
-              }
-            />
+            {structuredReport ? (
+              <StructuredReportView
+                turnId={turn.id}
+                report={structuredReport}
+                varianceReports={varianceReports}
+                citations={citations}
+                isChunkActive={isChunkActive}
+                onSelectCitation={(token) =>
+                  onSelectInlineCitation(token, citations)
+                }
+                onInspectXbrlFact={onInspectXbrlFact}
+              />
+            ) : (
+              <GroundedMarkdown
+                turnId={turn.id}
+                markdown={resp.answer_markdown ?? ''}
+                activeChunkId={activeChunkId}
+                isChunkActive={isChunkActive}
+                onSelectCitation={(token) =>
+                  onSelectInlineCitation(token, citations)
+                }
+                onSelectXbrlCitation={
+                  onSelectXbrlCitation
+                    ? (token) => onSelectXbrlCitation(token, turn)
+                    : undefined
+                }
+              />
+            )}
           </div>
 
           {/* Supporting deterministic evidence — only for tools the agent invoked */}

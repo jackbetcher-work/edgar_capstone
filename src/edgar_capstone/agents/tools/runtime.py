@@ -56,7 +56,6 @@ DETERMINISTIC_TOOL_NAMES: frozenset[str] = frozenset(
         "compare_disclosures_across_years",
         "sector_thematic_map_reduce",
         "query_analytics_view",
-        "query_looker_financial_explore",
         "fetch_financial_metrics",
     }
 )
@@ -210,10 +209,85 @@ def _merge_citation_lists(
     return list(merged.values())
 
 
+def _merge_company_evolutions(
+    existing_comp: dict[str, Any], new_comp: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge two `CompanyDisclosureEvolution` dicts for the same ticker (e.g. two themes)."""
+    pairs_by_years: dict[tuple[int, int], dict[str, Any]] = {}
+    for comp in (existing_comp, new_comp):
+        for pair in comp.get("year_pairs") or []:
+            key = (
+                int(pair.get("prior_fiscal_year") or 0),
+                int(pair.get("current_fiscal_year") or 0),
+            )
+            if key not in pairs_by_years:
+                pairs_by_years[key] = {
+                    "prior_fiscal_year": key[0],
+                    "current_fiscal_year": key[1],
+                    "counts": dict(pair.get("counts") or {}),
+                    "deltas": list(pair.get("deltas") or []),
+                }
+                continue
+            merged_pair = pairs_by_years[key]
+            seen_deltas: dict[tuple[Any, ...], dict[str, Any]] = {}
+            for d in [*merged_pair["deltas"], *(pair.get("deltas") or [])]:
+                dkey = (
+                    d.get("section_id"),
+                    d.get("change_type"),
+                    d.get("prior_chunk_id"),
+                    d.get("current_chunk_id"),
+                )
+                prev = seen_deltas.get(dkey)
+                if prev is None or float(d.get("theme_relevance") or 0.0) > float(
+                    prev.get("theme_relevance") or 0.0
+                ):
+                    seen_deltas[dkey] = d
+            merged_deltas = list(seen_deltas.values())
+            new_counts = pair.get("counts") or {}
+            old_counts = merged_pair["counts"]
+            merged_pair["deltas"] = merged_deltas
+            merged_pair["counts"] = {
+                kind: max(
+                    int(old_counts.get(kind, 0) or 0),
+                    int(new_counts.get(kind, 0) or 0),
+                    sum(1 for d in merged_deltas if d.get("change_type") == kind),
+                )
+                for kind in ("added", "removed", "modified", "unchanged")
+            }
+
+    avail_years = sorted(
+        {
+            *(int(y) for y in (existing_comp.get("fiscal_years_available") or [])),
+            *(int(y) for y in (new_comp.get("fiscal_years_available") or [])),
+        }
+    )
+    missing_years = sorted(
+        {
+            *(int(y) for y in (existing_comp.get("missing_fiscal_years") or [])),
+            *(int(y) for y in (new_comp.get("missing_fiscal_years") or [])),
+        }
+        - set(avail_years)
+    )
+    old_mentions = existing_comp.get("theme_mentions") or {}
+    new_mentions = new_comp.get("theme_mentions") or {}
+    merged_mentions = {
+        k: int(old_mentions.get(k, 0) or 0) + int(new_mentions.get(k, 0) or 0)
+        for k in sorted({*old_mentions, *new_mentions})
+    }
+    return {
+        **existing_comp,
+        **new_comp,
+        "fiscal_years_available": avail_years,
+        "missing_fiscal_years": missing_years,
+        "theme_mentions": merged_mentions,
+        "year_pairs": [pairs_by_years[k] for k in sorted(pairs_by_years)],
+    }
+
+
 def merge_disclosure_deltas(
     existing: dict[str, Any] | None, new: dict[str, Any] | None
 ) -> dict[str, Any] | None:
-    """Merge two `compare_disclosures_across_years` payloads (companies keyed by ticker)."""
+    """Merge two `compare_disclosures_across_years` payloads (merging year_pairs per ticker)."""
     if not new or new.get("status") != "success":
         return existing if existing else new
     if not existing or existing.get("status") != "success":
@@ -222,24 +296,47 @@ def merge_disclosure_deltas(
         str(c.get("ticker")): c for c in existing.get("companies") or []
     }
     for c in new.get("companies") or []:
-        companies[str(c.get("ticker"))] = c
-    summary = {
-        k: int((existing.get("summary") or {}).get(k, 0) or 0)
-        + int((new.get("summary") or {}).get(k, 0) or 0)
-        for k in ("added", "removed", "modified", "unchanged", "year_pairs")
-    }
-    summary["companies_analyzed"] = len(companies)
+        tk = str(c.get("ticker"))
+        companies[tk] = _merge_company_evolutions(companies[tk], c) if tk in companies else c
+    merged_companies = list(companies.values())
+    if any(comp.get("year_pairs") for comp in merged_companies):
+        summary = {"added": 0, "removed": 0, "modified": 0, "unchanged": 0, "year_pairs": 0}
+        for comp in merged_companies:
+            for pair in comp.get("year_pairs") or []:
+                summary["year_pairs"] += 1
+                counts = pair.get("counts") or {}
+                for kind in ("added", "removed", "modified", "unchanged"):
+                    summary[kind] += int(counts.get(kind, 0) or 0)
+    else:
+        summary = {
+            k: int((existing.get("summary") or {}).get(k, 0) or 0)
+            + int((new.get("summary") or {}).get(k, 0) or 0)
+            for k in ("added", "removed", "modified", "unchanged", "year_pairs")
+        }
+    summary["companies_analyzed"] = len(merged_companies)
     starts = [int(y) for y in (existing.get("start_year"), new.get("start_year")) if y]
     ends = [int(y) for y in (existing.get("end_year"), new.get("end_year")) if y]
+    themes = list(
+        dict.fromkeys(
+            str(t).strip()
+            for t in (existing.get("theme"), new.get("theme"))
+            if str(t or "").strip()
+        )
+    )
+    terms = list(
+        dict.fromkeys([*(existing.get("theme_terms") or []), *(new.get("theme_terms") or [])])
+    )
     return {
         **new,
+        "theme": "; ".join(themes) if themes else new.get("theme"),
+        "theme_terms": terms,
         "start_year": min(starts) if starts else None,
         "end_year": max(ends) if ends else None,
         "missing_tickers": sorted(
             {*(existing.get("missing_tickers") or []), *(new.get("missing_tickers") or [])}
         ),
         "summary": summary,
-        "companies": list(companies.values()),
+        "companies": merged_companies,
         "citations": _merge_citation_lists(
             list(existing.get("citations") or []), list(new.get("citations") or [])
         ),

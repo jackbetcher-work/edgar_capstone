@@ -43,10 +43,7 @@ from edgar_capstone.vector_db.models import (
     FilingChunk,
     VectorDBBuildSummary,
 )
-from edgar_capstone.vector_db.monitoring import (
-    CloudMonitoringHealthPublisher,
-    evaluate_chunk_health,
-)
+from edgar_capstone.vector_db.monitoring import evaluate_chunk_health
 
 try:
     from google.cloud import storage
@@ -58,7 +55,6 @@ logger = logging.getLogger(__name__)
 
 VECTOR_DB_ARTIFACT_PATHS: tuple[str, ...] = (
     "manifests/bigquery_filing_chunks.jsonl",
-    "vector_search/embeddings/chunks_embeddings.json",
     "manifests/chunk_health_report.json",
     "manifests/vector_db_catalog.json",
 )
@@ -98,7 +94,6 @@ class VectorDBBuildConfig:
     # publishing to GCS, BigQuery, or Cloud Monitoring.
     local_only: bool = False
     load_bigquery: bool = True
-    publish_monitoring_metrics: bool = True
     create_bucket_if_missing: bool = True
 
 
@@ -192,32 +187,24 @@ def _write_vector_db_artifacts(
     chunks: list[FilingChunk],
     health_report: ChunkHealthReport,
     summary: VectorDBBuildSummary,
-) -> tuple[Path, Path, Path, Path]:
-    """Write BigQuery chunks JSONL, Vertex AI Vector Search JSONL, health report, and catalog."""
+) -> tuple[Path, Path, Path]:
+    """Write BigQuery chunks JSONL, health report, and catalog."""
     manifests_dir = output_dir / "manifests"
-    vector_dir = output_dir / "vector_search" / "embeddings"
     manifests_dir.mkdir(parents=True, exist_ok=True)
-    vector_dir.mkdir(parents=True, exist_ok=True)
 
     bq_chunks_path = manifests_dir / "bigquery_filing_chunks.jsonl"
-    vertex_chunks_path = vector_dir / "chunks_embeddings.json"
 
-    with (
-        bq_chunks_path.open("w", encoding="utf-8") as bq_f,
-        vertex_chunks_path.open("w", encoding="utf-8") as vx_f,
-    ):
+    with bq_chunks_path.open("w", encoding="utf-8") as bq_f:
         for chunk in chunks:
             bq_f.write(json.dumps(chunk.to_bigquery_record()) + "\n")
-            vx_f.write(json.dumps(chunk.to_vertex_vector_search_record()) + "\n")
 
     health_path, catalog_path = _write_status_artifacts(output_dir, health_report, summary)
-    return bq_chunks_path, vertex_chunks_path, health_path, catalog_path
+    return bq_chunks_path, health_path, catalog_path
 
 
 def _vector_artifact_content_type(local_path: Path, blob_path: str) -> str:
-    """Resolve HTTP Content-Type for vector DB artifacts (Vertex batch JSON is NDJSON)."""
-    if blob_path.endswith("chunks_embeddings.json"):
-        return "application/x-ndjson; charset=utf-8"
+    """Resolve HTTP Content-Type for vector DB artifacts."""
+    _ = blob_path
     return content_type_for_path(local_path)
 
 
@@ -320,7 +307,6 @@ def run_vector_db_pipeline(
     *,
     storage_client: Any | None = None,
     vertex_embedder: VertexAIEmbedder | None = None,
-    monitoring_publisher: CloudMonitoringHealthPublisher | None = None,
     http_client: httpx.Client | None = None,
 ) -> tuple[VectorDBBuildSummary, ChunkHealthReport]:
     """Execute end-to-end 10-K chunking, embedding, manifest writing, GCS/BQ sync, and monitoring."""
@@ -409,7 +395,6 @@ def run_vector_db_pipeline(
     item_1a_count = sum(1 for c in all_chunks if c.section_id == "item_1a")
     item_7_count = sum(1 for c in all_chunks if c.section_id == "item_7")
 
-    vertex_manifest_path = output_dir / "vector_search" / "embeddings" / "chunks_embeddings.json"
     health_report_path = output_dir / "manifests" / "chunk_health_report.json"
 
     summary = VectorDBBuildSummary(
@@ -426,7 +411,6 @@ def run_vector_db_pipeline(
         item_1a_chunks=item_1a_count,
         item_7_chunks=item_7_count,
         bigquery_manifest_path=str(bq_manifest_path),
-        vertex_vector_manifest_path=str(vertex_manifest_path),
         health_report_path=str(health_report_path),
         health_score=health_report.health_score,
         health_status=health_report.health_status,
@@ -462,22 +446,8 @@ def run_vector_db_pipeline(
             )
             summary.loaded_to_bigquery = True
 
-        if config.publish_monitoring_metrics:
-            owns_publisher = monitoring_publisher is None
-            publisher = monitoring_publisher or CloudMonitoringHealthPublisher(
-                project_id=config.project_id,
-                http_client=http_client,
-                write_cloud_logging=True,
-            )
-            try:
-                publisher.publish_report(health_report)
-            finally:
-                if owns_publisher:
-                    publisher.close()
-            summary.published_monitoring_metrics = True
-
         # Write ONLY the tiny catalog & health report files so published flags are persisted
-        # without rewriting multi-GB `bigquery_filing_chunks.jsonl` and `chunks_embeddings.json`.
+        # without rewriting multi-GB `bigquery_filing_chunks.jsonl`.
         _write_status_artifacts(output_dir, health_report, summary)
         upload_vector_db_artifacts_to_gcs(
             output_dir=output_dir,

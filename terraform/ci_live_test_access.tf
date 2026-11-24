@@ -12,12 +12,9 @@
 # EDGAR_FEEDBACK_BACKEND=local), so no write roles are granted.
 
 locals {
-  ci_live_test_principals = merge(
-    { github_actions = "serviceAccount:${google_service_account.cicd_runner.email}" },
-    local.cloudbuild_enabled ? {
-      cloud_build = "serviceAccount:${google_service_account.cloudbuild_runner[0].email}"
-    } : {}
-  )
+  ci_live_test_principals = {
+    github_actions = "serviceAccount:${google_service_account.cicd_runner.email}"
+  }
 }
 
 # Run query jobs (financial metrics, YoY views, VECTOR_SEARCH over filing_chunks).

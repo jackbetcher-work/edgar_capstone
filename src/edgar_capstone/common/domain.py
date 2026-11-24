@@ -72,7 +72,6 @@ VARIANCE_TOOL_NAMES: frozenset[str] = frozenset(
         "calculate_period_variances",
         "fetch_financial_metrics",
         "query_analytics_view",
-        "query_looker_financial_explore",
         "flag_material_variances",
     }
 )

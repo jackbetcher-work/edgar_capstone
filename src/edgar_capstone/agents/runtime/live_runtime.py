@@ -46,10 +46,7 @@ from edgar_capstone.agents.prompts.builders import (
     build_narrative_evaluation_prompt,
     select_citations_for_judge,
 )
-from edgar_capstone.agents.runtime.callbacks import (
-    _DEFER_STRUCTURED_VERIFICATION_KEY,
-    ModelTelemetryPlugin,
-)
+from edgar_capstone.agents.runtime.callbacks import ModelTelemetryPlugin
 from edgar_capstone.agents.runtime.context_memory import (
     create_edgar_adk_app,
     get_conversation_memory_manager,
@@ -73,7 +70,6 @@ from edgar_capstone.common.env import TRUTHY_ENV_VALUES
 from edgar_capstone.common.formatting import _extract_json_dict, parse_model_output
 from edgar_capstone.gcp.defaults import resolve_gcp_project_id
 from edgar_capstone.observability.tracing import set_span_attributes, traced
-from edgar_capstone.security.model_armor import ModelArmorSafetyPlugin
 
 LiveBackendType = Literal["vertex_ai", "gemini_api", "custom_llm"]
 
@@ -336,15 +332,10 @@ def _run_coro_sync(coro: Coroutine[Any, Any, _T]) -> _T:
 
 
 def _resolve_runner_plugins(plugins: list[BasePlugin] | None) -> list[BasePlugin]:
-    """Ensure `ModelTelemetryPlugin` runs ahead of `ModelArmorSafetyPlugin` when guardrails are active."""
+    """Attach `ModelTelemetryPlugin` by default unless explicit plugins are supplied."""
     if plugins is None:
-        return [ModelTelemetryPlugin(), ModelArmorSafetyPlugin()]
-    resolved = list(plugins)
-    has_armor = any(isinstance(p, ModelArmorSafetyPlugin) for p in resolved)
-    has_telemetry = any(isinstance(p, ModelTelemetryPlugin) for p in resolved)
-    if has_armor and not has_telemetry:
-        return [ModelTelemetryPlugin(), *resolved]
-    return resolved
+        return [ModelTelemetryPlugin()]
+    return list(plugins)
 
 
 @dataclass
@@ -586,9 +577,7 @@ def run_live_adk_financial_reasoning(
     disclosure_deltas: dict[str, Any] | None = None,
     coverage_notices: list[dict[str, Any]] | None = None,
     sector_map_summaries: dict[str, Any] | None = None,
-    prompt_already_verified: bool = False,
     verification_feedback: str | None = None,
-    defer_callback_fact_check: bool = False,
     ephemeral: bool = False,
     enable_tools: bool = True,
     low_thinking: bool = False,
@@ -615,9 +604,6 @@ def run_live_adk_financial_reasoning(
 
     cache_hits = sum(1 for c in cached_explanations if c.get("cache_hit"))
     cache_misses = max(0, len(cached_explanations) - cache_hits)
-    cached_tokens = sum(
-        int(c.get("token_estimate") or 0) for c in cached_explanations if c.get("cache_hit")
-    )
     prompt_text = build_financial_reasoning_prompt(
         query=query,
         intent=intent,
@@ -653,20 +639,8 @@ def run_live_adk_financial_reasoning(
         "context_cache_stats": {
             "hits": cache_hits,
             "misses": cache_misses,
-            "cached_tokens_saved": cached_tokens,
         },
     }
-    if defer_callback_fact_check:
-        state_seed[_DEFER_STRUCTURED_VERIFICATION_KEY] = True
-
-    plugins_override: list[BasePlugin] | None = None
-    if prompt_already_verified:
-        prompt_hash = sha256_text(prompt_text)
-        state_seed["_model_armor_verified_prompt_sha256"] = prompt_hash
-        plugins_override = [
-            ModelTelemetryPlugin(),
-            ModelArmorSafetyPlugin(pre_verified_prompt_hashes={prompt_hash}),
-        ]
 
     eff_max_llm_calls = (
         max_llm_calls if max_llm_calls is not None else (2 if not enable_tools else 10)
@@ -684,7 +658,6 @@ def run_live_adk_financial_reasoning(
         # Retrieval is capped at 6 tool calls (retrieval_budget_before_tool_callback); the
         # remaining calls leave room for parallel tool rounds plus the final AnalystReport.
         max_llm_calls=eff_max_llm_calls,
-        plugins=plugins_override,
         ephemeral=ephemeral,
     )
 
@@ -728,7 +701,6 @@ def run_live_adk_narrative_evaluation(
         reference_explanation=reference_explanation,
     )
 
-    eval_prompt_hash = sha256_text(eval_prompt)
     stream_res = run_adk_agent_stream(
         agent=evaluator_agent,
         prompt_text=eval_prompt,
@@ -738,7 +710,6 @@ def run_live_adk_narrative_evaluation(
         state_delta={
             "calculated_variances": calc_map,
             "retrieved_citations": judge_citations,
-            "_model_armor_verified_prompt_sha256": eval_prompt_hash,
         },
         use_adk_app=False,
         backend=resolved.backend,

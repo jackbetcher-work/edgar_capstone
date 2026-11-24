@@ -42,13 +42,6 @@ resource "google_project_iam_member" "bq_connection_vertex_user" {
   depends_on = [time_sleep.wait_for_bq_connection_sa]
 }
 
-resource "google_storage_bucket_iam_member" "bq_connection_corpus_viewer" {
-  bucket     = local.sec_corpus_bucket_name
-  role       = "roles/storage.objectViewer"
-  member     = "serviceAccount:${google_bigquery_connection.vertex_ai.cloud_resource[0].service_account_id}"
-  depends_on = [time_sleep.wait_for_bq_connection_sa]
-}
-
 # ------------------------------------------------------------------------------
 # 1. Native Structured Financial Metrics Table (Partitioned & Clustered)
 # ------------------------------------------------------------------------------
@@ -75,27 +68,7 @@ resource "google_bigquery_table" "financial_metrics" {
 }
 
 # ------------------------------------------------------------------------------
-# 2. GCS External Table over manifests/bigquery_financials.jsonl
-# ------------------------------------------------------------------------------
-resource "google_bigquery_table" "financial_metrics_ext" {
-  project             = var.project_id
-  dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
-  table_id            = "financial_metrics_ext"
-  description         = "Live BigQuery external table backed directly by gs://${local.sec_corpus_bucket_name}/manifests/bigquery_financials.jsonl."
-  deletion_protection = var.deletion_protection
-  labels              = var.labels
-
-  external_data_configuration {
-    autodetect            = false
-    source_format         = "NEWLINE_DELIMITED_JSON"
-    source_uris           = ["gs://${local.sec_corpus_bucket_name}/manifests/bigquery_financials.jsonl"]
-    ignore_unknown_values = false
-    schema                = file("${path.module}/schemas/financial_metrics.json")
-  }
-}
-
-# ------------------------------------------------------------------------------
-# 3. Seed Native financial_metrics from GCS Manifest (auto-refreshes on update)
+# 2. Seed Native financial_metrics from GCS Manifest (auto-refreshes on update)
 # ------------------------------------------------------------------------------
 data "google_storage_bucket_object" "financials_manifest" {
   count  = var.seed_native_financial_metrics ? 1 : 0
@@ -128,28 +101,7 @@ resource "google_bigquery_job" "seed_financial_metrics" {
 }
 
 # ------------------------------------------------------------------------------
-# 4. GCS Object Table over Unstructured 10-K Markdown Corpus
-# ------------------------------------------------------------------------------
-resource "google_bigquery_table" "unstructured_10k_objects" {
-  project             = var.project_id
-  dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
-  table_id            = "unstructured_10k_objects"
-  description         = "BigQuery Object Table indexing unstructured 10-K Markdown documents in gs://${local.sec_corpus_bucket_name}/unstructured/."
-  deletion_protection = var.deletion_protection
-  labels              = var.labels
-
-  external_data_configuration {
-    connection_id   = google_bigquery_connection.vertex_ai.name
-    autodetect      = false
-    object_metadata = "SIMPLE"
-    source_uris     = ["gs://${local.sec_corpus_bucket_name}/unstructured/*"]
-  }
-
-  depends_on = [google_storage_bucket_iam_member.bq_connection_corpus_viewer]
-}
-
-# ------------------------------------------------------------------------------
-# 5. Filing Chunks & Embeddings Table for Metadata-Filtered RAG (VECTOR_SEARCH)
+# 3. Filing Chunks & Embeddings Table for Metadata-Filtered RAG (VECTOR_SEARCH)
 # ------------------------------------------------------------------------------
 resource "google_bigquery_table" "filing_chunks" {
   project             = var.project_id
@@ -174,27 +126,7 @@ resource "google_bigquery_table" "filing_chunks" {
 }
 
 # ------------------------------------------------------------------------------
-# 5b. GCS External Table over manifests/bigquery_filing_chunks.jsonl
-# ------------------------------------------------------------------------------
-resource "google_bigquery_table" "filing_chunks_ext" {
-  project             = var.project_id
-  dataset_id          = google_bigquery_dataset.sec_edgar.dataset_id
-  table_id            = "filing_chunks_ext"
-  description         = "Live BigQuery external table backed directly by gs://${local.sec_corpus_bucket_name}/manifests/bigquery_filing_chunks.jsonl."
-  deletion_protection = var.deletion_protection
-  labels              = var.labels
-
-  external_data_configuration {
-    autodetect            = false
-    source_format         = "NEWLINE_DELIMITED_JSON"
-    source_uris           = ["gs://${local.sec_corpus_bucket_name}/manifests/bigquery_filing_chunks.jsonl"]
-    ignore_unknown_values = false
-    schema                = file("${path.module}/schemas/filing_chunks.json")
-  }
-}
-
-# ------------------------------------------------------------------------------
-# 5c. Seed Native filing_chunks from GCS Manifest (auto-refreshes on update)
+# 4. Seed Native filing_chunks from GCS Manifest (auto-refreshes on update)
 # ------------------------------------------------------------------------------
 data "google_storage_bucket_object" "filing_chunks_manifest" {
   count  = var.seed_native_filing_chunks ? 1 : 0

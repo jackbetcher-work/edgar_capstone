@@ -10,6 +10,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from edgar_capstone.common.domain import SECTION_TITLES, SectionId
 from edgar_capstone.common.jsonl import write_json, write_jsonl
 from edgar_capstone.dataset.constituents import load_constituents
 from edgar_capstone.dataset.extractor import (
@@ -44,6 +45,7 @@ from edgar_capstone.gcp.defaults import (
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
 )
+from edgar_capstone.vector_db.chunker import extract_sections_from_combined_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +61,9 @@ _CACHED_MD_SPLIT_RE = re.compile(
 _STALE_FILE_SPECS: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("structured", "*_financials.json", re.compile(r"^(\d{4})_financials\.json$")),
     ("unstructured", "*_10k.md", re.compile(r"^(\d{4})_10k\.md$")),
+    ("unstructured", "*_item_*.md", re.compile(r"^(\d{4})_item_(?:1a|7)\.md$")),
 )
+_INDEXABLE_SECTIONS: tuple[SectionId, ...] = ("item_1a", "item_7")
 
 
 @dataclass(slots=True)
@@ -199,8 +203,69 @@ def _load_existing_company_bundles(
     return by_accession
 
 
+def _format_section_markdown(
+    profile: FinancialDataProfile, section_id: SectionId, body: str
+) -> str:
+    """Format a standalone section Markdown document for Vertex AI Search section-level indexing."""
+    heading = SECTION_TITLES[section_id]
+    return (
+        f"# {profile.company_name} ({profile.ticker}) — FY{profile.fiscal_year} Form 10-K — {heading}\n\n"
+        f"- **Fiscal Year:** {profile.fiscal_year} (Period Ended {profile.period_of_report})\n"
+        f"- **Section:** {heading}\n"
+        f"- **Accession Number:** `{profile.accession_number}`\n\n"
+        f"## {heading}\n\n"
+        f"{body.strip()}\n"
+    )
+
+
+def _write_section_markdowns(
+    output_dir: Path, profile: FinancialDataProfile, markdown_content: str
+) -> list[SectionId]:
+    """Write per-section Markdown files (`*_item_1a.md`, `*_item_7.md`) alongside `*_10k.md`."""
+    sections = extract_sections_from_combined_markdown(markdown_content)
+    written: list[SectionId] = []
+    for section_id in _INDEXABLE_SECTIONS:
+        body = (sections.get(section_id) or "").strip()
+        if not body:
+            continue
+        sec_path = output_dir / profile.section_blob_path(section_id)
+        sec_path.parent.mkdir(parents=True, exist_ok=True)
+        sec_path.write_text(_format_section_markdown(profile, section_id, body), encoding="utf-8")
+        written.append(section_id)
+    return written
+
+
+def materialize_section_markdowns(
+    output_dir: Path,
+    profile: FinancialDataProfile,
+    *,
+    force: bool = False,
+) -> list[SectionId]:
+    """Ensure per-section Markdown files exist for a staged profile; return present section IDs."""
+    combined_path = output_dir / profile.unstructured_blob_path
+    if not combined_path.exists():
+        return [s for s in _INDEXABLE_SECTIONS if s in profile.extracted_sections]
+
+    combined_mtime = combined_path.stat().st_mtime
+    expected = [s for s in _INDEXABLE_SECTIONS if s in profile.extracted_sections] or list(
+        _INDEXABLE_SECTIONS
+    )
+    needs_write = force or any(
+        not (sec_path := output_dir / profile.section_blob_path(sid)).exists()
+        or sec_path.stat().st_mtime < combined_mtime
+        for sid in expected
+    )
+    if needs_write:
+        return _write_section_markdowns(
+            output_dir, profile, combined_path.read_text(encoding="utf-8")
+        )
+    return [
+        sid for sid in _INDEXABLE_SECTIONS if (output_dir / profile.section_blob_path(sid)).exists()
+    ]
+
+
 def _write_bundle_to_disk(output_dir: Path, bundle: ExtractedFilingBundle) -> None:
-    """Persist paired unstructured Markdown and structured financial JSON files locally."""
+    """Persist paired unstructured Markdown, per-section Markdowns, and structured JSON locally."""
     md_path = output_dir / bundle.profile.unstructured_blob_path
     json_path = output_dir / bundle.profile.structured_blob_path
 
@@ -208,6 +273,7 @@ def _write_bundle_to_disk(output_dir: Path, bundle: ExtractedFilingBundle) -> No
     json_path.parent.mkdir(parents=True, exist_ok=True)
 
     md_path.write_text(bundle.markdown_content, encoding="utf-8")
+    _write_section_markdowns(output_dir, bundle.profile, bundle.markdown_content)
     json_path.write_text(
         json.dumps(bundle.profile.model_dump(mode="json"), indent=2) + "\n",
         encoding="utf-8",
@@ -302,13 +368,15 @@ def write_manifests(
     vais_path = manifests_dir / "vertex_ai_search_metadata.jsonl"
     bq_path = manifests_dir / "bigquery_financials.jsonl"
 
-    write_jsonl(
-        vais_path,
-        (
-            VertexAISearchManifestRecord.from_profile(prof).model_dump(mode="json")
-            for prof in profiles
-        ),
-    )
+    vais_records: list[dict[str, Any]] = []
+    for prof in profiles:
+        present_sections = materialize_section_markdowns(output_dir, prof)
+        for rec in VertexAISearchManifestRecord.records_from_profile(
+            prof, section_ids=present_sections
+        ):
+            vais_records.append(rec.model_dump(mode="json"))
+
+    write_jsonl(vais_path, vais_records)
     write_jsonl(
         bq_path,
         (prof.model_dump(mode="json") for prof in profiles),
@@ -431,6 +499,8 @@ def run_dataset_pipeline(
         for prof in staged_profiles:
             profiles_by_blob[prof.unstructured_blob_path] = prof
             profiles_by_blob[prof.structured_blob_path] = prof
+            for sec_id in _INDEXABLE_SECTIONS:
+                profiles_by_blob[prof.section_blob_path(sec_id)] = prof
 
         uploaded_count = upload_staged_dataset(
             output_dir=output_dir,

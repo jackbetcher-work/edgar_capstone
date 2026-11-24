@@ -92,10 +92,9 @@ def audited_permissions(
     permission: str,
     *extra_permissions: str,
     event_type: str,
-    agent_tool: str | None = None,
 ) -> Callable[..., AuthenticatedUser]:
-    """Enforce RBAC / S2S permissions and automatically record a static security audit event."""
-    permission_dep = require_permissions(permission, *extra_permissions, agent_tool=agent_tool)
+    """Enforce permissions and automatically record a static security audit event."""
+    permission_dep = require_permissions(permission, *extra_permissions)
 
     def _dependency(
         request: Request,

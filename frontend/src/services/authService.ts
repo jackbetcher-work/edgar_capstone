@@ -105,9 +105,7 @@ export function buildExternalOidcAuthorizeUrl(
   loginHint?: string
 ): string | null {
   const endpoint = config.identity_provider.authorization_endpoint
-  const clientId =
-    config.identity_provider.okta_client_id ||
-    config.identity_provider.google_client_id
+  const clientId = config.identity_provider.google_client_id
   if (!endpoint || !clientId) {
     return null
   }

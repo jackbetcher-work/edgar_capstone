@@ -1,9 +1,4 @@
-"""ADK lifecycle callbacks for latency tracking, least-privilege tool identity, and fact-checking.
-
-Prompt and response Model Armor / SDP guardrails are owned exclusively by
-`ModelArmorSafetyPlugin` (`edgar_capstone.security.model_armor.adk_plugin`) at the ADK `App`/
-`Runner` plugin layer and at the orchestration boundary in `chat_engine.py`.
-"""
+"""ADK lifecycle callbacks for latency tracking, retrieval budgets, and narrative fact-checking."""
 
 from __future__ import annotations
 
@@ -27,11 +22,6 @@ from edgar_capstone.agents.core.schemas import (
     ModelContextLatencyRecord,
     ModelTaskCategory,
 )
-from edgar_capstone.agents.evaluation.structured_report import (
-    parse_analyst_report,
-    render_analyst_report_markdown,
-    verify_analyst_report,
-)
 from edgar_capstone.agents.runtime.context_memory import logical_session_id
 from edgar_capstone.agents.runtime.latency_tracker import (
     extract_llm_request_context_breakdown,
@@ -49,13 +39,6 @@ from edgar_capstone.common.domain import (
     VARIANCE_TOOL_NAMES,
 )
 from edgar_capstone.common.env import env_positive_int
-from edgar_capstone.security.agent_identity import (
-    AgentAuthorizationError,
-    authorize_agent_tool_invocation,
-    resolve_agent_identity,
-)
-from edgar_capstone.security.auth import record_security_audit_event
-from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +50,6 @@ _PERCENT_NUMBER_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)\s*%")
 
 DEFAULT_ANALYST_RETRIEVAL_BUDGET = 6
 _RETRIEVAL_CALLS_STATE_KEY = "temp:retrieval_calls_used"  # temp: = scoped to one invocation
-_DEFER_STRUCTURED_VERIFICATION_KEY = "temp:defer_structured_verification"
 _ACTIVE_CALL_TOKEN_KEY = "_active_model_call_token"
 _RECORDED_CALL_TOKEN_KEY = "_recorded_model_call_token"
 _RECORDED_CALL_LATENCY_MS_KEY = "_recorded_model_call_latency_ms"
@@ -76,45 +58,20 @@ _RECORDED_CALL_LATENCY_MS_KEY = "_recorded_model_call_latency_ms"
 def before_agent_telemetry_callback(
     callback_context: CallbackContext,
 ) -> genai_types.Content | None:
-    """Initialize session state keys, bind per-agent identity, and track S2S attestations."""
+    """Initialize per-invocation telemetry and tool session state keys."""
     state = callback_context.state
     state.setdefault("calculated_variances", {})
     state.setdefault("fetched_metrics", [])
     state.setdefault("retrieved_citations", [])
     state.setdefault(
         "context_cache_stats",
-        {"hits": 0, "misses": 0, "cached_tokens_saved": 0},
+        {"hits": 0, "misses": 0},
     )
     state.setdefault("tool_telemetry", [])
     state.setdefault("latency_metrics", [])
     state.setdefault("react_trace", [])
     state.setdefault("memory_context", {})
-    state.setdefault("agent_identity_attestations", [])
-    state.setdefault("s2s_audit_trail", [])
     state["_agent_start_monotonic"] = time.perf_counter()
-
-    agent_name = getattr(callback_context, "agent_name", "") or ""
-    if isinstance(agent_name, str) and agent_name.strip():
-        try:
-            spec = resolve_agent_identity(agent_name.strip())
-            identity_record = spec.to_public_dict()
-            state["active_agent_identity"] = identity_record
-            attestations = list(state.get("agent_identity_attestations", []))
-            attestations.append(
-                {
-                    "agent_name": spec.agent_name,
-                    "service_account_email": identity_record["service_account_email"],
-                    "spiffe_id": identity_record["spiffe_id"],
-                    "allowed_tools": identity_record["allowed_tools"],
-                }
-            )
-            state["agent_identity_attestations"] = attestations
-        except AgentAuthorizationError:
-            logger.warning(
-                "Agent '%s' does not have a registered per-agent identity specification.",
-                agent_name,
-            )
-
     return None
 
 
@@ -156,7 +113,6 @@ _AGENT_TOOL_PROGRESS_LABELS: dict[str, str] = {
     "compare_disclosures_across_years": "Comparing 10-K disclosure wording across fiscal years",
     "sector_thematic_map_reduce": "Running full-sector thematic map-reduce",
     "query_analytics_view": "Querying BigQuery analytics view",
-    "query_looker_financial_explore": "Querying BigQuery analytics view",
     "fetch_financial_metrics": "Fetching structured XBRL financial metrics",
     "search_10k_chunks_rag": "Searching 10-K passages",
     "query_cached_10k_context": "Reading cached 10-K section passages",
@@ -208,68 +164,6 @@ def agent_tool_timing_after_tool_callback(
         turn_ctx.tool_durations_ms.append(
             (name, round((time.perf_counter() - started) * 1000.0, 2))
         )
-    return None
-
-
-def before_tool_agent_identity_callback(
-    tool: BaseTool,
-    args: dict[str, Any],
-    tool_context: ToolContext | Any,
-) -> dict[str, Any] | None:
-    """Enforce per-agent least-privilege tool & S2S service boundaries before tool execution."""
-    _ = args
-    state = getattr(tool_context, "state", None)
-    state_dict = state if isinstance(state, dict) or hasattr(state, "get") else {}
-
-    raw_agent_name = getattr(tool_context, "agent_name", None)
-    if not isinstance(raw_agent_name, str) or not raw_agent_name.strip():
-        active_id = state_dict.get("active_agent_identity") if state_dict else None
-        if isinstance(active_id, dict):
-            raw_agent_name = active_id.get("agent_name")
-
-    if not isinstance(raw_agent_name, str) or not raw_agent_name.strip():
-        return None
-
-    agent_name = raw_agent_name.strip()
-    tool_name = getattr(tool, "name", "") or str(tool)
-
-    try:
-        s2s_claims = authorize_agent_tool_invocation(
-            agent_name=agent_name,
-            tool_name=tool_name,
-            caller=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-        )
-    except AgentAuthorizationError as exc:
-        record_security_audit_event(
-            event_type="agent_s2s_denied",
-            user=None,
-            resource=f"tool://{tool_name}",
-            status_outcome="denied_403",
-            detail=f"agent={agent_name} target={exc.target}: {exc.message}",
-        )
-        return {
-            "status": "forbidden",
-            "error": "agent_least_privilege_violation",
-            "agent_name": agent_name,
-            "tool": tool_name,
-            "message": exc.message,
-        }
-
-    if state is not None and hasattr(state, "__setitem__"):
-        s2s_log = list(state_dict.get("s2s_audit_trail", []))
-        s2s_log.append(
-            {
-                "agent_name": s2s_claims.agent_name,
-                "service_account_email": s2s_claims.service_account_email,
-                "spiffe_id": s2s_claims.spiffe_id,
-                "tool_name": tool_name,
-                "target_service": s2s_claims.target_service,
-                "audience": s2s_claims.audience,
-                "jti": s2s_claims.jti,
-            }
-        )
-        state["s2s_audit_trail"] = s2s_log
-
     return None
 
 
@@ -587,58 +481,11 @@ def _record_model_telemetry(
     return latency_rec.total_model_latency_ms, latency_rec
 
 
-def _run_post_model_fact_check(
-    state: Any,
-    *,
-    response_text: str,
-    model_latency_ms: float,
-) -> None:
-    """Verify structured AnalystReport claims and run deterministic citation/percentage fact-check."""
-    if state.get(_DEFER_STRUCTURED_VERIFICATION_KEY):
-        return
-
-    calc_vars = dict(state.get("calculated_variances", {}))
-    citations = list(state.get("retrieved_citations", []))
-    checked_text = response_text
-    # Structured AnalystReport answers (JSON) are verified claim by claim and rendered
-    # first, so the numeric/citation check runs on what the analyst will actually see.
-    structured = (
-        parse_analyst_report(response_text.strip())
-        if response_text.strip().startswith("{")
-        else None
-    )
-    if structured is not None:
-        reports = [v for v in calc_vars.values() if isinstance(v, dict)]
-        verified = verify_analyst_report(
-            structured,
-            variance_reports=reports,
-            citations=citations,
-            material_flags=state.get("material_variance_flags"),
-        )
-        checked_text = render_analyst_report_markdown(
-            verified, variance_reports=reports, citations=citations
-        )
-        state["structured_report_markdown"] = checked_text
-        state["structured_report_verification"] = verified.verification.model_dump(mode="json")
-
-    verification = verify_narrative_against_calculations(
-        response_text=checked_text,
-        calculated_variances=calc_vars,
-        retrieved_citations=citations,
-        model_latency_ms=model_latency_ms,
-    )
-    state["fact_check_report"] = verification.model_dump(mode="json")
-
-
 def after_model_telemetry_callback(
     callback_context: CallbackContext,
     llm_response: LlmResponse,
 ) -> LlmResponse | None:
-    """Record TTFT, token/cost telemetry, and `react_trace` without fact-checking.
-
-    Wired onto `NarrativeEvaluatorAgent` so the judge records accurate latency/token/cost
-    metrics without triggering `AnalystReport` parsing or narrative fact-checks.
-    """
+    """Record TTFT, token/cost telemetry, and `react_trace` for every ADK model call."""
     if _capture_stream_ttft(callback_context.state, llm_response):
         return None
     _, thought_text, called_tools, has_function_call = _extract_response_parts(llm_response)
@@ -652,44 +499,8 @@ def after_model_telemetry_callback(
     return None
 
 
-def after_model_fact_check_callback(
-    callback_context: CallbackContext,
-    llm_response: LlmResponse,
-) -> LlmResponse | None:
-    """Track context-induced model call latency (including SSE streaming TTFT), record ReAct steps, and fact-check."""
-    state = callback_context.state
-    if _capture_stream_ttft(state, llm_response):
-        return None
-
-    response_text, thought_text, called_tools, has_function_call = _extract_response_parts(
-        llm_response
-    )
-    model_latency_ms, _ = _record_model_telemetry(
-        callback_context,
-        llm_response,
-        thought_text=thought_text,
-        called_tools=called_tools,
-        has_function_call=has_function_call,
-    )
-
-    if response_text.strip() and not has_function_call:
-        _run_post_model_fact_check(
-            state,
-            response_text=response_text,
-            model_latency_ms=model_latency_ms,
-        )
-
-    return None
-
-
 class ModelTelemetryPlugin(BasePlugin):
-    """ADK `BasePlugin` capturing TTFT & token/cost telemetry ahead of safety plugins.
-
-    In ADK 2.x, if `ModelArmorSafetyPlugin.after_model_callback` blocks or SDP-redacts a response
-    and returns a replacement `LlmResponse`, agent-level `after_model_callback` is short-circuited.
-    Placing `ModelTelemetryPlugin` before `ModelArmorSafetyPlugin` guarantees every real Gemini
-    invocation records TTFT, token usage, and USD cost without double-counting allowed turns.
-    """
+    """ADK `BasePlugin` capturing TTFT & token/cost telemetry for agents without per-agent callbacks."""
 
     def __init__(self, *, name: str = "ModelTelemetryPlugin") -> None:
         super().__init__(name=name)

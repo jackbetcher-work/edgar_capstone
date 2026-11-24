@@ -8,12 +8,10 @@ const MOCK_DEV_AUTH_CONFIG = {
   auth_required: true,
   access_pattern: 'iap_jwt_bearer',
   identity_provider: {
-    name: 'Google Workspace (Okta SSO)',
-    protocol: 'OIDC / SAML-Federated Workspace + IAP',
+    name: 'Google Workspace / Cloud IAP',
+    protocol: 'Google Workspace OIDC + Direct Cloud Run IAP',
     google_issuer: 'https://accounts.google.com',
     iap_issuer: 'https://cloud.google.com/iap',
-    okta_issuer: 'https://acme.okta.com/oauth2/default',
-    okta_client_id: null,
     google_client_id: null,
     authorization_endpoint: null,
     allowed_workspace_domains: ['fde-workspace.corp'],
@@ -33,8 +31,8 @@ const MOCK_PROD_AUTH_CONFIG = {
   ...MOCK_DEV_AUTH_CONFIG,
   identity_provider: {
     ...MOCK_DEV_AUTH_CONFIG.identity_provider,
-    okta_client_id: 'okta-prod-client-id',
-    authorization_endpoint: 'https://acme.okta.com/oauth2/default/v1/authorize',
+    google_client_id: 'google-prod-client-id',
+    authorization_endpoint: 'https://accounts.google.com/o/oauth2/v2/auth',
     local_sso_dev_broker_enabled: false,
   },
   iap: {

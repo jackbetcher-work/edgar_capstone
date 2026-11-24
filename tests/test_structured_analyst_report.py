@@ -322,3 +322,112 @@ def test_table_aware_figure_verification_honors_chunk_scale_and_rejects_unground
     assert bad_verified.verification.usable is False
     assert bad_verified.verification.findings_verified == 0
     assert bad_verified.verification.findings_rejected == 1
+
+
+def test_figure_extraction_ignores_3m_and_bare_short_suffix_identifiers() -> None:
+    """Company names like '3M' and bare identifiers ('10K', '4K', '2B') are not monetary amounts."""
+    assert extract_figures("In FY2021, 3M's 10K cited 4K displays and 2B standards.") == []
+    figs = extract_figures(
+        "3M recorded a $3M adjustment, $4.5B charge, and 12 million units (up 5%)."
+    )
+    assert [(f.kind, f.value) for f in figs] == [
+        ("amount", 3e6),
+        ("amount", 4.5e9),
+        ("amount", 12e6),
+        ("pct", 5.0),
+    ]
+
+    cit = {
+        "chunk_id": "MMM_2021_item_1a_0004",
+        "ticker": "MMM",
+        "fiscal_year": 2021,
+        "section_id": "item_1a",
+        "section_title": "Item 1A. Risk Factors",
+        "sec_filing_url": "https://www.sec.gov/mmm-2021.htm",
+        "excerpt": (
+            "As previously reported, the Company has been voluntarily cooperating with various "
+            "local, state, federal, and international agencies reviewing PFAS."
+        ),
+    }
+    report = AnalystReport(
+        headline="3M framed PFAS around voluntary regulatory cooperation in FY2021.",
+        findings=[
+            AnalystFinding(
+                ticker="MMM",
+                fiscal_year=2021,
+                statement="In FY2021, 3M framed PFAS risk around voluntary cooperation with regulators.",
+                chunk_ids=["MMM_2021_item_1a_0004"],
+                evidence_quote=(
+                    "the Company has been voluntarily cooperating with various local, state, "
+                    "federal, and international agencies"
+                ),
+            )
+        ],
+    )
+    verified = verify_analyst_report(report, variance_reports=[], citations=[cit])
+    assert verified.verification.findings_verified == 1
+    assert verified.verification.findings_rejected == 0
+    assert verified.verification.headline_verified is True
+
+
+def test_quote_normalization_handles_markdown_tables_html_tags_and_vais_chunk_ids() -> None:
+    """Markdown table pipes, empty cells, inline HTML tags, and headings do not cause false drops."""
+    from edgar_capstone.agents.evaluation.structured_report import _CHUNK_SECTION_RE
+
+    assert _CHUNK_SECTION_RE.match("XOM_2022_item_7_vais_0000") is not None
+    assert _CHUNK_SECTION_RE.match("XOM_2022_item_7_vais_0000").group("key") == "XOM_2022_item_7"
+
+    table_cit = {
+        "chunk_id": "UAL_2024_item_7_0007",
+        "ticker": "UAL",
+        "fiscal_year": 2024,
+        "section_id": "item_7",
+        "section_title": "Item 7. MD&A",
+        "sec_filing_url": "https://www.sec.gov/ual-2024.htm",
+        "excerpt": (
+            "### Results of Operations\n"
+            "<u>Table of Contents</u>\n"
+            "| (in millions) | 2024 |  | 2023 |  | 2022 |  |\n"
+            "| --- | --- | --- | --- | --- | --- | --- |\n"
+            "| Operating revenue | $ | 57,063 | $ | 53,717 | $ | 44,955 |\n"
+            "| Operating income | 5,096 |  | 4,211 |  | 2,337 |  |\n"
+            "• Net income rose on stronger passenger demand.\n"
+        ),
+    }
+    report = AnalystReport(
+        headline="United Airlines grew operating income from 2022 to 2024.",
+        findings=[
+            AnalystFinding(
+                ticker="UAL",
+                fiscal_year=2024,
+                statement="United reported higher operating income across 2022-2024.",
+                chunk_ids=["UAL_2024_item_7_0007"],
+                evidence_quote="Operating income | 5,096 | 4,211 | 2,337",
+            ),
+            AnalystFinding(
+                ticker="UAL",
+                fiscal_year=2024,
+                statement="United reported higher operating revenue and net income.",
+                chunk_ids=["UAL_2024_item_7_0007"],
+                evidence_quote=("Operating revenue $57,063 $53,717 $44,955"),
+            ),
+            AnalystFinding(
+                ticker="UAL",
+                fiscal_year=2024,
+                statement="Passenger demand drove stronger net income.",
+                chunk_ids=["UAL_2024_item_7_0007"],
+                evidence_quote="Net income rose on stronger passenger demand.",
+            ),
+            # Fabricated quote must still be rejected
+            AnalystFinding(
+                ticker="UAL",
+                fiscal_year=2024,
+                statement="Invented claim.",
+                chunk_ids=["UAL_2024_item_7_0007"],
+                evidence_quote="Operating income collapsed due to imaginary strikes.",
+            ),
+        ],
+    )
+    verified = verify_analyst_report(report, variance_reports=[], citations=[table_cit])
+    assert verified.verification.findings_verified == 3
+    assert verified.verification.findings_rejected == 1

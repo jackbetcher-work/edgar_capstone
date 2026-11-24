@@ -16,6 +16,7 @@ from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
 
+from edgar_capstone.agents.core.citations import deduplicate_citations_by_text
 from edgar_capstone.agents.orchestration.intent import (
     infer_intent_from_tool_calls,
     is_sector_wide_scope,
@@ -66,12 +67,6 @@ from edgar_capstone.agents.tools.sec_tools import (
 )
 from edgar_capstone.common.concurrency import run_parallel_with_context
 from edgar_capstone.observability.tracing import traced
-from edgar_capstone.security.agent_identity import (
-    VerifiedAgentS2SClaims,
-    authorize_agent_s2s_hop,
-    authorize_agent_tool_invocation,
-    get_agent_s2s_broker,
-)
 from edgar_capstone.security.model_armor import (
     GuardrailDecision,
     get_model_armor_guardrail,
@@ -81,13 +76,9 @@ from edgar_capstone.telemetry import get_telemetry_sink
 
 logger = logging.getLogger(__name__)
 
-# Active runtime agent roster exported to the API & server layer (Wave 4 contract).
+# Active runtime agent roster exported to the API & server layer.
 PRIMARY_ORCHESTRATOR_NAME: str = "FinancialAnalystAgent"
 ACTIVE_AGENT_NAMES: tuple[str, ...] = ("FinancialAnalystAgent", "NarrativeEvaluatorAgent")
-
-# SPIFFE S2S identity key registered in `security.agent_identity.PER_AGENT_IDENTITIES` for
-# the intent-classification hop & upstream pipeline attestation.
-_S2S_ROUTER_IDENTITY_NAME: str = "RootOrchestrator"
 
 _CORPUS_YEARS_GROUP = "|".join(str(y) for y in range(MIN_CORPUS_YEAR, MAX_CORPUS_YEAR + 1))
 # Scope / metadata-filter resolution only (fiscal-year window and 10-K section filter). These are
@@ -654,41 +645,24 @@ def _retrieve_balanced_citations(
 
 
 # ---------------------------------------------------------------------------
-# Trace, Identity & Canonical Turn-Response Helpers
+# Trace & Canonical Turn-Response Helpers
 # ---------------------------------------------------------------------------
-
-
-def _track_identity(
-    identities_used_by_agent: dict[str, dict[str, str]],
-    claims: VerifiedAgentS2SClaims,
-) -> None:
-    if claims.agent_name not in identities_used_by_agent:
-        identities_used_by_agent[claims.agent_name] = {
-            "agent_name": claims.agent_name,
-            "service_account_email": claims.service_account_email,
-            "spiffe_id": claims.spiffe_id,
-        }
 
 
 def _append_trace_step(
     agent_trace: list[dict[str, Any]],
     *,
     agent: str,
-    claims: VerifiedAgentS2SClaims,
     tool: str,
     status: str,
     duration_ms: float,
     summary: str,
     model_used: str | None = None,
 ) -> None:
-    """Append a standardized S2S-attested trace step to `agent_trace`."""
+    """Append a standardized trace step to `agent_trace`."""
     entry: dict[str, Any] = {
         "step": len(agent_trace) + 1,
         "agent": agent,
-        "agent_service_account": claims.service_account_email,
-        "spiffe_id": claims.spiffe_id,
-        "s2s_target_service": claims.target_service,
-        "s2s_verified": True,
         "tool": tool,
         "status": status,
         "duration_ms": duration_ms,
@@ -709,7 +683,6 @@ class _TurnContext:
     user_id: str
     memory_ctx: dict[str, Any] = field(default_factory=dict)
     agent_trace: list[dict[str, Any]] = field(default_factory=list)
-    identities_used_by_agent: dict[str, dict[str, str]] = field(default_factory=dict)
     on_progress: ProgressCallback | None = None
 
     def elapsed_ms(self) -> float:
@@ -719,14 +692,10 @@ class _TurnContext:
         if self.on_progress is not None:
             self.on_progress(stage, message, meta)
 
-    def track_identity(self, claims: VerifiedAgentS2SClaims) -> None:
-        _track_identity(self.identities_used_by_agent, claims)
-
     def append_trace(
         self,
         *,
         agent: str,
-        claims: VerifiedAgentS2SClaims,
         tool: str,
         status: str,
         duration_ms: float,
@@ -736,7 +705,6 @@ class _TurnContext:
         _append_trace_step(
             self.agent_trace,
             agent=agent,
-            claims=claims,
             tool=tool,
             status=status,
             duration_ms=duration_ms,
@@ -877,7 +845,6 @@ def _finalize_turn(
         "react_execution": react_execution,
         "context_and_memory": context_and_memory,
         "agent_trace": ctx.agent_trace,
-        "agent_identities_used": list(ctx.identities_used_by_agent.values()),
         "total_latency_ms": total_ms,
     }
 
@@ -965,15 +932,9 @@ def _run_prompt_guardrail(
         elapsed_guard_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
     if prompt_decision.blocked:
-        guard_claims = authorize_agent_s2s_hop(
-            caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-            callee_agent="ModelArmorGuardrail",
-        )
-        ctx.track_identity(guard_claims)
         cats_str = ", ".join(prompt_decision.matched_categories) or "policy_violation"
         ctx.append_trace(
             agent="ModelArmorGuardrail",
-            claims=guard_claims,
             tool="model_armor_sanitize_user_prompt",
             status="blocked",
             duration_ms=elapsed_guard_ms,
@@ -1030,14 +991,8 @@ def _run_prompt_guardrail(
 
     if prompt_decision.sdp_redacted:
         query = prompt_decision.sanitized_text
-        guard_claims = authorize_agent_s2s_hop(
-            caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-            callee_agent="ModelArmorGuardrail",
-        )
-        ctx.track_identity(guard_claims)
         ctx.append_trace(
             agent="ModelArmorGuardrail",
-            claims=guard_claims,
             tool="cloud_sdp_deidentify_content",
             status="sanitized",
             duration_ms=elapsed_guard_ms,
@@ -1073,7 +1028,6 @@ def _run_rag_prepass(
     query: str,
     public_scope: dict[str, Any],
     top_k: int,
-    rag_claims: VerifiedAgentS2SClaims,
     agent_trace: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
     """Balanced hybrid-RAG evidence leads (the only pre-pass; deterministic engines are tools)."""
@@ -1090,7 +1044,6 @@ def _run_rag_prepass(
     _append_trace_step(
         agent_trace,
         agent="FinancialAnalystAgent",
-        claims=rag_claims,
         tool="search_10k_chunks_rag",
         status="completed",
         duration_ms=round((time.perf_counter() - ts) * 1000.0, 2),
@@ -1159,7 +1112,7 @@ def _agent_tool_summary(tool: str, bundle: _RetrievalBundle, calls: list[dict[st
             f"({int(cov.get('total_chunks_evaluated', 0) or 0):,} passages in "
             f"{cov.get('batches_processed', 0)} parallel Flash batches)."
         )
-    if tool in ("query_analytics_view", "query_looker_financial_explore"):
+    if tool == "query_analytics_view":
         explores = sorted(
             {str((c.get("args") or {}).get("explore_name") or "") for c in calls} - {""}
         )
@@ -1174,12 +1127,11 @@ def _agent_tool_summary(tool: str, bundle: _RetrievalBundle, calls: list[dict[st
 def _append_agent_tool_trace_steps(
     *,
     agent_trace: list[dict[str, Any]],
-    identities_used_by_agent: dict[str, dict[str, str]],
     tool_calls: list[dict[str, Any]],
     bundle: _RetrievalBundle,
     turn_ctx: ToolTurnContext,
 ) -> list[str]:
-    """S2S-attested trace steps for every deterministic tool and cached 10-K lookup the agent invoked."""
+    """Trace steps for every deterministic tool and cached 10-K lookup the agent invoked."""
     invoked: dict[str, list[dict[str, Any]]] = {}
     cache_calls: list[dict[str, Any]] = []
     for call in tool_calls:
@@ -1189,41 +1141,23 @@ def _append_agent_tool_trace_steps(
         elif name == "query_cached_10k_context":
             cache_calls.append(call)
     for name, calls in invoked.items():
-        claims = authorize_agent_tool_invocation(
-            agent_name="FinancialAnalystAgent",
-            tool_name=name,
-            caller=_S2S_ROUTER_IDENTITY_NAME,
-        )
-        _track_identity(identities_used_by_agent, claims)
         trace_tool = (
             f"{name}({','.join(sorted({str((c.get('args') or {}).get('explore_name') or '') for c in calls}))})"
-            if name in ("query_analytics_view", "query_looker_financial_explore")
+            if name == "query_analytics_view"
             else name
         )
         _append_trace_step(
             agent_trace,
             agent="FinancialAnalystAgent",
-            claims=claims,
             tool=trace_tool,
             status="completed",
             duration_ms=turn_ctx.tool_duration_ms(name),
             summary=_agent_tool_summary(name, bundle, calls),
         )
     if cache_calls:
-        authorize_agent_s2s_hop(
-            caller_agent="FinancialAnalystAgent",
-            callee_agent="ContextCacheManager",
-        )
-        c_claims = authorize_agent_tool_invocation(
-            agent_name="ContextCacheManager",
-            tool_name="query_cached_10k_context",
-            caller="FinancialAnalystAgent",
-        )
-        _track_identity(identities_used_by_agent, c_claims)
         _append_trace_step(
             agent_trace,
-            agent="ContextCacheManager",
-            claims=c_claims,
+            agent="FinancialAnalystAgent",
             tool="query_cached_10k_context",
             status="completed",
             duration_ms=turn_ctx.tool_duration_ms("query_cached_10k_context"),
@@ -1242,41 +1176,27 @@ def _inspect_response_guardrail(
     coverage_notices: list[dict[str, Any]],
     bundle: _RetrievalBundle,
 ) -> tuple[str, GuardrailDecision, bool, dict[str, Any] | None]:
-    """Reconcile ADK/Model Armor response inspection; return `(text, decision, sdp_modified, blocked_resp)`."""
+    """Run Model Armor + SEC projection filter once on the synthesized response."""
     t_resp_armor = time.perf_counter()
-    if react_result.get("model_armor_response_blocked") is True:
-        raw_plugin_dec = react_result.get("model_armor_response_decision") or {}
-        resp_decision = GuardrailDecision.from_audit_dict(
-            {**raw_plugin_dec, "blocked": True, "action": "blocked"},
-            text="",
-            block_message=str(
-                react_result.get("model_armor_response_block_message") or answer_markdown
-            ),
-        )
-    elif react_result.get("adk_response_already_inspected") and isinstance(
-        react_result.get("adk_response_decision"), dict
-    ):
-        resp_decision = GuardrailDecision.from_audit_dict(
-            react_result["adk_response_decision"],
-            text=answer_markdown,
-        )
-    else:
-        resp_decision = get_model_armor_guardrail().inspect_model_response(
-            answer_markdown,
+    guardrail = get_model_armor_guardrail()
+    resp_decision = guardrail.inspect_model_response(
+        answer_markdown,
+        caller_agent="FinancialAnalystAgent",
+    )
+    raw_llm_text = str(react_result.get("raw_llm_text_for_guardrail") or "")
+    if not resp_decision.blocked and raw_llm_text.strip():
+        raw_decision = guardrail.inspect_model_response(
+            raw_llm_text,
             caller_agent="FinancialAnalystAgent",
         )
+        if raw_decision.blocked:
+            resp_decision = raw_decision
 
     if resp_decision.blocked:
-        out_guard_claims = authorize_agent_s2s_hop(
-            caller_agent="FinancialAnalystAgent",
-            callee_agent="ModelArmorGuardrail",
-        )
-        ctx.track_identity(out_guard_claims)
         out_guard_ms = round((time.perf_counter() - t_resp_armor) * 1000.0, 2)
         cats_str = ", ".join(resp_decision.matched_categories) or "policy_violation"
         ctx.append_trace(
             agent="ModelArmorGuardrail",
-            claims=out_guard_claims,
             tool="model_armor_sanitize_model_response",
             status="blocked",
             duration_ms=out_guard_ms,
@@ -1342,14 +1262,8 @@ def _inspect_response_guardrail(
         if resp_decision.sanitized_text and resp_decision.sanitized_text != answer_markdown:
             answer_markdown = resp_decision.sanitized_text
             sdp_modified = True
-        out_guard_claims = authorize_agent_s2s_hop(
-            caller_agent="FinancialAnalystAgent",
-            callee_agent="ModelArmorGuardrail",
-        )
-        ctx.track_identity(out_guard_claims)
         ctx.append_trace(
             agent="ModelArmorGuardrail",
-            claims=out_guard_claims,
             tool="cloud_sdp_deidentify_content",
             status="sanitized",
             duration_ms=round((time.perf_counter() - t_resp_armor) * 1000.0, 2),
@@ -1458,12 +1372,6 @@ def _resolve_and_validate_scope(
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str, dict[str, Any] | None]:
     """Resolve scope, run coverage/clarification gates, and return `(public_scope, pre_notices, provisional_intent, early_resp)`."""
     t1 = time.perf_counter()
-    route_claims = authorize_agent_tool_invocation(
-        agent_name=_S2S_ROUTER_IDENTITY_NAME,
-        tool_name="resolve_query_scope",
-        caller=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-    )
-    ctx.track_identity(route_claims)
     scope = resolve_query_scope(
         query=query,
         tickers=tickers,
@@ -1502,8 +1410,7 @@ def _resolve_and_validate_scope(
             else "Outside Curated SEC 10-K Corpus Coverage"
         )
         ctx.append_trace(
-            agent=_S2S_ROUTER_IDENTITY_NAME,
-            claims=route_claims,
+            agent=PRIMARY_ORCHESTRATOR_NAME,
             model_used=resolve_model_for_task("orchestration"),
             tool="validate_query_scope_and_coverage",
             status=early_status,
@@ -1542,8 +1449,7 @@ def _resolve_and_validate_scope(
         )
     )
     ctx.append_trace(
-        agent=_S2S_ROUTER_IDENTITY_NAME,
-        claims=route_claims,
+        agent=PRIMARY_ORCHESTRATOR_NAME,
         model_used=orchestrator_model,
         tool="resolve_query_scope",
         status="completed",
@@ -1602,17 +1508,6 @@ def _verify_and_finalize_success(
         "verifying", "Verifying citations, XBRL provenance, and compliance guardrails...", None
     )
     t5 = time.perf_counter()
-    s2s_broker = get_agent_s2s_broker()
-    raw_fc_assertion = s2s_broker.mint_s2s_assertion(
-        agent_name="FinancialAnalystAgent",
-        target_service="fact-check-verification-service",
-        caller=_S2S_ROUTER_IDENTITY_NAME,
-    )
-    fc_claims = s2s_broker.verify_s2s_assertion(
-        raw_fc_assertion,
-        expected_target_service="fact-check-verification-service",
-    )
-    ctx.track_identity(fc_claims)
     synth_step = next(
         (s for s in react_steps if s.phase == "format_grounded_output"), react_steps[-1]
     )
@@ -1630,6 +1525,28 @@ def _verify_and_finalize_success(
     if blocked_resp is not None:
         return blocked_resp
 
+    # Deduplicate exact & near-duplicate 10-K excerpts once on the backend and remap references.
+    citations, citation_aliases = deduplicate_citations_by_text(citations)
+    structured_report = adk_runtime_meta.get("structured_report")
+    if citation_aliases:
+        for old_id, primary_id in citation_aliases.items():
+            if old_id != primary_id and old_id in answer_markdown:
+                answer_markdown = answer_markdown.replace(old_id, primary_id)
+        if isinstance(structured_report, dict) and isinstance(
+            structured_report.get("findings"), list
+        ):
+            remapped_findings = []
+            for finding in structured_report["findings"]:
+                if isinstance(finding, dict) and isinstance(finding.get("chunk_ids"), list):
+                    dedup_ids: list[str] = []
+                    for cid in finding["chunk_ids"]:
+                        target = citation_aliases.get(str(cid), str(cid))
+                        if target not in dedup_ids:
+                            dedup_ids.append(target)
+                    finding = {**finding, "chunk_ids": dedup_ids}
+                remapped_findings.append(finding)
+            structured_report = {**structured_report, "findings": remapped_findings}
+
     # Reuse the single FactCheckVerification computed by `react_loop` unless SDP modified the text.
     cached_fc = react_result.get("fact_check_verification")
     if cached_fc is not None and not sdp_modified:
@@ -1643,18 +1560,17 @@ def _verify_and_finalize_success(
         )
 
     score_label = (
-        f"{eval_report.overall_score:.2f}" if eval_report.overall_score is not None else "pending"
+        f"{eval_report.overall_score:.2f}" if eval_report.overall_score is not None else "offline"
     )
     ctx.append_trace(
         agent="FinancialAnalystAgent",
-        claims=fc_claims,
         model_used=f"{reasoning_model} + {evaluation_model}",
-        tool="after_model_fact_check_callback",
+        tool="verify_analyst_report",
         status="completed" if fact_check.passed else "warning",
         duration_ms=fc_ms,
         summary=(
             f"Formatted grounded report (`{reasoning_model}`) & verification "
-            f"(judge_mode={react_result.get('judge_mode', 'async_background')}, "
+            f"(judge_mode={react_result.get('judge_mode', 'offline_only')}, "
             f"grade={eval_report.grade}, score={score_label}) · "
             f"Verified {fact_check.checked_metrics_count} variance figure(s) & "
             f"{fact_check.matched_citations_count} citation tag(s) · Passed: {fact_check.passed}."
@@ -1697,7 +1613,7 @@ def _verify_and_finalize_success(
         response_decision=resp_decision,
         execution_mode=active_execution_mode,
         adk_runtime=adk_runtime_meta,
-        structured_report=adk_runtime_meta.get("structured_report"),
+        structured_report=structured_report,
         report_verification=adk_runtime_meta.get("report_verification"),
         intent=intent,
         intent_source=intent_source,
@@ -1722,7 +1638,7 @@ def _verify_and_finalize_success(
             "strategy": "structured_react_loop",
             "execution_mode": active_execution_mode,
             "observed_ttft_ms": adk_runtime_meta.get("observed_ttft_ms"),
-            "judge_mode": react_result.get("judge_mode", "async_background"),
+            "judge_mode": react_result.get("judge_mode", "offline_only"),
             "iterations": len(react_steps),
             "steps": [s.model_dump(mode="json") for s in react_steps],
             "variance_evaluations": [v.model_dump(mode="json") for v in variance_evaluations],
@@ -1832,22 +1748,11 @@ def run_conversational_rag_turn(
         return early_resp
 
     # Step 2: Hybrid RAG evidence-lead pre-pass (deterministic engines are agent-invoked tools)
-    authorize_agent_s2s_hop(
-        caller_agent=_S2S_ROUTER_IDENTITY_NAME,
-        callee_agent="FinancialAnalystAgent",
-    )
-    rag_claims = authorize_agent_tool_invocation(
-        agent_name="FinancialAnalystAgent",
-        tool_name="search_10k_chunks_rag",
-        caller=_S2S_ROUTER_IDENTITY_NAME,
-    )
-    ctx.track_identity(rag_claims)
     ctx.emit("retrieving", "Retrieving 10-K evidence leads...", None)
     prepass_citations, prepass_candidates = _run_rag_prepass(
         query=query,
         public_scope=public_scope,
         top_k=top_k,
-        rag_claims=rag_claims,
         agent_trace=ctx.agent_trace,
     )
     base_coverage_notices = build_coverage_notices(
@@ -1891,7 +1796,6 @@ def run_conversational_rag_turn(
             telemetry_session_id=ctx.telemetry_session_id,
             user_id=user_id,
             coverage_notices=base_coverage_notices,
-            prompt_already_verified=True,
             run_judge_sync=run_judge_sync,
             skip_background_judge=skip_background_judge,
             on_progress=on_progress,
@@ -1915,7 +1819,6 @@ def run_conversational_rag_turn(
     eval_var_step = react_result["react_steps"][0]
     ctx.append_trace(
         agent="FinancialAnalystAgent",
-        claims=rag_claims,
         model_used=react_result["reasoning_model"],
         tool="evaluate_calculated_variances",
         status="completed",
@@ -1927,7 +1830,6 @@ def run_conversational_rag_turn(
     )
     invoked_tools = _append_agent_tool_trace_steps(
         agent_trace=ctx.agent_trace,
-        identities_used_by_agent=ctx.identities_used_by_agent,
         tool_calls=agent_tool_calls,
         bundle=bundle,
         turn_ctx=turn_ctx,

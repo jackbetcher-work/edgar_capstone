@@ -54,8 +54,7 @@ def _explores(tool_calls: Iterable[dict[str, Any]] | None) -> set[str]:
     return {
         str((c.get("args") or {}).get("explore_name") or "").strip().lower()
         for c in tool_calls or []
-        if isinstance(c, dict)
-        and c.get("name") in ("query_analytics_view", "query_looker_financial_explore")
+        if isinstance(c, dict) and c.get("name") == "query_analytics_view"
     }
 
 

@@ -76,12 +76,19 @@ def _collect_extracted_candidates(
     doc_rank: int,
 ) -> list[tuple[str, float, str | None, str | None]]:
     """Collect candidate `(text, score, raw_section_id, raw_section_title)` tuples from a doc."""
+    doc_sec_id = struct_data.get("section_id")
+    doc_sec_title = struct_data.get("section_title")
     candidates: list[tuple[str, float, str | None, str | None]] = []
     for seg in derived.get("extractive_segments") or []:
         if isinstance(seg, dict) and seg.get("content"):
             rel = float(seg.get("relevanceScore") or max(0.35, 0.92 - 0.05 * doc_rank))
             candidates.append(
-                (str(seg["content"]).strip(), rel, seg.get("section_id"), seg.get("section_title"))
+                (
+                    str(seg["content"]).strip(),
+                    rel,
+                    seg.get("section_id") or doc_sec_id,
+                    seg.get("section_title") or doc_sec_title,
+                )
             )
     for ans in derived.get("extractive_answers") or []:
         if isinstance(ans, dict) and ans.get("content"):
@@ -89,22 +96,24 @@ def _collect_extracted_candidates(
                 (
                     str(ans["content"]).strip(),
                     max(0.30, 0.85 - 0.05 * doc_rank),
-                    ans.get("section_id"),
-                    ans.get("section_title"),
+                    ans.get("section_id") or doc_sec_id,
+                    ans.get("section_title") or doc_sec_title,
                 )
             )
     for snip in derived.get("snippets") or []:
         if isinstance(snip, dict) and snip.get("snippet"):
             clean_snip = _HTML_TAG_RE.sub("", str(snip["snippet"])).strip()
             if clean_snip:
-                candidates.append((clean_snip, max(0.25, 0.75 - 0.05 * doc_rank), None, None))
+                candidates.append(
+                    (clean_snip, max(0.25, 0.75 - 0.05 * doc_rank), doc_sec_id, doc_sec_title)
+                )
     if struct_data.get("chunk_text"):
         candidates.append(
             (
                 str(struct_data["chunk_text"]).strip(),
                 max(0.35, 0.88 - 0.05 * doc_rank),
-                struct_data.get("section_id"),
-                struct_data.get("section_title"),
+                doc_sec_id,
+                doc_sec_title,
             )
         )
     return candidates
@@ -166,7 +175,7 @@ class VertexAISearchAdapter(GcpAdapterErrorTranslationMixin, GcpRestClient):
             safe_sec = canon_sector.replace('"', '\\"')
             clauses.append(f'gics_sector: ANY("{safe_sec}")')
         if section_id in ("item_1a", "item_7"):
-            clauses.append(f'extracted_sections: ANY("{section_id}")')
+            clauses.append(f'section_id: ANY("{section_id}")')
         return " AND ".join(clauses)
 
     def _post_with_url_fallback(

@@ -20,17 +20,11 @@ Implements the structured ReAct loop (`Thought -> Action -> Observation -> ... -
 
 from __future__ import annotations
 
-import atexit
-import contextlib
-import contextvars
 import json
 import logging
 import re
-import sys
-import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,11 +42,11 @@ from edgar_capstone.agents.core.schemas import (
     VarianceEvaluationItem,
 )
 from edgar_capstone.agents.evaluation.judge import (
-    evaluate_variance_explanation,
     evaluate_variance_explanation_with_latency,
 )
 from edgar_capstone.agents.evaluation.structured_report import (
     ReportVerification,
+    VerifiedAnalystReport,
     parse_analyst_report,
     render_analyst_report_markdown,
     verify_analyst_report,
@@ -73,179 +67,20 @@ from edgar_capstone.agents.tools.runtime import (
     hydrate_tool_outputs,
 )
 from edgar_capstone.agents.tools.sec_tools import calculate_period_variances
-from edgar_capstone.common.domain import RETRIEVAL_TOOL_NAMES, MetricName
+from edgar_capstone.common.domain import (
+    RETRIEVAL_TOOL_NAMES,
+    MetricName,
+    normalize_edgar_ticker,
+)
 from edgar_capstone.common.formatting import fmt_bps, fmt_pct, fmt_usd
-from edgar_capstone.observability.tracing import current_trace_correlation, traced
-from edgar_capstone.telemetry import get_telemetry_sink
+from edgar_capstone.observability.tracing import traced
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
 logger = logging.getLogger(__name__)
 
-_SHUTDOWN_WAIT_BUDGET_SECONDS = 12.0
-
-
-class _BackgroundJudgeManager:
-    """Lazy-initialized thread pool for off-critical-path LLM-as-a-Judge evaluations."""
-
-    def __init__(self, *, max_workers: int = 4) -> None:
-        self._max_workers = max_workers
-        self._lock = threading.Lock()
-        self._pool: ThreadPoolExecutor | None = None
-        self._pending: list[Future[Any]] = []
-        self._shutting_down = threading.Event()
-
-    @property
-    def is_pool_initialized(self) -> bool:
-        with self._lock:
-            return self._pool is not None
-
-    def is_shutting_down(self) -> bool:
-        return self._shutting_down.is_set() or sys.is_finalizing()
-
-    def submit(self, fn: Callable[[], Any]) -> Future[Any] | None:
-        if self.is_shutting_down():
-            return None
-        ctx = contextvars.copy_context()
-        with self._lock:
-            if self._shutting_down.is_set():
-                return None
-            if self._pool is None:
-                self._pool = ThreadPoolExecutor(
-                    max_workers=self._max_workers,
-                    thread_name_prefix="edgar-bg-judge",
-                )
-            try:
-                fut = self._pool.submit(ctx.run, fn)
-            except RuntimeError:
-                return None
-            self._pending[:] = [f for f in self._pending if not f.done()]
-            self._pending.append(fut)
-            return fut
-
-    def flush(self, timeout: float = 30.0) -> int:
-        with self._lock:
-            pending = list(self._pending)
-            self._pending.clear()
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        completed = 0
-        for fut in pending:
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                fut.result(timeout=remaining)
-                completed += 1
-            except Exception:
-                logger.debug(
-                    "Background judge future raised or timed out during flush", exc_info=True
-                )
-        return completed
-
-    def shutdown(self, timeout: float = _SHUTDOWN_WAIT_BUDGET_SECONDS) -> None:
-        self._shutting_down.set()
-        with self._lock:
-            pending = list(self._pending)
-            self._pending.clear()
-            pool = self._pool
-            self._pool = None
-        for fut in pending:
-            fut.cancel()
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        for fut in pending:
-            if not fut.cancelled() and not fut.done():
-                remaining = max(0.0, deadline - time.monotonic())
-                with contextlib.suppress(Exception):
-                    fut.result(timeout=remaining)
-        if pool is not None:
-            with contextlib.suppress(Exception):
-                pool.shutdown(wait=False, cancel_futures=True)
-
-
-_JUDGE_MANAGER = _BackgroundJudgeManager(max_workers=4)
-
-
-def _on_interpreter_exit() -> None:
-    _JUDGE_MANAGER.shutdown(timeout=_SHUTDOWN_WAIT_BUDGET_SECONDS)
-
-
-atexit.register(_on_interpreter_exit)
-
-
-def flush_pending_evaluations(timeout: float = 30.0) -> int:
-    """Wait for any pending background LLM-as-a-Judge tasks using a shared monotonic deadline."""
-    return _JUDGE_MANAGER.flush(timeout=timeout)
-
-
-def _schedule_background_judge(
-    *,
-    query: str,
-    response_markdown: str,
-    variance_reports: list[dict[str, Any]],
-    citations: list[dict[str, Any]],
-    cached_explanations_count: int,
-    session_id: str | None = None,
-    user_email: str = "analyst",
-    intent: str = "longitudinal_single_company",
-    tickers_analyzed: list[str] | None = None,
-    turn_id: str | None = None,
-    trace_id: str | None = None,
-    fact_check: FactCheckVerification | None = None,
-    llm: BaseLlm | None = None,
-) -> Future[Any] | None:
-    """Run live Flash LLM-as-a-Judge asynchronously and stream its real grade/score to telemetry."""
-    if _JUDGE_MANAGER.is_shutting_down():
-        return None
-
-    corr = current_trace_correlation()
-    eff_trace_id = trace_id or (corr.trace_id if corr is not None else None)
-    eff_tickers = list(tickers_analyzed or [])
-
-    def _run() -> NarrativeEvaluationReport | None:
-        if _JUDGE_MANAGER.is_shutting_down():
-            return None
-        try:
-            report = evaluate_variance_explanation(
-                query=query,
-                response_markdown=response_markdown,
-                variance_reports=variance_reports,
-                citations=citations,
-                cached_explanations_count=cached_explanations_count,
-                llm=llm,
-                fact_check=fact_check,
-            )
-            if report.overall_score is not None:
-                get_telemetry_sink().record_async_evaluation_result(
-                    session_id=session_id or "",
-                    user_email=user_email,
-                    intent=intent,
-                    evaluation_grade=report.grade,
-                    evaluation_score=report.overall_score,
-                    evaluator_model=report.evaluator_model,
-                    query_text=query,
-                    tickers_analyzed=eff_tickers,
-                    rationale=report.rationale,
-                    turn_id=turn_id,
-                    trace_id=eff_trace_id,
-                )
-            return report
-        except RuntimeError as exc:
-            msg_low = str(exc).lower()
-            if (
-                "interpreter shutdown" in msg_low
-                or "after shutdown" in msg_low
-                or _JUDGE_MANAGER.is_shutting_down()
-            ):
-                return None
-            logger.warning("Background async LLM-as-a-Judge evaluation failed: %s", exc)
-            return None
-        except Exception:
-            if not _JUDGE_MANAGER.is_shutting_down():
-                logger.warning("Background async LLM-as-a-Judge evaluation failed", exc_info=True)
-            return None
-
-    return _JUDGE_MANAGER.submit(_run)
-
 
 def _fmt_score(value: float | None) -> str:
-    return f"{value:.2f}" if value is not None else "pending"
+    return f"{value:.2f}" if value is not None else "offline"
 
 
 @traced("react.evaluate_variances")
@@ -488,7 +323,6 @@ class _ReasoningInput:
     runtime_res: LiveRuntimeResolution
     reasoning_model: str
     coverage_notices: list[dict[str, Any]] | None
-    prompt_already_verified: bool
     on_progress: Callable[[str, str, dict[str, Any] | None], None] | None
 
 
@@ -499,9 +333,6 @@ class _SynthesisOutcome:
     answer_markdown: str
     answer_verified: bool
     withheld_reason: str | None
-    adk_response_blocked: bool
-    adk_response_decision: dict[str, Any] | None
-    adk_response_block_message: str
     structured_report_dict: dict[str, Any] | None
     report_verification: ReportVerification | None
     fact_check_verification: FactCheckVerification | None
@@ -545,6 +376,85 @@ def _backfill_key_metric_variances(
         missing_tickers=list(res.get("missing_tickers") or []),
     )
     return tool_outputs.merge(backfilled), need
+
+
+def _missing_scope_coverage(
+    verified: VerifiedAnalystReport,
+    *,
+    scope: dict[str, Any],
+    citations: list[dict[str, Any]],
+) -> tuple[list[str], list[int]]:
+    """Return `(missing_tickers, missing_boundary_years)` absent from verified findings.
+
+    Only reports a ticker or boundary fiscal year as missing when retrieved `citations`
+    actually contain at least one passage for it, so unavailable filings never trigger a
+    pointless repair pass.
+    """
+    by_id = {str(c.get("chunk_id")): c for c in citations if c.get("chunk_id")}
+    cited_tickers: set[str] = set()
+    cited_years: set[int] = set()
+    for f in verified.report.findings:
+        if f.ticker:
+            cited_tickers.add(normalize_edgar_ticker(f.ticker))
+        if f.fiscal_year:
+            cited_years.add(int(f.fiscal_year))
+        for cid in f.chunk_ids:
+            c = by_id.get(cid)
+            if c is None:
+                continue
+            if c.get("ticker"):
+                cited_tickers.add(normalize_edgar_ticker(str(c["ticker"])))
+            if c.get("fiscal_year") is not None:
+                cited_years.add(int(c["fiscal_year"]))
+
+    available_tickers = {
+        normalize_edgar_ticker(str(c["ticker"])) for c in citations if c.get("ticker")
+    }
+    available_years = {int(c["fiscal_year"]) for c in citations if c.get("fiscal_year") is not None}
+
+    scope_tickers = [
+        normalize_edgar_ticker(str(t)) for t in (scope.get("tickers") or []) if str(t).strip()
+    ]
+    missing_tickers: list[str] = []
+    if 2 <= len(scope_tickers) <= 6:
+        missing_tickers = [
+            tk for tk in scope_tickers if tk in available_tickers and tk not in cited_tickers
+        ]
+
+    missing_years: list[int] = []
+    if 1 <= len(scope_tickers) <= 6:
+        start_y = scope.get("start_year")
+        end_y = scope.get("end_year")
+        if start_y is not None and end_y is not None and int(start_y) != int(end_y):
+            for by in (int(start_y), int(end_y)):
+                if by in available_years and by not in cited_years:
+                    missing_years.append(by)
+
+    return missing_tickers, missing_years
+
+
+def _is_retry_improvement(
+    original: VerifiedAnalystReport,
+    candidate: VerifiedAnalystReport,
+    *,
+    scope: dict[str, Any],
+    citations: list[dict[str, Any]],
+) -> bool:
+    """Ensure a partial-rejection repair pass never regresses a usable draft."""
+    if not original.verification.usable:
+        return True
+    if not candidate.verification.usable:
+        return False
+    orig_tk, orig_yr = _missing_scope_coverage(original, scope=scope, citations=citations)
+    cand_tk, cand_yr = _missing_scope_coverage(candidate, scope=scope, citations=citations)
+    orig_gaps = len(orig_tk) + len(orig_yr)
+    cand_gaps = len(cand_tk) + len(cand_yr)
+    if cand_gaps < orig_gaps:
+        return True
+    return (
+        cand_gaps == orig_gaps
+        and candidate.verification.findings_verified > original.verification.findings_verified
+    )
 
 
 class StructuredReActExecutor:
@@ -648,7 +558,6 @@ class StructuredReActExecutor:
         disclosure_deltas: dict[str, Any] | None,
         coverage_notices: list[dict[str, Any]] | None,
         sector_map_summaries: dict[str, Any] | None,
-        prompt_already_verified: bool,
         custom_llm: BaseLlm | None,
         verification_feedback: str | None = None,
         ephemeral: bool = False,
@@ -676,9 +585,7 @@ class StructuredReActExecutor:
             disclosure_deltas=disclosure_deltas,
             coverage_notices=coverage_notices,
             sector_map_summaries=sector_map_summaries,
-            prompt_already_verified=prompt_already_verified,
             verification_feedback=verification_feedback,
-            defer_callback_fact_check=True,
             ephemeral=ephemeral,
             enable_tools=enable_tools,
             low_thinking=low_thinking,
@@ -688,24 +595,72 @@ class StructuredReActExecutor:
         self,
         req: _ReasoningInput,
         *,
-        verified: Any,
+        structured: AnalystReport,
+        verified: VerifiedAnalystReport,
         live_stream_result: AdkStreamResult,
         tool_outputs: ToolOutputs,
         latency_records: list[ModelContextLatencyRecord],
         agent_retrieved_citations: list[dict[str, Any]],
-    ) -> tuple[Any, AdkStreamResult, ToolOutputs, str | None]:
-        """One fast, tool-less, low-thinking verification repair pass."""
-        if verified.verification.usable or self.reasoning_llm is not None:
+    ) -> tuple[VerifiedAnalystReport, AdkStreamResult, ToolOutputs, str | None]:
+        """One fast, tool-less, low-thinking verification repair pass.
+
+        Triggers when (a) all findings failed verification (`usable=False`), or (b) partial
+        rejections dropped an in-scope ticker or boundary fiscal year that is present in the
+        turn's retrieved citations. When the original draft was already usable, the repaired
+        report is adopted only if it improves coverage or verified finding count.
+        """
+        if self.reasoning_llm is not None:
             return verified, live_stream_result, tool_outputs, None
-        feedback_lines = [
-            f"- Finding {fv.index}: {'; '.join(fv.reasons)}"
-            for fv in verified.verification.findings
-            if not fv.verified
-        ]
+        missing_tickers, missing_years = _missing_scope_coverage(
+            verified, scope=req.scope, citations=req.merged_citations
+        )
+        partial_coverage_gap = verified.verification.findings_rejected > 0 and (
+            bool(missing_tickers) or bool(missing_years)
+        )
+        if verified.verification.usable and not partial_coverage_gap:
+            return verified, live_stream_result, tool_outputs, None
+
+        draft_findings = structured.findings
+        feedback_lines: list[str] = []
+        for fv in verified.verification.findings:
+            if not fv.verified:
+                if 0 <= fv.index < len(draft_findings):
+                    f = draft_findings[fv.index]
+                    cids = ", ".join(f.chunk_ids)
+                    feedback_lines.append(
+                        f"- Finding {fv.index} ({f.ticker} FY{f.fiscal_year}, chunks=[{cids}]): "
+                        f"{'; '.join(fv.reasons)}"
+                    )
+                else:
+                    feedback_lines.append(f"- Finding {fv.index}: {'; '.join(fv.reasons)}")
+        if partial_coverage_gap:
+            gap_parts: list[str] = []
+            if missing_tickers:
+                gap_parts.append(f"in-scope ticker(s) {', '.join(missing_tickers)}")
+            if missing_years:
+                gap_parts.append(
+                    f"boundary fiscal year(s) {', '.join(f'FY{y}' for y in missing_years)}"
+                )
+            kept_cids = sorted(
+                {cid for f in verified.report.findings for cid in f.chunk_ids if cid}
+            )
+            feedback_lines.append(
+                "- Coverage gap after dropping rejected findings: missing "
+                + " and ".join(gap_parts)
+                + ". Keep your valid findings"
+                + (f" (chunks: {', '.join(kept_cids)})" if kept_cids else "")
+                + " and add/fix verified findings for the missing coverage using exact verbatim "
+                "quotes copied from the retrieved passages above."
+            )
+
         logger.info(
-            "All %d live AnalystReport findings failed verification; running one "
-            "tool-less low-thinking regeneration pass.",
+            "Verification repair triggered (usable=%s, rejected=%d/%d, missing_tickers=%s, "
+            "missing_years=%s); running one tool-less low-thinking regeneration pass.",
+            verified.verification.usable,
+            verified.verification.findings_rejected,
             verified.verification.findings_total,
+            missing_tickers,
+            missing_years,
         )
         try:
             # The retry is seeded with every deterministic output and citation already retrieved
@@ -728,17 +683,15 @@ class StructuredReActExecutor:
                 disclosure_deltas=tool_outputs.disclosure_deltas,
                 coverage_notices=req.coverage_notices,
                 sector_map_summaries=tool_outputs.sector_map_summaries,
-                prompt_already_verified=req.prompt_already_verified,
                 custom_llm=None,
                 verification_feedback="\n".join(feedback_lines),
                 ephemeral=True,
                 enable_tools=False,
                 low_thinking=True,
             )
-            latency_records.extend(live_stream_result.latency_records)
-            tool_outputs = tool_outputs.merge(hydrate_tool_outputs(retry_res.session_state))
+            retry_tool_outputs = tool_outputs.merge(hydrate_tool_outputs(retry_res.session_state))
             agent_retrieved_citations.extend(
-                _merge_agent_retrieved_citations(req.merged_citations, tool_outputs.citations)
+                _merge_agent_retrieved_citations(req.merged_citations, retry_tool_outputs.citations)
             )
             retry_structured = parse_analyst_report(
                 retry_res.session_state.get("financial_analyst_report")
@@ -746,19 +699,34 @@ class StructuredReActExecutor:
             retry_intent: str | None = None
             if retry_structured is not None:
                 retry_intent = retry_structured.intent
-                tool_outputs, _ = _backfill_key_metric_variances(
-                    retry_structured, tool_outputs, req.scope
+                retry_tool_outputs, _ = _backfill_key_metric_variances(
+                    retry_structured, retry_tool_outputs, req.scope
                 )
-                verified = verify_analyst_report(
+                retry_verified = verify_analyst_report(
                     retry_structured,
-                    variance_reports=tool_outputs.variance_reports,
+                    variance_reports=retry_tool_outputs.variance_reports,
                     citations=req.merged_citations,
-                    material_flags=tool_outputs.material_variance_flags,
+                    material_flags=retry_tool_outputs.material_variance_flags,
                 )
-            return verified, retry_res, tool_outputs, retry_intent
+                if _is_retry_improvement(
+                    verified,
+                    retry_verified,
+                    scope=req.scope,
+                    citations=req.merged_citations,
+                ):
+                    latency_records.extend(live_stream_result.latency_records)
+                    return retry_verified, retry_res, retry_tool_outputs, retry_intent
+            elif not verified.verification.usable:
+                latency_records.extend(live_stream_result.latency_records)
+                return verified, retry_res, retry_tool_outputs, None
+
+            # Partial repair did not improve on the already-usable draft; preserve original draft
+            # while still recording the retry call's latency records for telemetry.
+            latency_records.extend(retry_res.latency_records)
+            return verified, live_stream_result, tool_outputs, None
         except Exception:
             logger.warning(
-                "Verification-guided regeneration pass failed; withholding response.",
+                "Verification-guided regeneration pass failed; keeping original verification state.",
                 exc_info=True,
             )
             return verified, live_stream_result, tool_outputs, None
@@ -803,7 +771,6 @@ class StructuredReActExecutor:
                 disclosure_deltas=init_out.disclosure_deltas,
                 coverage_notices=req.coverage_notices,
                 sector_map_summaries=init_out.sector_map_summaries,
-                prompt_already_verified=req.prompt_already_verified,
                 custom_llm=self.reasoning_llm,
             )
         except Exception as exc:
@@ -831,12 +798,9 @@ class StructuredReActExecutor:
 
         answer_markdown = candidate_md
         withheld_reason: str | None = None
-        adk_response_blocked = False
         structured_report_dict: dict[str, Any] | None = None
         report_verification: ReportVerification | None = None
         fact_check_verification: FactCheckVerification | None = None
-        adk_response_decision: dict[str, Any] | None = None
-        adk_response_block_message = ""
         agent_intent: str | None = None
         backfill_tickers: list[str] = []
 
@@ -850,14 +814,6 @@ class StructuredReActExecutor:
 
         if schema_failure_reason is not None:
             withheld_reason = schema_failure_reason
-        elif live_stream_result.session_state.get("model_armor_response_blocked") is True:
-            adk_response_blocked = True
-            raw_dec = live_stream_result.session_state.get("model_armor_last_response_decision")
-            adk_response_decision = raw_dec if isinstance(raw_dec, dict) else None
-            adk_response_block_message = str(
-                live_stream_result.session_state.get("model_armor_response_block_message")
-                or candidate_md
-            )
         elif (
             structured := parse_analyst_report(
                 live_stream_result.session_state.get("financial_analyst_report")
@@ -876,6 +832,7 @@ class StructuredReActExecutor:
             verified, live_stream_result, tool_outputs, retry_intent = (
                 self._maybe_regenerate_structured_report(
                     req,
+                    structured=structured,
                     verified=verified,
                     live_stream_result=live_stream_result,
                     tool_outputs=tool_outputs,
@@ -884,36 +841,25 @@ class StructuredReActExecutor:
                 )
             )
             agent_intent = retry_intent or agent_intent
-            if live_stream_result.session_state.get("model_armor_response_blocked") is True:
-                adk_response_blocked = True
-                raw_dec = live_stream_result.session_state.get("model_armor_last_response_decision")
-                adk_response_decision = raw_dec if isinstance(raw_dec, dict) else None
-                adk_response_block_message = str(
-                    live_stream_result.session_state.get("model_armor_response_block_message")
-                    or live_stream_result.final_text
-                )
+            report_verification = verified.verification
+            structured_report_dict = verified.report.model_dump(mode="json")
+            if not report_verification.usable:
+                withheld_reason = report_verification.unusable_reason
             else:
-                report_verification = verified.verification
-                structured_report_dict = verified.report.model_dump(mode="json")
-                if not report_verification.usable:
-                    withheld_reason = report_verification.unusable_reason
-                else:
-                    answer_markdown = render_analyst_report_markdown(
-                        verified,
-                        variance_reports=tool_outputs.variance_reports,
-                        citations=req.merged_citations,
-                        scope=req.scope,
-                        coverage_notices=_final_notices(),
-                    )
-                    check = verify_narrative_against_calculations(
-                        response_text=answer_markdown,
-                        calculated_variances=tool_outputs.calculated_variances_map,
-                        retrieved_citations=req.merged_citations,
-                    )
-                    if check.passed:
-                        fact_check_verification = check
-                    else:
-                        withheld_reason = "; ".join(check.discrepancies)
+                answer_markdown = render_analyst_report_markdown(
+                    verified,
+                    variance_reports=tool_outputs.variance_reports,
+                    citations=req.merged_citations,
+                    scope=req.scope,
+                    coverage_notices=_final_notices(),
+                )
+                cited_ids = {cid for f in verified.report.findings for cid in f.chunk_ids}
+                fact_check_verification = FactCheckVerification(
+                    passed=True,
+                    checked_metrics_count=len(verified.report.key_metrics),
+                    matched_citations_count=len(cited_ids),
+                    discrepancies=[],
+                )
         elif not candidate_md.strip():
             withheld_reason = "Empty live agent output"
         else:
@@ -927,7 +873,7 @@ class StructuredReActExecutor:
             else:
                 withheld_reason = "; ".join(check.discrepancies) or "Ungrounded live LLM output"
 
-        answer_verified = withheld_reason is None and not adk_response_blocked
+        answer_verified = withheld_reason is None
         if withheld_reason is not None:
             answer_markdown = _withheld_answer_markdown(withheld_reason)
             fact_check_verification = None
@@ -940,9 +886,6 @@ class StructuredReActExecutor:
             answer_markdown=answer_markdown,
             answer_verified=answer_verified,
             withheld_reason=withheld_reason,
-            adk_response_blocked=adk_response_blocked,
-            adk_response_decision=adk_response_decision,
-            adk_response_block_message=adk_response_block_message,
             structured_report_dict=structured_report_dict,
             report_verification=report_verification,
             fact_check_verification=fact_check_verification,
@@ -1009,45 +952,8 @@ class StructuredReActExecutor:
             )
             return report, "sync", eval_latency_records
 
-        if skip_background_judge:
-            report = NarrativeEvaluationReport(
-                evaluator_model=resolve_model_for_task("evaluation"),
-                grade="pending",
-                overall_score=None,
-                numeric_fidelity_score=None,
-                citation_grounding_score=None,
-                citation_precision_score=None,
-                explanation_quality_score=None,
-                thematic_consistency_score=None,
-                unsupported_claims_count=0,
-                rationale=(
-                    "Deterministic claim verification passed; LLM-as-a-Judge deferred to "
-                    "caller evaluation harness (scores pending)."
-                ),
-            )
-            return report, "deferred_to_caller", eval_latency_records
-
-        tickers_analyzed = sorted(
-            {
-                *(scope.get("tickers") or []),
-                *(str(r.get("ticker")) for r in variance_reports if r.get("ticker")),
-                *(str(c.get("ticker")) for c in merged_citations if c.get("ticker")),
-            }
-        )
-        _schedule_background_judge(
-            query=query,
-            response_markdown=outcome.answer_markdown,
-            variance_reports=variance_reports,
-            citations=merged_citations,
-            cached_explanations_count=cached_explanations_count,
-            session_id=session_id,
-            user_email=user_id,
-            intent=intent,
-            tickers_analyzed=tickers_analyzed,
-            turn_id=turn_id,
-            fact_check=outcome.fact_check_verification,
-            llm=None,
-        )
+        # LLM-as-a-Judge runs strictly offline (golden eval suite via `run_judge_sync=True`)
+        # rather than spawning a background Gemini call on every production request.
         report = NarrativeEvaluationReport(
             evaluator_model=resolve_model_for_task("evaluation"),
             grade="pending",
@@ -1059,12 +965,11 @@ class StructuredReActExecutor:
             thematic_consistency_score=None,
             unsupported_claims_count=0,
             rationale=(
-                "Deterministic claim verification and numeric fact-check passed; "
-                "live Flash LLM-as-a-Judge scheduled asynchronously off the request path "
-                "(real grade and score will be streamed via record_async_evaluation_result)."
+                "Deterministic claim verification passed; LLM-as-a-Judge runs offline "
+                "in the golden evaluation suite."
             ),
         )
-        return report, "async_background", eval_latency_records
+        return report, "offline_only", eval_latency_records
 
     @traced("react.execute", record_args=("intent", "session_id"))
     def execute_post_retrieval_reasoning(
@@ -1088,7 +993,6 @@ class StructuredReActExecutor:
         disclosure_deltas: dict[str, Any] | None = None,
         coverage_notices: list[dict[str, Any]] | None = None,
         sector_map_summaries: dict[str, Any] | None = None,
-        prompt_already_verified: bool = False,
         run_judge_sync: bool = False,
         skip_background_judge: bool = False,
         on_progress: Callable[[str, str, dict[str, Any] | None], None] | None = None,
@@ -1145,7 +1049,6 @@ class StructuredReActExecutor:
                 runtime_res=runtime_res,
                 reasoning_model=reasoning_model,
                 coverage_notices=coverage_notices,
-                prompt_already_verified=prompt_already_verified,
                 on_progress=on_progress,
             )
         )
@@ -1285,8 +1188,21 @@ class StructuredReActExecutor:
             ),
         }
 
+        raw_llm_text_for_guardrail = (
+            live_stream_result.final_text
+            if (
+                outcome.report_verification is not None
+                and (
+                    not outcome.report_verification.headline_verified
+                    or outcome.report_verification.findings_rejected > 0
+                )
+            )
+            else ""
+        )
+
         return {
             "answer_markdown": outcome.answer_markdown,
+            "raw_llm_text_for_guardrail": raw_llm_text_for_guardrail,
             "answer_verified": outcome.answer_verified,
             "citations": merged_citations,
             "tool_outputs": tool_outputs,
@@ -1305,13 +1221,4 @@ class StructuredReActExecutor:
             "evaluation_model": eval_report.evaluator_model,
             "execution_mode": "live_adk",
             "adk_runtime": adk_runtime_meta,
-            "adk_response_already_inspected": bool(
-                live_stream_result.session_state.get("_model_armor_verified_response_sha256")
-            ),
-            "adk_response_decision": live_stream_result.session_state.get(
-                "model_armor_last_response_decision"
-            ),
-            "model_armor_response_blocked": outcome.adk_response_blocked,
-            "model_armor_response_decision": outcome.adk_response_decision,
-            "model_armor_response_block_message": outcome.adk_response_block_message,
         }

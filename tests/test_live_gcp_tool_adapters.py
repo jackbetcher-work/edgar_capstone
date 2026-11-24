@@ -669,24 +669,26 @@ def test_hybrid_rag_fuses_bigquery_vector_search_and_vertex_ai_search() -> None:
                 hit_log.append("vais_datastore_search")
                 assert 'ticker: ANY("NVDA")' in body["filter"]
                 assert 'gics_sector: ANY("Information Technology")' in body["filter"]
-                assert 'extracted_sections: ANY("item_1a")' in body["filter"]
+                assert 'section_id: ANY("item_1a")' in body["filter"]
                 return httpx.Response(
                     200,
                     json={
                         "results": [
                             {
                                 "document": {
-                                    "id": "NVDA_2026_10K",
+                                    "id": "NVDA_2026_item_1a",
                                     "structData": {
                                         "profile_id": "NVDA_2026",
                                         "ticker": "NVDA",
                                         "company_name": "NVIDIA CORP",
                                         "gics_sector": "Information Technology",
                                         "fiscal_year": 2026,
+                                        "section_id": "item_1a",
+                                        "section_title": "Item 1A. Risk Factors",
                                         "sec_filing_url": "https://www.sec.gov/Archives/edgar/data/1045810/NVDA_2026.htm",
                                     },
                                     "content": {
-                                        "uri": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"
+                                        "uri": "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_item_1a.md"
                                     },
                                     "derivedStructData": {
                                         "extractive_segments": [
@@ -1231,14 +1233,36 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_gcs() -> No
         backend="vertex_ai",
     )
 
+    from edgar_capstone.agents.evaluation.structured_report import (
+        parse_analyst_report,
+        render_analyst_report_markdown,
+        verify_analyst_report,
+    )
+
     report = stream_res.session_state["financial_analyst_report"]
     assert report["headline"] == "NVDA Live GCP Grounded Analysis"
     assert report["findings"][0]["chunk_ids"][0] in {
         "NVDA_2026_item_7_0001",
         "NVDA_2026_item_7_vais_0000",
     }
-    # The callback fact-check verifies the structured claims and renders deterministic figures
-    assert "+254.45%" in stream_res.session_state["structured_report_markdown"]
+    # Deterministic claim verification renders exact calculated figures from tool state
+    parsed = parse_analyst_report(report)
+    assert parsed is not None
+    calc_reports = [
+        v for v in stream_res.session_state["calculated_variances"].values() if isinstance(v, dict)
+    ]
+    verified = verify_analyst_report(
+        parsed,
+        variance_reports=calc_reports,
+        citations=stream_res.session_state["retrieved_citations"],
+    )
+    assert verified.verification.usable is True
+    rendered = render_analyst_report_markdown(
+        verified,
+        variance_reports=calc_reports,
+        citations=stream_res.session_state["retrieved_citations"],
+    )
+    assert "+254.45%" in rendered
     assert {fc["name"] for fc in stream_res.function_calls} == {
         "calculate_period_variances",
         "search_10k_chunks_rag",
@@ -1248,7 +1272,6 @@ def test_end_to_end_adk_agent_runner_hits_bigquery_vertex_search_and_gcs() -> No
         "vertex_ai_embeddings",
         "vertex_ai_search",
     }
-    assert stream_res.session_state["fact_check_report"]["passed"] is True
 
     # Also verify `load_cached_10k_section` hits BigQuery + GCS on a cache miss
     cache_res = load_cached_10k_section(

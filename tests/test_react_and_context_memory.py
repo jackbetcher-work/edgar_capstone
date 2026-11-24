@@ -29,10 +29,8 @@ from edgar_capstone.agents.core.schemas import ContextBreakdown
 from edgar_capstone.agents.orchestration.react_loop import (
     StructuredReActExecutor,
     evaluate_calculated_variances,
-    flush_pending_evaluations,
 )
 from edgar_capstone.agents.runtime.callbacks import (
-    after_model_fact_check_callback,
     after_model_telemetry_callback,
     before_model_telemetry_callback,
 )
@@ -279,7 +277,7 @@ def test_dual_model_specialization_and_adk_app_configuration() -> None:
     assert isinstance(analyst.planner, BuiltInPlanner)
     assert analyst.planner.thinking_config.include_thoughts is True
     assert analyst.before_model_callback is before_model_telemetry_callback
-    assert analyst.after_model_callback is after_model_fact_check_callback
+    assert analyst.after_model_callback is after_model_telemetry_callback
 
     assert evaluator.model == "gemini-3.8-flash"
     assert evaluator.generate_content_config is not None
@@ -397,10 +395,8 @@ def test_adk_runner_executes_structured_react_loop_with_context_latency_tracking
     assert final_call_metric["estimated_cache_latency_saved_ms"] > 100.0
     assert final_call_metric["within_ttft_slo"] is True
 
-    # 4. Verify S2S audit trail, numeric fact-check, and after_agent memory duration callback
-    s2s_tools = [entry["tool_name"] for entry in session.state["s2s_audit_trail"]]
-    assert s2s_tools == ["calculate_period_variances", "query_cached_10k_context"]
-    assert session.state["fact_check_report"]["passed"] is True
+    # 4. Verify structured report output and after_agent memory duration callback
+    assert session.state.get("financial_analyst_report") is not None
     assert session.state["last_agent_total_duration_ms"] >= 0.0
 
 
@@ -678,16 +674,7 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     tracker.reset()
     get_conversation_memory_manager().reset()
 
-    from edgar_capstone.agents.orchestration import react_loop as react_loop_mod
-
     judge_llm = ScriptedJudgeLlm()
-    orig_eval = react_loop_mod.evaluate_variance_explanation
-
-    def _scripted_bg_eval(**kwargs: Any):
-        kwargs["llm"] = judge_llm
-        return orig_eval(**kwargs)
-
-    monkeypatch.setattr(react_loop_mod, "evaluate_variance_explanation", _scripted_bg_eval)
     patch_http_chat_llms(
         monkeypatch,
         reasoning_llm=ScriptedAnalystLlm(
@@ -723,7 +710,7 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     assert _is_model(turn1["evaluation"]["evaluator_model"], "gemini-3.8-flash")
     assert turn1["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
     assert turn1["context_and_memory"]["turn_context_latency"]["total_calls"] >= 1
-    assert turn1["react_execution"]["judge_mode"] == "async_background"
+    assert turn1["react_execution"]["judge_mode"] == "offline_only"
     assert turn1["evaluation"]["grade"] == "pending"
     assert turn1["evaluation"]["overall_score"] is None
 
@@ -745,9 +732,8 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     assert turn2["context_and_memory"]["session_memory"]["has_prior_memory"] is True
     assert turn2["context_and_memory"]["session_memory"]["turn_count"] == 1
 
-    # Flush async scripted judge tasks so telemetry records reflect both analyst & judge calls
-    flush_pending_evaluations(timeout=10.0)
-    assert judge_llm.call_count == 2
+    # Interactive turns do not spawn a live background judge; judge runs offline in evals.
+    assert judge_llm.call_count == 0
 
     sess_tel_resp = client.get(
         "/api/v1/telemetry/sessions",
@@ -760,7 +746,7 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     assert st_body["event_count"] >= 2
 
     tracker_summary = tracker.summarize()
-    assert tracker_summary.total_calls >= 4
+    assert tracker_summary.total_calls >= 2
     by_model = list(tracker_summary.by_model)
     assert any(_is_model(m, "gemini-3.8-flash") for m in by_model), by_model
 
@@ -769,7 +755,6 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify async background judge updates local telemetry sink from pending/None to scored."""
-    from edgar_capstone.agents.core.schemas import NarrativeEvaluationReport
     from edgar_capstone.agents.orchestration import react_loop
     from edgar_capstone.agents.runtime.live_runtime import AdkStreamResult
     from edgar_capstone.telemetry import get_telemetry_sink
@@ -814,21 +799,6 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
         react_loop.StructuredReActExecutor,
         "_invoke_financial_reasoning",
         lambda self, **_kw: stub_stream,
-    )
-    monkeypatch.setattr(
-        react_loop,
-        "evaluate_variance_explanation",
-        lambda **_kw: NarrativeEvaluationReport(
-            evaluator_model="gemini-3.8-flash",
-            grade="pass",
-            overall_score=0.93,
-            numeric_fidelity_score=1.0,
-            citation_grounding_score=0.95,
-            citation_precision_score=0.95,
-            explanation_quality_score=0.90,
-            thematic_consistency_score=0.88,
-            rationale="Verified async judge result.",
-        ),
     )
 
     sink = get_telemetry_sink()
@@ -876,19 +846,9 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
         skip_background_judge=False,
     )
     eval_rep = result["evaluation_report"]
-    assert result["judge_mode"] == "async_background"
+    assert result["judge_mode"] == "offline_only"
     assert eval_rep.grade == "pending"
     assert eval_rep.overall_score is None
-
-    completed = react_loop.flush_pending_evaluations(timeout=5.0)
-    assert completed >= 1
-    async_evals = sink.recent_async_evaluations(session_id=session_id)
-    assert len(async_evals) == 1
-    assert async_evals[0]["evaluation_grade"] == "pass"
-    assert async_evals[0]["evaluation_score"] == 0.93
-    updated_turns = sink.query_session_telemetry(session_id=session_id)
-    assert updated_turns[0]["evaluation_grade"] == "pass"
-    assert updated_turns[0]["evaluation_score"] == 0.93
     sink.reset_local_buffers()
 
 
@@ -1064,27 +1024,224 @@ def test_react_guided_regeneration_retry_recovers_and_handles_exception(
     assert withheld["answer_markdown"].startswith("### Answer withheld")
 
 
-def test_background_judge_manager_shutdown_and_error_isolation() -> None:
-    """Exercise `_BackgroundJudgeManager` error handling and `shutdown()` cleanly."""
-    from edgar_capstone.agents.orchestration.react_loop import _BackgroundJudgeManager
+def test_partial_rejection_coverage_gap_triggers_repair_and_never_regresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When partial rejections drop an in-scope peer ticker or boundary year, repair runs and preserves usable drafts."""
+    from edgar_capstone.agents.orchestration import react_loop
+    from edgar_capstone.agents.prompts.builders import build_financial_reasoning_prompt
+    from edgar_capstone.agents.runtime.live_runtime import AdkStreamResult
 
-    mgr = _BackgroundJudgeManager(max_workers=1)
-    ran: list[str] = []
+    dal_excerpt = (
+        "Delta operating income rose to $6.0 billion in 2024 on international and premium demand."
+    )
+    ual_excerpt = "United Airlines capacity grew 6.8% in 2024 alongside higher cargo and co-brand card revenue."
+    citations = [
+        {
+            "chunk_id": "DAL_2024_item_7_0001",
+            "ticker": "DAL",
+            "company_name": "Delta Air Lines",
+            "fiscal_year": 2024,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "sec_filing_url": "https://www.sec.gov/dal-2024",
+            "excerpt": dal_excerpt,
+            "score": 0.94,
+        },
+        {
+            "chunk_id": "UAL_2024_item_7_0010",
+            "ticker": "UAL",
+            "company_name": "United Airlines",
+            "fiscal_year": 2024,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "sec_filing_url": "https://www.sec.gov/ual-2024",
+            "excerpt": ual_excerpt,
+            "score": 0.91,
+        },
+    ]
+    # Attempt 1: DAL verifies, UAL fails quote match -> UAL is missing from surviving findings
+    partial_payload = {
+        "headline": "Delta and United grew earnings in 2024.",
+        "intent": "multi_company_peer_comparison",
+        "key_metrics": [],
+        "findings": [
+            {
+                "statement": "Delta grew operating income on international and premium demand.",
+                "ticker": "DAL",
+                "fiscal_year": 2024,
+                "chunk_ids": ["DAL_2024_item_7_0001"],
+                "evidence_quote": dal_excerpt,
+            },
+            {
+                "statement": "United grew earnings on capacity expansion.",
+                "ticker": "UAL",
+                "fiscal_year": 2024,
+                "chunk_ids": ["UAL_2024_item_7_0010"],
+                "evidence_quote": "paraphrased quote that does not exist verbatim in the chunk",
+            },
+        ],
+    }
+    repaired_payload = {
+        "headline": "Delta and United grew earnings in 2024.",
+        "intent": "multi_company_peer_comparison",
+        "key_metrics": [],
+        "findings": [
+            {
+                "statement": "Delta grew operating income on international and premium demand.",
+                "ticker": "DAL",
+                "fiscal_year": 2024,
+                "chunk_ids": ["DAL_2024_item_7_0001"],
+                "evidence_quote": dal_excerpt,
+            },
+            {
+                "statement": "United expanded capacity and co-brand credit card revenue.",
+                "ticker": "UAL",
+                "fiscal_year": 2024,
+                "chunk_ids": ["UAL_2024_item_7_0010"],
+                "evidence_quote": ual_excerpt,
+            },
+        ],
+    }
 
-    def _ok() -> None:
-        ran.append("ok")
+    captured: list[dict[str, Any]] = []
 
-    def _fail() -> None:
-        raise RuntimeError("judge boom")
+    def _invoke_partial_repair(self, **kwargs: Any) -> AdkStreamResult:
+        captured.append(dict(kwargs))
+        payload = partial_payload if len(captured) == 1 else repaired_payload
+        return AdkStreamResult(
+            agent_name="FinancialAnalystAgent",
+            app_name="edgar_chat_app",
+            session_id="sess-partial-repair",
+            backend="vertex_ai",
+            final_text=json.dumps(payload),
+            observed_ttft_ms=40.0,
+            session_state={"financial_analyst_report": payload},
+        )
 
-    mgr.submit(_ok)
-    mgr.submit(_fail)
-    completed = mgr.flush(timeout=5.0)
-    assert completed >= 0
-    assert ran == ["ok"]
-    mgr.shutdown(timeout=2.0)
-    # Submitting after shutdown is safely ignored / handled without crashing
-    mgr.shutdown(timeout=1.0)
+    monkeypatch.setattr(
+        react_loop.StructuredReActExecutor, "_invoke_financial_reasoning", _invoke_partial_repair
+    )
+    res = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="Compare Delta and United operating income in 2024.",
+        intent="multi_company_peer_comparison",
+        scope={
+            "tickers": ["DAL", "UAL"],
+            "tickers_csv": "DAL,UAL",
+            "gics_sector": "ALL",
+            "section_id": "item_7",
+            "start_year": 2024,
+            "end_year": 2024,
+        },
+        variance_reports=[],
+        citations=citations,
+        sector_benchmarks=[],
+        chunk_health=None,
+        skip_background_judge=True,
+    )
+    assert len(captured) == 2
+    assert "UAL" in (captured[1].get("verification_feedback") or "")
+    assert "UAL_2024_item_7_0010" in (captured[1].get("verification_feedback") or "")
+    assert captured[1].get("enable_tools") is False and captured[1].get("low_thinking") is True
+    assert res["answer_verified"] is True
+    assert "UAL_2024_item_7_0010" in res["answer_markdown"]
+    assert "DAL_2024_item_7_0001" in res["answer_markdown"]
+
+    # Non-regression guard: if the repair retry produces an unusable report, keep the original usable draft
+    bad_retry_payload = {
+        "headline": "Broken retry.",
+        "intent": "multi_company_peer_comparison",
+        "key_metrics": [],
+        "findings": [
+            {
+                "statement": "Completely unverified claim.",
+                "ticker": "UAL",
+                "fiscal_year": 2024,
+                "chunk_ids": ["UAL_2024_item_7_0010"],
+                "evidence_quote": "still not in the chunk text at all anywhere",
+            }
+        ],
+    }
+    calls_nr = [0]
+
+    def _invoke_bad_retry(self, **kwargs: Any) -> AdkStreamResult:
+        calls_nr[0] += 1
+        payload = partial_payload if calls_nr[0] == 1 else bad_retry_payload
+        return AdkStreamResult(
+            agent_name="FinancialAnalystAgent",
+            app_name="edgar_chat_app",
+            session_id="sess-partial-nr",
+            backend="vertex_ai",
+            final_text=json.dumps(payload),
+            observed_ttft_ms=40.0,
+            session_state={"financial_analyst_report": payload},
+        )
+
+    monkeypatch.setattr(
+        react_loop.StructuredReActExecutor, "_invoke_financial_reasoning", _invoke_bad_retry
+    )
+    kept = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="Compare Delta and United operating income in 2024.",
+        intent="multi_company_peer_comparison",
+        scope={
+            "tickers": ["DAL", "UAL"],
+            "tickers_csv": "DAL,UAL",
+            "gics_sector": "ALL",
+            "section_id": "item_7",
+            "start_year": 2024,
+            "end_year": 2024,
+        },
+        variance_reports=[],
+        citations=citations,
+        sector_benchmarks=[],
+        chunk_health=None,
+        skip_background_judge=True,
+    )
+    assert calls_nr[0] == 2
+    assert kept["answer_verified"] is True
+    assert "DAL_2024_item_7_0001" in kept["answer_markdown"]
+
+    # Prompt builder prioritizes chunks referenced in verification_feedback with expanded excerpts
+    long_ual = ("United Airlines " + "capacity and mileage revenue growth " * 30).strip()
+    many_cits = [
+        {
+            "chunk_id": f"DAL_2024_item_7_{i:04d}",
+            "ticker": "DAL",
+            "fiscal_year": 2024,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "excerpt": f"Filler passage {i}.",
+        }
+        for i in range(15)
+    ] + [
+        {
+            "chunk_id": "UAL_2024_item_7_0010",
+            "ticker": "UAL",
+            "fiscal_year": 2024,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "excerpt": long_ual,
+        }
+    ]
+    repair_prompt = build_financial_reasoning_prompt(
+        query="Compare Delta and United.",
+        intent="multi_company_peer_comparison",
+        scope={
+            "tickers": ["DAL", "UAL"],
+            "tickers_csv": "DAL,UAL",
+            "start_year": 2024,
+            "end_year": 2024,
+        },
+        variance_reports=[],
+        variance_evaluations=[],
+        cached_explanations=[],
+        citations=many_cits,
+        sector_benchmarks=[],
+        chunk_health=None,
+        verification_feedback="- Finding 1 (UAL FY2024, chunks=[UAL_2024_item_7_0010]): quote mismatch",
+    )
+    assert "UAL_2024_item_7_0010" in repair_prompt
+    assert long_ual[:900] in repair_prompt
 
 
 def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(

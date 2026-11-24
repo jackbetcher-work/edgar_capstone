@@ -78,9 +78,6 @@ class LocalModelArmorEmulatorTransport(httpx.BaseTransport):
         raw_body = request.content.decode("utf-8") if request.content else "{}"
         payload = json.loads(raw_body) if raw_body.strip() else {}
 
-        if "dlp.googleapis.com" in url_str:
-            return self._handle_dlp_request(url_str, payload)
-
         if ":sanitizeUserPrompt" in url_str:
             text = str((payload.get("userPromptData") or {}).get("text") or "")
             return httpx.Response(
@@ -95,26 +92,6 @@ class LocalModelArmorEmulatorTransport(httpx.BaseTransport):
 
         return httpx.Response(
             404, json={"error": {"code": 404, "message": f"Unknown endpoint: {url_str}"}}
-        )
-
-    def _handle_dlp_request(self, url_str: str, payload: dict[str, Any]) -> httpx.Response:
-        if not url_str.endswith(":deidentify"):
-            return httpx.Response(
-                404, json={"error": {"code": 404, "message": "Unsupported DLP operation"}}
-            )
-        text = str((payload.get("item") or {}).get("value") or "")
-        spans = _detect_sensitive_spans(text)
-        redacted = _redact_spans(text, spans)
-        summaries = [
-            {"infoType": {"name": info_type}, "results": [{"count": "1", "code": "SUCCESS"}]}
-            for _, _, info_type in spans
-        ]
-        return httpx.Response(
-            200,
-            json={
-                "item": {"value": redacted},
-                "overview": {"transformationSummaries": summaries},
-            },
         )
 
     def _build_sanitization_response(self, text: str, *, is_user_prompt: bool) -> dict[str, Any]:

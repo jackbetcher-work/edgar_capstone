@@ -77,7 +77,6 @@ from edgar_capstone.gcp.discovery_engine import (
     DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID,
     DEFAULT_VERTEX_AI_SEARCH_LOCATION,
 )
-from edgar_capstone.telemetry import get_telemetry_sink
 from edgar_capstone.vector_db.chunker import (
     estimate_token_count,
     extract_sections_from_combined_markdown,
@@ -105,15 +104,8 @@ _SUPPORTED_ANALYTICS_VIEWS = frozenset(
         "sector_benchmarks",
         "peer_comparison",
         "chunk_health",
-        "llm_telemetry",
-        "session_analytics",
-        "audit_trail",
     }
 )
-_ANALYTICS_VIEW_ALIASES: dict[str, str] = {
-    "llm_telemetry_and_cost": "llm_telemetry",
-    "security_audit_logs": "audit_trail",
-}
 
 
 class _TrackedSectionCache(BoundedTTLCache[str, dict[str, Any]]):
@@ -149,21 +141,17 @@ class _TrackedSectionCache(BoundedTTLCache[str, dict[str, Any]]):
 
 @dataclass(slots=True)
 class _ContextCacheRuntimeStats:
-    """Thread-safe runtime hit/miss, token-savings, and latency metrics backed by `CacheMetrics`."""
+    """Thread-safe runtime hit/miss and latency metrics for the process-local L1 section cache."""
 
     metrics: CacheMetrics = field(default_factory=CacheMetrics)
-    cached_tokens_saved: int = 0
     total_hit_latency_ms: float = 0.0
     total_miss_latency_ms: float = 0.0
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def record_hit(self, *, token_estimate: int, latency_ms: float) -> int:
-        saved_delta = int(token_estimate * 0.75)
+    def record_hit(self, *, token_estimate: int, latency_ms: float) -> None:
         self.metrics.record_hit(token_estimate)
         with self._lock:
-            self.cached_tokens_saved += saved_delta
             self.total_hit_latency_ms += latency_ms
-        return saved_delta
 
     def record_miss(self, *, token_estimate: int, latency_ms: float) -> None:
         self.metrics.record_miss(token_estimate)
@@ -175,7 +163,6 @@ class _ContextCacheRuntimeStats:
         with self._lock:
             return {
                 **base,
-                "cached_tokens_saved": self.cached_tokens_saved,
                 "total_hit_latency_ms": self.total_hit_latency_ms,
                 "total_miss_latency_ms": self.total_miss_latency_ms,
             }
@@ -241,7 +228,6 @@ def get_context_cache_runtime_stats() -> dict[str, Any]:
         "hits": hits,
         "misses": misses,
         "hit_rate": round(hits / total, 4) if total > 0 else 0.0,
-        "cached_tokens_saved": int(counters["cached_tokens_saved"]),
         "mean_hit_lookup_latency_ms": round(hit_ms / hits, 3) if hits > 0 else 0.0,
         "mean_miss_load_latency_ms": round(miss_ms / misses, 3) if misses > 0 else 0.0,
     }
@@ -271,7 +257,6 @@ def _update_context_cache_state(
     tool_context: ToolContext | None,
     *,
     cache_hit: bool,
-    saved_tokens_delta: int,
     lookup_latency_ms: float,
     cache_key: str,
 ) -> None:
@@ -280,12 +265,11 @@ def _update_context_cache_state(
     stats = dict(
         tool_context.state.get(
             "context_cache_stats",
-            {"hits": 0, "misses": 0, "cached_tokens_saved": 0},
+            {"hits": 0, "misses": 0},
         )
     )
     if cache_hit:
         stats["hits"] = int(stats.get("hits", 0)) + 1
-        stats["cached_tokens_saved"] = int(stats.get("cached_tokens_saved", 0)) + saved_tokens_delta
     else:
         stats["misses"] = int(stats.get("misses", 0)) + 1
     stats["last_lookup_latency_ms"] = lookup_latency_ms
@@ -294,58 +278,8 @@ def _update_context_cache_state(
 
 
 # ---------------------------------------------------------------------------
-# Analytics View Dispatch Helpers (BigQuery SQL Views & Telemetry Store)
+# Analytics View Dispatch Helpers (BigQuery SQL Views)
 # ---------------------------------------------------------------------------
-
-
-def _query_telemetry_explore(explore_key: str, ticker_filter: set[str]) -> dict[str, Any]:
-    sink = get_telemetry_sink()
-    if explore_key == "llm_telemetry":
-        rows = sink.query_llm_telemetry_explore(limit=50)
-        return {
-            "status": "success",
-            "explore_name": "llm_telemetry",
-            "lookml_model": "sec_edgar_analytics",
-            "lookml_explore": "llm_telemetry_and_cost",
-            "row_count": len(rows),
-            "rows": rows,
-        }
-    if explore_key == "session_analytics":
-        rows = sink.query_session_telemetry(limit=50)
-        if ticker_filter:
-            rows = [
-                r
-                for r in rows
-                if ticker_filter.intersection(
-                    {normalize_edgar_ticker(str(t)) for t in (r.get("tickers_analyzed") or [])}
-                )
-            ]
-        return {
-            "status": "success",
-            "explore_name": "session_analytics",
-            "lookml_model": "sec_edgar_analytics",
-            "lookml_explore": "session_analytics",
-            "summary": sink.summarize_session_telemetry(),
-            "row_count": len(rows),
-            "rows": rows,
-        }
-    rows = sink.query_security_audit_logs(limit=50)
-    if ticker_filter:
-        rows = [
-            r
-            for r in rows
-            if ticker_filter.intersection(
-                {normalize_edgar_ticker(str(t)) for t in (r.get("tickers") or [])}
-            )
-        ]
-    return {
-        "status": "success",
-        "explore_name": "audit_trail",
-        "lookml_model": "sec_edgar_analytics",
-        "lookml_explore": "security_audit_logs",
-        "row_count": len(rows),
-        "rows": rows,
-    }
 
 
 def _query_bigquery_explore(
@@ -446,10 +380,10 @@ def query_analytics_view(
     end_year: int,
     tool_context: ToolContext | None = None,
 ) -> dict[str, Any]:
-    """Queries BigQuery analytics and telemetry views for YoY variances, sector benchmarks, peer comparisons, chunk health, telemetry/cost, session analytics, or audit trail.
+    """Queries BigQuery analytics views for YoY variances, sector benchmarks, peer comparisons, or chunk health.
 
     Args:
-        explore_name: Analytics view to query: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', 'chunk_health', 'llm_telemetry', 'session_analytics', or 'audit_trail'.
+        explore_name: Analytics view to query: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', or 'chunk_health'.
         tickers: Comma-separated ticker symbols (e.g., 'NVDA,AMD,AVGO') or 'ALL'.
         gics_sector: GICS Sector filter (e.g., 'Information Technology', 'Financials') or 'ALL'.
         start_year: Earliest fiscal year to include (e.g., 2024).
@@ -458,36 +392,31 @@ def query_analytics_view(
     Returns:
         Dictionary with 'status', 'explore_name', 'row_count', and 'rows' from the requested analytics view.
     """
-    raw_explore_key = explore_name.strip().lower()
-    explore_key = _ANALYTICS_VIEW_ALIASES.get(raw_explore_key, raw_explore_key)
+    explore_key = explore_name.strip().lower()
     if explore_key not in _SUPPORTED_ANALYTICS_VIEWS:
         return {
             "status": "error",
             "explore_name": explore_name,
             "message": (
                 f"Unsupported explore_name '{explore_name}'. "
-                "Supported: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', "
-                "'chunk_health', 'llm_telemetry', 'session_analytics', 'audit_trail'."
+                "Supported: 'yoy_variances', 'sector_benchmarks', 'peer_comparison', 'chunk_health'."
             ),
         }
 
     ticker_filter = _parse_ticker_list(tickers)
-    if explore_key in ("llm_telemetry", "session_analytics", "audit_trail"):
-        result = _query_telemetry_explore(explore_key, ticker_filter)
-    else:
-        result = _query_bigquery_explore(
-            explore_key,
-            ticker_filter=ticker_filter,
-            sector_norm=_normalize_sector_filter(gics_sector),
-            start_year=start_year,
-            end_year=end_year,
-        )
-        _record_gcp_backend_invocation(
-            tool_context,
-            tool_name="query_analytics_view",
-            data_source="gcp",
-            services_hit=["bigquery"],
-        )
+    result = _query_bigquery_explore(
+        explore_key,
+        ticker_filter=ticker_filter,
+        sector_norm=_normalize_sector_filter(gics_sector),
+        start_year=start_year,
+        end_year=end_year,
+    )
+    _record_gcp_backend_invocation(
+        tool_context,
+        tool_name="query_analytics_view",
+        data_source="gcp",
+        services_hit=["bigquery"],
+    )
 
     if tool_context is not None and hasattr(tool_context, "state"):
         if explore_key == "chunk_health":
@@ -498,10 +427,6 @@ def query_analytics_view(
             history.append(result)
             tool_context.state[STATE_ANALYTICS_VIEW_RESULTS] = history
     return result
-
-
-# Backward-compatible deprecated alias (prefer `query_analytics_view`).
-query_looker_financial_explore = query_analytics_view
 
 
 @with_tool_resilience(tool_name="calculate_period_variances")
@@ -756,9 +681,8 @@ def load_cached_10k_section(
     excerpt = str(entry["full_text"])[:effective_max]
     lookup_latency_ms = round((time.perf_counter() - t0) * 1000.0, 3)
 
-    saved_tokens_delta = 0
     if cache_hit:
-        saved_tokens_delta = _CONTEXT_CACHE_STATS.record_hit(
+        _CONTEXT_CACHE_STATS.record_hit(
             token_estimate=int(entry["token_estimate"]),
             latency_ms=lookup_latency_ms,
         )
@@ -771,7 +695,6 @@ def load_cached_10k_section(
     _update_context_cache_state(
         tool_context,
         cache_hit=cache_hit,
-        saved_tokens_delta=saved_tokens_delta,
         lookup_latency_ms=lookup_latency_ms,
         cache_key=cache_id,
     )
@@ -1004,9 +927,8 @@ def query_cached_10k_context(
         )
 
     total_lookup_ms = round((time.perf_counter() - t0) * 1000.0, 3)
-    saved_tokens_delta = 0
     if cache_hit:
-        saved_tokens_delta = _CONTEXT_CACHE_STATS.record_hit(
+        _CONTEXT_CACHE_STATS.record_hit(
             token_estimate=int(cached_chunks_entry["token_estimate"]),
             latency_ms=total_lookup_ms,
         )
@@ -1018,7 +940,6 @@ def query_cached_10k_context(
     _update_context_cache_state(
         tool_context,
         cache_hit=cache_hit,
-        saved_tokens_delta=saved_tokens_delta,
         lookup_latency_ms=total_lookup_ms,
         cache_key=cache_key,
     )
@@ -1106,7 +1027,6 @@ __all__ = [
     "parse_10k_cache_key",
     "query_analytics_view",
     "query_cached_10k_context",
-    "query_looker_financial_explore",
     "reset_gcp_tool_adapters",
     "search_10k_chunks_rag",
 ]

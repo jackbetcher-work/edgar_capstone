@@ -18,13 +18,11 @@ from edgar_capstone.agents.core.schemas import (
 )
 from edgar_capstone.agents.prompts.store import make_adk_instruction_provider
 from edgar_capstone.agents.runtime.callbacks import (
-    after_model_fact_check_callback,
     after_model_telemetry_callback,
     agent_tool_progress_before_tool_callback,
     agent_tool_timing_after_tool_callback,
     before_agent_telemetry_callback,
     before_model_telemetry_callback,
-    before_tool_agent_identity_callback,
     retrieval_budget_before_tool_callback,
 )
 from edgar_capstone.agents.runtime.context_memory import after_agent_memory_callback
@@ -37,7 +35,6 @@ from edgar_capstone.agents.tools.material_variances import AnomalyFlagTool
 from edgar_capstone.agents.tools.sec_tools import (
     AnalyticsViewQueryTool,
     HybridSearchTool,
-    MetricFetchTool,
     QueryCached10KTool,
     VarianceCalculationTool,
 )
@@ -63,24 +60,10 @@ def build_edgar_agent(
     generate_content_config: genai_types.GenerateContentConfig | None = None,
     before_tool_callback: Any | None = None,
     after_tool_callback: Any | None = None,
-    include_fact_check_callback: bool = True,
 ) -> Agent:
-    """Build an ADK `Agent` with dynamic model resolution, versioned prompt, and standard callbacks.
-
-    Model Armor prompt/response guardrails are owned at the ADK `App`/`Runner` plugin layer by
-    `ModelArmorSafetyPlugin`, so every agent attaches `before_model_telemetry_callback` to measure
-    input context breakdown and start timers. When `include_fact_check_callback=False` (used by
-    `NarrativeEvaluatorAgent`), the agent also uses `after_model_telemetry_callback` so it records
-    exact TTFT/tokens/cost into `ContextLatencyTracker` without running `parse_analyst_report()` or
-    `verify_narrative_against_calculations()` on judge JSON.
-    """
+    """Build an ADK `Agent` with dynamic model resolution, versioned prompt, and standard callbacks."""
     resolved_model: str | BaseLlm = (
         model if model is not None else resolve_model_for_task(task_category)
-    )
-    after_model_cb = (
-        after_model_fact_check_callback
-        if include_fact_check_callback
-        else after_model_telemetry_callback
     )
     kwargs: dict[str, Any] = {
         "name": name,
@@ -90,7 +73,7 @@ def build_edgar_agent(
         "before_agent_callback": before_agent_telemetry_callback,
         "after_agent_callback": after_agent_memory_callback,
         "before_model_callback": before_model_telemetry_callback,
-        "after_model_callback": after_model_cb,
+        "after_model_callback": after_model_telemetry_callback,
     }
     if tools:
         kwargs["tools"] = list(tools)
@@ -137,7 +120,6 @@ def create_financial_analyst_agent(
         [
             VarianceCalculationTool,
             AnomalyFlagTool,
-            MetricFetchTool,
             AnalyticsViewQueryTool,
             # Targeted retrieval only: ranked passages and hybrid search, each returning
             # chunk_ids. Whole-section loading (`load_cached_10k_section`) stays with the
@@ -180,7 +162,6 @@ def create_financial_analyst_agent(
         output_key="financial_analyst_report",
         before_tool_callback=(
             [
-                before_tool_agent_identity_callback,
                 retrieval_budget_before_tool_callback,
                 agent_tool_progress_before_tool_callback,
             ]
@@ -188,7 +169,6 @@ def create_financial_analyst_agent(
             else None
         ),
         after_tool_callback=agent_tool_timing_after_tool_callback if enable_tools else None,
-        include_fact_check_callback=True,
     )
 
 
@@ -198,12 +178,7 @@ def create_narrative_evaluator_agent(
     model: str | BaseLlm | None = None,
     prompt_version: str | None = None,
 ) -> Agent:
-    """Create the `NarrativeEvaluatorAgent` ADK `LlmAgent` (`gemini-3.8-flash`, `ThinkingLevel.LOW`).
-
-    Wired with telemetry-only model callbacks (`include_fact_check_callback=False`) so judge
-    calls record exact TTFT, tokens, and USD cost in `ContextLatencyTracker` without firing
-    redundant Model Armor HTTP checks or `AnalystReport` parsing on the judge's JSON output.
-    """
+    """Create the `NarrativeEvaluatorAgent` ADK `LlmAgent` (`gemini-3.8-flash`, `ThinkingLevel.LOW`)."""
     resolved_model: str | BaseLlm = (
         model if model is not None else resolve_model_for_task("evaluation")
     )
@@ -225,7 +200,6 @@ def create_narrative_evaluator_agent(
             max_output_tokens=8192,
             thinking_config=low_thinking_config_for_model(resolved_model),
         ),
-        include_fact_check_callback=False,
     )
 
 

@@ -85,7 +85,7 @@ def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() 
         chunk_health=None,
     )
     assert "<10k_section" not in prompt
-    assert "query_cached_10k_context(" in prompt and "search_10k_chunks_rag(" in prompt
+    assert "## Evidence Coverage" in prompt
     # Leads are capped in count (12) and length (850 chars) and point at citable chunk ids
     assert prompt.count('"chunk_id": "NVDA_2026_item_7_') == 12
     assert long_excerpt[:900] not in prompt

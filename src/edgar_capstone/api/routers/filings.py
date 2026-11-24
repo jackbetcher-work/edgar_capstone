@@ -102,12 +102,7 @@ def get_cached_section(
     fiscal_year: int = Query(2026, ge=2015, le=2035),
     section_id: Literal["item_1a", "item_7"] = Query("item_7"),
     max_chars: int = Query(32000, ge=500, le=50000),
-    user: AuthenticatedUser = Depends(
-        require_permissions(
-            Permission.FILINGS_READ.value,
-            agent_tool="load_cached_10k_section",
-        )
-    ),
+    user: AuthenticatedUser = Depends(require_permissions(Permission.FILINGS_READ.value)),
 ) -> dict[str, Any]:
     """Load a cached 10-K filing section (Item 1A Risk Factors or Item 7 MD&A) for the split-pane viewer."""
     norm_ticker = normalize_edgar_ticker(ticker)

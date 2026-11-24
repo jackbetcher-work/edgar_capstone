@@ -238,11 +238,15 @@ def test_end_to_end_pipeline_local_and_mock_gcs(tmp_path: Path) -> None:
     fake_filing_2019.obj.assert_not_called()
 
     md_file = tmp_path / "unstructured" / "NVDA" / "2026_10k.md"
+    item_1a_file = tmp_path / "unstructured" / "NVDA" / "2026_item_1a.md"
+    item_7_file = tmp_path / "unstructured" / "NVDA" / "2026_item_7.md"
     json_file = tmp_path / "structured" / "NVDA" / "2026_financials.json"
     vais_manifest = tmp_path / "manifests" / "vertex_ai_search_metadata.jsonl"
     bq_manifest = tmp_path / "manifests" / "bigquery_financials.jsonl"
 
     assert md_file.exists()
+    assert item_1a_file.exists()
+    assert item_7_file.exists()
     assert json_file.exists()
     assert vais_manifest.exists()
     assert bq_manifest.exists()
@@ -256,14 +260,24 @@ def test_end_to_end_pipeline_local_and_mock_gcs(tmp_path: Path) -> None:
         == "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"
     )
 
-    vais_payload = json.loads(vais_manifest.read_text(encoding="utf-8").strip())
-    assert re.match(r"^[a-zA-Z0-9_-]+$", vais_payload["id"])
-    assert vais_payload["content"]["mimeType"] == "text/plain"
-    assert (
-        vais_payload["content"]["uri"]
-        == "gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_10k.md"
-    )
-    assert vais_payload["structData"]["revenue"] == 215938000000.0
+    vais_lines = [
+        json.loads(line)
+        for line in vais_manifest.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(vais_lines) == 2
+    by_sec = {rec["structData"]["section_id"]: rec for rec in vais_lines}
+    assert set(by_sec) == {"item_1a", "item_7"}
+    for sec_id, vais_payload in by_sec.items():
+        assert re.match(r"^[a-zA-Z0-9_-]+$", vais_payload["id"])
+        assert vais_payload["id"] == f"NVDA_2026_{sec_id}"
+        assert vais_payload["content"]["mimeType"] == "text/plain"
+        assert (
+            vais_payload["content"]["uri"]
+            == f"gs://fde-sec-edgar-sandbox-dev-sec-corpus/unstructured/NVDA/2026_{sec_id}.md"
+        )
+        assert vais_payload["structData"]["extracted_sections"] == [sec_id]
+        assert vais_payload["structData"]["revenue"] == 215938000000.0
 
     # Step 2: Run --upload-only with a mocked GCS Client (verifying bucket creation + blob uploads)
     mock_client = MagicMock()
@@ -293,7 +307,9 @@ def test_end_to_end_pipeline_local_and_mock_gcs(tmp_path: Path) -> None:
     summary_upload = run_dataset_pipeline(upload_cfg, storage_client=mock_client)
 
     assert summary_upload.uploaded_to_gcs is True
-    assert summary_upload.uploaded_blob_count == 5  # 1 md + 1 json + 3 manifest files
+    assert (
+        summary_upload.uploaded_blob_count == 7
+    )  # 1 combined + 2 section mds + 1 json + 3 manifests
     assert mock_bucket.iam_configuration.uniform_bucket_level_access_enabled is True
     mock_client.create_bucket.assert_called_once_with(
         mock_bucket,
@@ -301,6 +317,8 @@ def test_end_to_end_pipeline_local_and_mock_gcs(tmp_path: Path) -> None:
         location="us-central1",
     )
     assert "unstructured/NVDA/2026_10k.md" in uploaded_blobs
+    assert "unstructured/NVDA/2026_item_1a.md" in uploaded_blobs
+    assert "unstructured/NVDA/2026_item_7.md" in uploaded_blobs
     assert "structured/NVDA/2026_financials.json" in uploaded_blobs
     assert "manifests/vertex_ai_search_metadata.jsonl" in uploaded_blobs
     assert "manifests/bigquery_financials.jsonl" in uploaded_blobs

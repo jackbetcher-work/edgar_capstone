@@ -258,10 +258,10 @@ def test_build_coverage_notices_covers_missing_fy2026_calendar_misalignment_and_
         query="Compare NVDA and META R&D expense from 2024 to 2026",
         sector_coverage={
             "gics_sector": "Information Technology",
-            "total_sector_companies": 76,
-            "companies_analyzed": 76,
-            "companies_with_matches": 58,
-            "batches_executed": 6,
+            "issuers_in_sector": 76,
+            "issuers_analyzed": 76,
+            "issuers_with_theme_matches": 58,
+            "batches_processed": 6,
         },
     )
     codes = {n["code"] for n in notices}
@@ -270,6 +270,9 @@ def test_build_coverage_notices_covers_missing_fy2026_calendar_misalignment_and_
     assert "fiscal_calendar_misalignment" in codes
     assert "missing_metric" in codes
     assert "sector_coverage_summary" in codes
+    sec_notice = next(n for n in notices if n["code"] == "sector_coverage_summary")
+    assert "76/76 Information Technology issuers" in sec_notice["message"]
+    assert "58 with theme matches" in sec_notice["message"]
     rd_notice = next(n for n in notices if n["code"] == "missing_metric")
     assert rd_notice["tickers"] == ["META"]
     fy_msg = next(n["message"] for n in notices if n["code"] == "missing_fiscal_year")

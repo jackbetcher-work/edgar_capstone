@@ -18,12 +18,10 @@ const AUTH_CONFIG_OPEN = {
   auth_required: false,
   access_pattern: 'iap_jwt_bearer',
   identity_provider: {
-    name: 'Google Workspace (Okta SSO)',
-    protocol: 'OIDC / SAML-Federated Workspace + IAP',
+    name: 'Google Workspace / Cloud IAP',
+    protocol: 'Google Workspace OIDC + Direct Cloud Run IAP',
     google_issuer: 'https://accounts.google.com',
     iap_issuer: 'https://cloud.google.com/iap',
-    okta_issuer: null,
-    okta_client_id: null,
     google_client_id: null,
     authorization_endpoint: null,
     allowed_workspace_domains: [],
@@ -120,9 +118,10 @@ const CHAT_RESPONSE = {
   ],
   sector_coverage: {
     gics_sector: 'Information Technology',
-    total_sector_companies: 76,
-    companies_analyzed: 76,
-    companies_with_matches: 58,
+    issuers_in_sector: 76,
+    issuers_analyzed: 76,
+    issuers_with_theme_matches: 58,
+    batches_processed: 6,
   },
   variance_reports: [
     {
@@ -279,9 +278,15 @@ function mockBackend(overrides: RouteOverrides = {}) {
             {
               event: 'progress',
               data: {
-                stage: 'sector_map',
+                stage: 'sector_map_progress',
                 message: '28/76 Information Technology companies analyzed (batch 2/6)',
-                meta: { companies_analyzed: 28, total_companies: 76 },
+                meta: {
+                  analyzed: 28,
+                  total: 76,
+                  issuers_in_sector: 76,
+                  batch_completed: 2,
+                  total_batches: 6,
+                },
                 elapsed_ms: 420,
               },
             },

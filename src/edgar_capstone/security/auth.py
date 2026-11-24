@@ -27,13 +27,6 @@ from edgar_capstone.common.domain import sha256_text
 from edgar_capstone.common.env import env_bool, split_csv_env
 from edgar_capstone.gcp.defaults import DEFAULT_PROJECT_ID, DEFAULT_PROJECT_NAME
 from edgar_capstone.observability.tracing import traced
-from edgar_capstone.security.agent_identity import (
-    S2S_AGENT_ASSERTION_HEADER,
-    AgentAuthorizationError,
-    get_agent_s2s_broker,
-    resolve_agent_by_service_account_id,
-    resolve_agent_identity,
-)
 from edgar_capstone.security.jwt_codec import (
     PublicKey,
     b64url_decode,
@@ -91,10 +84,7 @@ _AUTH_ENV_KEYS: tuple[str, ...] = (
     "EDGAR_ENABLE_LOCAL_SSO_DEV_BROKER",
     "INTERNAL_IAP_AUDIENCE",
     "ADDITIONAL_IAP_AUDIENCES",
-    "OKTA_CLIENT_ID",
     "GOOGLE_OAUTH_CLIENT_ID",
-    "OKTA_ISSUER_URI",
-    "OKTA_JWKS_URI",
     "ALLOWED_WORKSPACE_DOMAINS",
     "REQUIRED_ANALYST_GROUPS",
     "ADMIN_CLOUD_IDENTITY_GROUPS",
@@ -142,14 +132,6 @@ def _sanitize_www_auth_value(raw: str, *, max_len: int = 200) -> str:
     return collapsed.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _derive_okta_endpoints(okta_issuer_uri: str) -> tuple[str, str]:
-    """Derive Okta JWKS URI and OAuth2 authorization endpoint from an Okta issuer URL."""
-    issuer = okta_issuer_uri.strip().rstrip("/")
-    if "/oauth2/" in issuer:
-        return f"{issuer}/v1/keys", f"{issuer}/v1/authorize"
-    return f"{issuer}/oauth2/v1/keys", f"{issuer}/oauth2/v1/authorize"
-
-
 def is_production_iap_mode() -> bool:
     """Return True when running in Cloud Run or when strict IAP mode is enabled."""
     if os.environ.get("K_SERVICE"):
@@ -170,9 +152,6 @@ class AuthSettings:
     """Runtime authentication and authorization settings loaded from environment variables."""
 
     audiences: tuple[str, ...]
-    okta_issuer_uri: str | None
-    okta_jwks_uri: str | None
-    okta_client_id: str | None
     google_oauth_client_id: str | None
     allowed_workspace_domains: tuple[str, ...]
     required_analyst_groups: tuple[str, ...]
@@ -204,7 +183,6 @@ class AuthSettings:
     def from_env(cls) -> AuthSettings:
         strict_mode = is_production_iap_mode()
         raw_iap_aud = os.environ.get("INTERNAL_IAP_AUDIENCE", "").strip()
-        okta_client_id = os.environ.get("OKTA_CLIENT_ID", "").strip() or None
         google_client_id = os.environ.get("GOOGLE_OAUTH_CLIENT_ID", "").strip() or None
         extra_audiences = split_csv_env(os.environ.get("ADDITIONAL_IAP_AUDIENCES"))
 
@@ -212,20 +190,11 @@ class AuthSettings:
         for candidate in (*split_csv_env(raw_iap_aud), *extra_audiences):
             if candidate and candidate not in aud_list:
                 aud_list.append(candidate)
-        for cid in (okta_client_id, google_client_id):
-            if cid and cid not in aud_list:
-                aud_list.append(cid)
+        if google_client_id and google_client_id not in aud_list:
+            aud_list.append(google_client_id)
 
         if not aud_list and not strict_mode:
             aud_list.append(DEFAULT_LOCAL_IAP_AUDIENCE)
-
-        okta_issuer = os.environ.get("OKTA_ISSUER_URI", "").strip().rstrip("/") or None
-        if okta_issuer and not okta_issuer.startswith("https://"):
-            raise ValueError("OKTA_ISSUER_URI must use https://")
-
-        okta_jwks = os.environ.get("OKTA_JWKS_URI", "").strip() or None
-        if okta_issuer and not okta_jwks:
-            okta_jwks, _ = _derive_okta_endpoints(okta_issuer)
 
         allowed_domains = tuple(
             d.lower() for d in split_csv_env(os.environ.get("ALLOWED_WORKSPACE_DOMAINS"))
@@ -274,9 +243,6 @@ class AuthSettings:
 
         return cls(
             audiences=tuple(aud_list),
-            okta_issuer_uri=okta_issuer,
-            okta_jwks_uri=okta_jwks,
-            okta_client_id=okta_client_id,
             google_oauth_client_id=google_client_id,
             allowed_workspace_domains=allowed_domains,
             required_analyst_groups=required_groups,
@@ -303,10 +269,7 @@ class AuthSettings:
         )
 
     def authorization_endpoint(self) -> str | None:
-        """Return the external OIDC authorization URL when Okta or Google OAuth is configured."""
-        if self.okta_issuer_uri and self.okta_client_id:
-            _, auth_url = _derive_okta_endpoints(self.okta_issuer_uri)
-            return auth_url
+        """Return the Google OAuth authorization URL when Google OAuth is configured."""
         if self.google_oauth_client_id:
             return "https://accounts.google.com/o/oauth2/v2/auth"
         return None
@@ -756,11 +719,6 @@ class IAPJwtVerifier:
         if issuer in GOOGLE_WORKSPACE_ISSUERS:
             return GOOGLE_WORKSPACE_JWKS_URI, "google_workspace_oidc"
 
-        if self.settings.okta_issuer_uri and issuer.rstrip("/") == self.settings.okta_issuer_uri:
-            if not self.settings.okta_jwks_uri:
-                raise AuthenticationError("Okta JWKS URI is not configured on the server.")
-            return self.settings.okta_jwks_uri, "okta_sso"
-
         if not self.settings.strict_production_mode and issuer == LOCAL_DEV_SSO_ISSUER:
             return f"{LOCAL_DEV_SSO_ISSUER}/.well-known/jwks.json", "local_workspace_okta_dev"
 
@@ -887,21 +845,7 @@ class IAPJwtVerifier:
                 ("authenticated", "service_account", "analyst"),
                 tuple(sorted(ANALYST_PERMISSIONS)),
                 None,
-                f"spiffe://{project_name}.svc.id.goog/ns/sec-edgar/sa/{account_id}",
-            )
-
-        agent_spec = resolve_agent_by_service_account_id(account_id)
-        if agent_spec is not None:
-            return (
-                (
-                    "authenticated",
-                    "service_account",
-                    "agent",
-                    f"agent:{agent_spec.agent_name}",
-                ),
-                tuple(sorted(agent_spec.api_permissions)),
-                agent_spec.agent_name,
-                agent_spec.spiffe_id(project_name),
+                None,
             )
 
         if account_id == "sec-edgar-cicd-sa":
@@ -909,7 +853,7 @@ class IAPJwtVerifier:
                 ("authenticated", "service_account", "cicd_probe"),
                 (Permission.RBAC_INSPECT.value,),
                 None,
-                f"spiffe://{project_name}.svc.id.goog/ns/sec-edgar/sa/{account_id}",
+                None,
             )
 
         if is_explicitly_allowed:
@@ -917,13 +861,12 @@ class IAPJwtVerifier:
                 ("authenticated", "service_account"),
                 (Permission.FILINGS_READ.value, Permission.RBAC_INSPECT.value),
                 None,
-                f"spiffe://{project_name}.svc.id.goog/ns/sec-edgar/sa/{account_id}",
+                None,
             )
 
         raise AuthorizationError(
             f"Unrecognized service account {email!r}; only custom runtime SA "
-            f"'{CUSTOM_RUNTIME_SA_ACCOUNT_ID}@<project>.iam.gserviceaccount.com' and registered "
-            "per-agent service accounts are authorized."
+            f"'{CUSTOM_RUNTIME_SA_ACCOUNT_ID}@<project>.iam.gserviceaccount.com' is authorized."
         )
 
     def _enforce_workspace_and_rbac(
@@ -1204,66 +1147,6 @@ def require_authenticated_user(
                 spiffe_id=user.spiffe_id,
             )
 
-        # Per-agent S2S Least Privilege attenuation: when a service-to-service request
-        # carries an `X-Agent-Identity-Assertion` JWT, verify it cryptographically and
-        # attenuate effective permissions strictly to that agent's least-privilege scope.
-        s2s_assertion = request.headers.get(S2S_AGENT_ASSERTION_HEADER, "").strip()
-        if s2s_assertion:
-            if "service_account" not in user.roles:
-                raise AuthorizationError(
-                    f"{S2S_AGENT_ASSERTION_HEADER} header is restricted to service-to-service "
-                    "service account principals."
-                )
-            try:
-                s2s_claims = get_agent_s2s_broker().verify_s2s_assertion(s2s_assertion)
-            except AgentAuthorizationError as exc:
-                raise AuthorizationError(exc.message) from exc
-            except (ValueError, KeyError, TypeError, AttributeError) as exc:
-                raise AuthorizationError(
-                    f"Invalid {S2S_AGENT_ASSERTION_HEADER} assertion: {exc}"
-                ) from exc
-
-            # If Bearer token is itself a per-agent SA, ensure it matches the S2S assertion agent
-            if user.agent_identity and user.agent_identity != s2s_claims.agent_name:
-                raise AuthenticationError(
-                    f"Agent identity mismatch between Bearer SA ({user.agent_identity}) "
-                    f"and {S2S_AGENT_ASSERTION_HEADER} ({s2s_claims.agent_name})."
-                )
-
-            attenuated_permissions = tuple(
-                sorted(set(user.permissions).intersection(s2s_claims.permissions))
-            )
-            agent_roles = tuple(
-                dict.fromkeys(
-                    (
-                        "authenticated",
-                        "service_account",
-                        "agent",
-                        f"agent:{s2s_claims.agent_name}",
-                    )
-                )
-            )
-            user = AuthenticatedUser(
-                sub=user.sub,
-                email=user.email,
-                name=user.name,
-                hosted_domain=user.hosted_domain,
-                identity_provider=user.identity_provider,
-                sso_federation="gcp_agent_workload_identity",
-                issuer=user.issuer,
-                audience=user.audience,
-                groups=user.groups,
-                roles=agent_roles,
-                issued_at=user.issued_at,
-                expires_at=min(user.expires_at, s2s_claims.expires_at),
-                token_fingerprint=user.token_fingerprint,
-                iap_assertion_verified=user.iap_assertion_verified,
-                permissions=attenuated_permissions,
-                cloud_identity_groups=user.cloud_identity_groups,
-                agent_identity=s2s_claims.agent_name,
-                spiffe_id=s2s_claims.spiffe_id,
-            )
-
         request.state.authenticated_user = user
         request.state.raw_bearer_token = raw_bearer
         return user
@@ -1313,11 +1196,8 @@ def require_authenticated_user(
         ) from exc
 
 
-def require_permissions(
-    *required_permissions: str,
-    agent_tool: str | None = None,
-):
-    """Build a FastAPI dependency enforcing Cloud Identity RBAC or per-agent S2S permissions."""
+def require_permissions(*required_permissions: str):
+    """Build a FastAPI dependency enforcing role permissions."""
 
     def _dependency(
         request: Request,
@@ -1332,8 +1212,7 @@ def require_permissions(
                 status_outcome="denied_403",
                 detail=(
                     f"Missing required permission(s) {missing}; "
-                    f"principal={user.email} roles={list(user.roles)} "
-                    f"agent_identity={user.agent_identity}."
+                    f"principal={user.email} roles={list(user.roles)}."
                 ),
             )
             raise HTTPException(
@@ -1342,42 +1221,12 @@ def require_permissions(
                     "status": "forbidden",
                     "error": "insufficient_permissions",
                     "message": (
-                        f"Principal '{user.email}' lacks required RBAC / agent permission(s): "
-                        f"{missing}."
+                        f"Principal '{user.email}' lacks required permission(s): {missing}."
                     ),
                     "required_permissions": list(required_permissions),
                     "granted_permissions": list(user.permissions),
-                    "agent_identity": user.agent_identity,
                 },
             )
-
-        if agent_tool is not None and user.agent_identity is not None:
-            agent_spec = resolve_agent_identity(user.agent_identity)
-            if agent_tool not in agent_spec.allowed_tools:
-                record_security_audit_event(
-                    event_type="agent_s2s_tool_boundary_denied",
-                    user=user,
-                    resource=request.url.path,
-                    status_outcome="denied_403",
-                    detail=(
-                        f"Agent '{agent_spec.agent_name}' ({user.email}) is forbidden from "
-                        f"calling endpoint bound to tool '{agent_tool}'."
-                    ),
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail={
-                        "status": "forbidden",
-                        "error": "agent_least_privilege_violation",
-                        "message": (
-                            f"Agent identity '{agent_spec.agent_name}' ({user.email}) is not "
-                            f"authorized for tool boundary '{agent_tool}' under Least Privilege."
-                        ),
-                        "agent_identity": agent_spec.agent_name,
-                        "required_tool": agent_tool,
-                        "allowed_tools": sorted(agent_spec.allowed_tools),
-                    },
-                )
         return user
 
     return _dependency

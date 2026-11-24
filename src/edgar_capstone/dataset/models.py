@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from edgar_capstone.common.domain import SECTION_TITLES, SectionId
 from edgar_capstone.common.formatting import utc_now_iso
 from edgar_capstone.common.models import FilingMetadataBase
+
+_INDEXABLE_SECTIONS: tuple[SectionId, ...] = ("item_1a", "item_7")
 
 
 class CompanyConstituent(BaseModel):
@@ -106,6 +110,19 @@ class FinancialDataProfile(FilingMetadataBase):
         default_factory=utc_now_iso, description="UTC ingestion timestamp (ISO-8601)"
     )
 
+    def section_blob_path(self, section_id: SectionId) -> str:
+        """Relative GCS object path for a single extracted 10-K section Markdown file."""
+        if self.unstructured_blob_path.endswith("_10k.md"):
+            return f"{self.unstructured_blob_path[: -len('_10k.md')]}_{section_id}.md"
+        return f"unstructured/{self.ticker}/{self.fiscal_year}_{section_id}.md"
+
+    def section_gcs_uri(self, section_id: SectionId) -> str:
+        """Full `gs://` URI for a single extracted 10-K section Markdown file."""
+        if self.unstructured_gcs_uri.endswith("_10k.md"):
+            return f"{self.unstructured_gcs_uri[: -len('_10k.md')]}_{section_id}.md"
+        base = self.unstructured_gcs_uri.rsplit("/", 1)[0]
+        return f"{base}/{self.fiscal_year}_{section_id}.md"
+
 
 class VertexAISearchContent(BaseModel):
     """Content reference block for Vertex AI Search unstructured JSONL import."""
@@ -120,15 +137,27 @@ class VertexAISearchContent(BaseModel):
 class VertexAISearchManifestRecord(BaseModel):
     """Single JSONL record for Vertex AI Search (GEAP Agent Search) ingestion."""
 
-    id: str = Field(..., description="Unique document ID (e.g., NVDA_2026_10K)")
+    id: str = Field(..., description="Unique document ID (e.g., NVDA_2026_item_1a)")
     structData: dict[str, Any] = Field(
-        ..., description="Filterable structured metadata attached to the 10-K document"
+        ..., description="Filterable structured metadata attached to the 10-K section document"
     )
     content: VertexAISearchContent
 
     @classmethod
-    def from_profile(cls, profile: FinancialDataProfile) -> VertexAISearchManifestRecord:
-        """Build a Vertex AI Search manifest entry directly from a FinancialDataProfile."""
+    def from_profile(
+        cls,
+        profile: FinancialDataProfile,
+        *,
+        section_id: SectionId | None = None,
+        section_gcs_uri: str | None = None,
+    ) -> VertexAISearchManifestRecord:
+        """Build a Vertex AI Search manifest entry from a FinancialDataProfile.
+
+        When `section_id` is supplied (`'item_1a'` or `'item_7'`), emits a section-scoped
+        document (`<profile_id>_<section_id>`) pointing at the per-section Markdown blob with
+        filterable `section_id` and `section_title` metadata so Discovery Engine filters natively
+        at the section boundary.
+        """
         struct_data: dict[str, Any] = {
             "profile_id": profile.profile_id,
             "ticker": profile.ticker,
@@ -142,10 +171,13 @@ class VertexAISearchManifestRecord(BaseModel):
             "filing_date": profile.filing_date,
             "accession_number": profile.accession_number,
             "currency": profile.currency,
-            "extracted_sections": profile.extracted_sections,
+            "extracted_sections": [section_id] if section_id else list(profile.extracted_sections),
             "structured_gcs_uri": profile.structured_gcs_uri,
             "sec_filing_url": profile.sec_filing_url,
         }
+        if section_id is not None:
+            struct_data["section_id"] = section_id
+            struct_data["section_title"] = SECTION_TITLES[section_id]
         if profile.revenue is not None:
             struct_data["revenue"] = profile.revenue
         if profile.operating_income is not None:
@@ -155,15 +187,42 @@ class VertexAISearchManifestRecord(BaseModel):
         if profile.research_and_development is not None:
             struct_data["research_and_development"] = profile.research_and_development
 
-        safe_doc_id = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{profile.profile_id}_10K")
+        doc_suffix = section_id if section_id is not None else "10K"
+        safe_doc_id = re.sub(r"[^a-zA-Z0-9_-]", "_", f"{profile.profile_id}_{doc_suffix}")
+        content_uri = (
+            section_gcs_uri
+            if section_gcs_uri is not None
+            else (
+                profile.section_gcs_uri(section_id)
+                if section_id is not None
+                else profile.unstructured_gcs_uri
+            )
+        )
         return cls(
             id=safe_doc_id,
             structData=struct_data,
             content=VertexAISearchContent(
                 mimeType="text/plain",
-                uri=profile.unstructured_gcs_uri,
+                uri=content_uri,
             ),
         )
+
+    @classmethod
+    def records_from_profile(
+        cls,
+        profile: FinancialDataProfile,
+        *,
+        section_ids: Sequence[SectionId] | None = None,
+    ) -> list[VertexAISearchManifestRecord]:
+        """Build one Vertex AI Search manifest record per extracted section (`item_1a`, `item_7`)."""
+        sections: list[SectionId] = (
+            list(section_ids)
+            if section_ids is not None
+            else [s for s in _INDEXABLE_SECTIONS if s in profile.extracted_sections]
+        )
+        if not sections:
+            return [cls.from_profile(profile)]
+        return [cls.from_profile(profile, section_id=sec) for sec in sections]
 
 
 class ExtractedFilingBundle(BaseModel):

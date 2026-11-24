@@ -91,7 +91,6 @@ describe('ChatTurnItem interpreted scope', () => {
         resolved_scope: scope,
         answer_markdown: '### Answer\n\nText.',
         citations: [],
-        context_cache: null,
         fact_check: {
           passed: true,
           checked_metrics_count: 0,

@@ -70,10 +70,7 @@ def idp_keyring(session_idp_keys: dict[str, Any]):
         http_client=httpx.Client(transport=httpx.MockTransport(_mock_transport))
     )
     settings = AuthSettings(
-        audiences=(TEST_IAP_AUDIENCE, TEST_OKTA_CLIENT_ID),
-        okta_issuer_uri=TEST_OKTA_ISSUER,
-        okta_jwks_uri=TEST_OKTA_JWKS_URI,
-        okta_client_id=TEST_OKTA_CLIENT_ID,
+        audiences=(TEST_IAP_AUDIENCE,),
         google_oauth_client_id=None,
         allowed_workspace_domains=("acme-corp.com",),
         required_analyst_groups=("sec-edgar-analysts",),
@@ -114,7 +111,7 @@ def test_all_internal_apis_require_jwt_bearer_authentication(
     assert cfg_resp.status_code == 200
     assert cfg_resp.json()["auth_required"] is True
     assert cfg_resp.json()["access_pattern"] == "iap_jwt_bearer"
-    assert cfg_resp.json()["identity_provider"]["name"] == "Google Workspace (Okta SSO)"
+    assert cfg_resp.json()["identity_provider"]["name"] == "Google Workspace / Cloud IAP"
 
     # Verify all 12 pruned routes are removed:
     # GET paths return 404 via spa.py's explicit `/api/*` & `/healthz` guard;
@@ -172,13 +169,12 @@ def test_all_internal_apis_require_jwt_bearer_authentication(
     ):
         assert removed_path not in schema_paths
 
-    # ALL 14 retained authenticated routes must reject unauthenticated calls with HTTP 401
+    # ALL retained authenticated routes must reject unauthenticated calls with HTTP 401
     protected_calls = [
         ("GET", "/api/v1/auth/me", None),
         ("POST", "/api/v1/auth/logout", None),
         ("GET", "/api/v1/auth/audit", None),
         ("GET", "/api/v1/admin/rbac/policies", None),
-        ("GET", "/api/v1/secrets/status", None),
         ("GET", "/api/v1/companies", None),
         ("GET", "/api/v1/section?ticker=NVDA&fiscal_year=2026&section_id=item_7", None),
         ("POST", "/api/v1/chat", {"query": "NVDA FY2026 revenue drivers"}),
@@ -189,7 +185,7 @@ def test_all_internal_apis_require_jwt_bearer_authentication(
         ("POST", "/api/v1/feedback", {"message_id": "m1", "rating": "up"}),
         ("GET", "/api/v1/feedback", None),
     ]
-    assert len(protected_calls) == 14
+    assert len(protected_calls) == 13
 
     for method, path, payload in protected_calls:
         resp = (
@@ -269,31 +265,32 @@ def test_iap_es256_google_workspace_rs256_and_okta_sso_verification(idp_keyring)
         assert me_gws.json()["user"]["identity_provider"] == "google_workspace_oidc"
         assert me_gws.json()["user"]["iap_assertion_verified"] is False
 
-        # 3. Okta SSO OIDC RS256 JWT + accompanying X-Goog-IAP-JWT-Assertion (dual-header defense)
-        okta_jwt = sign_jwt_rs256(
+        # 3. Google Workspace RS256 JWT + accompanying X-Goog-IAP-JWT-Assertion (dual-header defense)
+        gws_admin_jwt = sign_jwt_rs256(
             {
-                "iss": TEST_OKTA_ISSUER,
-                "sub": "00u8okta9911",
-                "aud": TEST_OKTA_CLIENT_ID,
-                "preferred_username": "jane.doe@acme-corp.com",
+                "iss": "https://accounts.google.com",
+                "sub": "00u8gws9911",
+                "aud": TEST_IAP_AUDIENCE,
+                "email": "jane.doe@acme-corp.com",
+                "hd": "acme-corp.com",
                 "name": "Jane Doe",
                 "groups": ["sec-edgar-admins"],
                 "iat": now,
                 "exp": now + 1800,
             },
-            idp_keyring["okta_rsa_key"],
-            kid="okta-rs256-k1",
+            idp_keyring["google_rsa_key"],
+            kid="gws-rs256-k1",
         )
         dual_resp = client.get(
             "/api/v1/auth/me",
             headers={
-                "Authorization": f"Bearer {okta_jwt}",
+                "Authorization": f"Bearer {gws_admin_jwt}",
                 "X-Goog-IAP-JWT-Assertion": iap_jwt,
             },
         )
         assert dual_resp.status_code == 200
         dual_user = dual_resp.json()["user"]
-        assert dual_user["identity_provider"] == "okta_sso"
+        assert dual_user["identity_provider"] == "google_workspace_oidc"
         assert dual_user["iap_assertion_verified"] is True
         assert dual_user["roles"] == ["authenticated", "analyst", "admin"]
         # Bearer groups stay strictly authoritative (no union from IAP JWT's analyst group)
@@ -490,19 +487,20 @@ def test_workspace_domain_rbac_production_lockdown_logout_and_audit_trail(
             == 403
         )
 
-        # Valid domain but missing required Cloud Identity / Okta analyst group -> 403 Forbidden
+        # Valid domain but missing required Cloud Identity analyst group -> 403 Forbidden
         missing_group_jwt = sign_jwt_rs256(
             {
-                "iss": TEST_OKTA_ISSUER,
+                "iss": "https://accounts.google.com",
                 "sub": "00u-nogroup",
-                "aud": TEST_OKTA_CLIENT_ID,
+                "aud": TEST_IAP_AUDIENCE,
                 "email": "hr.user@acme-corp.com",
+                "hd": "acme-corp.com",
                 "groups": ["general-employees"],
                 "iat": now,
                 "exp": now + 600,
             },
-            idp_keyring["okta_rsa_key"],
-            kid="okta-rs256-k1",
+            idp_keyring["google_rsa_key"],
+            kid="gws-rs256-k1",
         )
         assert (
             client.get(
@@ -537,18 +535,19 @@ def test_workspace_domain_rbac_production_lockdown_logout_and_audit_trail(
         # Authorized analyst accesses 10-K section -> tracked in audit trail, then logs out -> token revoked
         analyst_jwt = sign_jwt_rs256(
             {
-                "iss": TEST_OKTA_ISSUER,
+                "iss": "https://accounts.google.com",
                 "sub": "00u-analyst-1",
-                "aud": TEST_OKTA_CLIENT_ID,
+                "aud": TEST_IAP_AUDIENCE,
                 "email": "lead.analyst@acme-corp.com",
+                "hd": "acme-corp.com",
                 "name": "Lead Analyst",
                 "groups": ["sec-edgar-analysts"],
-                "jti": "session-okta-001",
+                "jti": "session-gws-001",
                 "iat": now,
                 "exp": now + 1800,
             },
-            idp_keyring["okta_rsa_key"],
-            kid="okta-rs256-k1",
+            idp_keyring["google_rsa_key"],
+            kid="gws-rs256-k1",
         )
         headers = {"Authorization": f"Bearer {analyst_jwt}"}
 
@@ -566,7 +565,7 @@ def test_workspace_domain_rbac_production_lockdown_logout_and_audit_trail(
         assert len(section_events) >= 1
         assert section_events[0]["user_email"] == "lead.analyst@acme-corp.com"
         assert section_events[0]["tickers"] == ["AAPL"]
-        assert section_events[0]["identity_provider"] == "okta_sso"
+        assert section_events[0]["identity_provider"] == "google_workspace_oidc"
 
         # Logout revokes the Bearer JWT immediately
         logout_resp = client.post("/api/v1/auth/logout", headers=headers)
@@ -698,61 +697,63 @@ def test_sso_token_exchange_endpoint_and_audit_trail(idp_keyring) -> None:
         client = TestClient(app)
         now = int(time.time())
 
-        valid_okta_jwt = sign_jwt_rs256(
+        valid_gws_jwt = sign_jwt_rs256(
             {
-                "iss": TEST_OKTA_ISSUER,
+                "iss": "https://accounts.google.com",
                 "sub": "00u-exchange-1",
-                "aud": TEST_OKTA_CLIENT_ID,
+                "aud": TEST_IAP_AUDIENCE,
                 "email": "exchange.analyst@acme-corp.com",
+                "hd": "acme-corp.com",
                 "name": "Exchange Analyst",
                 "groups": ["sec-edgar-analysts"],
                 "iat": now,
                 "exp": now + 1800,
             },
-            idp_keyring["okta_rsa_key"],
-            kid="okta-rs256-k1",
+            idp_keyring["google_rsa_key"],
+            kid="gws-rs256-k1",
         )
 
         # 1. Valid raw JWT -> 200 + sso_token_exchange audit event
-        ok_resp = client.post("/api/v1/auth/sso/exchange", json={"id_token": valid_okta_jwt})
+        ok_resp = client.post("/api/v1/auth/sso/exchange", json={"id_token": valid_gws_jwt})
         assert ok_resp.status_code == 200, ok_resp.text
         ok_body = ok_resp.json()
         assert ok_body["status"] == "authenticated"
         assert ok_body["token_type"] == "Bearer"
-        assert ok_body["access_token"] == valid_okta_jwt
+        assert ok_body["access_token"] == valid_gws_jwt
         assert ok_body["expires_at"] == now + 1800
         assert ok_body["user"]["email"] == "exchange.analyst@acme-corp.com"
-        assert ok_body["user"]["identity_provider"] == "okta_sso"
+        assert ok_body["user"]["identity_provider"] == "google_workspace_oidc"
         assert ok_body["user"]["roles"] == ["authenticated", "analyst"]
 
         # 2. `Bearer ` prefix (including mixed-case and whitespace) is stripped cleanly
         prefixed_resp = client.post(
             "/api/v1/auth/sso/exchange",
-            json={"id_token": f"  Bearer {valid_okta_jwt}  "},
+            json={"id_token": f"  Bearer {valid_gws_jwt}  "},
         )
         assert prefixed_resp.status_code == 200, prefixed_resp.text
-        assert prefixed_resp.json()["access_token"] == valid_okta_jwt
+        assert prefixed_resp.json()["access_token"] == valid_gws_jwt
 
         lower_prefixed_resp = client.post(
             "/api/v1/auth/sso/exchange",
-            json={"id_token": f"bearer {valid_okta_jwt}"},
+            json={"id_token": f"bearer {valid_gws_jwt}"},
         )
         assert lower_prefixed_resp.status_code == 200, lower_prefixed_resp.text
-        assert lower_prefixed_resp.json()["access_token"] == valid_okta_jwt
+        assert lower_prefixed_resp.json()["access_token"] == valid_gws_jwt
 
         # 3. Expired JWT -> 401 + WWW-Authenticate header + sso_token_exchange_failed audit event
         expired_jwt = sign_jwt_rs256(
             {
-                "iss": TEST_OKTA_ISSUER,
+                "iss": "https://accounts.google.com",
                 "sub": "00u-expired",
-                "aud": TEST_OKTA_CLIENT_ID,
+                "aud": TEST_IAP_AUDIENCE,
                 "email": "exchange.analyst@acme-corp.com",
+                "hd": "acme-corp.com",
                 "groups": ["sec-edgar-analysts"],
                 "iat": now - 7200,
                 "exp": now - 120,
             },
-            idp_keyring["okta_rsa_key"],
-            kid="okta-rs256-k1",
+            idp_keyring["google_rsa_key"],
+            kid="gws-rs256-k1",
         )
         exp_resp = client.post("/api/v1/auth/sso/exchange", json={"id_token": expired_jwt})
         assert exp_resp.status_code == 401
@@ -770,16 +771,17 @@ def test_sso_token_exchange_endpoint_and_audit_trail(idp_keyring) -> None:
         # 5. Forbidden group -> 403 + sso_token_exchange_forbidden audit event
         no_group_jwt = sign_jwt_rs256(
             {
-                "iss": TEST_OKTA_ISSUER,
+                "iss": "https://accounts.google.com",
                 "sub": "00u-nogroup",
-                "aud": TEST_OKTA_CLIENT_ID,
+                "aud": TEST_IAP_AUDIENCE,
                 "email": "hr.user@acme-corp.com",
+                "hd": "acme-corp.com",
                 "groups": ["general-employees"],
                 "iat": now,
                 "exp": now + 600,
             },
-            idp_keyring["okta_rsa_key"],
-            kid="okta-rs256-k1",
+            idp_keyring["google_rsa_key"],
+            kid="gws-rs256-k1",
         )
         forb_group_resp = client.post("/api/v1/auth/sso/exchange", json={"id_token": no_group_jwt})
         assert forb_group_resp.status_code == 403
@@ -850,18 +852,19 @@ def test_dual_iap_and_bearer_never_escalates_privileges(
         client = TestClient(app)
         now = int(time.time())
 
-        viewer_okta_jwt = sign_jwt_rs256(
+        viewer_gws_jwt = sign_jwt_rs256(
             {
-                "iss": TEST_OKTA_ISSUER,
+                "iss": "https://accounts.google.com",
                 "sub": "00u-viewer-1",
-                "aud": TEST_OKTA_CLIENT_ID,
+                "aud": TEST_IAP_AUDIENCE,
                 "email": "auditor@acme-corp.com",
+                "hd": "acme-corp.com",
                 "groups": ["sec-edgar-viewers"],
                 "iat": now,
                 "exp": now + 1200,
             },
-            idp_keyring["okta_rsa_key"],
-            kid="okta-rs256-k1",
+            idp_keyring["google_rsa_key"],
+            kid="gws-rs256-k1",
         )
 
         # Case 1: IAP assertion has no groups (alone would receive iap_default_role="analyst")
@@ -888,7 +891,7 @@ def test_dual_iap_and_bearer_never_escalates_privileges(
 
         # Combined with Viewer Bearer JWT: must stay strictly `viewer`, NEVER escalate to `analyst`!
         dual_viewer_headers = {
-            "Authorization": f"Bearer {viewer_okta_jwt}",
+            "Authorization": f"Bearer {viewer_gws_jwt}",
             "X-Goog-IAP-JWT-Assertion": iap_default_analyst_jwt,
         }
         me_dual = client.get("/api/v1/auth/me", headers=dual_viewer_headers)
@@ -898,7 +901,6 @@ def test_dual_iap_and_bearer_never_escalates_privileges(
         assert user_dual["roles"] == ["authenticated", "viewer"]
         assert "analyst" not in user_dual["roles"]
         assert "chat:query" not in user_dual["permissions"]
-        assert client.get("/api/v1/secrets/status", headers=dual_viewer_headers).status_code == 403
         assert (
             client.post(
                 "/api/v1/feedback",
@@ -932,7 +934,7 @@ def test_dual_iap_and_bearer_never_escalates_privileges(
             kid="iap-es256-k1",
         )
         dual_viewer_vs_admin_iap = {
-            "Authorization": f"Bearer {viewer_okta_jwt}",
+            "Authorization": f"Bearer {viewer_gws_jwt}",
             "X-Goog-IAP-JWT-Assertion": iap_admin_jwt,
         }
         me_v_admin = client.get("/api/v1/auth/me", headers=dual_viewer_vs_admin_iap)
@@ -944,12 +946,12 @@ def test_dual_iap_and_bearer_never_escalates_privileges(
         )
 
         # Case 3: Service account Bearer + human admin IAP assertion -> SA MUST NOT escalate!
-        sa_guardrail_jwt = sign_jwt_rs256(
+        sa_cicd_jwt = sign_jwt_rs256(
             {
                 "iss": "https://accounts.google.com",
                 "sub": "114455667799",
                 "aud": TEST_IAP_AUDIENCE,
-                "email": "model-armor-guardrail-sa@iron-radio-514217-q7.iam.gserviceaccount.com",
+                "email": "sec-edgar-cicd-sa@iron-radio-514217-q7.iam.gserviceaccount.com",
                 "email_verified": True,
                 "iat": now,
                 "exp": now + 600,
@@ -958,17 +960,15 @@ def test_dual_iap_and_bearer_never_escalates_privileges(
             kid="gws-rs256-k1",
         )
         dual_sa_headers = {
-            "Authorization": f"Bearer {sa_guardrail_jwt}",
+            "Authorization": f"Bearer {sa_cicd_jwt}",
             "X-Goog-IAP-JWT-Assertion": iap_admin_jwt,
         }
         me_sa = client.get("/api/v1/auth/me", headers=dual_sa_headers)
         assert me_sa.status_code == 200
         sa_user = me_sa.json()["user"]
         assert sa_user["iap_assertion_verified"] is True
-        assert sa_user["agent_identity"] == "ModelArmorGuardrail"
         assert "analyst" not in sa_user["roles"]
         assert "admin" not in sa_user["roles"]
-        assert sa_user["permissions"] == []
         assert client.get("/api/v1/companies", headers=dual_sa_headers).status_code == 403
         assert client.get("/api/v1/admin/rbac/policies", headers=dual_sa_headers).status_code == 403
     finally:

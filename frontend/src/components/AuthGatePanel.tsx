@@ -30,8 +30,7 @@ export function AuthGatePanel({
     authConfig?.identity_provider.local_sso_dev_broker_enabled ?? false
   const hasExternalOidc = Boolean(
     authConfig?.identity_provider.authorization_endpoint &&
-      (authConfig?.identity_provider.okta_client_id ||
-        authConfig?.identity_provider.google_client_id)
+      authConfig?.identity_provider.google_client_id
   )
   const canSignInViaSso = hasExternalOidc || devBrokerEnabled
 

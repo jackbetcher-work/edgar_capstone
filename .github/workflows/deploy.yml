@@ -1,25 +1,19 @@
 name: SEC EDGAR Analyst CI/CD Pipeline
 
-# Cloud Build (terraform/cloudbuild.tf + cloudbuild.yaml) is the primary deploy
-# path. This workflow always runs the lint/test gates on every push. The build
-# and deploy jobs run only on pushes to main, and only when the repository
-# variable DEPLOY_WITH_GITHUB_ACTIONS is 'true'. That way a merge never deploys
-# twice.
+# Single CI/CD pipeline via GitHub Actions with keyless Workload Identity Federation.
+# Terraform (terraform/cicd_and_secrets.tf) is the single source of truth for Cloud Run
+# configuration, IAP, scaling, and environment variables; the deploy job updates only the
+# container image and deployment labels.
 
 on:
   push:
     branches:
       - main
       - "**"
-  # Manual redeploy from the Actions tab or `gh workflow run deploy.yml --ref main`.
-  # Build/deploy jobs still require refs/heads/main and DEPLOY_WITH_GITHUB_ACTIONS == 'true'.
-  #
   # Eval gate mode. Resolved as: workflow_dispatch input > repo variable EVAL_GATE_MODE > 'skip'.
   #   skip     - eval does not run; deploy goes ahead right after build (default).
   #   advisory - eval runs and reports regressions, but deploy goes ahead anyway.
   #   blocking - eval regressions fail the run and block deploy.
-  # Example: gh workflow run deploy.yml --ref main -f eval_mode=advisory
-  # Turn the gate back on for every push with: gh variable set EVAL_GATE_MODE --body blocking
   workflow_dispatch:
     inputs:
       eval_mode:
@@ -41,12 +35,9 @@ concurrency:
 
 env:
   GCP_PROJECT_ID: iron-radio-514217-q7
-  GCP_PROJECT_NAME: fde-sec-edgar-sandbox-dev
   GCP_REGION: us-central1
   GAR_REPOSITORY: sec-edgar-repo
   SERVICE_NAME: sec-edgar-analyst
-  RUNTIME_SERVICE_ACCOUNT: sec-analyst-sa@iron-radio-514217-q7.iam.gserviceaccount.com
-  CLOUD_IDENTITY_DOMAIN: fde-workspace.corp
   IMAGE_URI: us-central1-docker.pkg.dev/iron-radio-514217-q7/sec-edgar-repo/sec-edgar-analyst
 
 jobs:
@@ -91,8 +82,6 @@ jobs:
           terraform -chdir=terraform init -backend=false -input=false -no-color
           terraform -chdir=terraform validate -no-color
 
-      # The suite reads live BigQuery / Vertex AI Search / GCS data and calls Vertex AI
-      # (embeddings, Gemini, Model Armor), so authenticate with keyless WIF first.
       - name: Authenticate to Google Cloud via Workload Identity Federation
         id: auth
         uses: google-github-actions/auth@v2
@@ -128,12 +117,12 @@ jobs:
           test -f frontend/dist/index.html
 
   # ============================================================================
-  # Stage 2: Build — Keyless WIF auth, Secret Manager lookup & Docker image push
+  # Stage 2: Build — Keyless WIF auth, Docker build, smoke test & GAR push
   # ============================================================================
   build:
     name: Build Stage - Container Image & Artifact Registry
     needs: test
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       image_digest_uri: ${{ steps.build_image.outputs.image_uri }}
@@ -149,14 +138,6 @@ jobs:
           service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
           create_credentials_file: true
 
-      - name: Retrieve build-time configuration from Google Cloud Secret Manager
-        id: secrets
-        uses: google-github-actions/get-secretmanager-secrets@v2
-        with:
-          secrets: |-
-            SEC_EDGAR_USER_AGENT:${{ env.GCP_PROJECT_ID }}/sec-edgar-user-agent:latest
-          export_environment: false
-
       - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
@@ -169,7 +150,6 @@ jobs:
         env:
           DOCKER_BUILDKIT: "1"
         run: |
-          test -n "${{ steps.secrets.outputs.SEC_EDGAR_USER_AGENT }}"
           IMAGE_TAG="${{ env.IMAGE_URI }}:${{ github.sha }}"
           IMAGE_LATEST="${{ env.IMAGE_URI }}:latest"
           docker build \
@@ -178,11 +158,6 @@ jobs:
             --tag "${IMAGE_LATEST}" \
             .
           docker run --rm --entrypoint test "${IMAGE_TAG}" -f /app/frontend/dist/index.html
-          # Container smoke test with live BigQuery check using WIF credentials file mounted read-only.
-          # google-github-actions/auth writes gha-creds-*.json with mode 0640 (non-world-readable)
-          # owned by the runner UID/GID, whereas Dockerfile runs as USER appuser (10001:10001).
-          # Run with the runner's UID/GID and mount only the single credentials file (no workspace
-          # exposure); HOME=/tmp avoids pwd.getpwuid() failures for an unmapped UID inside the image.
           test -n "${GOOGLE_APPLICATION_CREDENTIALS}" && test -f "${GOOGLE_APPLICATION_CREDENTIALS}"
           docker run --rm \
             --user "$(id -u):$(id -g)" \
@@ -204,15 +179,12 @@ jobs:
           echo "image_uri=${IMAGE_TAG}" >> "${GITHUB_OUTPUT}"
 
   # ============================================================================
-  # Stage 2.5: Eval Gate — Live golden regression gates (main deploy only)
-  # Optional: see eval_mode / EVAL_GATE_MODE at the top. Only 'blocking' gates deploy.
+  # Stage 2.5: Eval Gate — Optional live golden regression gates (main only)
   # ============================================================================
   eval:
     name: Eval Stage - Live Golden Regression Gates
     needs: build
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true' && (inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'skip'
-    # In advisory mode a failing eval doesn't fail the run. The failure still shows
-    # on the job and as an annotation.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && (inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'skip'
     continue-on-error: ${{ (inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'blocking' }}
     runs-on: ubuntu-latest
     steps:
@@ -237,16 +209,6 @@ jobs:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
 
-      # TTFT delta (agentic tool selection refactor)
-      #   p95_ttft_ms target unchanged at 3000 ms (evals/thresholds.yaml); a TTFT-only regression
-      #   stays an advisory warning below. TTFT = react_execution.observed_ttft_ms (first streamed
-      #   token / function call of the FIRST analyst model call, from ADK stream start). The
-      #   pre-synthesis pre-pass is now RAG-only (variance / flag / delta / sector map-reduce
-      #   pre-computation removed), so TTFT is expected unchanged-to-lower; total turn latency
-      #   grows by one or more model/tool round-trips (measured +6 to +17 s) on turns where the agent calls a
-      #   deterministic tool (quantitative, anomaly, sector-wide), unchanged-to-lower on
-      #   qualitative turns. Measured 2026-11-18: mean TTFT delta -99 ms (n=4 live turns); see the
-      #   "TTFT delta" block in evals/thresholds.yaml for per-query TTFT / total latency.
       - name: Run live golden evaluation regression gates
         env:
           EDGAR_TEST_PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
@@ -271,7 +233,7 @@ jobs:
               val = (report.get("metrics") or {}).get("p95_ttft_ms")
               print(
                   f"::warning::Advisory latency notice: p95_ttft_ms={val} ms exceeded 3000 ms "
-                  "(non-blocking while iterating on latency; all 17 quality, grounding, and safety gates passed)."
+                  "(non-blocking while iterating on latency; all quality, grounding, and safety gates passed)."
               )
               sys.exit(0)
           print(f"::error::Blocking eval gate regression(s): {regs}")
@@ -284,125 +246,46 @@ jobs:
       - name: Report advisory eval result
         if: failure() && (inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'blocking'
         run: |
-          echo "::warning::Live golden eval gates FAILED, but eval mode is advisory. Deploy continues anyway. Set EVAL_GATE_MODE=blocking (or eval_mode=blocking) to enforce the gates."
+          echo "::warning::Live golden eval gates FAILED, but eval mode is advisory. Deploy continues anyway."
 
   # ============================================================================
-  # Stage 3: Deploy — Secret Manager integration & Google Cloud Run deployment
+  # Stage 3: Deploy — Image-only Cloud Run rollout (Terraform owns env/IAP/SA)
   # ============================================================================
   deploy:
-    name: Deploy Stage - Google Cloud Run with Secret Manager
+    name: Deploy Stage - Google Cloud Run Image Rollout
     needs:
       - build
       - eval
-    # !cancelled() lets deploy run when eval failed (advisory) or was skipped (skip).
-    # build must succeed. In blocking mode, eval must succeed too.
     if: >-
       ${{ !cancelled()
       && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
       && github.ref == 'refs/heads/main'
-      && vars.DEPLOY_WITH_GITHUB_ACTIONS == 'true'
       && needs.build.result == 'success'
       && (needs.eval.result == 'success' || (inputs.eval_mode || vars.EVAL_GATE_MODE || 'skip') != 'blocking') }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Authenticate to Google Cloud via Workload Identity Federation
         id: auth
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
-          token_format: access_token
 
-      - name: Retrieve runtime secrets metadata from Google Cloud Secret Manager
-        id: secrets
-        uses: google-github-actions/get-secretmanager-secrets@v2
-        with:
-          secrets: |-
-            SEC_EDGAR_USER_AGENT:${{ env.GCP_PROJECT_ID }}/sec-edgar-user-agent:latest
-            GEMINI_API_KEY:${{ env.GCP_PROJECT_ID }}/sec-edgar-gemini-api-key:latest
-            INTERNAL_IAP_AUDIENCE:${{ env.GCP_PROJECT_ID }}/sec-edgar-iap-audience:latest
-          export_environment: false
-
-      - name: Deploy service to Google Cloud Run with Secret Manager mounts
-        id: deploy_cloud_run
-        uses: google-github-actions/deploy-cloudrun@v2
-        with:
-          service: ${{ env.SERVICE_NAME }}
-          project_id: ${{ env.GCP_PROJECT_ID }}
-          region: ${{ env.GCP_REGION }}
-          image: ${{ env.IMAGE_URI }}:${{ github.sha }}
-          # Underscore label keys only. deploy-cloudrun@v2 adds `managed-by=github-actions`
-          # and `commit-sha=<sha>` by default; Cloud Logging copies Cloud Run labels onto
-          # every LogEntry and the BigQuery log sink normalizes '-' to '_', so `managed-by`
-          # collides with Terraform's `managed_by` (table_invalid_schema). Skip the defaults,
-          # set equivalent underscore labels, and strip any legacy hyphenated keys (flags).
-          skip_default_labels: true
-          labels: |-
-            commit_sha=${{ github.sha }}
-            deployed_by=github-actions
-          env_vars: |-
-            GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }}
-            GOOGLE_CLOUD_PROJECT=${{ env.GCP_PROJECT_ID }}
-            GCP_PROJECT_NAME=${{ env.GCP_PROJECT_NAME }}
-            GCP_REGION=${{ env.GCP_REGION }}
-            GOOGLE_CLOUD_LOCATION=${{ env.GCP_REGION }}
-            GOOGLE_GENAI_USE_VERTEXAI=true
-            EDGAR_ANALYST_MODEL=gemini-3.8-flash
-            EDGAR_GEMINI_LOCATION=global
-            EDGAR_FLASH_MODEL=gemini-3.8-flash
-            EDGAR_LITE_MODEL=gemini-3.5-flash-lite
-            EDGAR_MODEL_ARMOR_MODE=gcp
-            MODEL_ARMOR_TEMPLATE_ID=sec-edgar-analyst-armor
-            SDP_INSPECT_TEMPLATE_ID=sec-edgar-sdp-inspect
-            SDP_DEIDENTIFY_TEMPLATE_ID=sec-edgar-sdp-deidentify
-            EDGAR_PROMPT_STORE_BACKEND=auto
-            RUNTIME_SERVICE_ACCOUNT=${{ env.RUNTIME_SERVICE_ACCOUNT }}
-            CLOUD_IDENTITY_DOMAIN=${{ env.CLOUD_IDENTITY_DOMAIN }}
-            ADMIN_CLOUD_IDENTITY_GROUPS=sec-edgar-admins@fde-workspace.corp
-            ANALYST_CLOUD_IDENTITY_GROUPS=sec-edgar-analysts@fde-workspace.corp
-            VIEWER_CLOUD_IDENTITY_GROUPS=sec-edgar-viewers@fde-workspace.corp
-            BIGQUERY_DATASET_ID=sec_edgar
-            SEC_CORPUS_BUCKET=fde-sec-edgar-sandbox-dev-sec-corpus
-            EDGAR_TELEMETRY_BACKEND=gcp
-            EDGAR_FEEDBACK_BACKEND=gcp
-            OTEL_SERVICE_NAME=${{ env.SERVICE_NAME }}
-            OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental
-            OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=SPAN_AND_EVENT
-            OTEL_INSTRUMENTATION_GENAI_EMIT_EVENT=true
-            ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS=true
-            GOOGLE_CLOUD_AGENT_ENGINE_ENABLE_TELEMETRY=true
-            EDGAR_TRACE_CAPTURE_CONTENT=true
-            FIRESTORE_DATABASE_ID=(default)
-            FIRESTORE_FEEDBACK_COLLECTION=analyst_feedback
-            IAP_STRICT_MODE=true
-            IAP_ASSERTION_DEFAULT_ROLE=analyst
-          secrets: |-
-            SEC_EDGAR_USER_AGENT=sec-edgar-user-agent:latest
-            GEMINI_API_KEY=sec-edgar-gemini-api-key:latest
-            INTERNAL_IAP_AUDIENCE=sec-edgar-iap-audience:latest
-          flags: >-
-            --service-account=${{ env.RUNTIME_SERVICE_ACCOUNT }}
-            --no-allow-unauthenticated
-            --cpu=2
-            --memory=4Gi
-            --concurrency=8
-            --min-instances=1
-            --max-instances=10
-            --timeout=300
-            --remove-labels=managed-by,commit-sha
-            --startup-probe=httpGet.path=/health,initialDelaySeconds=0,periodSeconds=10,timeoutSeconds=5,failureThreshold=24
-
-      # The service is not reachable from GitHub's runners: in load_balancer mode its
-      # ingress is internal-and-cloud-load-balancing (run.app answers 404), and in
-      # iap_direct mode IAP gates every request. Health is therefore verified inside
-      # Cloud Run: the startup probe above sends GET /health to the new revision, and
-      # Cloud Run only marks the revision Ready (and the deploy step only succeeds)
-      # once /health returns 200. This step confirms that revision is the one serving.
       - name: Set up gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
+
+      - name: Roll out new container image to Google Cloud Run
+        id: deploy_cloud_run
+        run: |
+          set -euo pipefail
+          IMAGE_TAG="${{ env.IMAGE_URI }}:${{ github.sha }}"
+          gcloud run services update "${{ env.SERVICE_NAME }}" \
+            --project "${{ env.GCP_PROJECT_ID }}" \
+            --region "${{ env.GCP_REGION }}" \
+            --image "${IMAGE_TAG}" \
+            --update-labels "commit_sha=${{ github.sha }},deployed_by=github-actions" \
+            --remove-labels "managed-by,commit-sha" \
+            --startup-probe "httpGet.path=/health,initialDelaySeconds=0,periodSeconds=10,timeoutSeconds=5,failureThreshold=24"
 
       - name: Verify the new revision passed its /health probe and serves all traffic
         id: verify_revision
@@ -419,7 +302,6 @@ jobs:
           probe_path="$(jq -r '.spec.template.spec.containers[0].startupProbe.httpGet.path // ""' <<<"${svc}")"
           traffic="$(jq -r --arg rev "${ready}" \
             '[.status.traffic[] | select(.revisionName == $rev) | .percent] | add // 0' <<<"${svc}")"
-          # Ingress and IAP settings come from the v2 API (iapEnabled is v2-only).
           svc_v2="$(curl --fail --silent --show-error \
             --header "Authorization: Bearer $(gcloud auth print-access-token)" \
             "https://run.googleapis.com/v2/projects/${GCP_PROJECT_ID}/locations/${GCP_REGION}/services/${SERVICE_NAME}")"
@@ -433,32 +315,3 @@ jobs:
           [[ "${probe_path}" == "/health" ]] || { echo "::error::Startup probe is not GET /health (got '${probe_path}')."; fail=1; }
           [[ "${traffic}" == "100" ]] || { echo "::error::Revision ${ready} serves ${traffic}% of traffic, expected 100%."; fail=1; }
           if (( fail )); then exit 1; fi
-
-          if [[ "${ingress}" == "INGRESS_TRAFFIC_ALL" && "${iap}" != "true" ]]; then
-            echo "public_http=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "public_http=false" >> "${GITHUB_OUTPUT}"
-          fi
-
-      - name: Mint OIDC ID token for Cloud Run health check
-        id: id_token_auth
-        if: steps.verify_revision.outputs.public_http == 'true'
-        uses: google-github-actions/auth@v2
-        with:
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_CICD_SERVICE_ACCOUNT }}
-          token_format: id_token
-          id_token_audience: ${{ steps.deploy_cloud_run.outputs.url }}
-          id_token_include_email: true
-
-      # Only runs when the service accepts direct internet traffic without IAP.
-      - name: Verify deployed Cloud Run service health and frontend UI over HTTPS
-        if: steps.verify_revision.outputs.public_http == 'true'
-        run: |
-          SERVICE_URL="${{ steps.deploy_cloud_run.outputs.url }}"
-          curl --fail --silent --show-error \
-            --header "Authorization: Bearer ${{ steps.id_token_auth.outputs.id_token }}" \
-            "${SERVICE_URL}/health"
-          curl --fail --silent --show-error \
-            --header "Authorization: Bearer ${{ steps.id_token_auth.outputs.id_token }}" \
-            "${SERVICE_URL}/" > /dev/null

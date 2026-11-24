@@ -1,4 +1,4 @@
-"""Regional Google Cloud Model Armor v1 & Cloud SDP/DLP REST client."""
+"""Regional Google Cloud Model Armor v1 REST client."""
 
 from __future__ import annotations
 
@@ -16,19 +16,12 @@ from edgar_capstone.gcp.rest_client import (
     GcpTimeoutError,
     parse_retry_after,
 )
-from edgar_capstone.security.agent_identity import GcpAgentIamCredentialsClient
 from edgar_capstone.security.model_armor.config import (
-    DEFAULT_SDP_INFO_TYPES,
     ModelArmorConfig,
     ModelArmorSanitizationSummary,
     parse_model_armor_response,
 )
 from edgar_capstone.security.model_armor.emulator import LocalModelArmorEmulatorTransport
-from edgar_capstone.security.model_armor.projection_filter import (
-    _detect_sensitive_spans,
-    _redact_spans,
-    format_redaction_tag,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +93,6 @@ class ModelArmorClient(GcpRestClient):
         *,
         http_client: httpx.Client | None = None,
         credentials: Any | None = None,
-        iam_credentials_client: GcpAgentIamCredentialsClient | None = None,
     ) -> None:
         self.config = config or ModelArmorConfig.from_env()
         super().__init__(
@@ -111,7 +103,6 @@ class ModelArmorClient(GcpRestClient):
             max_connections=32,
             max_keepalive_connections=16,
         )
-        self._iam_credentials_client = iam_credentials_client
         self._emulator_client: httpx.Client | None = None
 
     def _get_emulator_client(self) -> httpx.Client:
@@ -144,12 +135,7 @@ class ModelArmorClient(GcpRestClient):
         return self._should_use_live_gcp()
 
     def _get_auth_token(self, *, target_service: str = "model-armor-service") -> str:
-        if self._iam_credentials_client is not None:
-            secret_tok = self._iam_credentials_client.mint_downscoped_agent_access_token(
-                agent_name="ModelArmorGuardrail",
-                target_service=target_service,
-            )
-            return secret_tok.get_secret_value()
+        _ = target_service
         return self._get_bearer_token()
 
     def _post_json(
@@ -240,126 +226,3 @@ class ModelArmorClient(GcpRestClient):
     def sanitize_model_response(self, text: str) -> ModelArmorSanitizationSummary:
         """Invoke Google Cloud Model Armor `templates.sanitizeModelResponse`."""
         return self._sanitize("response", text)
-
-    def _build_dlp_deidentify_payload(self, text: str) -> dict[str, Any]:
-        """Build a Cloud DLP v2 ``content:deidentify`` request without duplicating inline & template configs."""
-        parent = f"projects/{self.config.project_id}/locations/{self.config.location}"
-        payload: dict[str, Any] = {"item": {"value": text}}
-
-        # Use either `inspectTemplateName` OR inline `inspectConfig` — never both together,
-        # because Cloud DLP merges/overrides template settings when inline config is also sent.
-        if self.config.sdp_inspect_template_id:
-            insp_t = self.config.sdp_inspect_template_id
-            payload["inspectTemplateName"] = (
-                insp_t if insp_t.startswith("projects/") else f"{parent}/inspectTemplates/{insp_t}"
-            )
-        else:
-            payload["inspectConfig"] = {
-                "infoTypes": [{"name": name} for name in DEFAULT_SDP_INFO_TYPES],
-                "minLikelihood": "LIKELY",
-                "ruleSet": [
-                    {
-                        "infoTypes": [{"name": "EMAIL_ADDRESS"}],
-                        "rules": [
-                            {
-                                "exclusionRule": {
-                                    "matchingType": "MATCHING_TYPE_FULL_MATCH",
-                                    "regex": {
-                                        "pattern": r".*@.*\.iam\.gserviceaccount\.com$",
-                                    },
-                                }
-                            },
-                            {
-                                "exclusionRule": {
-                                    "matchingType": "MATCHING_TYPE_FULL_MATCH",
-                                    "regex": {
-                                        "pattern": r".*@(sec\.gov|.*\.googleapis\.com)$",
-                                    },
-                                }
-                            },
-                        ],
-                    }
-                ],
-            }
-
-        # Use inline `deidentifyConfig` alone (never duplicated alongside `deidentifyTemplateName`).
-        # On live GCP, Model Armor's own template already executes `sdp_deidentify_template_id`
-        # server-side via `sdp_settings.advanced_config`; direct DLP fallback applies the same
-        # `replaceWithInfoTypeConfig` primitive transformation cleanly across all matched info types.
-        payload["deidentifyConfig"] = {
-            "infoTypeTransformations": {
-                "transformations": [{"primitiveTransformation": {"replaceWithInfoTypeConfig": {}}}]
-            }
-        }
-        return payload
-
-    def inspect_and_deidentify_sdp(
-        self,
-        text: str,
-        *,
-        model_armor_sdp_executed: bool = False,
-    ) -> tuple[bool, tuple[str, ...], str]:
-        """Inspect & de-identify PII/credentials via Google Cloud Sensitive Data Protection (DLP v2)."""
-        local_spans = _detect_sensitive_spans(text)
-        has_explicit_templates = bool(
-            self.config.sdp_inspect_template_id or self.config.sdp_deidentify_template_id
-        )
-
-        # Skip redundant live Cloud DLP round-trip on clean text when Model Armor's template
-        # already executed SDP inspection with zero findings and no local candidate spans remain.
-        if not local_spans:
-            if model_armor_sdp_executed:
-                return False, (), text
-            if not (self._should_use_live_gcp() and has_explicit_templates):
-                return False, (), text
-
-        parent = f"projects/{self.config.project_id}/locations/{self.config.location}"
-        deid_payload = self._build_dlp_deidentify_payload(text)
-        url = f"https://dlp.googleapis.com/v2/{parent}/content:deidentify"
-
-        def _invoke_dlp() -> dict[str, Any]:
-            raw, _ = self._post_json(
-                url,
-                deid_payload,
-                service_label="Cloud SDP content:deidentify",
-                target_service="sdp-dlp-service",
-            )
-            return raw
-
-        try:
-            raw = _call_with_retries("cloud_sdp_deidentify_content", _invoke_dlp)
-        except Exception as exc:
-            # Always propagate transient errors (after retry exhaustion) so retry logic is never
-            # swallowed and fail-closed callers observe upstream availability failures accurately.
-            if _is_retryable_dlp_error(exc) or not local_spans:
-                raise
-            # For non-retryable DLP failures when local candidate spans were already found,
-            # never pass raw PII through: redact locally with canonical `[INFO_TYPE]` tags.
-            logger.warning(
-                "Cloud SDP deidentify failed (%s); redacting %d locally detected span(s).",
-                type(exc).__name__,
-                len(local_spans),
-            )
-            return (
-                True,
-                tuple(sorted({it for _, _, it in local_spans})),
-                _redact_spans(text, local_spans),
-            )
-
-        deid_text = str((raw.get("item") or {}).get("value") or text)
-        # DLP may skip values it treats as synthetic placeholders (e.g. 123-45-6789) at LIKELY.
-        # Ensure every locally detected span is redacted with the consistent `[INFO_TYPE]` tag.
-        for start, end, info_type in local_spans:
-            original = text[start:end]
-            if original and original in deid_text:
-                deid_text = deid_text.replace(original, format_redaction_tag(info_type))
-
-        info_types: list[str] = [it for _, _, it in local_spans]
-        summaries = (raw.get("overview") or {}).get("transformationSummaries") or []
-        for s_item in summaries:
-            if isinstance(s_item, dict):
-                it_name = (s_item.get("infoType") or {}).get("name")
-                if it_name:
-                    info_types.append(str(it_name))
-        matched = bool(info_types) or (deid_text != text)
-        return matched, tuple(sorted(set(info_types))), deid_text

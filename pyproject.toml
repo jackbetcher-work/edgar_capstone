@@ -54,7 +54,6 @@ publish-sec-corpus = "scripts.publish_corpus:main"
 backfill-rd-metric = "scripts.backfill_rd_metric:main"
 run-golden-evals = "scripts.run_evals:main"
 load-golden-dataset = "scripts.load_golden_dataset:main"
-publish-chunk-health = "scripts.publish_chunk_health:main"
 
 [tool.setuptools.packages.find]
 where = ["src", "."]

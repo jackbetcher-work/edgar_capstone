@@ -93,8 +93,21 @@ export function dedupeCitations(citations: GroundedCitation[]): DedupedCitations
       isDuplicatePassage(g.fp, fp, g.primary.section_id === cit.section_id)
     )
     if (!match) {
-      groups.push({ primary: cit, duplicates: [], fp })
+      const backendDups: GroundedCitation[] = (cit.duplicate_sources ?? []).map((ds) => ({
+        ...cit,
+        chunk_id: ds.chunk_id,
+        ticker: ds.ticker,
+        fiscal_year: ds.fiscal_year,
+        section_id: ds.section_id,
+        section_title: ds.section_title,
+        sec_filing_url: ds.sec_filing_url,
+        duplicate_sources: undefined,
+      }))
+      groups.push({ primary: cit, duplicates: backendDups, fp })
       aliasOf[cit.chunk_id] = cit.chunk_id
+      for (const ds of backendDups) {
+        aliasOf[ds.chunk_id] = cit.chunk_id
+      }
       continue
     }
     // Prefer the fuller excerpt as the visible text, keeping the group's position.
