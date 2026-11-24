@@ -956,6 +956,21 @@ class BigQueryTelemetrySink(GcpRestClient):
             "updated_local_turn": updated_local_turn,
         }
 
+    def recent_async_evaluations(
+        self,
+        *,
+        limit: int = 50,
+        session_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recently buffered async LLM-as-a-Judge evaluation records."""
+        bounded = max(1, min(int(limit), 500))
+        with self._lock:
+            items = list(self._evaluation_events)
+        if session_id and session_id.strip():
+            target = session_id.strip()
+            items = [r for r in items if r.get("session_id") == target]
+        return items[:bounded]
+
     def record_security_audit_log(self, entry: dict[str, Any]) -> dict[str, Any]:
         """Stream a structured authentication or 10-K access audit log to `security_audit_logs`."""
         epoch = float(entry.get("recorded_at_epoch") or time.time())

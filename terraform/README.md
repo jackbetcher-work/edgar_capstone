@@ -41,7 +41,7 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `sec-edgar-10k-corpus-ds` (`google_discovery_engine_data_store`) & `sec-edgar-10k-hybrid-search` (`google_discovery_engine_search_engine`): Unstructured 10-K search datastore and Enterprise LLM-enabled search app queried in parallel with BigQuery `VECTOR_SEARCH` over native `sec_edgar.filing_chunks`.
 - **BigQuery Cloud Resource Connection (`vertex-ai-rag-conn`, `terraform/bigquery.tf`):** Granted `roles/aiplatform.user` for Vertex AI integration.
 - **Gemini Models & APIs (`terraform/variables.tf`, `terraform/apis.tf`):**
-  - `financial_reasoning_model` (default `gemini-3.8-flash`), `coding_and_evaluation_model` (`gemini-3.8-flash`, `ThinkingLevel.LOW`), `compaction_and_mapping_model` (`gemini-3.5-flash-lite`), and `gemini_location` (`global`) become Cloud Run's `EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`, `EDGAR_LITE_MODEL`, and `EDGAR_GEMINI_LOCATION`.
+  - `financial_reasoning_model` (default `gemini-3.8-flash`), `coding_and_evaluation_model` (`gemini-3.8-flash`, `ThinkingLevel.LOW`), `compaction_and_mapping_model` (`gemini-3.5-flash-lite`), `gemini_location` (`global`), and `async_judge_sample_rate` (`1.0`, validated in `[0.0, 1.0]`) become Cloud Run's `EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`, `EDGAR_LITE_MODEL`, `EDGAR_GEMINI_LOCATION`, and `EDGAR_ASYNC_JUDGE_SAMPLE_RATE`.
   - Gemini models are served from the `global` endpoint (`var.gemini_location`), while BigQuery, GCS, Model Armor, and embeddings run in `var.region`.
   - `serviceconsumermanagement.googleapis.com` is enabled because Vertex AI context caching needs it to provision its tenant project.
 - **Observability (`terraform/observability.tf`, `terraform/monitoring.tf`):**

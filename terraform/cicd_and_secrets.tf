@@ -187,6 +187,11 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       }
 
       env {
+        name  = "EDGAR_ASYNC_JUDGE_SAMPLE_RATE"
+        value = tostring(var.async_judge_sample_rate)
+      }
+
+      env {
         name  = "EDGAR_LITE_MODEL"
         value = var.compaction_and_mapping_model
       }

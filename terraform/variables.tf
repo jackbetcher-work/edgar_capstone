@@ -104,6 +104,17 @@ variable "coding_and_evaluation_model" {
   default     = "gemini-3.8-flash"
 }
 
+variable "async_judge_sample_rate" {
+  description = "Probability in [0.0, 1.0] that a verified interactive turn triggers the background async LLM-as-a-Judge (EDGAR_ASYNC_JUDGE_SAMPLE_RATE). 1.0 evaluates every verified turn; 0.0 disables live background judging."
+  type        = number
+  default     = 1.0
+
+  validation {
+    condition     = var.async_judge_sample_rate >= 0.0 && var.async_judge_sample_rate <= 1.0
+    error_message = "async_judge_sample_rate must be between 0.0 and 1.0 inclusive."
+  }
+}
+
 variable "compaction_and_mapping_model" {
   description = "Lightweight Gemini Flash-Lite model used for SectorMapSummarizerAgent map-reduce batches and ADK LlmEventSummarizer compaction (EDGAR_LITE_MODEL)."
   type        = string

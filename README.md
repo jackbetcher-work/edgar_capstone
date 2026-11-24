@@ -55,14 +55,14 @@ Each turn runs through [`run_conversational_rag_turn`](src/edgar_capstone/agents
 6. **Verify.** [`structured_report.py`](src/edgar_capstone/agents/evaluation/structured_report.py) is the single deterministic verification gate, checking every finding against the retrieved passages and hydrated tool outputs before rendering fallback Markdown and returning `structured_report` JSON. If every finding fails, one guided regeneration runs with the rejection reasons; if that also fails, the answer is withheld (`answer_verified: false`).
 7. **Response guardrails, citation deduplication, persistence, and telemetry.** The response is screened once by Model Armor and the SEC projection filter, exact/near-duplicate citations are collapsed once on the backend ([`citations.py`](src/edgar_capstone/agents/core/citations.py)), intent is finalized ([`intent.py`](src/edgar_capstone/agents/orchestration/intent.py)), the turn is saved to Firestore, and telemetry is streamed to BigQuery.
 
-LLM-as-a-Judge scoring ([`judge.py`](src/edgar_capstone/agents/evaluation/judge.py)) runs offline in the golden evaluation suite (`make eval-all`) rather than spawning a background judge call on every live user turn. Every live request reads GCP data and calls Gemini; upstream failures return HTTP `503`.
+LLM-as-a-Judge scoring ([`judge.py`](src/edgar_capstone/agents/evaluation/judge.py)) runs both **asynchronously off the critical path** on verified live turns (sampled via `EDGAR_ASYNC_JUDGE_SAMPLE_RATE`, default `1.0`, streaming grades and scores to BigQuery `session_telemetry_events` and the `sec_edgar/evaluation_scores` Cloud Monitoring metric) and **synchronously offline** in the golden evaluation suite (`make eval-all`). Every live request reads GCP data and calls Gemini; upstream failures return HTTP `503`.
 
 ### Agents and Tools
 
 | Component | Module | Role |
 | :--- | :--- | :--- |
 | `FinancialAnalystAgent` | [`runtime/factories.py`](src/edgar_capstone/agents/runtime/factories.py) | Primary ADK agent (`gemini-3.8-flash`, native thinking). Output is constrained to the `AnalystReport` schema. |
-| `NarrativeEvaluatorAgent` | [`evaluation/judge.py`](src/edgar_capstone/agents/evaluation/judge.py) | Offline LLM-as-a-Judge (`gemini-3.8-flash`, `ThinkingLevel.LOW`) used by `make eval-all` to score faithfulness, citation precision, and explanation quality. |
+| `NarrativeEvaluatorAgent` | [`evaluation/judge.py`](src/edgar_capstone/agents/evaluation/judge.py) | LLM-as-a-Judge (`gemini-3.8-flash`, `ThinkingLevel.LOW`) scoring faithfulness, citation precision, and explanation quality asynchronously on sampled live turns (`EDGAR_ASYNC_JUDGE_SAMPLE_RATE`) and synchronously in `make eval-all`. |
 | `SectorMapSummarizerAgent` | [`tools/sector_map_reduce.py`](src/edgar_capstone/agents/tools/sector_map_reduce.py) | Parallel batch summarizer (`gemini-3.5-flash-lite`) for the map phase of sector-wide thematic reviews. |
 | `ScopeContinuityAgent` | [`orchestration/scope_continuity.py`](src/edgar_capstone/agents/orchestration/scope_continuity.py) | Fast structured scope & subject-continuity classifier (`gemini-3.5-flash-lite`, `ThinkingLevel.MINIMAL`) invoked only on unresolved/ambiguous turns (overlapped with Model Armor when warm) and strictly validated against `EntityCatalog`. |
 | `calculate_period_variances` | [`tools/sec_tools.py`](src/edgar_capstone/agents/tools/sec_tools.py), [`tools/variance_engine.py`](src/edgar_capstone/agents/tools/variance_engine.py) | Deterministic multi-period and YoY variance engine over BigQuery `financial_metrics`. |
@@ -87,7 +87,7 @@ core ──▶ adapters, prompts ──▶ tools ──▶ runtime, evaluation �
 - **`prompts/`** — Local Git-versioned prompt store (`store.py`) and dynamic payload/scope prompt builders (`builders.py`).
 - **`tools/`** — ADK `FunctionTool` wrappers, deterministic analytical engines, and turn-scoped tool plumbing (`runtime.py`).
 - **`runtime/`** — ADK `Runner` and persistent SSE event loop (`live_runtime.py`), agent factories (`factories.py`), lifecycle callbacks for telemetry and retrieval budgets (`callbacks.py`), and model routing, latency tracking, and session memory (`model_config.py`, `latency_tracker.py`, `context_memory.py`).
-- **`evaluation/`** — Claim-level `AnalystReport` verification and fallback Markdown rendering (`structured_report.py`), plus the offline Flash LLM-as-a-Judge (`judge.py`).
+- **`evaluation/`** — Claim-level `AnalystReport` verification and fallback Markdown rendering (`structured_report.py`), plus the Flash LLM-as-a-Judge (`judge.py`) used asynchronously on sampled live turns and synchronously in golden evals.
 - **`orchestration/`** — Conversational turn entry point and S&P 500 catalog cache (`chat_engine.py`), post-retrieval synthesis & guided verification retry (`react_loop.py`), scope/sub-industry/coverage validation (`scope_validation.py`), Flash-Lite subject-continuity classification (`scope_continuity.py`), and non-lexical intent resolution (`intent.py`).
 
 Two conventions are worth knowing before editing `agents/`:
@@ -146,6 +146,7 @@ CORPUS_PROJECT_ID=<other-project> make dev   # point at another project
 | :--- | :--- | :--- |
 | `EDGAR_ANALYST_MODEL` | `gemini-3.8-flash` | Reasoning model for `FinancialAnalystAgent` |
 | `EDGAR_FLASH_MODEL` | `gemini-3.8-flash` | LLM-as-a-Judge (`NarrativeEvaluatorAgent`, `ThinkingLevel.LOW`) |
+| `EDGAR_ASYNC_JUDGE_SAMPLE_RATE` | `1.0` | Sampling probability in `[0.0, 1.0]` for off-critical-path async LLM-as-a-Judge scoring on verified live turns (`0.0` disables live background judging) |
 | `EDGAR_LITE_MODEL` | `gemini-3.5-flash-lite` | Sector map-reduce (`SectorMapSummarizerAgent`), scope/continuity classification (`ScopeContinuityAgent`), and event compaction (`LlmEventSummarizer`) |
 | `EDGAR_SCOPE_LLM_MODE` | `auto` | Controls `ScopeContinuityAgent`: `auto` (live Flash-Lite in production, deterministic fallback when scripted/offline), `live`, or `deterministic` |
 | `EDGAR_GEMINI_LOCATION` | `global` | Vertex AI endpoint for Gemini. BigQuery, GCS, and embeddings use `GOOGLE_CLOUD_LOCATION`. |
@@ -262,7 +263,7 @@ See [`evals/README.md`](evals/README.md) for the record schema and gate definiti
 │   │   ├── prompts/         # Local Git-versioned prompt store and dynamic prompt builders
 │   │   ├── tools/           # ADK tools, turn-scoped runtime, variance/delta/RAG/sector engines
 │   │   ├── runtime/         # ADK Runner/streaming, agent factories, telemetry/budget callbacks, session memory
-│   │   ├── evaluation/      # Structured report claim verification/rendering and offline Flash judge
+│   │   ├── evaluation/      # Structured report claim verification/rendering and Flash LLM-as-a-Judge
 │   │   └── orchestration/   # Conversational RAG chat engine, intent, scope validation & continuity, synthesis loop
 │   ├── security/            # Direct IAP / Google Workspace OIDC auth, RBAC, Model Armor, secret scanner
 │   ├── observability/       # OpenTelemetry tracing, structured logging, request middleware

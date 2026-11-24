@@ -29,6 +29,7 @@ from edgar_capstone.agents.core.schemas import ContextBreakdown
 from edgar_capstone.agents.orchestration.react_loop import (
     StructuredReActExecutor,
     evaluate_calculated_variances,
+    flush_pending_evaluations,
 )
 from edgar_capstone.agents.runtime.callbacks import (
     after_model_telemetry_callback,
@@ -674,7 +675,16 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     tracker.reset()
     get_conversation_memory_manager().reset()
 
+    from edgar_capstone.agents.orchestration import react_loop as react_loop_mod
+
     judge_llm = ScriptedJudgeLlm()
+    orig_eval = react_loop_mod.evaluate_variance_explanation
+
+    def _scripted_bg_eval(**kwargs: Any):
+        kwargs["llm"] = judge_llm
+        return orig_eval(**kwargs)
+
+    monkeypatch.setattr(react_loop_mod, "evaluate_variance_explanation", _scripted_bg_eval)
     patch_http_chat_llms(
         monkeypatch,
         reasoning_llm=ScriptedAnalystLlm(
@@ -710,7 +720,7 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     assert _is_model(turn1["evaluation"]["evaluator_model"], "gemini-3.8-flash")
     assert turn1["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
     assert turn1["context_and_memory"]["turn_context_latency"]["total_calls"] >= 1
-    assert turn1["react_execution"]["judge_mode"] == "offline_only"
+    assert turn1["react_execution"]["judge_mode"] == "async_background"
     assert turn1["evaluation"]["grade"] == "pending"
     assert turn1["evaluation"]["overall_score"] is None
 
@@ -732,8 +742,9 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     assert turn2["context_and_memory"]["session_memory"]["has_prior_memory"] is True
     assert turn2["context_and_memory"]["session_memory"]["turn_count"] == 1
 
-    # Interactive turns do not spawn a live background judge; judge runs offline in evals.
-    assert judge_llm.call_count == 0
+    # Flush async scripted judge tasks so telemetry records reflect both analyst & judge calls
+    flush_pending_evaluations(timeout=10.0)
+    assert judge_llm.call_count == 2
 
     sess_tel_resp = client.get(
         "/api/v1/telemetry/sessions",
@@ -746,7 +757,7 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     assert st_body["event_count"] >= 2
 
     tracker_summary = tracker.summarize()
-    assert tracker_summary.total_calls >= 2
+    assert tracker_summary.total_calls >= 4
     by_model = list(tracker_summary.by_model)
     assert any(_is_model(m, "gemini-3.8-flash") for m in by_model), by_model
 
@@ -755,6 +766,7 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify async background judge updates local telemetry sink from pending/None to scored."""
+    from edgar_capstone.agents.core.schemas import NarrativeEvaluationReport
     from edgar_capstone.agents.orchestration import react_loop
     from edgar_capstone.agents.runtime.live_runtime import AdkStreamResult
     from edgar_capstone.telemetry import get_telemetry_sink
@@ -775,6 +787,7 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
     }
     report_payload = {
         "headline": "NVIDIA revenue expanded on data center demand.",
+        "intent": "thematic_trend_tracking",
         "key_metrics": [],
         "findings": [
             {
@@ -799,6 +812,21 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
         react_loop.StructuredReActExecutor,
         "_invoke_financial_reasoning",
         lambda self, **_kw: stub_stream,
+    )
+    monkeypatch.setattr(
+        react_loop,
+        "evaluate_variance_explanation",
+        lambda **_kw: NarrativeEvaluationReport(
+            evaluator_model="gemini-3.8-flash",
+            grade="pass",
+            overall_score=0.93,
+            numeric_fidelity_score=1.0,
+            citation_grounding_score=0.95,
+            citation_precision_score=0.95,
+            explanation_quality_score=0.90,
+            thematic_consistency_score=0.88,
+            rationale="Verified async judge result.",
+        ),
     )
 
     sink = get_telemetry_sink()
@@ -846,9 +874,21 @@ def test_react_async_judge_pending_and_background_telemetry_callback(
         skip_background_judge=False,
     )
     eval_rep = result["evaluation_report"]
-    assert result["judge_mode"] == "offline_only"
+    assert result["judge_mode"] == "async_background"
     assert eval_rep.grade == "pending"
     assert eval_rep.overall_score is None
+
+    completed = react_loop.flush_pending_evaluations(timeout=5.0)
+    assert completed >= 1
+    async_evals = sink.recent_async_evaluations(session_id=session_id)
+    assert len(async_evals) == 1
+    assert async_evals[0]["evaluation_grade"] == "pass"
+    assert async_evals[0]["evaluation_score"] == 0.93
+    # Agent's resolved canonical intent overrides provisional intent on the async eval row.
+    assert async_evals[0]["intent"] == "thematic_trend_tracking"
+    updated_turns = sink.query_session_telemetry(session_id=session_id)
+    assert updated_turns[0]["evaluation_grade"] == "pass"
+    assert updated_turns[0]["evaluation_score"] == 0.93
     sink.reset_local_buffers()
 
 
@@ -1291,3 +1331,184 @@ def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
     assert "(`gemini-next-flash`)" in make_adk_instruction_provider("narrative_evaluator")(ctx)
     monkeypatch.setenv("EDGAR_LITE_MODEL", "gemini-next-lite")
     assert resolve_model_for_task("context_compaction") == "gemini-next-lite"
+
+
+def test_background_judge_manager_shutdown_and_error_isolation() -> None:
+    """Exercise `_BackgroundJudgeManager` error handling and `shutdown()` cleanly."""
+    from edgar_capstone.agents.orchestration.react_loop import _BackgroundJudgeManager
+
+    mgr = _BackgroundJudgeManager(max_workers=1)
+    ran: list[str] = []
+
+    def _ok() -> None:
+        ran.append("ok")
+
+    def _fail() -> None:
+        raise RuntimeError("judge boom")
+
+    mgr.submit(_ok)
+    mgr.submit(_fail)
+    completed = mgr.flush(timeout=5.0)
+    assert completed >= 0
+    assert ran == ["ok"]
+    mgr.shutdown(timeout=2.0)
+    assert mgr.submit(_ok) is None
+    # Idempotent second shutdown
+    mgr.shutdown(timeout=1.0)
+
+
+def test_async_judge_sampling_rate_configuration_and_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify EDGAR_ASYNC_JUDGE_SAMPLE_RATE parsing, clamping, and sampled_out / offline_only modes."""
+    from edgar_capstone.agents.core.schemas import NarrativeEvaluationReport
+    from edgar_capstone.agents.orchestration import react_loop
+    from edgar_capstone.agents.runtime.live_runtime import AdkStreamResult
+    from edgar_capstone.telemetry import get_telemetry_sink
+
+    monkeypatch.delenv("EDGAR_ASYNC_JUDGE_SAMPLE_RATE", raising=False)
+    assert react_loop.resolve_async_judge_sample_rate() == 1.0
+
+    for raw, expected in [
+        ("0", 0.0),
+        ("0.0", 0.0),
+        ("0.25", 0.25),
+        ("1.0", 1.0),
+        ("-0.5", 0.0),
+        ("2.5", 1.0),
+        ("not-a-float", 1.0),
+        ("nan", 1.0),
+        ("inf", 1.0),
+    ]:
+        monkeypatch.setenv("EDGAR_ASYNC_JUDGE_SAMPLE_RATE", raw)
+        assert react_loop.resolve_async_judge_sample_rate() == expected
+
+    excerpt = "Data center demand drove strong revenue expansion across cloud customers."
+    citation = {
+        "chunk_id": "NVDA_2026_item_7_0001",
+        "ticker": "NVDA",
+        "company_name": "NVIDIA Corporation",
+        "fiscal_year": 2026,
+        "section_id": "item_7",
+        "section_title": "Item 7. MD&A",
+        "gics_sector": "Information Technology",
+        "accession_number": "0001045810-26-000021",
+        "sec_filing_url": "https://www.sec.gov/example",
+        "excerpt": excerpt,
+        "score": 0.95,
+    }
+    report_payload = {
+        "headline": "NVIDIA revenue expanded on data center demand.",
+        "intent": "longitudinal_single_company",
+        "key_metrics": [],
+        "findings": [
+            {
+                "statement": "Data center demand drove strong revenue expansion.",
+                "ticker": "NVDA",
+                "fiscal_year": 2026,
+                "chunk_ids": ["NVDA_2026_item_7_0001"],
+                "evidence_quote": excerpt,
+            }
+        ],
+    }
+    stub_stream = AdkStreamResult(
+        agent_name="FinancialAnalystAgent",
+        app_name="edgar_chat_app",
+        session_id="sess-sampling-test",
+        backend="custom_llm",
+        final_text=json.dumps(report_payload),
+        observed_ttft_ms=80.0,
+        session_state={"financial_analyst_report": report_payload},
+    )
+    monkeypatch.setattr(
+        react_loop.StructuredReActExecutor,
+        "_invoke_financial_reasoning",
+        lambda self, **_kw: stub_stream,
+    )
+    judge_calls: list[str] = []
+
+    def _stub_judge(**kwargs: Any) -> NarrativeEvaluationReport:
+        judge_calls.append(str(kwargs.get("query")))
+        return NarrativeEvaluationReport(
+            evaluator_model="gemini-3.8-flash",
+            grade="pass",
+            overall_score=0.91,
+            numeric_fidelity_score=1.0,
+            citation_grounding_score=0.9,
+            citation_precision_score=0.9,
+            explanation_quality_score=0.85,
+            thematic_consistency_score=0.85,
+            rationale="Sampled async judge result.",
+        )
+
+    monkeypatch.setattr(react_loop, "evaluate_variance_explanation", _stub_judge)
+
+    scope = {
+        "tickers": ["NVDA"],
+        "gics_sector": "ALL",
+        "section_id": "item_7",
+        "start_year": 2025,
+        "end_year": 2026,
+    }
+    sink = get_telemetry_sink()
+    sink.reset_local_buffers()
+
+    # 1. Sample rate 0.0 -> offline_only (never calls judge)
+    monkeypatch.setenv("EDGAR_ASYNC_JUDGE_SAMPLE_RATE", "0.0")
+    res_off = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="q-off",
+        intent="longitudinal_single_company",
+        scope=scope,
+        citations=[citation],
+        session_id="sess-sampling-test",
+        skip_background_judge=False,
+    )
+    assert res_off["judge_mode"] == "offline_only"
+    assert res_off["evaluation_report"].grade == "pending"
+    assert res_off["evaluation_report"].overall_score is None
+    assert judge_calls == []
+
+    # 2. Sample rate 0.25 with random roll >= 0.25 -> sampled_out
+    monkeypatch.setenv("EDGAR_ASYNC_JUDGE_SAMPLE_RATE", "0.25")
+    monkeypatch.setattr(react_loop.random, "random", lambda: 0.75)
+    res_skip = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="q-sampled-out",
+        intent="longitudinal_single_company",
+        scope=scope,
+        citations=[citation],
+        session_id="sess-sampling-test",
+        skip_background_judge=False,
+    )
+    assert res_skip["judge_mode"] == "sampled_out"
+    assert judge_calls == []
+
+    # 3. Sample rate 0.25 with random roll < 0.25 -> async_background
+    monkeypatch.setattr(react_loop.random, "random", lambda: 0.10)
+    res_hit = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="q-sampled-in",
+        intent="longitudinal_single_company",
+        scope=scope,
+        citations=[citation],
+        session_id="sess-sampling-test",
+        skip_background_judge=False,
+    )
+    assert res_hit["judge_mode"] == "async_background"
+    react_loop.flush_pending_evaluations(timeout=5.0)
+    assert judge_calls == ["q-sampled-in"]
+    evals = sink.recent_async_evaluations(session_id="sess-sampling-test")
+    assert len(evals) == 1
+    assert evals[0]["evaluation_score"] == 0.91
+
+    # 4. skip_background_judge=True always defers regardless of sample rate
+    monkeypatch.setenv("EDGAR_ASYNC_JUDGE_SAMPLE_RATE", "1.0")
+    res_defer = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="q-deferred",
+        intent="longitudinal_single_company",
+        scope=scope,
+        citations=[citation],
+        session_id="sess-sampling-test",
+        skip_background_judge=True,
+    )
+    assert res_defer["judge_mode"] == "deferred_to_caller"
+    assert judge_calls == ["q-sampled-in"]
+    sink.reset_local_buffers()

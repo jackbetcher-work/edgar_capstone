@@ -1560,7 +1560,7 @@ def _verify_and_finalize_success(
         )
 
     score_label = (
-        f"{eval_report.overall_score:.2f}" if eval_report.overall_score is not None else "offline"
+        f"{eval_report.overall_score:.2f}" if eval_report.overall_score is not None else "pending"
     )
     ctx.append_trace(
         agent="FinancialAnalystAgent",
@@ -1570,7 +1570,7 @@ def _verify_and_finalize_success(
         duration_ms=fc_ms,
         summary=(
             f"Formatted grounded report (`{reasoning_model}`) & verification "
-            f"(judge_mode={react_result.get('judge_mode', 'offline_only')}, "
+            f"(judge_mode={react_result.get('judge_mode', 'async_background')}, "
             f"grade={eval_report.grade}, score={score_label}) · "
             f"Verified {fact_check.checked_metrics_count} variance figure(s) & "
             f"{fact_check.matched_citations_count} citation tag(s) · Passed: {fact_check.passed}."
@@ -1638,7 +1638,7 @@ def _verify_and_finalize_success(
             "strategy": "structured_react_loop",
             "execution_mode": active_execution_mode,
             "observed_ttft_ms": adk_runtime_meta.get("observed_ttft_ms"),
-            "judge_mode": react_result.get("judge_mode", "offline_only"),
+            "judge_mode": react_result.get("judge_mode", "async_background"),
             "iterations": len(react_steps),
             "steps": [s.model_dump(mode="json") for s in react_steps],
             "variance_evaluations": [v.model_dump(mode="json") for v in variance_evaluations],

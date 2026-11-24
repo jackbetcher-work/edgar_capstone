@@ -30,18 +30,19 @@ flowchart TD
     X --> Q["tool.query_cached_10k_context"]
     X --> M["sector.map_reduce (for GICS sector thematic queries)"]
     X --> L["adk.run_agent_stream -> ADK invoke_agent / call_llm / execute_tool (+ Vertex AI Gemini HTTP spans)"]
+    X -.->|"async background (sampled)"| J["evaluation.narrative_judge -> record_async_evaluation_result"]
     T --> RG["guardrail.inspect_model_response (+ Model Armor HTTP span)"]
     T --> B["BigQuery insertAll HTTP spans (async pool -> telemetry + audit sinks)"]
     T --> FS["Firestore REST spans (analyst_sessions / analyst_feedback)"]
 ```
 
 - **Server span:** `opentelemetry-instrumentation-fastapi`. It continues the upstream W3C `traceparent` (or the legacy `X-Cloud-Trace-Context`), so Cloud Run's own request span and the app spans share one trace. Health probes and static assets are excluded (`EDGAR_TRACE_EXCLUDED_URLS`).
-- **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.scope_continuity_llm`, `chat.retrieve_citations`), intent fallback (`orchestrator.infer_intent_from_tools`; the analyst emits intent in `AnalystReport.intent`), anomaly explanation linker (`anomaly.attach_explanations`), synthesis (`react.execute`, `react.evaluate_variances`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and offline narrative evaluator (`evaluation.narrative_judge` during `make eval-all`). `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls.
+- **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.scope_continuity_llm`, `chat.retrieve_citations`), intent fallback (`orchestrator.infer_intent_from_tools`; the analyst emits intent in `AnalystReport.intent`), anomaly explanation linker (`anomaly.attach_explanations`), synthesis (`react.execute`, `react.evaluate_variances`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and narrative evaluator (`evaluation.narrative_judge` asynchronously on sampled live turns via `EDGAR_ASYNC_JUDGE_SAMPLE_RATE` and synchronously during `make eval-all`). `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls.
 - **Model calls:** ADK's built-in `gcp.vertex.agent` spans (`invoke_agent`, `call_llm`, `execute_tool`) attach to the same global provider. Every recorded model call also adds an `llm.call` span event with `gen_ai.request.model`, input/output/cached/thinking tokens, `edgar.ttft_ms`, latency, and cost.
 - **Outbound HTTP:** `opentelemetry-instrumentation-httpx` creates client spans for Vertex AI (google-genai), BigQuery, Discovery Engine, GCS, Firestore, and Model Armor, and propagates context on them.
-- **Thread hops:** `_run_coro_sync` (persistent background ADK `asyncio` event loop), `POST /api/v1/chat/stream` SSE worker threads, and `sector.map_reduce` batch pools all copy `contextvars` (`contextvars.copy_context().run` / `loop.create_task(coro, context=ctx)`), so live ADK runs and map-reduce batches stay correlated under the parent request trace.
+- **Thread hops:** `_run_coro_sync` (persistent background ADK `asyncio` event loop), `POST /api/v1/chat/stream` SSE worker threads, `sector.map_reduce` batch pools, and the async judge pool (`_BackgroundJudgeManager`) all copy `contextvars` (`contextvars.copy_context().run` / `loop.create_task(coro, context=ctx)`), so live ADK runs, map-reduce batches, and async judge evaluations stay correlated under the parent request trace.
 - **Error & mid-stream access logging:** `RequestTelemetryMiddleware` emits `http_request_completed` inside a `finally` block so latency metrics and trace-linked access logs are recorded even when an unhandled exception raises HTTP `500`. If an exception occurs mid-stream after headers are already flushed (e.g., SSE on `/api/v1/chat/stream`), the original HTTP status code is preserved and the log sets `unhandled_exception: true` and `stream_aborted: true` (alongside an `http_request_failed` exception log at `ERROR`).
-- **Shutdown flushing:** FastAPI's lifespan shutdown hook flushes async BigQuery streaming inserts (`flush_async_writes`), closes telemetry/feedback stores (`reset_telemetry_stores`), and flushes OpenTelemetry trace spans (`flush_tracing`).
+- **Shutdown flushing:** FastAPI's lifespan shutdown hook drains pending background judge evaluations (`flush_pending_evaluations`), flushes async BigQuery streaming inserts (`flush_async_writes`), closes telemetry/feedback stores (`reset_telemetry_stores`), and flushes OpenTelemetry trace spans (`flush_tracing`).
 
 ## Structured log format
 
@@ -118,7 +119,7 @@ All telemetry metrics filter on `resource.type="cloud_run_revision" AND resource
 | `sec_edgar/llm_cost_usd` | DISTRIBUTION, 1 (USD) | `llm_telemetry_events` → `total_cost_usd` | `model_name`, `task_category` |
 | `sec_edgar/llm_cache_savings_usd` | DISTRIBUTION, 1 (USD) | `llm_telemetry_events` → `cached_token_savings_usd` | `model_name`, `task_category` |
 | `sec_edgar/session_turns` | DELTA INT64 counter | `session_telemetry_events` with `execution_mode!="async_evaluation"` | `intent`, `execution_mode`, `status`, `fact_check_passed`, `report_generated` |
-| `sec_edgar/evaluation_scores` | DISTRIBUTION, 1 (0–1) | `session_telemetry_events` with `execution_mode="async_evaluation" AND evaluation_score>=0` (retained for scored evaluation rows; interactive turns no longer spawn background judge calls) | `intent`, `evaluation_grade` |
+| `sec_edgar/evaluation_scores` | DISTRIBUTION, 1 (0–1) | `session_telemetry_events` with `execution_mode="async_evaluation" AND evaluation_score>=0` (populated asynchronously on sampled verified turns via `EDGAR_ASYNC_JUDGE_SAMPLE_RATE`) | `intent`, `evaluation_grade` |
 | `sec_edgar/security_audit_events` | DELTA INT64 counter | `security_audit_logs` | `event_type`, `status`, `identity_provider` |
 
 LLM token reporting (`total_context_tokens`, `cached_context_tokens`, `uncached_context_tokens`, `output_tokens`, `thoughts_tokens`) lives exclusively in BigQuery (`sec_edgar.llm_telemetry_events` and `sec_edgar.v_telemetry_cost_and_latency`) rather than being duplicated in Cloud Monitoring. USD distributions use exponential buckets from `$0.0001` (scale `0.0001`, growth `1.5`, 29 buckets, about `$12.8` plus overflow). Log-based counter metrics count entries and cannot sum float fields, so the dashboard's USD tiles are **approximate**. Exact cumulative USD totals also come from BigQuery `sec_edgar.v_telemetry_cost_and_latency`.
@@ -142,7 +143,7 @@ All policies are enabled and notify `var.monitoring_notification_channels`.
 | View | Grain | Highlights |
 | :-- | :-- | :-- |
 | `sec_edgar.v_telemetry_cost_and_latency` | day × model × agent × task | Exact token totals, `total_cost_usd`, `cached_token_savings_usd`, cache hit rate, avg/p95 TTFT & latency, TTFT SLO compliance |
-| `sec_edgar.v_session_analytics_summary` | day × intent × execution_mode | Turn counts, latency, cost, and fact-check pass rate over interactive turns (separate from offline/eval scored rows) |
+| `sec_edgar.v_session_analytics_summary` | day × intent × execution_mode | Turn counts, latency, cost, and fact-check pass rate over interactive turns, separated from sampled async LLM-as-a-Judge `avg_evaluation_score` / `p50_evaluation_score` rows |
 | `sec_edgar.v_security_audit_summary` | day × event_type × status × identity_provider | Totals, `denied_401` / `denied_403` / blocked counts, distinct principals, IAP-verified events, distinct traces |
 
 ```sql
@@ -206,6 +207,7 @@ ORDER BY recorded_at DESC;
 | `EDGAR_TRACE_INSTRUMENT_HTTPX` | `true` | Outbound httpx client spans |
 | `EDGAR_LOG_FORMAT` | `auto` | `json` on Cloud Run, `text` locally |
 | `EDGAR_LOG_LEVEL` | `INFO` | Root log level |
+| `EDGAR_ASYNC_JUDGE_SAMPLE_RATE` | `1.0` | Probability in `[0.0, 1.0]` for running the off-critical-path async LLM-as-a-Judge on verified live turns (`0.0` disables live background judging; `0 < r < 1` samples turns) |
 | `OTEL_SERVICE_NAME` / `K_SERVICE`, `COMMIT_SHA` | — | `service.name` / `service.version` resource attributes |
 
 Terraform enables `cloudtrace.googleapis.com` and `logging.googleapis.com` in `terraform/apis.tf` and grants `sec-analyst-sa` `roles/cloudtrace.agent` and `roles/logging.logWriter` in `terraform/iam.tf`. With `EDGAR_TRACE_EXPORTER=auto` and `EDGAR_LOG_FORMAT=auto`, Cloud Run is detected automatically.

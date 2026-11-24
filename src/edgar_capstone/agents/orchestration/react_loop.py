@@ -20,11 +20,20 @@ Implements the structured ReAct loop (`Thought -> Action -> Observation -> ... -
 
 from __future__ import annotations
 
+import atexit
+import contextlib
+import contextvars
 import json
 import logging
+import math
+import os
+import random
 import re
+import sys
+import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -42,6 +51,7 @@ from edgar_capstone.agents.core.schemas import (
     VarianceEvaluationItem,
 )
 from edgar_capstone.agents.evaluation.judge import (
+    evaluate_variance_explanation,
     evaluate_variance_explanation_with_latency,
 )
 from edgar_capstone.agents.evaluation.structured_report import (
@@ -51,6 +61,7 @@ from edgar_capstone.agents.evaluation.structured_report import (
     render_analyst_report_markdown,
     verify_analyst_report,
 )
+from edgar_capstone.agents.orchestration.intent import QUERY_INTENT_VALUES
 from edgar_capstone.agents.orchestration.scope_validation import extend_coverage_notices
 from edgar_capstone.agents.runtime.callbacks import verify_narrative_against_calculations
 from edgar_capstone.agents.runtime.latency_tracker import get_context_latency_tracker
@@ -73,14 +84,220 @@ from edgar_capstone.common.domain import (
     normalize_edgar_ticker,
 )
 from edgar_capstone.common.formatting import fmt_bps, fmt_pct, fmt_usd
-from edgar_capstone.observability.tracing import traced
+from edgar_capstone.observability.tracing import current_trace_correlation, traced
+from edgar_capstone.telemetry import get_telemetry_sink
 from edgar_capstone.vector_db.chunker import estimate_token_count
 
 logger = logging.getLogger(__name__)
 
+_SHUTDOWN_WAIT_BUDGET_SECONDS = 12.0
+ASYNC_JUDGE_SAMPLE_RATE_ENV = "EDGAR_ASYNC_JUDGE_SAMPLE_RATE"
+DEFAULT_ASYNC_JUDGE_SAMPLE_RATE = 1.0
+
+
+def resolve_async_judge_sample_rate() -> float:
+    """Resolve the async LLM-as-a-Judge sampling probability in ``[0.0, 1.0]``.
+
+    Controlled by ``EDGAR_ASYNC_JUDGE_SAMPLE_RATE`` (default ``1.0`` = evaluate every verified
+    interactive turn; set ``0.0`` to disable background judging; set e.g. ``0.1``–``0.25`` at
+    higher traffic to bound evaluation token spend). Invalid or non-finite values fall back to
+    ``DEFAULT_ASYNC_JUDGE_SAMPLE_RATE`` and out-of-range finite values are clamped to ``[0.0, 1.0]``.
+    """
+    raw = os.environ.get(ASYNC_JUDGE_SAMPLE_RATE_ENV, "").strip()
+    if not raw:
+        return DEFAULT_ASYNC_JUDGE_SAMPLE_RATE
+    try:
+        parsed = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r; falling back to %.2f",
+            ASYNC_JUDGE_SAMPLE_RATE_ENV,
+            raw,
+            DEFAULT_ASYNC_JUDGE_SAMPLE_RATE,
+        )
+        return DEFAULT_ASYNC_JUDGE_SAMPLE_RATE
+    if not math.isfinite(parsed):
+        logger.warning(
+            "Non-finite %s=%r; falling back to %.2f",
+            ASYNC_JUDGE_SAMPLE_RATE_ENV,
+            raw,
+            DEFAULT_ASYNC_JUDGE_SAMPLE_RATE,
+        )
+        return DEFAULT_ASYNC_JUDGE_SAMPLE_RATE
+    return max(0.0, min(1.0, parsed))
+
+
+def _should_sample_async_judge(sample_rate: float) -> bool:
+    """Return True when the current turn is selected for background LLM-as-a-Judge scoring."""
+    if sample_rate <= 0.0:
+        return False
+    if sample_rate >= 1.0:
+        return True
+    return random.random() < sample_rate
+
+
+class _BackgroundJudgeManager:
+    """Lazy-initialized thread pool for off-critical-path LLM-as-a-Judge evaluations."""
+
+    def __init__(self, *, max_workers: int = 4) -> None:
+        self._max_workers = max_workers
+        self._lock = threading.Lock()
+        self._pool: ThreadPoolExecutor | None = None
+        self._pending: list[Future[Any]] = []
+        self._shutting_down = threading.Event()
+
+    @property
+    def is_pool_initialized(self) -> bool:
+        with self._lock:
+            return self._pool is not None
+
+    def is_shutting_down(self) -> bool:
+        return self._shutting_down.is_set() or sys.is_finalizing()
+
+    def submit(self, fn: Callable[[], Any]) -> Future[Any] | None:
+        if self.is_shutting_down():
+            return None
+        ctx = contextvars.copy_context()
+        with self._lock:
+            if self._shutting_down.is_set():
+                return None
+            if self._pool is None:
+                self._pool = ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="edgar-bg-judge",
+                )
+            try:
+                fut = self._pool.submit(ctx.run, fn)
+            except RuntimeError:
+                return None
+            self._pending[:] = [f for f in self._pending if not f.done()]
+            self._pending.append(fut)
+            return fut
+
+    def flush(self, timeout: float = 30.0) -> int:
+        with self._lock:
+            pending = list(self._pending)
+            self._pending.clear()
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        completed = 0
+        for fut in pending:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                fut.result(timeout=remaining)
+                completed += 1
+            except Exception:
+                logger.debug(
+                    "Background judge future raised or timed out during flush", exc_info=True
+                )
+        return completed
+
+    def shutdown(self, timeout: float = _SHUTDOWN_WAIT_BUDGET_SECONDS) -> None:
+        self._shutting_down.set()
+        with self._lock:
+            pending = list(self._pending)
+            self._pending.clear()
+            pool = self._pool
+            self._pool = None
+        for fut in pending:
+            fut.cancel()
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        for fut in pending:
+            if not fut.cancelled() and not fut.done():
+                remaining = max(0.0, deadline - time.monotonic())
+                with contextlib.suppress(Exception):
+                    fut.result(timeout=remaining)
+        if pool is not None:
+            with contextlib.suppress(Exception):
+                pool.shutdown(wait=False, cancel_futures=True)
+
+
+_JUDGE_MANAGER = _BackgroundJudgeManager(max_workers=4)
+
+
+def _on_interpreter_exit() -> None:
+    _JUDGE_MANAGER.shutdown(timeout=_SHUTDOWN_WAIT_BUDGET_SECONDS)
+
+
+atexit.register(_on_interpreter_exit)
+
+
+def flush_pending_evaluations(timeout: float = 30.0) -> int:
+    """Wait for any pending background LLM-as-a-Judge tasks using a shared monotonic deadline."""
+    return _JUDGE_MANAGER.flush(timeout=timeout)
+
+
+def _schedule_background_judge(
+    *,
+    query: str,
+    response_markdown: str,
+    variance_reports: list[dict[str, Any]],
+    citations: list[dict[str, Any]],
+    cached_explanations_count: int,
+    session_id: str | None = None,
+    user_email: str = "analyst",
+    intent: str = "longitudinal_single_company",
+    tickers_analyzed: list[str] | None = None,
+    turn_id: str | None = None,
+    trace_id: str | None = None,
+    fact_check: FactCheckVerification | None = None,
+    llm: BaseLlm | None = None,
+) -> Future[Any] | None:
+    """Run live Flash LLM-as-a-Judge asynchronously and stream its real grade/score to telemetry."""
+    if _JUDGE_MANAGER.is_shutting_down():
+        return None
+
+    corr = current_trace_correlation()
+    eff_trace_id = trace_id or (corr.trace_id if corr is not None else None)
+    eff_tickers = list(tickers_analyzed or [])
+
+    def _run() -> NarrativeEvaluationReport | None:
+        if _JUDGE_MANAGER.is_shutting_down():
+            return None
+        try:
+            report = evaluate_variance_explanation(
+                query=query,
+                response_markdown=response_markdown,
+                variance_reports=variance_reports,
+                citations=citations,
+                cached_explanations_count=cached_explanations_count,
+                llm=llm,
+                fact_check=fact_check,
+            )
+            if report.overall_score is not None:
+                get_telemetry_sink().record_async_evaluation_result(
+                    session_id=session_id or "",
+                    user_email=user_email,
+                    intent=intent,
+                    evaluation_grade=report.grade,
+                    evaluation_score=report.overall_score,
+                    evaluator_model=report.evaluator_model,
+                    query_text=query,
+                    tickers_analyzed=eff_tickers,
+                    rationale=report.rationale,
+                    turn_id=turn_id,
+                    trace_id=eff_trace_id,
+                )
+            return report
+        except RuntimeError as exc:
+            msg_low = str(exc).lower()
+            if (
+                "interpreter shutdown" in msg_low
+                or "after shutdown" in msg_low
+                or _JUDGE_MANAGER.is_shutting_down()
+            ):
+                return None
+            logger.warning("Background async LLM-as-a-Judge evaluation failed: %s", exc)
+            return None
+        except Exception:
+            if not _JUDGE_MANAGER.is_shutting_down():
+                logger.warning("Background async LLM-as-a-Judge evaluation failed", exc_info=True)
+            return None
+
+    return _JUDGE_MANAGER.submit(_run)
+
 
 def _fmt_score(value: float | None) -> str:
-    return f"{value:.2f}" if value is not None else "offline"
+    return f"{value:.2f}" if value is not None else "pending"
 
 
 @traced("react.evaluate_variances")
@@ -952,8 +1169,82 @@ class StructuredReActExecutor:
             )
             return report, "sync", eval_latency_records
 
-        # LLM-as-a-Judge runs strictly offline (golden eval suite via `run_judge_sync=True`)
-        # rather than spawning a background Gemini call on every production request.
+        if skip_background_judge:
+            report = NarrativeEvaluationReport(
+                evaluator_model=resolve_model_for_task("evaluation"),
+                grade="pending",
+                overall_score=None,
+                numeric_fidelity_score=None,
+                citation_grounding_score=None,
+                citation_precision_score=None,
+                explanation_quality_score=None,
+                thematic_consistency_score=None,
+                unsupported_claims_count=0,
+                rationale=(
+                    "Deterministic claim verification passed; LLM-as-a-Judge deferred to "
+                    "caller evaluation harness (scores pending)."
+                ),
+            )
+            return report, "deferred_to_caller", eval_latency_records
+
+        sample_rate = resolve_async_judge_sample_rate()
+        if sample_rate <= 0.0:
+            report = NarrativeEvaluationReport(
+                evaluator_model=resolve_model_for_task("evaluation"),
+                grade="pending",
+                overall_score=None,
+                numeric_fidelity_score=None,
+                citation_grounding_score=None,
+                citation_precision_score=None,
+                explanation_quality_score=None,
+                thematic_consistency_score=None,
+                unsupported_claims_count=0,
+                rationale=(
+                    "Deterministic claim verification passed; live async LLM-as-a-Judge is "
+                    f"disabled ({ASYNC_JUDGE_SAMPLE_RATE_ENV}=0)."
+                ),
+            )
+            return report, "offline_only", eval_latency_records
+
+        if not _should_sample_async_judge(sample_rate):
+            report = NarrativeEvaluationReport(
+                evaluator_model=resolve_model_for_task("evaluation"),
+                grade="pending",
+                overall_score=None,
+                numeric_fidelity_score=None,
+                citation_grounding_score=None,
+                citation_precision_score=None,
+                explanation_quality_score=None,
+                thematic_consistency_score=None,
+                unsupported_claims_count=0,
+                rationale=(
+                    "Deterministic claim verification passed; turn not selected for async "
+                    f"LLM-as-a-Judge sampling ({ASYNC_JUDGE_SAMPLE_RATE_ENV}={sample_rate:.2f})."
+                ),
+            )
+            return report, "sampled_out", eval_latency_records
+
+        tickers_analyzed = sorted(
+            {
+                *(scope.get("tickers") or []),
+                *(str(r.get("ticker")) for r in variance_reports if r.get("ticker")),
+                *(str(c.get("ticker")) for c in merged_citations if c.get("ticker")),
+            }
+        )
+        _schedule_background_judge(
+            query=query,
+            response_markdown=outcome.answer_markdown,
+            variance_reports=variance_reports,
+            citations=merged_citations,
+            cached_explanations_count=cached_explanations_count,
+            session_id=session_id,
+            user_email=user_id,
+            intent=intent,
+            tickers_analyzed=tickers_analyzed,
+            turn_id=turn_id,
+            fact_check=outcome.fact_check_verification,
+            llm=None,
+        )
         report = NarrativeEvaluationReport(
             evaluator_model=resolve_model_for_task("evaluation"),
             grade="pending",
@@ -965,11 +1256,12 @@ class StructuredReActExecutor:
             thematic_consistency_score=None,
             unsupported_claims_count=0,
             rationale=(
-                "Deterministic claim verification passed; LLM-as-a-Judge runs offline "
-                "in the golden evaluation suite."
+                "Deterministic claim verification and numeric fact-check passed; "
+                "live Flash LLM-as-a-Judge scheduled asynchronously off the request path "
+                "(real grade and score will be streamed via record_async_evaluation_result)."
             ),
         )
-        return report, "offline_only", eval_latency_records
+        return report, "async_background", eval_latency_records
 
     @traced("react.execute", record_args=("intent", "session_id"))
     def execute_post_retrieval_reasoning(
@@ -1108,10 +1400,15 @@ class StructuredReActExecutor:
             )
         )
 
-        # Iteration 4: Post-synthesis Flash LLM-as-a-Judge evaluation (sync or async with real scores)
+        # Iteration 4: Post-synthesis Flash LLM-as-a-Judge evaluation (sync or sampled async)
+        effective_eval_intent = (
+            outcome.agent_intent
+            if isinstance(outcome.agent_intent, str) and outcome.agent_intent in QUERY_INTENT_VALUES
+            else intent
+        )
         eval_report, judge_mode, eval_latency_records = self._run_post_synthesis_evaluation(
             query=query,
-            intent=intent,
+            intent=effective_eval_intent,
             scope=scope,
             variance_reports=hydrated_reports,
             merged_citations=merged_citations,

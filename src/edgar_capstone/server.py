@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.orchestration.react_loop import flush_pending_evaluations
 from edgar_capstone.api.dependencies import (
     LiveRuntimeUnavailableError,
     register_exception_handlers,
@@ -77,14 +78,18 @@ async def _app_lifespan(_app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        # Flush/close BigQuery telemetry writes and OpenTelemetry trace spans even if an earlier step raises.
+        # Drain async background LLM-as-a-Judge evaluations, flush/close BigQuery telemetry writes,
+        # and flush OpenTelemetry trace spans even if an earlier cleanup step raises.
         try:
-            await asyncio.to_thread(get_telemetry_sink().flush_async_writes, 10.0)
+            await asyncio.to_thread(flush_pending_evaluations, 10.0)
         finally:
             try:
-                await asyncio.to_thread(reset_telemetry_stores)
+                await asyncio.to_thread(get_telemetry_sink().flush_async_writes, 10.0)
             finally:
-                await asyncio.to_thread(flush_tracing)
+                try:
+                    await asyncio.to_thread(reset_telemetry_stores)
+                finally:
+                    await asyncio.to_thread(flush_tracing)
 
 
 def create_app() -> FastAPI:

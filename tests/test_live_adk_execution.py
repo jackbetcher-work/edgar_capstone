@@ -23,6 +23,7 @@ from google.genai import types as genai_types
 
 from edgar_capstone.agents.evaluation.judge import evaluate_variance_explanation
 from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
+from edgar_capstone.agents.orchestration.react_loop import flush_pending_evaluations
 from edgar_capstone.agents.runtime import live_runtime as live_runtime_mod
 from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
 from edgar_capstone.agents.runtime.factories import create_financial_analyst_agent
@@ -37,6 +38,7 @@ from edgar_capstone.agents.tools.sec_tools import (
     calculate_period_variances,
     search_10k_chunks_rag,
 )
+from edgar_capstone.telemetry import get_telemetry_sink
 from tests.structured_report_helpers import (
     ScriptedBaseLlm,
     ScriptedJudgeLlm,
@@ -377,13 +379,31 @@ def test_conversational_rag_turn_executes_live_gemini_end_to_end(
 
         models_called = [r["model_name"] for r in turn["context_and_memory"]["model_call_records"]]
         assert any(_is_model(m, "gemini-3.8-flash") for m in models_called), models_called
-        assert runtime["judge_mode"] == "offline_only"
+        assert runtime["judge_mode"] == "async_background"
+        flush_pending_evaluations(timeout=30.0)
+        all_records = tracker.recent_records(limit=20)
+        assert any(
+            r.agent_name == "NarrativeEvaluatorAgent"
+            and _is_model(r.model_name, "gemini-3.8-flash")
+            for r in all_records
+        ), [(r.agent_name, r.model_name) for r in all_records]
+
+        async_evals = get_telemetry_sink().recent_async_evaluations(session_id="live-chat-sess-01")
+        assert len(async_evals) >= 1
+        assert any(
+            _is_model(ev.get("evaluator_model", ""), "gemini-3.8-flash")
+            and ev.get("evaluation_grade") in {"pass", "needs_revision", "fail"}
+            and ev.get("evaluation_score") is not None
+            and 0.0 <= float(ev["evaluation_score"]) <= 1.0
+            for ev in async_evals
+        ), async_evals
 
         assert len(turn["agent_trace"]) >= 4
         for step in turn["agent_trace"]:
             assert step["status"] in ("completed", "warning")
     finally:
-        pass
+        # Never leak an in-flight background judge thread into subsequent test modules
+        flush_pending_evaluations(timeout=15.0)
 
 
 def test_unverifiable_live_answer_is_withheld_not_replaced(fake_gcp_adapters: Any) -> None:
