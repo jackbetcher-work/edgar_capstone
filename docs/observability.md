@@ -1,6 +1,6 @@
 # Observability: Cloud Trace, Cloud Logging, Cloud Monitoring & BigQuery
 
-The FastAPI service exports **OpenTelemetry spans to Cloud Trace** and writes **structured JSON logs carrying trace IDs** to stdout. Cloud Run ingests those logs into **Cloud Logging**. A single `/api/v1/chat` request produces one trace covering the Cloud Run front end (or the HTTPS load balancer in `load_balancer` access mode), FastAPI, guardrails, ReAct steps, tools, ADK model calls, and outbound GCP REST calls. That request's log lines appear grouped under the trace, and its BigQuery telemetry rows carry the same `trace_id`.
+The FastAPI service exports **OpenTelemetry spans to Cloud Trace** and writes **structured JSON logs carrying trace IDs** to stdout. Cloud Run ingests those logs into **Cloud Logging**. A single `/api/v1/chat` request produces one trace covering the Cloud Run front end, FastAPI, guardrails, synthesis steps, tools, ADK model calls, and outbound GCP REST calls. That request's log lines appear grouped under the trace, and its BigQuery telemetry rows carry the same `trace_id`.
 
 Everything is operated from the **Google Cloud Console**: two Cloud Monitoring dashboards, low-cardinality log-based metrics, alert policies, and BigQuery SQL views queried from BigQuery Studio.
 
@@ -8,7 +8,7 @@ Code lives in [`src/edgar_capstone/observability/`](../src/edgar_capstone/observ
 
 | Module | Responsibility |
 | :-- | :-- |
-| `tracing.py` | `TracerProvider` + `LoggerProvider` exporting over OTLP/HTTP to `telemetry.googleapis.com` via ADK's `google_cloud.get_gcp_exporters(...)` (with Vertex AI Agent Engine auto-configuration and legacy `CloudTraceSpanExporter` fallback), GCP resource detection, sampling, propagators (`traceparent` + `X-Cloud-Trace-Context`), FastAPI / Google GenAI SDK / httpx auto-instrumentation, `@traced` / `start_span` helpers |
+| `tracing.py` | `TracerProvider` + `LoggerProvider` exporting over OTLP/HTTP to `telemetry.googleapis.com` via ADK's `google_cloud.get_gcp_exporters(...)` (plus local `console` / `otlp` exporters), GCP resource detection, sampling, propagators (`traceparent` + `X-Cloud-Trace-Context`), FastAPI / Google GenAI SDK / httpx auto-instrumentation, `@traced` / `start_span` helpers |
 | `structured_logging.py` | `CloudLoggingJsonFormatter` (Cloud Logging special fields + Error Reporting), local trace-aware text formatter, uvicorn log routing |
 | `middleware.py` | `RequestTelemetryMiddleware`: request log context, `X-Trace-Id` / `X-Request-Id` / `Server-Timing` response headers, one `http_request_completed` access log per request |
 
@@ -16,10 +16,10 @@ Code lives in [`src/edgar_capstone/observability/`](../src/edgar_capstone/observ
 
 ```mermaid
 flowchart TD
-    LB["Cloud Run front end / optional HTTPS LB (traceparent, X-Cloud-Trace-Context)"] --> S["FastAPI server span: POST /api/v1/chat"]
+    LB["Cloud Run front end (Direct IAP · traceparent, X-Cloud-Trace-Context)"] --> S["FastAPI server span: POST /api/v1/chat"]
     S --> A["auth.verify_jwt"]
     S --> T["chat.rag_turn"]
-    T --> G["guardrail.inspect_user_prompt (+ Model Armor / SDP HTTP spans)"]
+    T --> G["guardrail.inspect_user_prompt (+ Model Armor HTTP span)"]
     T --> SC["chat.scope_continuity_llm (parallel with Model Armor on warm unresolved turns)"]
     T --> R["chat.resolve_scope / orchestrator.infer_intent_from_tools"]
     T --> V["tool.calculate_period_variances"]
@@ -27,21 +27,21 @@ flowchart TD
     T --> C["chat.retrieve_citations / tool.search_10k_chunks_rag (+ BigQuery, Vertex AI Search HTTP spans)"]
     T --> X["react.execute"]
     X --> E["react.evaluate_variances"]
-    X --> Q["react.query_cached_10k / tool.query_cached_10k_context"]
+    X --> Q["tool.query_cached_10k_context"]
     X --> M["sector.map_reduce (for GICS sector thematic queries)"]
     X --> L["adk.run_agent_stream -> ADK invoke_agent / call_llm / execute_tool (+ Vertex AI Gemini HTTP spans)"]
-    X -.->|Async off critical path| J["evaluation.narrative_judge"]
+    T --> RG["guardrail.inspect_model_response (+ Model Armor HTTP span)"]
     T --> B["BigQuery insertAll HTTP spans (async pool -> telemetry + audit sinks)"]
     T --> FS["Firestore REST spans (analyst_sessions / analyst_feedback)"]
 ```
 
 - **Server span:** `opentelemetry-instrumentation-fastapi`. It continues the upstream W3C `traceparent` (or the legacy `X-Cloud-Trace-Context`), so Cloud Run's own request span and the app spans share one trace. Health probes and static assets are excluded (`EDGAR_TRACE_EXCLUDED_URLS`).
-- **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.scope_continuity_llm`, `chat.retrieve_citations`), intent fallback (`orchestrator.infer_intent_from_tools`; the analyst emits intent in `AnalystReport.intent`), anomaly explanation linker (`anomaly.attach_explanations`), ReAct steps (`react.execute`, `react.evaluate_variances`, `react.query_cached_10k`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and narrative evaluator. `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls (such as `agents/prompts/store.py`).
+- **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.scope_continuity_llm`, `chat.retrieve_citations`), intent fallback (`orchestrator.infer_intent_from_tools`; the analyst emits intent in `AnalystReport.intent`), anomaly explanation linker (`anomaly.attach_explanations`), synthesis (`react.execute`, `react.evaluate_variances`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and offline narrative evaluator (`evaluation.narrative_judge` during `make eval-all`). `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls.
 - **Model calls:** ADK's built-in `gcp.vertex.agent` spans (`invoke_agent`, `call_llm`, `execute_tool`) attach to the same global provider. Every recorded model call also adds an `llm.call` span event with `gen_ai.request.model`, input/output/cached/thinking tokens, `edgar.ttft_ms`, latency, and cost.
-- **Outbound HTTP:** `opentelemetry-instrumentation-httpx` creates client spans for Vertex AI (google-genai), BigQuery, Firestore, Model Armor, SDP, Secret Manager, and IAM Credentials, and propagates context on them.
-- **Thread hops:** `_run_coro_sync` (persistent background ADK `asyncio` event loop), `POST /api/v1/chat/stream` SSE worker threads, `sector.map_reduce` batch pools, and the off-critical-path background Flash judge pool all copy `contextvars` (`contextvars.copy_context().run` / `loop.create_task(coro, context=ctx)`), so live ADK runs, map-reduce batches, and background evaluations stay correlated under the parent request trace.
+- **Outbound HTTP:** `opentelemetry-instrumentation-httpx` creates client spans for Vertex AI (google-genai), BigQuery, Discovery Engine, GCS, Firestore, and Model Armor, and propagates context on them.
+- **Thread hops:** `_run_coro_sync` (persistent background ADK `asyncio` event loop), `POST /api/v1/chat/stream` SSE worker threads, and `sector.map_reduce` batch pools all copy `contextvars` (`contextvars.copy_context().run` / `loop.create_task(coro, context=ctx)`), so live ADK runs and map-reduce batches stay correlated under the parent request trace.
 - **Error & mid-stream access logging:** `RequestTelemetryMiddleware` emits `http_request_completed` inside a `finally` block so latency metrics and trace-linked access logs are recorded even when an unhandled exception raises HTTP `500`. If an exception occurs mid-stream after headers are already flushed (e.g., SSE on `/api/v1/chat/stream`), the original HTTP status code is preserved and the log sets `unhandled_exception: true` and `stream_aborted: true` (alongside an `http_request_failed` exception log at `ERROR`).
-- **Shutdown flushing:** FastAPI's lifespan shutdown hook flushes pending background judge futures (`flush_pending_evaluations`), async BigQuery streaming inserts (`flush_async_writes`), and OpenTelemetry trace spans (`flush_tracing`).
+- **Shutdown flushing:** FastAPI's lifespan shutdown hook flushes async BigQuery streaming inserts (`flush_async_writes`), closes telemetry/feedback stores (`reset_telemetry_stores`), and flushes OpenTelemetry trace spans (`flush_tracing`).
 
 ## Structured log format
 
@@ -76,7 +76,7 @@ Example `http_request_completed` access log line as written to stdout (`EDGAR_LO
 - Every logger in the process is covered: app modules, `uvicorn` / `uvicorn.error`, and third-party libraries. They all go through one root handler. Uvicorn's own access log is turned off because the middleware's access log replaces it with trace IDs and route templates.
 - To add structured fields, use `logger.info("msg", extra={"json_fields": {...}})`. Other non-standard `extra=` keys are included too.
 - Every ERROR+ line carries `serviceContext` (`service` = `K_SERVICE`, `version` = `COMMIT_SHA` / `K_REVISION`). `logger.exception(...)` (ERROR+ with a traceback) also adds the Error Reporting `@type` and `context.reportLocation`, so stack traces appear in Cloud Error Reporting. Plain error lines (for example 5xx access logs) deliberately skip `@type` so they don't open one Error Reporting group per path/latency message; they still show in the dashboard's *Operational errors* logs panel.
-- Telemetry sink records (`edgar_capstone.cloud_logging_sink`, `telemetry.py:emit_cloud_logging_sink_record`) write `component="sec-edgar-telemetry-sink"`, `log_sink_target` (`llm_telemetry_events` \| `session_telemetry_events` \| `security_audit_logs`), and `event_payload` as top-level `jsonPayload` fields. They feed the `sec_edgar/*` log-based metrics and the `sec-edgar-telemetry-audit-bq-sink` export (`jsonPayload.component="sec-edgar-telemetry-sink"`).
+- Telemetry sink records (`edgar_capstone.cloud_logging_sink`, `telemetry.py:emit_cloud_logging_sink_record`) write `component="sec-edgar-telemetry-sink"`, `log_sink_target` (`llm_telemetry_events` \| `session_telemetry_events` \| `security_audit_logs`), and `event_payload` as top-level `jsonPayload` fields, feeding the `sec_edgar/*` Cloud Monitoring log-based metrics.
 - Locally (`auto` without `K_SERVICE`), logs are readable text that still includes `[trace=… span=…]`.
 
 ## Correlation surfaces
@@ -85,7 +85,7 @@ Example `http_request_completed` access log line as written to stdout (`EDGAR_LO
 | :-- | :-- |
 | Response headers | `X-Trace-Id`, `X-Request-Id`, `Server-Timing: app;dur=…` (exposed through CORS for the Vite dev UI) |
 | `/api/v1/chat` body | `observability.trace_id`, `span_id`, `cloud_trace_resource`, and a `cloud_trace_url` console deep link |
-| BigQuery | Nullable `trace_id` column in `llm_telemetry_events`, `session_telemetry_events`, and `security_audit_logs` (direct `insertAll` streaming), plus the raw LogEntry export in `sec_edgar_ops_logs` (`trace` column) |
+| BigQuery | Nullable `trace_id` column in `llm_telemetry_events`, `session_telemetry_events`, and `security_audit_logs` (direct `insertAll` streaming) |
 | Cloud Monitoring | `sec_edgar/api_request_latencies` (with trace exemplars) and the telemetry sink metrics below, charted on both dashboards; alert policies link back to the logs panels and traces |
 | `/health` | `observability.tracing` (exporter, sampling, instrumentation state) and `observability.logging` |
 
@@ -98,7 +98,7 @@ Model Armor, SDP, and projection-filter guardrail blocks (`model_armor_{prompt,r
 | Dashboard | Terraform | Contents |
 | :-- | :-- | :-- |
 | **SEC EDGAR RAG Vector Database — Chunk Health & Ingestion Monitoring** | `google_monitoring_dashboard.chunk_health_dashboard` (`monitoring.tf`) | Chunk health score, embedding / filing coverage, chunks by sector and section, anomalies, BigQuery query rate, chunk-health logs, API p50/p95/p99 by route |
-| **SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit** | `google_monitoring_dashboard.llm_observability_dashboard` (`observability.tf`) | Navigation tile (Trace Explorer, Logs Explorer, Error Reporting, Chunk Health dashboard, BigQuery Studio + SQL recipes); API request rate by route, responses by status class (2xx/4xx/5xx), server latency p50/p95/p99; LLM TTFT and end-to-end model latency p50/p95 by model & task; LLM calls by model, cache hit vs miss, TTFT SLO compliance; per-call USD cost and cache savings (mean/p95) and estimated USD/hour; interactive turns by intent and by `fact_check_passed`; async judge score mean/p50; security audit events by `event_type` and `status`; logs panels for operational errors, security audit logs, and LLM telemetry logs; Cloud Logging → BigQuery sink export errors |
+| **SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit** | `google_monitoring_dashboard.llm_observability_dashboard` (`observability.tf`) | Navigation tile (Trace Explorer, Logs Explorer, Error Reporting, Chunk Health dashboard, BigQuery Studio + SQL recipes); API request rate by route, responses by status class (2xx/4xx/5xx), server latency p50/p95/p99; LLM TTFT and end-to-end model latency p50/p95 by model & task; LLM calls by model, cache hit vs miss, TTFT SLO compliance; per-call USD cost and cache savings (mean/p95) and estimated USD/hour; interactive turns by intent and by `fact_check_passed`; scored evaluation mean/p50; security audit events by `event_type` and `status`; logs panels for operational errors, security audit logs, and LLM telemetry logs; project-wide Cloud Logging export error monitor |
 
 `terraform output llm_observability_dashboard_url` / `chunk_health_monitoring_dashboard_url` print the Console links.
 
@@ -118,7 +118,7 @@ All telemetry metrics filter on `resource.type="cloud_run_revision" AND resource
 | `sec_edgar/llm_cost_usd` | DISTRIBUTION, 1 (USD) | `llm_telemetry_events` → `total_cost_usd` | `model_name`, `task_category` |
 | `sec_edgar/llm_cache_savings_usd` | DISTRIBUTION, 1 (USD) | `llm_telemetry_events` → `cached_token_savings_usd` | `model_name`, `task_category` |
 | `sec_edgar/session_turns` | DELTA INT64 counter | `session_telemetry_events` with `execution_mode!="async_evaluation"` | `intent`, `execution_mode`, `status`, `fact_check_passed`, `report_generated` |
-| `sec_edgar/evaluation_scores` | DISTRIBUTION, 1 (0–1) | `session_telemetry_events` with `execution_mode="async_evaluation" AND evaluation_score>=0` | `intent`, `evaluation_grade` |
+| `sec_edgar/evaluation_scores` | DISTRIBUTION, 1 (0–1) | `session_telemetry_events` with `execution_mode="async_evaluation" AND evaluation_score>=0` (retained for scored evaluation rows; interactive turns no longer spawn background judge calls) | `intent`, `evaluation_grade` |
 | `sec_edgar/security_audit_events` | DELTA INT64 counter | `security_audit_logs` | `event_type`, `status`, `identity_provider` |
 
 LLM token reporting (`total_context_tokens`, `cached_context_tokens`, `uncached_context_tokens`, `output_tokens`, `thoughts_tokens`) lives exclusively in BigQuery (`sec_edgar.llm_telemetry_events` and `sec_edgar.v_telemetry_cost_and_latency`) rather than being duplicated in Cloud Monitoring. USD distributions use exponential buckets from `$0.0001` (scale `0.0001`, growth `1.5`, 29 buckets, about `$12.8` plus overflow). Log-based counter metrics count entries and cannot sum float fields, so the dashboard's USD tiles are **approximate**. Exact cumulative USD totals also come from BigQuery `sec_edgar.v_telemetry_cost_and_latency`.
@@ -133,23 +133,17 @@ All policies are enabled and notify `var.monitoring_notification_channels`.
 | `api_5xx_errors` | PromQL `sum(increase(…api_request_latencies_count{http_status=~"5.."}[5m])) >= N` | `api_5xx_alert_threshold` (`5`) |
 | `security_audit_blocks` | Sum of `security_audit_events` with `status` matching `denied_40[13]\|blocked.*` over 5 min `> N` | `security_block_alert_threshold` (`20`) |
 
-## BigQuery telemetry export
+## BigQuery telemetry streaming
 
-There are two complementary paths:
-
-1. **Direct streaming (analytical source of truth).** `BigQueryTelemetrySink` streams schema-validated rows with `tabledata.insertAll` into `sec_edgar.llm_telemetry_events`, `session_telemetry_events`, and `security_audit_logs`. The runtime SA only holds the append-only custom role `secEdgarTelemetrySinkAppend` on those three tables.
-2. **Cloud Logging export (raw, durable).** Project sink `sec-edgar-telemetry-audit-bq-sink` routes `jsonPayload.component="sec-edgar-telemetry-sink"` LogEntries into partitioned tables in the dedicated dataset **`sec_edgar_ops_logs`** (`us-central1`, 90-day partition expiry via `ops_logs_retention_days`). Its writer identity holds `roles/bigquery.dataEditor` **on that dataset only**. `sec_edgar.financial_metrics` / `filing_chunks` remain read-only.
-
-> [!NOTE]
-> Cloud Run labels are copied onto every Cloud Logging entry, and the BigQuery sink normalizes `-` to `_`. Both CI pipelines deploy with underscore-only labels (`commit_sha`, `deployed_by`), and `var.labels` validation rejects keys that collide after `-` → `_` normalization. Sink export errors can be checked on the *Cloud Logging → BigQuery Sink Export Errors* tile or with `gcloud logging read 'logName:"sink_error"' --freshness=1h`.
+`BigQueryTelemetrySink` streams schema-validated rows directly via `tabledata.insertAll` into `sec_edgar.llm_telemetry_events`, `session_telemetry_events`, and `security_audit_logs`. The runtime SA (`sec-analyst-sa`) only holds the append-only custom role `secEdgarTelemetrySinkAppend` (`bigquery.tables.get` + `bigquery.tables.updateData`) on those three tables, keeping `sec_edgar.financial_metrics` and `filing_chunks` strictly read-only. There is no duplicate Cloud Logging → BigQuery sink dataset; structured log lines stay in Cloud Logging to power the `sec_edgar/*` log-based metrics.
 
 ### SQL semantic views (BigQuery Studio)
 
 | View | Grain | Highlights |
 | :-- | :-- | :-- |
 | `sec_edgar.v_telemetry_cost_and_latency` | day × model × agent × task | Exact token totals, `total_cost_usd`, `cached_token_savings_usd`, cache hit rate, avg/p95 TTFT & latency, TTFT SLO compliance |
-| `sec_edgar.v_session_analytics_summary` | day × intent × execution_mode | Interactive turns vs async judge rows kept separate: turn counts / latency / cost only over `execution_mode != 'async_evaluation'` (no `0 ms` dilution); `avg_evaluation_score` only over scored async rows (`pending` / `NULL` excluded) |
-| `sec_edgar.v_security_audit_summary` | day × event_type × status × identity_provider | Totals, `denied_401` / `denied_403` / blocked counts, distinct principals, SPIFFE S2S attested and IAP-verified events, distinct traces |
+| `sec_edgar.v_session_analytics_summary` | day × intent × execution_mode | Turn counts, latency, cost, and fact-check pass rate over interactive turns (separate from offline/eval scored rows) |
+| `sec_edgar.v_security_audit_summary` | day × event_type × status × identity_provider | Totals, `denied_401` / `denied_403` / blocked counts, distinct principals, IAP-verified events, distinct traces |
 
 ```sql
 -- Exact LLM spend and cache savings, last 7 days
@@ -161,17 +155,17 @@ FROM `iron-radio-514217-q7.sec_edgar.v_telemetry_cost_and_latency`
 WHERE telemetry_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
 GROUP BY 1, 2 ORDER BY 1 DESC, cost_usd DESC;
 
--- Session quality: interactive turns vs async Flash judge scores
+-- Session volume, latency, and spend by intent
 SELECT session_date, intent,
-       SUM(interactive_turn_count) AS turns, SUM(pending_evaluation_turn_count) AS pending_at_turn_time,
-       SUM(scored_evaluation_count) AS scored, ROUND(AVG(avg_evaluation_score), 3) AS avg_score,
-       ROUND(AVG(p95_turn_latency_ms)) AS p95_turn_latency_ms, ROUND(SUM(total_cost_usd), 4) AS cost_usd
+       SUM(interactive_turn_count) AS turns,
+       ROUND(AVG(p95_turn_latency_ms)) AS p95_turn_latency_ms,
+       ROUND(SUM(total_cost_usd), 4) AS cost_usd
 FROM `iron-radio-514217-q7.sec_edgar.v_session_analytics_summary`
 GROUP BY 1, 2 ORDER BY 1 DESC, turns DESC;
 
--- Security audit trail: denials, guardrail blocks, SPIFFE attestations
+-- Security audit trail: denials, guardrail blocks, IAP-verified events
 SELECT audit_date, event_type, status, identity_provider,
-       total_events, denied_events, blocked_events, distinct_principals, spiffe_attested_events
+       total_events, denied_events, blocked_events, distinct_principals, iap_verified_events
 FROM `iron-radio-514217-q7.sec_edgar.v_security_audit_summary`
 WHERE audit_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
 ORDER BY audit_date DESC, total_events DESC;
@@ -241,4 +235,4 @@ curl -si -X POST localhost:8000/api/v1/chat -H "Authorization: Bearer $TOKEN" \
 - **BigQuery:** `SELECT * FROM sec_edgar.llm_telemetry_events WHERE trace_id = '<TRACE_ID>'` (same for `session_telemetry_events` / `security_audit_logs`).
 - **Cloud Monitoring:** the *LLM Telemetry, Cost, Sessions & Security Audit* dashboard and its logs panels.
 
-Tests: [`tests/test_observability.py`](../tests/test_observability.py) checks the span hierarchy with an in-memory exporter, upstream `traceparent` / `X-Cloud-Trace-Context` propagation, response headers, the JSON log format and trace fields, uvicorn routing, and `trace_id` on telemetry rows. [`tests/test_cloud_console_observability.py`](../tests/test_cloud_console_observability.py) covers the log-based metric definitions (low-cardinality labels), alert policies, dashboard widgets and layout, the ops-log sink dataset and IAM scope, the SQL views, the Cloud Run label-collision guard, guardrail audit principal and trace attribution, and the Error Reporting fields.
+Tests: [`tests/test_observability.py`](../tests/test_observability.py) checks the span hierarchy with an in-memory exporter, upstream `traceparent` / `X-Cloud-Trace-Context` propagation, response headers, the JSON log format and trace fields, uvicorn routing, and `trace_id` on telemetry rows. [`tests/test_cloud_console_observability.py`](../tests/test_cloud_console_observability.py) covers the log-based metric definitions (low-cardinality labels), alert policies, dashboard widgets and layout, append-only BigQuery telemetry IAM (with no duplicate log sink), the SQL views, the Cloud Run label-collision guard, guardrail audit principal and trace attribution, and the Error Reporting fields.
