@@ -10,7 +10,7 @@ Provisions the stack in project `iron-radio-514217-q7` (`us-central1`), with rem
 - Artifact Registry and keyless GitHub Actions Workload Identity Federation (`sec-edgar-cicd-sa`);
 - Cloud Monitoring dashboard, low-cardinality log-based metrics, alert policies, and BigQuery SQL semantic views.
 
-Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
+Requires Terraform `>= 1.7`.
 
 ## Provisioned Resources
 
@@ -39,7 +39,6 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `sec-edgar-sdp-inspect` uses `min_likelihood = "LIKELY"` and exempts `.*@.*\.iam\.gserviceaccount\.com$` and `.*@(sec\.gov|.*\.googleapis\.com)$` so service-account emails stay intact while personal emails, SSNs, phones, and credentials are redacted.
 - **Vertex AI Search / Discovery Engine (`terraform/vector_search.tf`):**
   - `sec-edgar-10k-corpus-ds` (`google_discovery_engine_data_store`) & `sec-edgar-10k-hybrid-search` (`google_discovery_engine_search_engine`): Unstructured 10-K search datastore and Enterprise LLM-enabled search app queried in parallel with BigQuery `VECTOR_SEARCH` over native `sec_edgar.filing_chunks`.
-- **BigQuery Cloud Resource Connection (`vertex-ai-rag-conn`, `terraform/bigquery.tf`):** Granted `roles/aiplatform.user` for Vertex AI integration.
 - **Gemini Models & APIs (`terraform/variables.tf`, `terraform/apis.tf`):**
   - `financial_reasoning_model` (default `gemini-3.8-flash`), `coding_and_evaluation_model` (`gemini-3.8-flash`, `ThinkingLevel.LOW`), `compaction_and_mapping_model` (`gemini-3.5-flash-lite`), `gemini_location` (`global`), and `async_judge_sample_rate` (`1.0`, validated in `[0.0, 1.0]`) become Cloud Run's `EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`, `EDGAR_LITE_MODEL`, `EDGAR_GEMINI_LOCATION`, and `EDGAR_ASYNC_JUDGE_SAMPLE_RATE`.
   - Gemini models are served from the `global` endpoint (`var.gemini_location`), while BigQuery, GCS, Model Armor, and embeddings run in `var.region`.
@@ -53,7 +52,7 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - See [`docs/observability.md`](../docs/observability.md) for metric names, labels, and trace correlation.
 - **Custom Application Service Account (`sec-analyst-sa`, `terraform/iam.tf`):**
   - Single custom runtime service account attached to `google_cloud_run_v2_service.sec_edgar_analyst` (default Compute Engine SAs are never used).
-  - Granted least-privilege read-only BigQuery (`roles/bigquery.dataViewer` on `sec_edgar`, `roles/bigquery.jobUser`, `roles/bigquery.connectionUser`), append-only telemetry writes (`secEdgarTelemetrySinkAppend` on the 3 telemetry/audit tables), GCS (`roles/storage.objectViewer` on `sec_corpus`), Vertex AI (`roles/aiplatform.user`), Discovery Engine (`roles/discoveryengine.viewer`), Model Armor (`roles/modelarmor.user`), DLP (`roles/dlp.user`), Firestore (`roles/datastore.user`), and observability writers (`roles/monitoring.metricWriter`, `roles/logging.logWriter`, `roles/cloudtrace.agent`, `roles/telemetry.writer`).
+  - Granted least-privilege read-only BigQuery (`roles/bigquery.dataViewer` on `sec_edgar`, `roles/bigquery.jobUser`), append-only telemetry writes (`secEdgarTelemetrySinkAppend` on the 3 telemetry/audit tables), GCS (`roles/storage.objectViewer` on `sec_corpus`), Vertex AI (`roles/aiplatform.user`), Discovery Engine (`roles/discoveryengine.viewer`), Model Armor (`roles/modelarmor.user`), DLP (`roles/dlp.user`), Firestore (`roles/datastore.user`), and observability writers (`roles/logging.logWriter`, `roles/cloudtrace.agent`, `roles/telemetry.writer`).
 - **Direct Cloud Run IAP (`terraform/iap_and_sso.tf`):**
   - `iap_enabled = true` directly on the Cloud Run v2 service (no external load balancer).
   - Only the Google-managed IAP service agent holds `roles/run.invoker`.
@@ -80,7 +79,7 @@ terraform plan
 terraform apply
 
 # 3. Populate curated SEC 10-K filings & vector DB manifests into the Terraform-managed bucket and BigQuery
-# (Requires the optional `[ingest]` extra for edgartools/pandas/google-cloud-storage: `pip install -e ".[ingest]"` or `".[dev]"`)
+# (Requires the optional `[ingest]` extra for edgartools/pandas: `pip install -e ".[ingest]"` or `".[dev]"`)
 ../.venv/bin/python ../scripts/build_sec_dataset.py --sp500 --no-create-bucket
 ../.venv/bin/python ../scripts/build_vector_db.py
 # (Already-built artifacts: publish without re-embedding)

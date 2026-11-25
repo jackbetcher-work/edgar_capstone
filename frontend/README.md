@@ -43,7 +43,7 @@ src/
 │   └── edgarApi.ts              # SSE streaming (/api/v1/chat/stream), /companies, /section, /sessions (reset/delete), /feedback
 ├── types/edgar.ts               # API response, SSE progress, NumericCitation, CoverageNotice & XBRL types
 └── utils/
-    ├── citationDedup.ts         # Consumes backend `duplicate_sources` aliases (with fallback passage dedup) so repeated passages map to one kept card
+    ├── citationDedup.ts         # Expands backend `duplicate_sources` aliases into display groups and `aliasOf` maps so repeated passages map to one kept card
     ├── citationTokens.ts        # Builds canonical inline-citation tokens for the source pane
     ├── deterministicEvidence.ts # Render predicates for variance, anomaly-flag, and disclosure-delta cards
     ├── filingMarkdown.ts        # Parses corpus chunk Markdown (strips header/escapes/footers, repairs SEC tables)
