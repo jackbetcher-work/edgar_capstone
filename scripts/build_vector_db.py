@@ -6,18 +6,14 @@ Produces:
        data/curated_dataset/manifests/bigquery_filing_chunks.jsonl
        -> gs://<bucket>/manifests/bigquery_filing_chunks.jsonl
        -> BigQuery table `sec_edgar.filing_chunks`
-  2. Vertex AI Vector Search (Matching Engine) embeddings + metadata restricts:
-       data/curated_dataset/vector_search/embeddings/chunks_embeddings.json
-       -> gs://<bucket>/vector_search/embeddings/chunks_embeddings.json
-  3. Chunk Health Telemetry Report & Google Cloud Monitoring TimeSeries:
+  2. Chunk Health Report (live corpus health is also exposed via BigQuery `v_chunk_health_metrics`):
        data/curated_dataset/manifests/chunk_health_report.json
-       -> custom.googleapis.com/sec_edgar/chunk_health/*
 
 Examples:
   # Stage locally without publishing (chunks are still embedded live with Vertex AI)
   .venv/bin/python scripts/build_vector_db.py --local-only
 
-  # End-to-end cloud population (Vertex AI embeddings -> GCS -> BigQuery -> Cloud Monitoring)
+  # End-to-end cloud population (Vertex AI embeddings -> GCS -> BigQuery)
   .venv/bin/python scripts/build_vector_db.py
 
   # Specific tickers or sector

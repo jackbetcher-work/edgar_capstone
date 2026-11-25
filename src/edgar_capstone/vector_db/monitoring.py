@@ -1,8 +1,7 @@
-"""Chunk health evaluation and structured telemetry for the RAG vector DB."""
+"""Chunk health evaluation for the SEC 10-K RAG vector DB."""
 
 from __future__ import annotations
 
-import logging
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -10,7 +9,6 @@ from typing import Any
 
 import numpy as np
 
-from edgar_capstone.common.formatting import utc_now_iso
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.gcp.bigquery import BigQueryClientWrapper
 from edgar_capstone.gcp.defaults import (
@@ -25,9 +23,6 @@ from edgar_capstone.vector_db.models import (
     SectionHealthBreakdown,
 )
 
-logger = logging.getLogger(__name__)
-
-METRIC_PREFIX = "custom.googleapis.com/sec_edgar/chunk_health"
 MIN_HEALTHY_CHARS = 100
 MAX_HEALTHY_CHARS = 8000
 MAX_HEALTHY_TOKENS = 2048
@@ -344,183 +339,6 @@ def evaluate_chunk_health(
         health_score=health_score,
         health_status=health_status,
     )
-
-
-def build_cloud_monitoring_timeseries(
-    report: ChunkHealthReport,
-    *,
-    timestamp_rfc3339: str | None = None,
-) -> list[dict[str, Any]]:
-    """Construct Google Cloud Monitoring v3 `TimeSeries` payloads from a `ChunkHealthReport`.
-
-    Aligns 1:1 with the custom metric descriptors and dashboard widgets provisioned
-    in `terraform/monitoring.tf`.
-    """
-    end_time = timestamp_rfc3339 or utc_now_iso()
-    resource = {
-        "type": "global",
-        "labels": {"project_id": report.project_id},
-    }
-    base_labels = {
-        "dataset_id": report.dataset_id,
-        "table_id": report.table_id,
-    }
-
-    series: list[dict[str, Any]] = []
-
-    def _add_gauge(
-        metric_name: str,
-        value_type: str,
-        value: int | float,
-        extra_labels: dict[str, str] | None = None,
-    ) -> None:
-        labels = dict(base_labels)
-        if extra_labels:
-            labels.update(extra_labels)
-        point_val = (
-            {"int64Value": str(int(value))}
-            if value_type == "INT64"
-            else {"doubleValue": float(value)}
-        )
-        series.append(
-            {
-                "metric": {
-                    "type": f"{METRIC_PREFIX}/{metric_name}",
-                    "labels": labels,
-                },
-                "resource": resource,
-                "metricKind": "GAUGE",
-                "valueType": value_type,
-                "points": [
-                    {
-                        "interval": {"endTime": end_time},
-                        "value": point_val,
-                    }
-                ],
-            }
-        )
-
-    # 1. Overall health score (0-100)
-    _add_gauge(
-        "health_score",
-        "DOUBLE",
-        report.health_score,
-        {"health_status": report.health_status},
-    )
-
-    # 2. Embedding coverage ratio (0.0-1.0)
-    _add_gauge(
-        "embedding_coverage_ratio",
-        "DOUBLE",
-        report.embedding_coverage_ratio,
-        {"embedding_model": report.embedding_model},
-    )
-
-    # 3. 10-K filing coverage ratio (0.0-1.0)
-    _add_gauge(
-        "filing_coverage_ratio",
-        "DOUBLE",
-        report.full_section_coverage_ratio,
-    )
-
-    # 4. Total chunks broken down by GICS sector & section
-    for sec_id, sec_breakdown in report.by_section.items():
-        _add_gauge(
-            "token_count_mean",
-            "DOUBLE",
-            sec_breakdown.avg_token_estimate,
-            {"section_id": sec_id},
-        )
-    for sector, sector_breakdown in report.by_sector.items():
-        _add_gauge(
-            "total_chunks",
-            "INT64",
-            sector_breakdown.total_chunks,
-            {"gics_sector": sector, "section_id": "all"},
-        )
-    for sec_id, sec_breakdown in report.by_section.items():
-        _add_gauge(
-            "total_chunks",
-            "INT64",
-            sec_breakdown.total_chunks,
-            {"gics_sector": "all", "section_id": sec_id},
-        )
-
-    # 5. Anomaly counts by anomaly_type (chunk-level + legacy missing_section_filings label)
-    anomaly_map = {
-        "missing_embedding": report.anomalies.missing_embedding,
-        "dimension_mismatch": report.anomalies.dimension_mismatch,
-        "non_finite_embedding": report.anomalies.non_finite_embedding,
-        "undersized_chunk": report.anomalies.undersized_chunk,
-        "oversized_chunk": report.anomalies.oversized_chunk,
-        "missing_metadata": report.anomalies.missing_metadata,
-        "missing_section_filings": report.anomalies.missing_section_filings,
-    }
-    for anomaly_type, count in anomaly_map.items():
-        _add_gauge(
-            "anomaly_chunk_count",
-            "INT64",
-            count,
-            {"anomaly_type": anomaly_type},
-        )
-
-    # 6. Dedicated filing-level gauge (unit={filings}) for missing-section company-years
-    _add_gauge(
-        "missing_section_filings",
-        "INT64",
-        report.anomalies.missing_section_filings,
-    )
-
-    return series
-
-
-def format_structured_health_log(
-    report: ChunkHealthReport,
-    *,
-    max_profile_ids: int = 50,
-) -> dict[str, Any]:
-    """Build a Cloud Logging structured JSON log record for the chunk health report."""
-    severity_map = {
-        "HEALTHY": "INFO",
-        "DEGRADED": "WARNING",
-        "UNHEALTHY": "ERROR",
-    }
-    missing_ids = list(report.missing_profile_ids[:max_profile_ids])
-    incomplete_ids = list(report.incomplete_section_profile_ids[:max_profile_ids])
-    return {
-        "severity": severity_map.get(report.health_status, "INFO"),
-        "event_type": "sec_edgar_chunk_health_evaluation",
-        "message": (
-            f"SEC EDGAR RAG Vector DB Health: {report.health_status} "
-            f"(score={report.health_score:.1f}/100, chunks={report.total_chunks}, "
-            f"embedding_coverage={report.embedding_coverage_ratio * 100:.1f}%, "
-            f"filing_coverage={report.full_section_coverage_ratio * 100:.1f}%, "
-            f"missing_section_filings={report.anomalies.missing_section_filings})"
-        ),
-        "project_id": report.project_id,
-        "dataset_id": report.dataset_id,
-        "table_id": report.table_id,
-        "health_score": report.health_score,
-        "health_status": report.health_status,
-        "total_chunks": report.total_chunks,
-        "valid_embedding_count": report.valid_embedding_count,
-        "embedding_coverage_ratio": report.embedding_coverage_ratio,
-        "total_profiles_expected": report.total_profiles_expected,
-        "total_profiles_indexed": report.total_profiles_indexed,
-        "profiles_with_both_sections": report.profiles_with_both_sections,
-        "full_section_coverage_ratio": report.full_section_coverage_ratio,
-        "missing_section_filings": report.anomalies.missing_section_filings,
-        "missing_profile_ids": missing_ids,
-        "missing_profile_ids_truncated": max(0, len(report.missing_profile_ids) - len(missing_ids)),
-        "incomplete_section_profile_ids": incomplete_ids,
-        "incomplete_section_profile_ids_truncated": max(
-            0, len(report.incomplete_section_profile_ids) - len(incomplete_ids)
-        ),
-        "avg_token_estimate": report.avg_token_estimate,
-        "p95_token_estimate": report.p95_token_estimate,
-        "anomalies": report.anomalies.model_dump(mode="json"),
-        "evaluated_at": report.evaluated_at,
-    }
 
 
 def _breakdown_from_bq_row(group_key: str, row: dict[str, Any]) -> SectionHealthBreakdown:

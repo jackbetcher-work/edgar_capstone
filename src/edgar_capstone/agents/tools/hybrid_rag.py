@@ -18,7 +18,94 @@ from edgar_capstone.common.domain import normalize_edgar_ticker
 
 logger = logging.getLogger(__name__)
 
-_WORD_TOKEN_RE = re.compile(r"[a-z0-9]{2,}")
+_WORD_TOKEN_RE = re.compile(r"[a-z0-9]+&[a-z0-9]+|[a-z0-9]{2,}")
+_YEAR_TOKEN_RE = re.compile(r"^(?:19\d{2}|20\d{2})$")
+_CHUNK_HEADER_PREFIX_RE = re.compile(r"^\[[^\]]+\]\s*")
+_LEXICAL_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "between",
+        "by",
+        "compare",
+        "compared",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "how",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "over",
+        "that",
+        "the",
+        "their",
+        "them",
+        "they",
+        "this",
+        "through",
+        "to",
+        "vs",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+    }
+)
+_ACRONYM_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "r&d": ("r&d", "research", "development"),
+    "sg&a": ("sg&a", "selling", "administrative"),
+    "md&a": ("md&a",),
+}
+_CANONICAL_CHUNK_BONUS = 0.03
+_PURE_TABLE_PENALTY = 0.04
+
+
+def extract_lexical_terms(query: str) -> set[str]:
+    """Extract domain-relevant lexical query terms (expanding acronyms, dropping stopwords/years)."""
+    raw_tokens = _WORD_TOKEN_RE.findall((query or "").lower())
+    terms: set[str] = set()
+    for tok in raw_tokens:
+        if tok in _ACRONYM_EXPANSIONS:
+            terms.update(_ACRONYM_EXPANSIONS[tok])
+            continue
+        if tok in _LEXICAL_STOPWORDS or _YEAR_TOKEN_RE.match(tok):
+            continue
+        terms.add(tok)
+    return terms or set(raw_tokens)
+
+
+def _is_pure_table_chunk(text: str) -> bool:
+    """Return True when a chunk is overwhelmingly Markdown table cells with minimal narrative prose."""
+    if text.count("|") < 20:
+        return False
+    body = _CHUNK_HEADER_PREFIX_RE.sub("", text.strip(), count=1)
+    prose_chars = sum(
+        len(line.strip())
+        for line in body.splitlines()
+        if line.strip() and "|" not in line
+    )
+    return prose_chars < 160
 
 # Coverage-aware retrieval: when a ticker-scoped search spans several company-years, every
 # `(ticker, fiscal_year)` slice gets at least one passage before the remaining slots are filled
@@ -349,16 +436,25 @@ def _rerank_and_build_citations(
     With `slices`, selection is coverage-aware (see `_select_with_coverage`); otherwise it is a
     plain top-k by score.
     """
-    query_terms = set(_WORD_TOKEN_RE.findall(query.lower()))
+    query_terms = extract_lexical_terms(query)
     scored_candidates: list[tuple[float, dict[str, Any]]] = []
     for cand in fused.values():
-        text_lower = cand["chunk_text"].lower()
+        chunk_text = cand["chunk_text"]
+        text_lower = chunk_text.lower()
         lexical_boost = 0.0
         if query_terms:
             matched_terms = sum(1 for term in query_terms if term in text_lower)
             lexical_boost = 0.35 * (matched_terms / len(query_terms))
         rrf_norm = min(1.0, cand["rrf_score"] * 30.0)
-        hybrid_score = 0.55 * float(cand["max_similarity"]) + 0.30 * rrf_norm + lexical_boost
+        canonical_bonus = _CANONICAL_CHUNK_BONUS if "_vais_" not in str(cand["chunk_id"]) else 0.0
+        table_penalty = _PURE_TABLE_PENALTY if _is_pure_table_chunk(chunk_text) else 0.0
+        hybrid_score = (
+            0.55 * float(cand["max_similarity"])
+            + 0.30 * rrf_norm
+            + lexical_boost
+            + canonical_bonus
+            - table_penalty
+        )
         scored_candidates.append((hybrid_score, cand))
 
     scored_candidates.sort(key=lambda item: item[0], reverse=True)

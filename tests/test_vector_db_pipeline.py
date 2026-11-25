@@ -28,11 +28,7 @@ from edgar_capstone.vector_db.embedder import (
     VertexAIEmbedder,
     populate_chunk_embeddings,
 )
-from edgar_capstone.vector_db.monitoring import (
-    build_cloud_monitoring_timeseries,
-    evaluate_chunk_health,
-    format_structured_health_log,
-)
+from edgar_capstone.vector_db.monitoring import evaluate_chunk_health
 from edgar_capstone.vector_db.pipeline import (
     VectorDBBuildConfig,
     run_vector_db_pipeline,
@@ -249,34 +245,6 @@ def test_chunk_health_evaluation_and_cloud_monitoring_export() -> None:
     assert anomaly_report.anomalies.missing_section_filings == 1
     assert anomaly_report.missing_profile_ids == ["MSFT_2026"]
     assert anomaly_report.health_score < 90.0
-
-    # Verify Cloud Monitoring TimeSeries generation & publishing
-    ts_list = build_cloud_monitoring_timeseries(healthy_report)
-    metric_types = {ts["metric"]["type"] for ts in ts_list}
-    assert "custom.googleapis.com/sec_edgar/chunk_health/health_score" in metric_types
-    assert "custom.googleapis.com/sec_edgar/chunk_health/embedding_coverage_ratio" in metric_types
-    assert "custom.googleapis.com/sec_edgar/chunk_health/filing_coverage_ratio" in metric_types
-    assert "custom.googleapis.com/sec_edgar/chunk_health/total_chunks" in metric_types
-    assert "custom.googleapis.com/sec_edgar/chunk_health/token_count_mean" in metric_types
-    assert "custom.googleapis.com/sec_edgar/chunk_health/anomaly_chunk_count" in metric_types
-    assert "custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings" in metric_types
-
-    structured_log = format_structured_health_log(healthy_report)
-    assert structured_log["event_type"] == "sec_edgar_chunk_health_evaluation"
-    assert structured_log["severity"] == "INFO"
-    assert structured_log["missing_section_filings"] == 0
-    assert structured_log["missing_profile_ids"] == []
-    assert structured_log["incomplete_section_profile_ids"] == []
-
-    anomaly_log = format_structured_health_log(anomaly_report, max_profile_ids=1)
-    assert anomaly_log["missing_section_filings"] == 1
-    assert anomaly_log["missing_profile_ids"] == ["MSFT_2026"]
-    assert anomaly_log["missing_profile_ids_truncated"] == 0
-
-    assert len(ts_list) >= 10
-    structured_log = format_structured_health_log(healthy_report)
-    assert structured_log["event_type"] == "sec_edgar_chunk_health_evaluation"
-    assert structured_log["health_status"] == "HEALTHY"
 
 
 def test_end_to_end_vector_db_pipeline_staged_locally(tmp_path: Path) -> None:
@@ -774,9 +742,3 @@ def test_evaluate_chunk_health_from_bigquery() -> None:
     assert report.incomplete_section_profile_ids == ["IBM_2025"]
     assert "item_1a" in report.by_section
     assert "Information Technology" in report.by_sector
-
-    log_entry = format_structured_health_log(report)
-    assert log_entry["event_type"] == "sec_edgar_chunk_health_evaluation"
-    assert log_entry["missing_section_filings"] == 2
-    assert log_entry["missing_profile_ids"] == ["FDX_2020"]
-    assert len(build_cloud_monitoring_timeseries(report)) >= 10

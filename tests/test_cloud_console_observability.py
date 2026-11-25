@@ -143,6 +143,10 @@ def test_alert_policies_wired_to_notification_channels() -> None:
         ), name
         assert re.search(r"enabled\s*=\s*true", block), name
 
+    latency = policies["api_latency_p95"]
+    assert 'per_series_aligner   = "ALIGN_DELTA"' in latency
+    assert 'cross_series_reducer = "REDUCE_PERCENTILE_95"' in latency
+
     five_xx = policies["api_5xx_errors"]
     assert "condition_prometheus_query_language" in five_xx
     assert 'http_status=~\\"5..\\"' in five_xx
@@ -182,22 +186,25 @@ def test_llm_observability_dashboard_mosaic_geometry_and_panels() -> None:
         assert not (cells & tile_cells), f"Overlapping dashboard tile {(x, y, w, h)}"
         cells |= tile_cells
 
-    # Core log panels and chunk health dashboard remain defined.
+    # Core operational & security audit log panels are defined (noisy raw LLM log dump removed).
     logs_filters = re.findall(r'logsPanel\s*=\s*\{\s*filter\s*=\s*"(.*?)"\s*\n', dash)
     assert any("severity>=ERROR" in f for f in logs_filters)
     assert any('log_sink_target=\\"security_audit_logs\\"' in f for f in logs_filters)
-    assert any('log_sink_target=\\"llm_telemetry_events\\"' in f for f in logs_filters)
-    assert re.search(
-        r'resource\s+"google_monitoring_dashboard"\s+"chunk_health_dashboard"',
-        _tf("monitoring.tf"),
-    )
+    assert not any('log_sink_target=\\"llm_telemetry_events\\"' in f for f in logs_filters)
+
+    # Dead Cloud Logging -> BigQuery sink export chart and orphaned chunk health dashboard removed.
+    assert "logging.googleapis.com/exports/error_count" not in dash
+    assert "chunk_health_dashboard" not in obs
+    assert not (TF_DIR / "monitoring.tf").exists()
 
     # Readability & plotting accuracy contracts for the LLM observability dashboard:
     # - Executive KPI scorecards sit above the fold.
     assert len(re.findall(r"\bscorecard\s*=\s*\{", dash)) >= 8
-    # - Cloud Monitoring legend templates require singular `metric.label.` / `resource.label.`.
+    # - Cloud Monitoring legend templates require singular `metric.label.` / `resource.label.`
+    #   and never PromQL `{{metric.label.*}}` braces inside timeSeriesFilter widgets.
     assert "${metric.labels." not in dash
     assert "${resource.labels." not in dash
+    assert "{{metric.label." not in dash
     # - Explicit 2xx/4xx/5xx status series (regression: label_replace `${1}xx` emitted `xx`).
     assert 'legendTemplate = "2xx"' in dash
     assert 'legendTemplate = "4xx"' in dash
@@ -209,51 +216,17 @@ def test_llm_observability_dashboard_mosaic_geometry_and_panels() -> None:
     eval_chart = dash[dash.index("evaluation_scores") :]
     assert "REDUCE_MEAN" in eval_chart
     assert "REDUCE_PERCENTILE_50" not in eval_chart
-    # - Security threshold chart filters strictly to denials/blocks.
+    # - Security blocks chart filters strictly to denials/blocks and never mixes a 5-min alert
+    #   threshold onto an hourly bar chart.
     assert 'status=monitoring.regex.full_match(\\"denied_40[13]|blocked.*\\")' in dash
+    assert "5-min Block Alert Threshold" not in dash
+    # - BigQuery SQL recipes stay current (no obsolete SPIFFE column; includes corpus health).
+    assert "spiffe_attested_events" not in obs
+    assert "v_chunk_health_metrics" in obs
 
 
-def test_chunk_health_dashboard_mosaic_geometry_and_accuracy_contracts() -> None:
-    mon = _tf("monitoring.tf")
+def test_bigquery_chunk_health_view_contracts() -> None:
     bq = _tf("bigquery.tf")
-
-    # Dedicated filing-level metric descriptor keeps unit `{filings}` distinct from chunks.
-    filing_desc = _resource_block(
-        mon, r'resource\s+"google_monitoring_metric_descriptor"\s+"missing_section_filings"'
-    )
-    assert (
-        'type         = "custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings"'
-        in filing_desc
-    )
-    assert 'unit         = "{filings}"' in filing_desc
-
-    # Chunk health dashboard tiles fit the 12-column mosaic with zero overlap.
-    dash = _resource_block(
-        mon, r'resource\s+"google_monitoring_dashboard"\s+"chunk_health_dashboard"'
-    )
-    tiles = [
-        tuple(int(v) for v in m)
-        for m in re.findall(
-            r"xPos\s*=\s*(\d+)\s*yPos\s*=\s*(\d+)\s*width\s*=\s*(\d+)\s*height\s*=\s*(\d+)", dash
-        )
-    ]
-    assert len(tiles) >= 11
-    cells: set[tuple[int, int]] = set()
-    for x, y, w, h in tiles:
-        assert w > 0 and h > 0 and x + w <= 12, (x, y, w, h)
-        tile_cells = {(cx, cy) for cx in range(x, x + w) for cy in range(y, y + h)}
-        assert not (cells & tile_cells), f"Overlapping chunk health dashboard tile {(x, y, w, h)}"
-        cells |= tile_cells
-
-    # Regression guard: chunk health gauges must use ALIGN_NEXT_OLDER (never ALIGN_MAX on
-    # anomalies, which previously surfaced stale historical 47-filing spikes after recovery).
-    assert "${metric.labels." not in dash
-    assert "ALIGN_NEXT_OLDER" in dash
-    assert "custom.googleapis.com/sec_edgar/chunk_health/missing_section_filings" in dash
-    assert 'metric.labels.anomaly_type!=\\"missing_section_filings\\"' in dash
-    anomaly_section = dash[dash.index("anomaly_chunk_count") : dash.index("token_count_mean")]
-    assert "ALIGN_MAX" not in anomaly_section
-    assert '"LINE"' in anomaly_section
 
     # BigQuery `v_chunk_health_metrics` tracks dual-section completeness and all grouping sets.
     view_block = _resource_block(

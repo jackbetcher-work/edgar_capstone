@@ -200,7 +200,7 @@ EDGAR_TRACE_EXPORTER=gcp make backend                             # send spans t
 
 Monitoring is done entirely in the Cloud Console:
 
-- **Dashboards:** two Cloud Monitoring dashboards, one for vector DB health and one for LLM telemetry, cost, sessions, and security.
+- **Dashboard:** Cloud Monitoring dashboard for API traffic/latency, LLM telemetry, cost, sessions, judge scores, and security audit.
 - **Metrics:** log-based metrics under `sec_edgar/*`.
 - **Alerts:** p95 latency, 5xx errors, and auth denials or guardrail blocks.
 - **BigQuery views:** queried from BigQuery Studio.

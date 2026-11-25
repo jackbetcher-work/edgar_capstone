@@ -8,7 +8,7 @@ Provisions the stack in project `iron-radio-514217-q7` (`us-central1`), with rem
 - Google Cloud Model Armor and Sensitive Data Protection (Cloud DLP) inspect/de-identify templates;
 - a single custom least-privilege runtime service account (`sec-analyst-sa`), Cloud Run v2, and Direct Cloud Run IAP;
 - Artifact Registry and keyless GitHub Actions Workload Identity Federation (`sec-edgar-cicd-sa`);
-- Cloud Monitoring dashboards, low-cardinality log-based metrics, alert policies, and BigQuery SQL semantic views.
+- Cloud Monitoring dashboard, low-cardinality log-based metrics, alert policies, and BigQuery SQL semantic views.
 
 Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
 
@@ -44,12 +44,12 @@ Requires Terraform `>= 1.7` (`for_each` in `import` blocks).
   - `financial_reasoning_model` (default `gemini-3.8-flash`), `coding_and_evaluation_model` (`gemini-3.8-flash`, `ThinkingLevel.LOW`), `compaction_and_mapping_model` (`gemini-3.5-flash-lite`), `gemini_location` (`global`), and `async_judge_sample_rate` (`1.0`, validated in `[0.0, 1.0]`) become Cloud Run's `EDGAR_ANALYST_MODEL`, `EDGAR_FLASH_MODEL`, `EDGAR_LITE_MODEL`, `EDGAR_GEMINI_LOCATION`, and `EDGAR_ASYNC_JUDGE_SAMPLE_RATE`.
   - Gemini models are served from the `global` endpoint (`var.gemini_location`), while BigQuery, GCS, Model Armor, and embeddings run in `var.region`.
   - `serviceconsumermanagement.googleapis.com` is enabled because Vertex AI context caching needs it to provision its tenant project.
-- **Observability (`terraform/observability.tf`, `terraform/monitoring.tf`):**
+- **Observability (`terraform/observability.tf`):**
   - `google_logging_metric.api_request_latencies`: log-based distribution metric (`logging.googleapis.com/user/sec_edgar/api_request_latencies`) built from `http_request_completed` access logs, labeled by route, method, and status, with trace exemplars.
   - `google_logging_metric.telemetry_distributions` (`for_each`): `sec_edgar/llm_ttft_ms`, `llm_model_latency_ms`, `llm_cost_usd`, `llm_cache_savings_usd`, and `evaluation_scores`. LLM token counts and exact USD totals live in BigQuery (`llm_telemetry_events` / `v_telemetry_cost_and_latency`).
   - `google_logging_metric.telemetry_counters` (`for_each`, DELTA INT64): `sec_edgar/llm_calls`, `session_turns`, and `security_audit_events`.
   - Alert policies (all → `monitoring_notification_channels`): `api_latency_p95` (`30,000 ms`), `api_5xx_errors` (`5` per 5 min), and `security_audit_blocks` (`20` per 5 min).
-  - Dashboards: `chunk_health_dashboard` (corpus/chunk health + API p50/p95/p99) and `llm_observability_dashboard` (*SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit*).
+  - Dashboard: `llm_observability_dashboard` (*SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit*). Corpus chunk health is queried live via BigQuery views `v_chunk_health_metrics` and `v_filing_chunk_coverage`.
   - See [`docs/observability.md`](../docs/observability.md) for metric names, labels, and trace correlation.
 - **Custom Application Service Account (`sec-analyst-sa`, `terraform/iam.tf`):**
   - Single custom runtime service account attached to `google_cloud_run_v2_service.sec_edgar_analyst` (default Compute Engine SAs are never used).

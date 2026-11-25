@@ -105,8 +105,8 @@ resource "google_monitoring_alert_policy" "api_latency_p95" {
 
       aggregations {
         alignment_period     = "300s"
-        per_series_aligner   = "ALIGN_PERCENTILE_95"
-        cross_series_reducer = "REDUCE_MAX"
+        per_series_aligner   = "ALIGN_DELTA"
+        cross_series_reducer = "REDUCE_PERCENTILE_95"
         group_by_fields      = ["metric.labels.http_route"]
       }
 
@@ -245,8 +245,6 @@ locals {
   # PromQL selector for Cloud Run log-based metrics (resource labels are exposed as PromQL labels).
   cloud_run_promql_selector = "monitored_resource=\"cloud_run_revision\",service_name=\"${var.cloud_run_service_name}\""
   api_request_count_promql  = "logging_googleapis_com:user_sec_edgar_api_request_latencies_count"
-
-  chunk_health_dashboard_console_url = "https://console.cloud.google.com/monitoring/dashboards/builder/${element(split("/", google_monitoring_dashboard.chunk_health_dashboard.id), 3)}?project=${var.project_id}"
 }
 
 resource "google_logging_metric" "telemetry_distributions" {
@@ -432,8 +430,6 @@ resource "google_monitoring_alert_policy" "security_audit_blocks" {
 
 # ------------------------------------------------------------------------------
 # Cloud Monitoring Dashboard — LLM Telemetry, Cost, Sessions & Security Audit
-# (replaces the removed LookML observability dashboard; chunk_health_dashboard in
-# monitoring.tf is unchanged)
 # ------------------------------------------------------------------------------
 locals {
   llm_dash_m  = local.sec_edgar_user_metric_prefix
@@ -450,13 +446,13 @@ locals {
   llm_dash_errors_url    = "https://console.cloud.google.com/errors?project=${var.project_id}"
 
   llm_dashboard_nav_markdown = <<-MD
-    **Drill-down:** [Cloud Trace Explorer](${local.llm_dash_trace_url}) (filter `service.name: ${var.cloud_run_service_name}`) · [Cloud Logging Explorer](${local.llm_dash_logs_url}) · [Error Reporting](${local.llm_dash_errors_url}) · [Chunk Health Dashboard](${local.chunk_health_dashboard_console_url}) · [BigQuery Studio](${local.llm_dash_bq_studio_url})
+    **Drill-down:** [Cloud Trace Explorer](${local.llm_dash_trace_url}) (filter `service.name: ${var.cloud_run_service_name}`) · [Cloud Logging Explorer](${local.llm_dash_logs_url}) · [Error Reporting](${local.llm_dash_errors_url}) · [BigQuery Studio](${local.llm_dash_bq_studio_url})
 
-    Every log line, BigQuery telemetry row (`trace_id`), and API response (`X-Trace-Id`) shares the same Cloud Trace ID. Top scorecards summarize rolling **7-day** totals/percentiles; charts below are aggregated **hourly** for readability on interactive traffic. Exact cumulative token & USD BigQuery SQL recipes are at the bottom of this dashboard.
+    Every log line, BigQuery telemetry row (`trace_id`), and API response (`X-Trace-Id`) shares the same Cloud Trace ID. Top scorecards summarize rolling **7-day** totals/percentiles; charts below are aggregated **hourly** for readability on interactive traffic. BigQuery SQL recipes (exact tokens, USD totals, and corpus chunk health) are at the bottom of this dashboard.
   MD
 
   llm_dashboard_sql_markdown = <<-MD
-    **LLM token reporting and exact cumulative USD totals live in BigQuery** (USD charts above come from approximate Cloud Logging distributions; copy into [BigQuery Studio](${local.llm_dash_bq_studio_url})):
+    **Exact token usage, cumulative USD totals, audit rollups, and RAG corpus health live in BigQuery** (copy into [BigQuery Studio](${local.llm_dash_bq_studio_url})):
 
     ```sql
     -- Exact daily LLM tokens, cost & cached-token savings
@@ -466,8 +462,11 @@ locals {
     SELECT session_date, intent, SUM(interactive_turn_count) AS turns, ROUND(AVG(avg_turn_latency_ms)) AS avg_latency_ms, SUM(scored_evaluation_count) AS evals, ROUND(AVG(avg_evaluation_score), 3) AS avg_score
     FROM `${local.llm_dash_bq}.v_session_analytics_summary` GROUP BY 1, 2 ORDER BY 1 DESC;
     -- Security audit rollup
-    SELECT audit_date, event_type, status, SUM(total_events) AS events, SUM(denied_events) AS denied, SUM(blocked_events) AS blocked, SUM(spiffe_attested_events) AS spiffe_attested
+    SELECT audit_date, event_type, status, SUM(total_events) AS events, SUM(denied_events) AS denied, SUM(blocked_events) AS blocked, SUM(iap_verified_events) AS iap_verified
     FROM `${local.llm_dash_bq}.v_security_audit_summary` GROUP BY 1, 2, 3 ORDER BY 1 DESC, events DESC;
+    -- RAG corpus chunk health (live over filing_chunks & financial_metrics)
+    SELECT gics_sector, section_id, total_chunks, expected_profiles, full_section_coverage_ratio, embedding_coverage_ratio, health_score, health_status
+    FROM `${local.llm_dash_bq}.v_chunk_health_metrics` WHERE gics_sector = 'ALL_SECTORS' OR section_id = 'ALL_SECTIONS' ORDER BY 1, 2;
     ```
   MD
 }
@@ -681,7 +680,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
               }
               thresholds = [
                 {
-                  label     = "Elevated Blocks"
+                  label     = "Elevated Blocks (7d)"
                   value     = var.security_block_alert_threshold
                   color     = "RED"
                   direction = "ABOVE"
@@ -774,7 +773,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
               ]
               yAxis = { label = "Latency (s)", scale = "LINEAR" }
               thresholds = [{
-                label = "p95 Alert Threshold (30s)"
+                label = "p95 Alert Threshold (${var.api_latency_p95_alert_threshold_ms / 1000}s)"
                 value = var.api_latency_p95_alert_threshold_ms / 1000.0
               }]
             }
@@ -843,18 +842,18 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
 
-        # Row 5: LLM call volume, cache hit breakdown, TTFT SLO compliance (hourly buckets)
+        # Row 5: LLM call volume by model & task + cache hit breakdown (hourly buckets)
         {
           xPos   = 0
           yPos   = 16
-          width  = 4
+          width  = 6
           height = 4
           widget = {
-            title = "LLM Calls by Model (per hour)"
+            title = "LLM Calls by Model & Task (per hour)"
             xyChart = {
               dataSets = [{
                 plotType       = "STACKED_BAR"
-                legendTemplate = "$${metric.label.model_name}"
+                legendTemplate = "$${metric.label.model_name} · $${metric.label.task_category}"
                 timeSeriesQuery = {
                   timeSeriesFilter = {
                     filter = "metric.type=\"${local.llm_dash_m}/llm_calls\" ${local.llm_dash_rf}"
@@ -862,7 +861,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                       alignmentPeriod    = "3600s"
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
-                      groupByFields      = ["metric.label.model_name"]
+                      groupByFields      = ["metric.label.model_name", "metric.label.task_category"]
                     }
                   }
                 }
@@ -872,9 +871,9 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
         {
-          xPos   = 4
+          xPos   = 6
           yPos   = 16
-          width  = 4
+          width  = 6
           height = 4
           widget = {
             title = "LLM Context Cache Hits vs Misses (per hour)"
@@ -890,33 +889,6 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                       perSeriesAligner   = "ALIGN_SUM"
                       crossSeriesReducer = "REDUCE_SUM"
                       groupByFields      = ["metric.label.cache_hit"]
-                    }
-                  }
-                }
-              }]
-              yAxis = { label = "Calls / hr", scale = "LINEAR" }
-            }
-          }
-        },
-        {
-          xPos   = 8
-          yPos   = 16
-          width  = 4
-          height = 4
-          widget = {
-            title = "LLM Calls Within TTFT SLO (per hour)"
-            xyChart = {
-              dataSets = [{
-                plotType       = "STACKED_BAR"
-                legendTemplate = "within_ttft_slo=$${metric.label.within_ttft_slo}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/llm_calls\" ${local.llm_dash_rf}"
-                    aggregation = {
-                      alignmentPeriod    = "3600s"
-                      perSeriesAligner   = "ALIGN_SUM"
-                      crossSeriesReducer = "REDUCE_SUM"
-                      groupByFields      = ["metric.label.within_ttft_slo"]
                     }
                   }
                 }
@@ -1004,7 +976,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
         {
           xPos   = 0
           yPos   = 24
-          width  = 4
+          width  = 6
           height = 4
           widget = {
             title = "Interactive Turns by Intent (per hour)"
@@ -1029,36 +1001,9 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
         {
-          xPos   = 4
+          xPos   = 6
           yPos   = 24
-          width  = 4
-          height = 4
-          widget = {
-            title = "Claim Verification Outcomes (per hour)"
-            xyChart = {
-              dataSets = [{
-                plotType       = "STACKED_BAR"
-                legendTemplate = "fact_check_passed=$${metric.label.fact_check_passed}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"${local.llm_dash_m}/session_turns\" ${local.llm_dash_rf}"
-                    aggregation = {
-                      alignmentPeriod    = "3600s"
-                      perSeriesAligner   = "ALIGN_SUM"
-                      crossSeriesReducer = "REDUCE_SUM"
-                      groupByFields      = ["metric.label.fact_check_passed"]
-                    }
-                  }
-                }
-              }]
-              yAxis = { label = "Turns / hr", scale = "LINEAR" }
-            }
-          }
-        },
-        {
-          xPos   = 8
-          yPos   = 24
-          width  = 4
+          width  = 6
           height = 4
           widget = {
             title = "Async Judge Mean Score by Intent (0.0 - 1.0)"
@@ -1087,7 +1032,7 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
 
-        # Row 8: Security audit events (all types vs denials/blocks only with matching threshold)
+        # Row 8: Security audit events (all types vs denials/blocks only)
         {
           xPos   = 0
           yPos   = 28
@@ -1139,19 +1084,15 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
                 }
               }]
               yAxis = { label = "Denials / Blocks / hr", scale = "LINEAR" }
-              thresholds = [{
-                label = "5-min Block Alert Threshold"
-                value = var.security_block_alert_threshold
-              }]
             }
           }
         },
 
-        # Row 9: Embedded Cloud Logging panels
+        # Row 9: Embedded Cloud Logging panels (errors + security audit; 6 cols each for readability)
         {
           xPos   = 0
           yPos   = 32
-          width  = 4
+          width  = 6
           height = 6
           widget = {
             title = "Operational Errors (severity >= ERROR on Cloud Run)"
@@ -1162,9 +1103,9 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
           }
         },
         {
-          xPos   = 4
+          xPos   = 6
           yPos   = 32
-          width  = 4
+          width  = 6
           height = 6
           widget = {
             title = "Security Audit Logs (security_audit_logs sink)"
@@ -1174,57 +1115,15 @@ resource "google_monitoring_dashboard" "llm_observability_dashboard" {
             }
           }
         },
-        {
-          xPos   = 8
-          yPos   = 32
-          width  = 4
-          height = 6
-          widget = {
-            title = "LLM Telemetry Sink Logs (llm_telemetry_events sink)"
-            logsPanel = {
-              filter        = "resource.type=\"cloud_run_revision\" resource.labels.service_name=\"${var.cloud_run_service_name}\" jsonPayload.component=\"sec-edgar-telemetry-sink\" jsonPayload.log_sink_target=\"llm_telemetry_events\""
-              resourceNames = ["projects/${var.project_id}"]
-            }
-          }
-        },
 
-        # Row 10: Cloud Logging -> BigQuery export health (sec-edgar-telemetry-audit-bq-sink)
+        # Row 10: BigQuery Studio SQL recipes (below charts so KPIs sit above the fold)
         {
           xPos   = 0
           yPos   = 38
           width  = 12
-          height = 3
-          widget = {
-            title = "Cloud Logging → BigQuery Sink Export Errors (should stay at 0)"
-            xyChart = {
-              dataSets = [{
-                plotType       = "STACKED_BAR"
-                legendTemplate = "$${resource.label.name}"
-                timeSeriesQuery = {
-                  timeSeriesFilter = {
-                    filter = "metric.type=\"logging.googleapis.com/exports/error_count\" resource.type=\"logging_sink\""
-                    aggregation = {
-                      alignmentPeriod    = "3600s"
-                      perSeriesAligner   = "ALIGN_SUM"
-                      crossSeriesReducer = "REDUCE_SUM"
-                      groupByFields      = ["resource.label.name"]
-                    }
-                  }
-                }
-              }]
-              yAxis = { label = "Errors / hr", scale = "LINEAR" }
-            }
-          }
-        },
-
-        # Row 11: BigQuery Studio SQL recipes (below charts so KPIs sit above the fold)
-        {
-          xPos   = 0
-          yPos   = 41
-          width  = 12
           height = 5
           widget = {
-            title = "BigQuery Studio SQL Recipes (Exact Cumulative Tokens, Spend & Audit Rollups)"
+            title = "BigQuery Studio SQL Recipes (Exact Tokens, Spend, Audit & Corpus Health)"
             text = {
               content = local.llm_dashboard_sql_markdown
               format  = "MARKDOWN"

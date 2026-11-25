@@ -30,10 +30,8 @@ if TYPE_CHECKING:
         VectorDBBuildSummary,
     )
     from edgar_capstone.vector_db.monitoring import (
-        build_cloud_monitoring_timeseries,
         evaluate_chunk_health,
         evaluate_chunk_health_from_bigquery,
-        format_structured_health_log,
     )
     from edgar_capstone.vector_db.pipeline import (
         VectorDBBuildConfig,
@@ -55,10 +53,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "VectorDBBuildConfig": ("edgar_capstone.vector_db.pipeline", "VectorDBBuildConfig"),
     "VectorDBBuildSummary": ("edgar_capstone.vector_db.models", "VectorDBBuildSummary"),
     "VertexAIEmbedder": ("edgar_capstone.vector_db.embedder", "VertexAIEmbedder"),
-    "build_cloud_monitoring_timeseries": (
-        "edgar_capstone.vector_db.monitoring",
-        "build_cloud_monitoring_timeseries",
-    ),
     "chunk_filing_document": ("edgar_capstone.vector_db.chunker", "chunk_filing_document"),
     "estimate_token_count": ("edgar_capstone.vector_db.chunker", "estimate_token_count"),
     "evaluate_chunk_health": ("edgar_capstone.vector_db.monitoring", "evaluate_chunk_health"),
@@ -69,10 +63,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "extract_sections_from_combined_markdown": (
         "edgar_capstone.vector_db.chunker",
         "extract_sections_from_combined_markdown",
-    ),
-    "format_structured_health_log": (
-        "edgar_capstone.vector_db.monitoring",
-        "format_structured_health_log",
     ),
     "populate_chunk_embeddings": ("edgar_capstone.vector_db.embedder", "populate_chunk_embeddings"),
     "run_vector_db_pipeline": ("edgar_capstone.vector_db.pipeline", "run_vector_db_pipeline"),
@@ -100,13 +90,11 @@ __all__ = [
     "VectorDBBuildConfig",
     "VectorDBBuildSummary",
     "VertexAIEmbedder",
-    "build_cloud_monitoring_timeseries",
     "chunk_filing_document",
     "estimate_token_count",
     "evaluate_chunk_health",
     "evaluate_chunk_health_from_bigquery",
     "extract_sections_from_combined_markdown",
-    "format_structured_health_log",
     "populate_chunk_embeddings",
     "run_vector_db_pipeline",
     "split_section_into_passages",

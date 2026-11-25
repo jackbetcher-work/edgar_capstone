@@ -68,16 +68,6 @@ output "vertex_ai_search_engine_id" {
   value       = var.enable_vertex_ai_search ? google_discovery_engine_search_engine.sec_10k_hybrid_search[0].id : null
 }
 
-output "chunk_health_monitoring_dashboard_id" {
-  description = "Resource ID of the Google Cloud Monitoring dashboard for RAG vector DB chunk health."
-  value       = google_monitoring_dashboard.chunk_health_dashboard.id
-}
-
-output "chunk_health_monitoring_dashboard_url" {
-  description = "Cloud Console URL of the RAG vector DB chunk health dashboard."
-  value       = local.chunk_health_dashboard_console_url
-}
-
 output "llm_observability_dashboard_id" {
   description = "Resource ID of the Cloud Monitoring dashboard for LLM telemetry, cost, sessions, and security audit."
   value       = google_monitoring_dashboard.llm_observability_dashboard.id
@@ -89,7 +79,7 @@ output "llm_observability_dashboard_url" {
 }
 
 output "observability_log_based_metrics" {
-  description = "Names of the low-cardinality sec_edgar/* log-based metrics backing the Cloud Monitoring dashboards and alert policies."
+  description = "Names of the low-cardinality sec_edgar/* log-based metrics backing the Cloud Monitoring dashboard and alert policies."
   value = sort(concat(
     [google_logging_metric.api_request_latencies.name],
     [for m in google_logging_metric.telemetry_distributions : m.name],

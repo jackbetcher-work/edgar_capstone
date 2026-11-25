@@ -2,7 +2,7 @@
 
 The FastAPI service exports **OpenTelemetry spans to Cloud Trace** and writes **structured JSON logs carrying trace IDs** to stdout. Cloud Run ingests those logs into **Cloud Logging**. A single `/api/v1/chat` request produces one trace covering the Cloud Run front end, FastAPI, guardrails, synthesis steps, tools, ADK model calls, and outbound GCP HTTP/gRPC SDK calls. That request's log lines appear grouped under the trace, and its BigQuery telemetry rows carry the same `trace_id`.
 
-Everything is operated from the **Google Cloud Console**: two Cloud Monitoring dashboards, low-cardinality log-based metrics, alert policies, and BigQuery SQL views queried from BigQuery Studio.
+Everything is operated from the **Google Cloud Console**: a Cloud Monitoring dashboard, low-cardinality log-based metrics, alert policies, and BigQuery SQL views queried from BigQuery Studio.
 
 Code lives in [`src/edgar_capstone/observability/`](../src/edgar_capstone/observability):
 
@@ -87,21 +87,20 @@ Example `http_request_completed` access log line as written to stdout (`EDGAR_LO
 | Response headers | `X-Trace-Id`, `X-Request-Id`, `Server-Timing: app;dur=…` (exposed through CORS for the Vite dev UI) |
 | `/api/v1/chat` body | `observability.trace_id`, `span_id`, `cloud_trace_resource`, and a `cloud_trace_url` console deep link |
 | BigQuery | Nullable `trace_id` column in `llm_telemetry_events`, `session_telemetry_events`, and `security_audit_logs` (direct `insertAll` streaming) |
-| Cloud Monitoring | `sec_edgar/api_request_latencies` (with trace exemplars) and the telemetry sink metrics below, charted on both dashboards; alert policies link back to the logs panels and traces |
+| Cloud Monitoring | `sec_edgar/api_request_latencies` (with trace exemplars) and the telemetry sink metrics below, charted on the observability dashboard; alert policies link back to the logs panels and traces |
 | `/health` | `observability.tracing` (exporter, sampling, instrumentation state) and `observability.logging` |
 
 ## Guardrail audit attribution
 
 Model Armor, SDP, and projection-filter guardrail blocks (`model_armor_{prompt,response}_blocked`, `projection_filter_*_blocked`, `sdp_sensitive_*_blocked`, `*_fail_closed`) are raised deep inside the ADK turn, where no `AuthenticatedUser` is threaded through. The chat router binds the authenticated principal for the duration of the turn (`security.auth.bind_audit_principal`), `contextvars` carries it across the SSE worker, the ADK loop, and parallel tool workers, and the guardrail service records its audit events with `inherit_request_principal=True`. The block is therefore attributed to the caller's email / identity provider / IAP verification state instead of `unauthenticated`. The `inherit_request_principal` flag on `record_security_audit_event` defaults to `False`, and events outside an authenticated request are recorded as `unauthenticated`. `trace_id` is always attached by the telemetry sink from the active span, or from the inbound `X-Cloud-Trace-Context` / `traceparent` fallback on Cloud Run.
 
-## Cloud Monitoring dashboards
+## Cloud Monitoring dashboard
 
 | Dashboard | Terraform | Contents |
 | :-- | :-- | :-- |
-| **SEC EDGAR RAG Vector Database — Chunk Health & Ingestion Monitoring** | `google_monitoring_dashboard.chunk_health_dashboard` (`monitoring.tf`) | Chunk health score, embedding / filing coverage, chunks by sector and section, anomalies, BigQuery query rate, chunk-health logs, API p50/p95/p99 by route |
-| **SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit** | `google_monitoring_dashboard.llm_observability_dashboard` (`observability.tf`) | Navigation tile (Trace Explorer, Logs Explorer, Error Reporting, Chunk Health dashboard, BigQuery Studio + SQL recipes); API request rate by route, responses by status class (2xx/4xx/5xx), server latency p50/p95/p99; LLM TTFT and end-to-end model latency p50/p95 by model & task; LLM calls by model, cache hit vs miss, TTFT SLO compliance; per-call USD cost and cache savings (mean/p95) and estimated USD/hour; interactive turns by intent and by `fact_check_passed`; scored evaluation mean/p50; security audit events by `event_type` and `status`; logs panels for operational errors, security audit logs, and LLM telemetry logs; project-wide Cloud Logging export error monitor |
+| **SEC EDGAR Analyst — LLM Telemetry, Cost, Sessions & Security Audit** | `google_monitoring_dashboard.llm_observability_dashboard` (`observability.tf`) | Navigation tile (Trace Explorer, Logs Explorer, Error Reporting, BigQuery Studio); 8 rolling 7-day KPI scorecards (chat turns, chat p95 latency, LLM TTFT p95, async judge mean score, cache hit rate, est. spend, est. cache savings, auth denials & blocks); API requests by route, responses by status class (2xx/4xx/5xx), chat latency p50/p95; LLM TTFT and end-to-end model latency p50/p95 by task; LLM calls by model & task and cache hit vs miss; estimated USD/hour spend vs cache savings and per-call USD cost (mean/p95); interactive turns by intent and async judge mean score by intent; security audit events by `event_type` and denials/blocks by `status`; logs panels for operational errors and security audit logs; BigQuery Studio SQL recipes (including live corpus health via `v_chunk_health_metrics`) |
 
-`terraform output llm_observability_dashboard_url` / `chunk_health_monitoring_dashboard_url` print the Console links.
+`terraform output llm_observability_dashboard_url` prints the Console link. Corpus chunk health is queried live on demand via BigQuery `sec_edgar.v_chunk_health_metrics` and `sec_edgar.v_filing_chunk_coverage` rather than a separate polled custom-metric dashboard.
 
 > [!NOTE]
 > Request counts are read from the PromQL `_count` series of the `api_request_latencies` distribution (`logging_googleapis_com:user_sec_edgar_api_request_latencies_count`). In Cloud Monitoring filters, `REDUCE_COUNT` on a DISTRIBUTION metric counts time series, not requests. Percentiles use `ALIGN_DELTA` + `REDUCE_PERCENTILE_*`, which merges the distributions across series.
@@ -193,7 +192,7 @@ ORDER BY recorded_at DESC;
    UNION ALL SELECT 'audit', recorded_at, CONCAT(event_type, ' / ', status) FROM `iron-radio-514217-q7.sec_edgar.security_audit_logs` WHERE trace_id = @trace_id
    ORDER BY recorded_at;
    ```
-5. **Cloud Monitoring:** latency points on `api_request_latencies` keep trace exemplars, so a spike on either dashboard links back to the trace that caused it.
+5. **Cloud Monitoring:** latency points on `api_request_latencies` keep trace exemplars, so a spike on the dashboard links back to the trace that caused it.
 
 ## Configuration
 
