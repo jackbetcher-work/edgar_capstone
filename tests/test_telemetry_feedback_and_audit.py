@@ -7,11 +7,12 @@ import logging
 import time
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
+from google.api_core import exceptions as gcp_exceptions
 from google.auth.exceptions import DefaultCredentialsError
 
 from edgar_capstone.agents.core.schemas import ContextBreakdown
@@ -43,10 +44,9 @@ from edgar_capstone.telemetry import (
     TelemetryRateLimitError,
     TelemetrySinkError,
     configure_telemetry_stores,
-    decode_firestore_document,
-    encode_firestore_fields,
     reset_telemetry_stores,
 )
+from tests.fake_gcp import FakeFirestoreClient
 from tests.structured_report_helpers import ScriptedAnalystLlm, patch_http_chat_llms
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -54,7 +54,7 @@ TEST_IAP_AUDIENCE = "/projects/991122334455/global/backendServices/887766554433"
 
 
 class _FakeGcpCredentials:
-    """Synthetic OAuth2 credentials stub for offline `httpx.MockTransport` verification."""
+    """Synthetic OAuth2 credentials stub for offline SDK store verification."""
 
     def __init__(self) -> None:
         self.valid = True
@@ -95,14 +95,12 @@ def auth_client_env(session_idp_keys: dict[str, Any]):
     ec_signing_key = session_idp_keys["iap_ec_key"]
     jwks_payload = {"keys": [ec_public_key_to_jwk(ec_signing_key.public_key(), kid="iap-telem-k1")]}
 
-    def _jwks_transport(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == GOOGLE_IAP_JWKS_URI:
-            return httpx.Response(200, json=jwks_payload)
-        return httpx.Response(404, json={"error": "not_found"})
+    def _jwk_fetcher(url: str) -> dict[str, Any]:
+        if url == GOOGLE_IAP_JWKS_URI:
+            return jwks_payload
+        raise RuntimeError(f"404 not found: {url}")
 
-    jwks_store = JwksKeyStore(
-        http_client=httpx.Client(transport=httpx.MockTransport(_jwks_transport))
-    )
+    jwks_store = JwksKeyStore(jwk_fetcher=_jwk_fetcher)
     settings = AuthSettings(
         audiences=(TEST_IAP_AUDIENCE,),
         google_oauth_client_id=None,
@@ -276,76 +274,72 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     }
     executed_queries: list[dict[str, Any]] = []
 
-    def _bq_transport(request: httpx.Request) -> httpx.Response:
-        assert request.headers.get("Authorization") == "Bearer test-gcp-oauth-bearer"
-        url_path = request.url.path
-        body = json.loads(request.content.decode("utf-8"))
+    class _FakeBqJob:
+        def __init__(self, rows: list[dict[str, Any]]) -> None:
+            self._rows = rows
 
-        if url_path.endswith("/insertAll"):
-            table_name = url_path.split("/tables/")[1].split("/")[0]
-            streamed_requests[table_name].append(body)
-            return httpx.Response(200, json={"kind": "bigquery#tableDataInsertAllResponse"})
+        def result(self, **_kw: Any) -> list[dict[str, Any]]:
+            return self._rows
 
-        if url_path.endswith("/queries"):
-            executed_queries.append(body)
-            sql = body.get("query", "")
+    class _FakeTelemetryBqClient:
+        def insert_rows_json(
+            self,
+            table_fqn: str,
+            rows: list[dict[str, Any]],
+            *,
+            row_ids: list[str] | None = None,
+            skip_invalid_rows: bool = False,
+            ignore_unknown_values: bool = False,
+            timeout: float | None = None,
+        ) -> list[Any]:
+            _ = (ignore_unknown_values, timeout)
+            table_name = table_fqn.rsplit(".", 1)[-1]
+            streamed_requests[table_name].append(
+                {
+                    "skipInvalidRows": skip_invalid_rows,
+                    "rows": [
+                        {"insertId": rid, "json": r}
+                        for rid, r in zip(row_ids or [], rows, strict=False)
+                    ],
+                }
+            )
+            return []
+
+        def query(
+            self,
+            sql: str,
+            *,
+            job_config: Any | None = None,
+            location: str | None = None,
+            timeout: float | None = None,
+        ) -> _FakeBqJob:
+            _ = (location, timeout)
+            executed_queries.append({"query": sql, "job_config": job_config})
             if "security_audit_logs" in sql:
-                return httpx.Response(
-                    200,
-                    json={
-                        "schema": {
-                            "fields": [
-                                {"name": "event_id", "type": "STRING"},
-                                {"name": "recorded_at", "type": "STRING"},
-                                {"name": "recorded_at_epoch", "type": "FLOAT64"},
-                                {"name": "event_type", "type": "STRING"},
-                                {"name": "status", "type": "STRING"},
-                                {"name": "resource", "type": "STRING"},
-                                {"name": "tickers", "type": "STRING", "mode": "REPEATED"},
-                                {"name": "user_email", "type": "STRING"},
-                                {"name": "user_sub", "type": "STRING"},
-                                {"name": "hosted_domain", "type": "STRING"},
-                                {"name": "identity_provider", "type": "STRING"},
-                                {"name": "roles", "type": "STRING", "mode": "REPEATED"},
-                                {
-                                    "name": "cloud_identity_groups",
-                                    "type": "STRING",
-                                    "mode": "REPEATED",
-                                },
-                                {"name": "agent_identity", "type": "STRING"},
-                                {"name": "spiffe_id", "type": "STRING"},
-                                {"name": "iap_assertion_verified", "type": "BOOL"},
-                                {"name": "detail", "type": "STRING"},
-                            ]
-                        },
-                        "rows": [
-                            {
-                                "f": [
-                                    {"v": "aud-bq-001"},
-                                    {"v": "2026-11-16T12:00:00Z"},
-                                    {"v": "1794830400.0"},
-                                    {"v": "filing_10k_section_read"},
-                                    {"v": "allowed"},
-                                    {"v": "/api/v1/section"},
-                                    {"v": [{"v": "NVDA"}]},
-                                    {"v": "analyst@fde-workspace.corp"},
-                                    {"v": "accounts.google.com:analyst"},
-                                    {"v": "fde-workspace.corp"},
-                                    {"v": "google_iap"},
-                                    {"v": [{"v": "analyst"}]},
-                                    {"v": [{"v": "sec-edgar-analysts@fde-workspace.corp"}]},
-                                    {"v": None},
-                                    {"v": None},
-                                    {"v": "true"},
-                                    {"v": "FY2026 item_7"},
-                                ]
-                            }
-                        ],
-                    },
+                return _FakeBqJob(
+                    [
+                        {
+                            "event_id": "aud-bq-001",
+                            "recorded_at": "2026-11-16T12:00:00Z",
+                            "recorded_at_epoch": 1794830400.0,
+                            "event_type": "filing_10k_section_read",
+                            "status": "allowed",
+                            "resource": "/api/v1/section",
+                            "tickers": ["NVDA"],
+                            "user_email": "analyst@fde-workspace.corp",
+                            "user_sub": "accounts.google.com:analyst",
+                            "hosted_domain": "fde-workspace.corp",
+                            "identity_provider": "google_iap",
+                            "roles": ["analyst"],
+                            "cloud_identity_groups": ["sec-edgar-analysts@fde-workspace.corp"],
+                            "agent_identity": None,
+                            "spiffe_id": None,
+                            "iap_assertion_verified": True,
+                            "detail": "FY2026 item_7",
+                        }
+                    ]
                 )
-            return httpx.Response(200, json={"schema": {"fields": []}, "rows": []})
-
-        return httpx.Response(404, json={"error": "unexpected_url"})
+            return _FakeBqJob([])
 
     cfg = TelemetryConfig(
         telemetry_backend="gcp",
@@ -355,8 +349,7 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     )
     sink = BigQueryTelemetrySink(
         cfg,
-        http_client=httpx.Client(transport=httpx.MockTransport(_bq_transport)),
-        credentials=_FakeGcpCredentials(),
+        bq_client=_FakeTelemetryBqClient(),
     )
     configure_telemetry_stores(telemetry_sink=sink)
 
@@ -473,7 +466,7 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
     assert queried_audits[0]["tickers"] == ["NVDA"]
     assert queried_audits[0]["iap_assertion_verified"] is True
     assert len(executed_queries) == 1
-    assert executed_queries[0]["parameterMode"] == "NAMED"
+    assert len(executed_queries[0]["job_config"].query_parameters) == 2
 
     status_meta = sink.status_metadata()
     assert status_meta["live_bigquery_streaming_enabled"] is True
@@ -482,33 +475,24 @@ def test_bigquery_streaming_insert_all_for_llm_session_and_audit_tables(
 
 
 def test_bigquery_insert_errors_strict_vs_auto_fallback() -> None:
-    """Verify `insertErrors` raises in strict `gcp` mode and falls back cleanly in `auto` mode."""
+    """Verify `insert_rows_json` errors raise in strict `gcp` mode and fall back cleanly in `auto` mode."""
 
-    def _rejecting_bq_transport(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={
-                "kind": "bigquery#tableDataInsertAllResponse",
-                "insertErrors": [
-                    {"index": 0, "errors": [{"reason": "invalid", "message": "schema mismatch"}]}
-                ],
-            },
-        )
+    class _RejectingBqClient:
+        def insert_rows_json(self, *_args: Any, **_kw: Any) -> list[dict[str, Any]]:
+            return [{"index": 0, "errors": [{"reason": "invalid", "message": "schema mismatch"}]}]
 
     strict_sink = BigQueryTelemetrySink(
         TelemetryConfig(telemetry_backend="gcp"),
-        http_client=httpx.Client(transport=httpx.MockTransport(_rejecting_bq_transport)),
-        credentials=_FakeGcpCredentials(),
+        bq_client=_RejectingBqClient(),
     )
-    with pytest.raises(TelemetrySinkError, match="BigQuery insertAll rejected rows"):
+    with pytest.raises(TelemetrySinkError, match="rejected rows"):
         strict_sink.record_security_audit_log(
             {"event_id": "aud-fail-1", "event_type": "test_event"}
         )
 
     auto_sink = BigQueryTelemetrySink(
         TelemetryConfig(telemetry_backend="auto", gcp_auto_triggered=True),
-        http_client=httpx.Client(transport=httpx.MockTransport(_rejecting_bq_transport)),
-        credentials=_FakeGcpCredentials(),
+        bq_client=_RejectingBqClient(),
     )
     res = auto_sink.record_security_audit_log(
         {"event_id": "aud-fallback-1", "event_type": "test_event"}
@@ -517,9 +501,13 @@ def test_bigquery_insert_errors_strict_vs_auto_fallback() -> None:
     assert auto_sink.status_metadata()["fallback_counts"]["security_audit_logs"] == 1
 
     # Also verify missing ADC credentials in auto mode falls back cleanly
+    class _MissingAdcBqClient:
+        def insert_rows_json(self, *_args: Any, **_kw: Any) -> list[Any]:
+            raise DefaultCredentialsError("ADC unavailable in test sandbox")
+
     no_adc_sink = BigQueryTelemetrySink(
         TelemetryConfig(telemetry_backend="auto", gcp_auto_triggered=True),
-        credentials=_MissingCredentials(),
+        bq_client=_MissingAdcBqClient(),
     )
     res_no_adc = no_adc_sink.record_security_audit_log(
         {"event_id": "aud-noadc-1", "event_type": "test_event"}
@@ -532,82 +520,11 @@ def test_bigquery_insert_errors_strict_vs_auto_fallback() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_firestore_typed_value_encoding_and_roundtrip_decoding() -> None:
-    """Verify typed Firestore REST v1 Value wire format (`timestampValue`, `doubleValue`, `arrayValue`, etc.)."""
-    sample = {
-        "feedback_id": "fbk-abc123456789",
-        "rating": "up",
-        "recorded_at": "2026-11-16T15:04:05Z",
-        "recorded_at_epoch": 1794841445.125,
-        "tickers": ["NVDA", "MSFT"],
-        "verified": True,
-        "turn_count": 3,
-        "optional_note": None,
-        "nested": {"grade": "A"},
-    }
-    encoded = encode_firestore_fields(sample)
-    assert encoded["recorded_at"] == {"timestampValue": "2026-11-16T15:04:05Z"}
-    assert encoded["recorded_at_epoch"] == {"doubleValue": 1794841445.125}
-    assert encoded["tickers"] == {
-        "arrayValue": {"values": [{"stringValue": "NVDA"}, {"stringValue": "MSFT"}]}
-    }
-    assert encoded["verified"] == {"booleanValue": True}
-    assert encoded["turn_count"] == {"integerValue": "3"}
-    assert encoded["optional_note"] == {"nullValue": None}
-
-    decoded = decode_firestore_document(
-        {
-            "name": "projects/iron-radio-514217-q7/databases/(default)/documents/analyst_feedback/fbk-abc123456789",
-            "fields": encoded,
-        }
-    )
-    for k, v in sample.items():
-        assert decoded[k] == v
-    assert decoded["document_name"].endswith("/analyst_feedback/fbk-abc123456789")
-
-
 def test_firestore_feedback_api_persistence_query_and_rbac(
     auth_client_env: dict[str, Any],
 ) -> None:
-    """Verify `POST /api/v1/feedback` and `GET /api/v1/feedback` against Firestore REST v1 & RBAC."""
-    stored_firestore_docs: list[dict[str, Any]] = []
-    run_query_payloads: list[dict[str, Any]] = []
-
-    def _firestore_transport(request: httpx.Request) -> httpx.Response:
-        assert request.headers.get("Authorization") == "Bearer test-gcp-oauth-bearer"
-        url_str = str(request.url)
-        body = json.loads(request.content.decode("utf-8"))
-
-        if "/documents/analyst_feedback" in url_str and request.method == "POST":
-            doc_id = request.url.params.get("documentId")
-            assert doc_id and doc_id.startswith("fbk-")
-            doc_obj = {
-                "name": (
-                    "projects/iron-radio-514217-q7/databases/(default)"
-                    f"/documents/analyst_feedback/{doc_id}"
-                ),
-                "fields": body["fields"],
-            }
-            stored_firestore_docs.append(doc_obj)
-            return httpx.Response(200, json=doc_obj)
-
-        if url_str.endswith(":runQuery") and request.method == "POST":
-            run_query_payloads.append(body)
-            sq = body.get("structuredQuery", {})
-            rating_filter = (
-                sq.get("where", {}).get("fieldFilter", {}).get("value", {}).get("stringValue")
-            )
-            docs = list(reversed(stored_firestore_docs))
-            if rating_filter:
-                docs = [
-                    d
-                    for d in docs
-                    if d["fields"].get("rating", {}).get("stringValue") == rating_filter
-                ]
-            return httpx.Response(200, json=[{"document": d} for d in docs])
-
-        return httpx.Response(404, json={"error": "unexpected_firestore_endpoint"})
-
+    """Verify `POST /api/v1/feedback` and `GET /api/v1/feedback` against Firestore SDK & RBAC."""
+    fake_fs = FakeFirestoreClient()
     fs_store = FirestoreFeedbackStore(
         TelemetryConfig(
             telemetry_backend="local",
@@ -616,8 +533,7 @@ def test_firestore_feedback_api_persistence_query_and_rbac(
             firestore_database_id="(default)",
             firestore_feedback_collection="analyst_feedback",
         ),
-        http_client=httpx.Client(transport=httpx.MockTransport(_firestore_transport)),
-        credentials=_FakeGcpCredentials(),
+        firestore_client=fake_fs,
     )
     configure_telemetry_stores(feedback_store=fs_store)
 
@@ -675,9 +591,9 @@ def test_firestore_feedback_api_persistence_query_and_rbac(
         },
     )
     assert down_resp.status_code == 200
-    assert len(stored_firestore_docs) == 2
+    assert len(fake_fs._collections["analyst_feedback"]) == 2
 
-    # 3. Both Viewer and Analyst hold `audit:read` -> can list persisted feedback from Firestore `:runQuery`
+    # 3. Both Viewer and Analyst hold `audit:read` -> can list persisted feedback from Firestore
     list_resp = client.get(
         "/api/v1/feedback",
         headers={"Authorization": f"Bearer {viewer_jwt}"},
@@ -690,7 +606,7 @@ def test_firestore_feedback_api_persistence_query_and_rbac(
     assert list_json["thumbs_down_count"] == 1
     assert list_json["positive_rating_ratio"] == pytest.approx(0.5)
 
-    # Filtered `:runQuery` by rating="up"
+    # Filtered query by rating="up"
     up_only = client.get(
         "/api/v1/feedback?rating=up",
         headers={"Authorization": f"Bearer {analyst_jwt}"},
@@ -698,21 +614,20 @@ def test_firestore_feedback_api_persistence_query_and_rbac(
     assert up_only.status_code == 200
     assert up_only.json()["feedback_count"] == 1
     assert up_only.json()["feedback"][0]["message_id"] == "msg-nvda-001"
-    assert len(run_query_payloads) == 2
+    assert sum(1 for m, _ in fake_fs.calls if m == "STREAM") == 2
 
 
 def test_firestore_feedback_strict_vs_auto_fallback() -> None:
-    """Verify Firestore HTTP 503 / missing ADC raises in strict `gcp` mode and falls back in `auto` mode."""
-
-    def _failing_fs_transport(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(503, json={"error": {"message": "Service unavailable"}})
+    """Verify Firestore 503 raises in strict `gcp` mode and falls back in `auto` mode."""
+    failing_fs = FakeFirestoreClient(
+        error_to_raise=gcp_exceptions.ServiceUnavailable("Service unavailable")
+    )
 
     strict_fs = FirestoreFeedbackStore(
         TelemetryConfig(feedback_backend="gcp"),
-        http_client=httpx.Client(transport=httpx.MockTransport(_failing_fs_transport)),
-        credentials=_FakeGcpCredentials(),
+        firestore_client=failing_fs,
     )
-    with pytest.raises(TelemetrySinkError, match="HTTP 503"):
+    with pytest.raises(TelemetrySinkError, match="ServiceUnavailable"):
         strict_fs.record_feedback(
             message_id="m-strict",
             rating="up",
@@ -721,8 +636,7 @@ def test_firestore_feedback_strict_vs_auto_fallback() -> None:
 
     auto_fs = FirestoreFeedbackStore(
         TelemetryConfig(feedback_backend="auto", gcp_auto_triggered=True),
-        http_client=httpx.Client(transport=httpx.MockTransport(_failing_fs_transport)),
-        credentials=_FakeGcpCredentials(),
+        firestore_client=failing_fs,
     )
     fallback_res = auto_fs.record_feedback(
         message_id="m-auto",
@@ -923,36 +837,35 @@ def test_telemetry_sql_trace_id_retry_after_lru_and_lifecycle() -> None:
     """Verify SQL queries select trace_id, 429 Retry-After propagates, LRU & deque bounds hold."""
     captured_sql: list[str] = []
 
-    def _sql_handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        captured_sql.append(str(body.get("query") or ""))
-        return httpx.Response(200, json={"schema": {"fields": []}, "rows": []})
+    class _EmptyJob:
+        def result(self, **_kw: Any) -> list[Any]:
+            return []
 
-    mock_http = httpx.Client(transport=httpx.MockTransport(_sql_handler))
+    class _SqlCaptureBq:
+        def query(self, sql: str, **_kw: Any) -> _EmptyJob:
+            captured_sql.append(sql)
+            return _EmptyJob()
+
     gcp_cfg = TelemetryConfig(telemetry_backend="gcp", feedback_backend="local")
-    gcp_sink = BigQueryTelemetrySink(
-        config=gcp_cfg, http_client=mock_http, credentials=_FakeGcpCredentials()
-    )
+    gcp_sink = BigQueryTelemetrySink(config=gcp_cfg, bq_client=_SqlCaptureBq())
     gcp_sink.query_session_telemetry(limit=5)
     gcp_sink.query_security_audit_logs(limit=5)
     assert len(captured_sql) == 2
     assert all("trace_id" in q for q in captured_sql)
     gcp_sink.close()
-    mock_http.close()
 
-    rate_http = httpx.Client(
-        transport=httpx.MockTransport(
-            lambda _req: httpx.Response(429, headers={"Retry-After": "7.5"}, text="quota")
-        )
-    )
-    rate_sink = BigQueryTelemetrySink(
-        config=gcp_cfg, http_client=rate_http, credentials=_FakeGcpCredentials()
-    )
+    class _RateLimitedBq:
+        def query(self, sql: str, **_kw: Any) -> Any:
+            _ = sql
+            raise gcp_exceptions.TooManyRequests(
+                "quota", response=SimpleNamespace(status_code=429, headers={"Retry-After": "7.5"})
+            )
+
+    rate_sink = BigQueryTelemetrySink(config=gcp_cfg, bq_client=_RateLimitedBq())
     with pytest.raises(TelemetryRateLimitError) as exc_rl:
         rate_sink.query_session_telemetry(limit=5)
     assert exc_rl.value.retry_after_seconds == 7.5
     rate_sink.close()
-    rate_http.close()
 
     local_sink = BigQueryTelemetrySink(
         config=TelemetryConfig(telemetry_backend="local"),
@@ -979,11 +892,8 @@ def test_telemetry_sql_trace_id_retry_after_lru_and_lifecycle() -> None:
     assert list(local_sink._sessions.keys()) == ["s3", "s1", "s4"]
     assert "s2" not in local_sink._sessions
 
-    pooled = local_sink._get_http_client()
-    assert not pooled.is_closed
     local_sink.close()
     assert local_sink._closed is True
-    assert pooled.is_closed
 
     fb_store = FirestoreFeedbackStore(
         config=TelemetryConfig(feedback_backend="local"),

@@ -8,8 +8,6 @@ import threading
 import time
 from typing import Any, Literal
 
-import httpx
-
 from edgar_capstone.observability.tracing import traced
 from edgar_capstone.security.auth import record_security_audit_event
 from edgar_capstone.security.model_armor.client import ModelArmorClient
@@ -158,6 +156,27 @@ class ModelArmorGuardrailService:
                 sdp_deidentified_text=None,
                 backend_used="degraded_fail_open",
             )
+
+        if ma_summary.invocation_result != "SUCCESS":
+            logger.error(
+                "Model Armor %s returned non-SUCCESS invocation_result=%s",
+                rpc_label,
+                ma_summary.invocation_result,
+            )
+            if self.config.fail_closed:
+                record_security_audit_event(
+                    event_type=fail_closed_event,
+                    user=None,
+                    inherit_request_principal=True,
+                    resource=self.config.template_resource_name,
+                    status_outcome="blocked_fail_closed",
+                    detail=f"invocation_result={ma_summary.invocation_result}",
+                )
+                return _blocked(
+                    categories=(fail_closed_cat,),
+                    block_message=str(policy[block_msg_key]),
+                    backend_used="gcp_model_armor_fail_closed",
+                )
 
         if ma_summary.blocking_categories:
             record_security_audit_event(
@@ -316,7 +335,7 @@ def configure_model_armor_guardrail(
     service: ModelArmorGuardrailService | None = None,
     *,
     config: ModelArmorConfig | None = None,
-    http_client: httpx.Client | None = None,
+    sdk_client: Any | None = None,
     credentials: Any | None = None,
 ) -> ModelArmorGuardrailService:
     """Configure or inject a custom `ModelArmorGuardrailService` (e.g. for Cloud Run startup or tests)."""
@@ -327,7 +346,7 @@ def configure_model_armor_guardrail(
         else:
             client = ModelArmorClient(
                 config=config,
-                http_client=http_client,
+                sdk_client=sdk_client,
                 credentials=credentials,
             )
             new_svc = ModelArmorGuardrailService(client=client)

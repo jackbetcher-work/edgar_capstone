@@ -739,6 +739,8 @@ def run_golden_evals(
     """
     if max_workers < 1:
         raise ValueError(f"max_workers must be >= 1 (got {max_workers})")
+    # Resolve git commit SHA before any live turns open gRPC channels (avoids post-gRPC fork warnings).
+    commit_sha = detect_commit_sha()
     thresholds = thresholds or EvalThresholds()
     turn_fn = turn_fn or _default_turn_fn()
     judge_fn = judge_fn or _default_judge_fn()
@@ -832,7 +834,7 @@ def run_golden_evals(
         dataset_source=dataset_source,
         dataset_version=dataset_fingerprint(items),
         corpus_kind=corpus,
-        commit_sha=detect_commit_sha(),
+        commit_sha=commit_sha,
         environment=detect_environment(),
         analyst_model=analyst_model,
         judge_model=", ".join(judge_models) or None,

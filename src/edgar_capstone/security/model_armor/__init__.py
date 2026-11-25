@@ -1,8 +1,5 @@
 """Google Cloud Managed Model Armor API, Sensitive Data Protection (SDP / Cloud DLP),
-and SEC Financial Projection Compliance Guardrails.
-
-Modular package replacing the monolithic ``model_armor.py`` while preserving all
-public and internal exports for backward compatibility (zero regex imports).
+and SEC Financial Projection Compliance Guardrails (zero regex imports).
 """
 
 from __future__ import annotations
@@ -18,7 +15,7 @@ from edgar_capstone.security.model_armor.config import (
     ModelArmorMode,
     ModelArmorSanitizationSummary,
     SdpActionMode,
-    parse_model_armor_response,
+    parse_model_armor_proto,
 )
 from edgar_capstone.security.model_armor.config import (
     _load_guardrail_policy_dict as _load_guardrail_policy_dict,
@@ -29,7 +26,7 @@ from edgar_capstone.security.model_armor.config import (
 from edgar_capstone.security.model_armor.config import (
     _normalize_words as _normalize_words,
 )
-from edgar_capstone.security.model_armor.emulator import LocalModelArmorEmulatorTransport
+from edgar_capstone.security.model_armor.emulator import LocalModelArmorEmulator
 from edgar_capstone.security.model_armor.projection_filter import (
     FinancialProjectionFilter,
     ProjectionFilterResult,
@@ -57,7 +54,7 @@ __all__ = [
     "FinancialProjectionFilter",
     "GuardrailAction",
     "GuardrailDecision",
-    "LocalModelArmorEmulatorTransport",
+    "LocalModelArmorEmulator",
     "ModelArmorClient",
     "ModelArmorConfig",
     "ModelArmorGuardrailService",
@@ -69,7 +66,7 @@ __all__ = [
     "format_redaction_tag",
     "get_model_armor_guardrail",
     "get_model_armor_status_metadata",
-    "parse_model_armor_response",
+    "parse_model_armor_proto",
     "reset_model_armor_guardrail",
     "schema_safe_block_text",
 ]

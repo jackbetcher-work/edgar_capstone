@@ -1,7 +1,8 @@
-"""Dense vector embedding generation for SEC 10-K RAG chunks via Vertex AI `text-embedding-005`.
+"""Dense vector embedding generation for SEC 10-K RAG chunks via ``google-genai`` on Vertex AI.
 
-There is no offline or synthetic embedding backend: ingestion always calls Vertex AI and
-fails loudly when it is unavailable, so every stored vector is a real model embedding.
+There is no offline or synthetic embedding backend: ingestion and query embedding always call
+Vertex AI ``text-embedding-005`` via the official ``google-genai`` SDK and fail loudly when
+unavailable, so every stored vector is a real model embedding.
 """
 
 from __future__ import annotations
@@ -9,18 +10,23 @@ from __future__ import annotations
 import json
 import logging
 import random
+import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from types import TracebackType
 from typing import Any
-
-import httpx
 
 from edgar_capstone.common.domain import sha256_text
 from edgar_capstone.common.jsonl import iter_jsonl
 from edgar_capstone.gcp.defaults import DEFAULT_LOCATION
-from edgar_capstone.gcp.rest_client import GcpRestClient
+from edgar_capstone.gcp.errors import (
+    GcpClientError,
+    GcpRateLimitError,
+    GcpTimeoutError,
+    translate_gcp_sdk_error,
+)
 from edgar_capstone.vector_db.models import FilingChunk
 
 logger = logging.getLogger(__name__)
@@ -43,18 +49,13 @@ def _retry_backoff_seconds(attempt: int) -> float:
     return min(30.0, 1.5 * (2 ** (attempt - 1))) * (0.75 + random.random() * 0.5)
 
 
-class VertexAIEmbedder(GcpRestClient):
-    """Client for generating dense embeddings via Vertex AI (`text-embedding-005`).
+class VertexAIEmbedder:
+    """Client for generating dense embeddings via ``google-genai`` on Vertex AI.
 
-    Inherits thread-safe ADC bearer authentication, empty-token guards, and pooled
-    `httpx.Client` lifecycle management (`close()` / context manager) from `GcpRestClient`.
-
-    Requests are packed by both instance count (`batch_size`) and total characters
-    (`max_batch_chars`) so a batch stays under the per-request input-token limit
-    (20,000 tokens for `text-embedding-005`). A batch the API still rejects as too
-    large is split in half and retried. With `max_workers > 1`, batches are sent
-    concurrently over the shared thread-safe HTTP pool and results are returned in
-    input order.
+    Requests are packed by instance count (``batch_size``), total characters
+    (``max_batch_chars``), and matching document ``title`` so each batch stays under the
+    20,000-token per-request limit while passing section titles natively via
+    ``EmbedContentConfig.title``. Oversized batches are split in half recursively.
     """
 
     def __init__(
@@ -66,44 +67,83 @@ class VertexAIEmbedder(GcpRestClient):
         dimensions: int = DEFAULT_EMBEDDING_DIMENSIONS,
         batch_size: int = 50,
         max_retries: int = 5,
-        http_client: httpx.Client | None = None,
+        genai_client: Any | None = None,
         credentials: Any | None = None,
         max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
         max_workers: int = 1,
     ) -> None:
-        workers = max(1, max_workers)
-        super().__init__(
-            http_client=http_client,
-            credentials=credentials,
-            default_timeout=60.0,
-            max_connections=max(32, workers * 2),
-            max_keepalive_connections=max(16, workers),
-        )
         self.project_id = project_id
         self.location = location
         self.model_name = model_name
         self.dimensions = dimensions
         self.batch_size = max(1, min(batch_size, 250))
-        self.max_retries = max_retries
+        self.max_retries = max(1, int(max_retries))
         self.max_batch_chars = max(1, max_batch_chars)
-        self.max_workers = workers
+        self.max_workers = max(1, max_workers)
+        self._injected_client = genai_client
+        self._owned_client: Any | None = None
+        self._credentials = credentials
+        self._client_lock = threading.Lock()
 
-    def _get_access_token(self) -> str:
-        """Obtain a valid OAuth2 bearer token from Application Default Credentials."""
-        return self._get_bearer_token()
+    def _get_client(self) -> Any:
+        if self._injected_client is not None:
+            return self._injected_client
+        with self._client_lock:
+            if self._owned_client is None:
+                from google import genai
+                from google.genai import types as genai_types
 
-    def _plan_batches(self, texts: list[str]) -> list[tuple[int, int]]:
-        """Split `texts` into `(start, end)` ranges bounded by count and total characters."""
+                kwargs: dict[str, Any] = {
+                    "vertexai": True,
+                    "project": self.project_id,
+                    "location": self.location,
+                    "http_options": genai_types.HttpOptions(timeout=60_000),
+                }
+                if self._credentials is not None:
+                    kwargs["credentials"] = self._credentials
+                self._owned_client = genai.Client(**kwargs)
+            return self._owned_client
+
+    def close(self) -> None:
+        """Close the internally managed ``genai.Client`` (leaves injected clients open)."""
+        with self._client_lock:
+            if self._owned_client is not None:
+                close_fn = getattr(self._owned_client, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                self._owned_client = None
+
+    def __enter__(self) -> VertexAIEmbedder:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def _plan_batches(
+        self,
+        texts: list[str],
+        titles: list[str] | None = None,
+    ) -> list[tuple[int, int]]:
+        """Split ``texts`` into ``(start, end)`` ranges bounded by count, chars, and title."""
         batches: list[tuple[int, int]] = []
         start = 0
         chars = 0
+        current_title = titles[0] if (titles and len(titles) > 0) else None
         for idx, text in enumerate(texts):
             size = len(text)
+            item_title = titles[idx] if (titles and idx < len(titles)) else None
             if idx > start and (
-                idx - start >= self.batch_size or chars + size > self.max_batch_chars
+                idx - start >= self.batch_size
+                or chars + size > self.max_batch_chars
+                or (titles is not None and item_title != current_title)
             ):
                 batches.append((start, idx))
-                start, chars = idx, 0
+                start, chars, current_title = idx, 0, item_title
             chars += size
         if start < len(texts):
             batches.append((start, len(texts)))
@@ -114,102 +154,92 @@ class VertexAIEmbedder(GcpRestClient):
         texts: list[str],
         *,
         task_type: str = "RETRIEVAL_DOCUMENT",
-        titles: list[str] | None = None,
+        title: str | None = None,
     ) -> list[list[float]]:
-        """Invoke the Vertex AI `predict` REST endpoint for a single batch of texts."""
-        url = (
-            f"https://{self.location}-aiplatform.googleapis.com/v1/"
-            f"projects/{self.project_id}/locations/{self.location}/"
-            f"publishers/google/models/{self.model_name}:predict"
-        )
-        instances: list[dict[str, Any]] = []
-        for idx, text in enumerate(texts):
-            inst: dict[str, Any] = {
-                "content": text,
-                "task_type": task_type,
-            }
-            if titles and idx < len(titles) and titles[idx]:
-                inst["title"] = titles[idx]
-            instances.append(inst)
+        """Invoke ``client.models.embed_content`` for a single homogeneous batch of texts."""
+        from google.genai import types as genai_types
 
-        payload: dict[str, Any] = {
-            "instances": instances,
-            "parameters": {
-                "outputDimensionality": self.dimensions,
-                "autoTruncate": True,
-            },
+        config_kwargs: dict[str, Any] = {
+            "task_type": task_type,
+            "output_dimensionality": self.dimensions,
+            "auto_truncate": True,
         }
+        if title and task_type == "RETRIEVAL_DOCUMENT":
+            config_kwargs["title"] = title
+        config = genai_types.EmbedContentConfig(**config_kwargs)
+
+        client = self._get_client()
+        last_translated: GcpClientError | None = None
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                resp = self._raw_request("POST", url, json_body=payload)
-            except httpx.TransportError as exc:
-                if attempt < self.max_retries:
-                    backoff = _retry_backoff_seconds(attempt)
-                    logger.warning(
-                        "Vertex AI embedding transport error %s (attempt %d/%d); retrying in %.1fs...",
-                        type(exc).__name__,
-                        attempt,
-                        self.max_retries,
-                        backoff,
-                    )
-                    time.sleep(backoff)
-                    continue
-                raise
-            if resp.status_code == 200:
-                data = resp.json()
-                predictions = data.get("predictions", [])
-                vectors: list[list[float]] = []
-                for pred in predictions:
-                    emb_obj = pred.get("embeddings", pred)
-                    values = emb_obj.get("values", [])
-                    vectors.append([float(v) for v in values])
-                if len(vectors) != len(texts):
-                    raise RuntimeError(
-                        f"Vertex AI returned {len(vectors)} embeddings for {len(texts)} inputs"
-                    )
-                return vectors
-
-            if resp.status_code == 400 and len(texts) > 1 and "token" in resp.text.lower():
-                raise _BatchTooLargeError(resp.text[:400])
-
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
-                backoff = _retry_backoff_seconds(attempt)
-                logger.warning(
-                    "Vertex AI embedding HTTP %d (attempt %d/%d); retrying in %.1fs...",
-                    resp.status_code,
-                    attempt,
-                    self.max_retries,
-                    backoff,
+                response = client.models.embed_content(
+                    model=self.model_name,
+                    contents=texts,
+                    config=config,
                 )
-                time.sleep(backoff)
-                continue
+            except Exception as exc:
+                msg_lower = str(exc).lower()
+                translated = translate_gcp_sdk_error(
+                    exc, context=f"Vertex AI embedding ({self.model_name})"
+                )
+                last_translated = translated
 
-            raise RuntimeError(
-                f"Vertex AI embedding request failed (HTTP {resp.status_code}): {resp.text[:400]}"
-            )
+                if translated.status_code == 400 and len(texts) > 1 and "token" in msg_lower:
+                    raise _BatchTooLargeError(str(exc)[:400]) from exc
 
-        raise RuntimeError("Exhausted retries calling Vertex AI embedding API")
+                if isinstance(translated, (GcpRateLimitError, GcpTimeoutError)):
+                    if attempt < self.max_retries:
+                        explicit_delay = (
+                            translated.retry_after_seconds
+                            if isinstance(translated, GcpRateLimitError)
+                            else None
+                        )
+                        backoff = (
+                            explicit_delay
+                            if explicit_delay is not None
+                            else _retry_backoff_seconds(attempt)
+                        )
+                        logger.warning(
+                            "Vertex AI embedding transient error %s (attempt %d/%d); retrying in %.1fs...",
+                            type(exc).__name__,
+                            attempt,
+                            self.max_retries,
+                            backoff,
+                        )
+                        time.sleep(backoff)
+                        continue
+                    raise translated from exc
+                raise translated from exc
+
+            embeddings = list(getattr(response, "embeddings", None) or ())
+            vectors = [
+                [float(v) for v in (getattr(emb, "values", None) or ())] for emb in embeddings
+            ]
+            if len(vectors) != len(texts):
+                raise GcpClientError(
+                    f"Vertex AI returned {len(vectors)} embeddings for {len(texts)} inputs"
+                )
+            return vectors
+
+        assert last_translated is not None
+        raise last_translated
 
     def _embed_batch_adaptive(
         self,
         texts: list[str],
         *,
         task_type: str,
-        titles: list[str] | None,
+        title: str | None,
     ) -> list[list[float]]:
         """Embed one batch, halving it recursively if the API rejects it as too many tokens."""
         try:
-            return self._predict_batch(texts, task_type=task_type, titles=titles)
+            return self._predict_batch(texts, task_type=task_type, title=title)
         except _BatchTooLargeError:
             mid = len(texts) // 2
             logger.info("Embedding batch of %d exceeded the token limit; splitting.", len(texts))
-            left = self._embed_batch_adaptive(
-                texts[:mid], task_type=task_type, titles=titles[:mid] if titles else None
-            )
-            right = self._embed_batch_adaptive(
-                texts[mid:], task_type=task_type, titles=titles[mid:] if titles else None
-            )
+            left = self._embed_batch_adaptive(texts[:mid], task_type=task_type, title=title)
+            right = self._embed_batch_adaptive(texts[mid:], task_type=task_type, title=title)
             return left + right
 
     def embed_texts(
@@ -220,21 +250,19 @@ class VertexAIEmbedder(GcpRestClient):
         titles: list[str] | None = None,
         on_batch_complete: Callable[[int, int, list[list[float]]], None] | None = None,
     ) -> list[list[float]]:
-        """Embed a list of texts in count- and size-bounded batches.
-
-        `on_batch_complete(start, end, vectors)` is called after each batch finishes
-        (from the calling thread), which lets callers checkpoint progress.
-        Thread-safe for concurrent callers: never mutates `self._http_client`.
-        """
-        batches = self._plan_batches(texts)
+        """Embed a list of texts in count-, char-, and title-bounded batches."""
+        batches = self._plan_batches(texts, titles=titles)
         results: list[list[float] | None] = [None] * len(texts)
 
         def run(bounds: tuple[int, int]) -> tuple[int, int, list[list[float]]]:
             start, end = bounds
+            batch_title = (
+                titles[start] if (titles and start < len(titles) and titles[start]) else None
+            )
             vecs = self._embed_batch_adaptive(
                 texts[start:end],
                 task_type=task_type,
-                titles=titles[start:end] if titles else None,
+                title=batch_title,
             )
             return start, end, vecs
 
@@ -247,8 +275,7 @@ class VertexAIEmbedder(GcpRestClient):
             for bounds in batches:
                 record(*run(bounds))
         else:
-            # Ensure the shared pooled httpx.Client is initialized safely under lock before fan-out.
-            _ = self._get_http_client()
+            _ = self._get_client()
             with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
                 futures = [pool.submit(run, bounds) for bounds in batches]
                 try:
@@ -261,7 +288,7 @@ class VertexAIEmbedder(GcpRestClient):
 
         missing = [i for i, vec in enumerate(results) if vec is None]
         if missing:
-            raise RuntimeError(f"Vertex AI embedding left {len(missing)} inputs without vectors")
+            raise GcpClientError(f"Vertex AI embedding left {len(missing)} inputs without vectors")
         return [vec for vec in results if vec is not None]
 
 
@@ -302,19 +329,7 @@ def populate_chunk_embeddings(
     max_batch_chars: int = DEFAULT_MAX_BATCH_CHARS,
     checkpoint_path: Path | None = None,
 ) -> tuple[list[FilingChunk], str]:
-    """Populate `embedding` on each `FilingChunk` with Vertex AI and return `(chunks, source)`.
-
-    `source` is `"vertex_ai"` when any vector was freshly generated or resumed from the
-    Vertex AI checkpoint, or `"cached"` when every vector was reused from a prior manifest.
-    Any Vertex AI failure propagates to the caller; there is no synthetic fallback.
-
-    If `existing_embeddings` is provided (mapping `chunk_id -> (sha256_text, embedding)`),
-    unchanged chunks with valid dimension embeddings are reused without recomputation.
-
-    If `checkpoint_path` is provided, every Vertex AI batch is appended to that JSONL
-    file as it completes, and rows already in it (same model and dimensions) are
-    reused, so an interrupted run resumes instead of re-embedding everything.
-    """
+    """Populate `embedding` on each `FilingChunk` with Vertex AI and return `(chunks, source)`."""
     if not chunks:
         return [], "vertex_ai"
 

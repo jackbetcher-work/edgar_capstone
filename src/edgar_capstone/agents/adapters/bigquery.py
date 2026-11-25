@@ -1,4 +1,4 @@
-"""Live BigQuery REST v2 adapter for SEC 10-K metrics, BI views, and `VECTOR_SEARCH`."""
+"""Live BigQuery SDK adapter for SEC 10-K metrics, BI views, and `VECTOR_SEARCH`."""
 
 from __future__ import annotations
 
@@ -6,23 +6,21 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any
 
-import httpx
-
 from edgar_capstone.agents.adapters.registry import (
-    GcpAdapterErrorTranslationMixin,
     GcpToolConfig,
+    translate_gcp_adapter_error,
 )
-from edgar_capstone.agents.core.resilience import ToolExecutionError, UpstreamTimeoutError
+from edgar_capstone.agents.core.resilience import ToolExecutionError
 from edgar_capstone.common.domain import CORE_METRICS, normalize_edgar_ticker
 from edgar_capstone.common.formatting import ratio_pct
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.gcp.bigquery import (
-    BigQueryRestClient,
-    bq_array_param,
-    bq_scalar_param,
+    BigQueryClientWrapper,
+    make_array_param,
+    make_scalar_param,
     validate_bq_identifier,
 )
-from edgar_capstone.gcp.rest_client import GcpRestError
+from edgar_capstone.gcp.errors import GcpClientError
 
 
 def _distance_to_similarity(raw_distance: Any) -> float:
@@ -44,29 +42,29 @@ def _build_scope_where_clauses(
     gics_sectors: set[str] | None = None,
     section_id: str | None = None,
     extra_clauses: Sequence[str] = (),
-) -> tuple[list[str], list[dict[str, Any]]]:
+) -> tuple[list[str], list[Any]]:
     """Build parameterized WHERE clauses shared across BigQuery metrics & vector queries."""
     clauses = ["fiscal_year BETWEEN @start_year AND @end_year", *extra_clauses]
-    params: list[dict[str, Any]] = [
-        bq_scalar_param("start_year", "INT64", int(start_year)),
-        bq_scalar_param("end_year", "INT64", int(end_year)),
+    params: list[Any] = [
+        make_scalar_param("start_year", "INT64", int(start_year)),
+        make_scalar_param("end_year", "INT64", int(end_year)),
     ]
     if tickers:
         norm_tickers = sorted({normalize_edgar_ticker(t) for t in tickers if t and t.strip()})
         if norm_tickers:
             clauses.append("UPPER(REPLACE(ticker, '.', '-')) IN UNNEST(@tickers)")
-            params.append(bq_array_param("tickers", "STRING", norm_tickers))
+            params.append(make_array_param("tickers", "STRING", norm_tickers))
     if gics_sectors:
         norm_sectors = sorted({s.strip().lower() for s in gics_sectors if s and s.strip()})
         if norm_sectors:
             clauses.append("LOWER(gics_sector) IN UNNEST(@sectors)")
-            params.append(bq_array_param("sectors", "STRING", norm_sectors))
+            params.append(make_array_param("sectors", "STRING", norm_sectors))
     elif gics_sector:
         clauses.append("LOWER(gics_sector) = @gics_sector")
-        params.append(bq_scalar_param("gics_sector", "STRING", gics_sector.strip().lower()))
+        params.append(make_scalar_param("gics_sector", "STRING", gics_sector.strip().lower()))
     if section_id:
         clauses.append("LOWER(section_id) = @section_id")
-        params.append(bq_scalar_param("section_id", "STRING", section_id.strip().lower()))
+        params.append(make_scalar_param("section_id", "STRING", section_id.strip().lower()))
     return clauses, params
 
 
@@ -120,21 +118,21 @@ def _rollup_section_cells(sec_id: str, cells: list[dict[str, Any]]) -> dict[str,
     }
 
 
-class BigQueryAdapter(GcpAdapterErrorTranslationMixin, BigQueryRestClient):
-    """Live BigQuery REST v2 adapter for SEC 10-K metrics, BI views, and `VECTOR_SEARCH`."""
+class BigQueryAdapter(BigQueryClientWrapper):
+    """Live BigQuery SDK adapter for SEC 10-K metrics, BI views, and `VECTOR_SEARCH`."""
 
     def __init__(
         self,
         config: GcpToolConfig,
         *,
-        http_client: httpx.Client | None = None,
+        bq_client: Any | None = None,
         credentials: Any | None = None,
     ) -> None:
         super().__init__(
             project_id=config.project_id,
             dataset_id=config.bq_dataset_id,
             location=config.location,
-            http_client=http_client,
+            bq_client=bq_client,
             credentials=credentials,
             default_timeout=45.0,
         )
@@ -157,25 +155,21 @@ class BigQueryAdapter(GcpAdapterErrorTranslationMixin, BigQueryRestClient):
     def run_query(
         self,
         sql: str,
-        query_parameters: list[dict[str, Any]] | None = None,
+        query_parameters: Sequence[Any] | None = None,
         *,
-        timeout_ms: int = 30000,
-        max_results: int = 10000,
-        max_polls: int = 20,
-        poll_interval_seconds: float = 0.1,
+        timeout: float | None = None,
+        max_results: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Execute a parameterized Standard SQL query on BigQuery and return decoded rows."""
+        """Execute a parameterized Standard SQL query on BigQuery and return normalized rows."""
         try:
             return super().run_query(
                 sql,
                 query_parameters=query_parameters,
-                timeout_ms=timeout_ms,
+                timeout=timeout,
                 max_results=max_results,
-                max_polls=max_polls,
-                poll_interval_seconds=poll_interval_seconds,
             )
-        except GcpRestError as exc:
-            raise UpstreamTimeoutError(str(exc)) from exc
+        except GcpClientError as exc:
+            raise translate_gcp_adapter_error(exc, context="BigQuery query") from exc
 
     def _row_to_profile(self, row: dict[str, Any]) -> FinancialDataProfile:
         """Convert a decoded `financial_metrics` BigQuery row into `FinancialDataProfile`."""
@@ -446,9 +440,9 @@ class BigQueryAdapter(GcpAdapterErrorTranslationMixin, BigQueryRestClient):
         )
         params.extend(
             [
-                bq_scalar_param("embedding_dim", "INT64", int(len(query_embedding))),
-                bq_array_param("query_embedding", "FLOAT64", query_embedding),
-                bq_scalar_param("top_k", "INT64", int(max(1, min(top_k, 500)))),
+                make_scalar_param("embedding_dim", "INT64", int(len(query_embedding))),
+                make_array_param("query_embedding", "FLOAT64", query_embedding),
+                make_scalar_param("top_k", "INT64", int(max(1, min(top_k, 500)))),
             ]
         )
         sql = (
@@ -564,9 +558,9 @@ class BigQueryAdapter(GcpAdapterErrorTranslationMixin, BigQueryRestClient):
         )
         params.extend(
             [
-                bq_scalar_param("embedding_dim", "INT64", int(len(query_embedding))),
-                bq_array_param("query_embedding", "FLOAT64", query_embedding),
-                bq_scalar_param(
+                make_scalar_param("embedding_dim", "INT64", int(len(query_embedding))),
+                make_array_param("query_embedding", "FLOAT64", query_embedding),
+                make_scalar_param(
                     "per_company_year", "INT64", int(max(1, min(per_company_year, 10)))
                 ),
             ]
@@ -617,9 +611,9 @@ class BigQueryAdapter(GcpAdapterErrorTranslationMixin, BigQueryRestClient):
             "ORDER BY chunk_index ASC"
         )
         params = [
-            bq_scalar_param("ticker", "STRING", normalize_edgar_ticker(ticker)),
-            bq_scalar_param("fiscal_year", "INT64", int(fiscal_year)),
-            bq_scalar_param("section_id", "STRING", section_id.lower()),
+            make_scalar_param("ticker", "STRING", normalize_edgar_ticker(ticker)),
+            make_scalar_param("fiscal_year", "INT64", int(fiscal_year)),
+            make_scalar_param("section_id", "STRING", section_id.lower()),
         ]
         return self.run_query(sql, params)
 

@@ -38,10 +38,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "require_permissions": ("edgar_capstone.security.auth", "require_permissions"),
     "revoke_bearer_token": ("edgar_capstone.security.auth", "revoke_bearer_token"),
     # jwt_codec
-    "b64url_decode": ("edgar_capstone.security.jwt_codec", "b64url_decode"),
-    "b64url_encode": ("edgar_capstone.security.jwt_codec", "b64url_encode"),
+    "decode_verified_jwt": ("edgar_capstone.security.jwt_codec", "decode_verified_jwt"),
     "ec_public_key_to_jwk": ("edgar_capstone.security.jwt_codec", "ec_public_key_to_jwk"),
     "jwk_to_public_key": ("edgar_capstone.security.jwt_codec", "jwk_to_public_key"),
+    "parse_unverified_jwt": ("edgar_capstone.security.jwt_codec", "parse_unverified_jwt"),
     "rsa_public_key_to_jwk": ("edgar_capstone.security.jwt_codec", "rsa_public_key_to_jwk"),
     "sign_jwt_es256": ("edgar_capstone.security.jwt_codec", "sign_jwt_es256"),
     "sign_jwt_rs256": ("edgar_capstone.security.jwt_codec", "sign_jwt_rs256"),
@@ -59,9 +59,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "FinancialProjectionFilter",
     ),
     "GuardrailDecision": ("edgar_capstone.security.model_armor", "GuardrailDecision"),
-    "LocalModelArmorEmulatorTransport": (
+    "LocalModelArmorEmulator": (
         "edgar_capstone.security.model_armor",
-        "LocalModelArmorEmulatorTransport",
+        "LocalModelArmorEmulator",
     ),
     "ModelArmorClient": ("edgar_capstone.security.model_armor", "ModelArmorClient"),
     "ModelArmorConfig": ("edgar_capstone.security.model_armor", "ModelArmorConfig"),
@@ -86,9 +86,9 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "edgar_capstone.security.model_armor",
         "get_model_armor_status_metadata",
     ),
-    "parse_model_armor_response": (
+    "parse_model_armor_proto": (
         "edgar_capstone.security.model_armor",
-        "parse_model_armor_response",
+        "parse_model_armor_proto",
     ),
     "reset_model_armor_guardrail": (
         "edgar_capstone.security.model_armor",

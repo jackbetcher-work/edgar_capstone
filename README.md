@@ -104,7 +104,7 @@ Data is split across Google Cloud storage and retrieval services by workload pat
 | **BigQuery** | Analytical scans, vector search, append-only logs | Structured XBRL `financial_metrics`, 768-d embedded `filing_chunks` (`VECTOR_SEARCH`), and streaming telemetry, audit, and eval tables | Serverless SQL and vector analytics at S&P 500 scale |
 | **Vertex AI Search** | Managed hybrid lexical + semantic retrieval | Indexed 10-K filings with auto query expansion, spell correction, and extractive segments | Pairs lexical recall and extractive snippets with BigQuery dense vector search in parallel for stronger grounding |
 | **Cloud Storage (GCS)** | Immutable large text objects | Full Item 1A (Risk Factors) and Item 7 (MD&A) Markdown sections | Low-cost blob storage for serving full filing sections to the source viewer and cached section reads |
-| **Cloud Firestore (Native)** | Low-latency mutable JSON CRUD and per-user state | `analyst_sessions` (multi-turn conversation memory) and `analyst_feedback` (thumbs-up/down ratings and comments) | Fast point `GET`/`PATCH`/`DELETE` and `:runQuery`; serverless scale-to-zero across stateless Cloud Run instances; schemaless nested JSON; SHA-256 `(user_id, session_id)` isolation with `OPTIMISTIC` concurrency via a lightweight REST v1 (`httpx`) client ([`firestore_stores.py`](src/edgar_capstone/firestore_stores.py)) |
+| **Cloud Firestore (Native)** | Low-latency mutable JSON CRUD and per-user state | `analyst_sessions` (multi-turn conversation memory) and `analyst_feedback` (thumbs-up/down ratings and comments) | Fast point `GET`/`PATCH`/`DELETE` and filtered queries; serverless scale-to-zero across stateless Cloud Run instances; schemaless nested JSON; SHA-256 `(user_id, session_id)` isolation with transactional read-modify-write concurrency via the official `google-cloud-firestore` SDK ([`firestore_stores.py`](src/edgar_capstone/firestore_stores.py)) |
 
 ---
 
@@ -132,7 +132,7 @@ Data is split across Google Cloud storage and retrieval services by workload pat
 | `make docker-build` / `make docker-smoke` | Build the production image and smoke-test it over HTTP |
 | `make help` | List all targets, including corpus publishing (`publish-financials`, `index-vertex-search`, `backfill-rd`) |
 
-Run `make smoke` or `make docker-smoke` with `SMOKE_LIVE_DATA=true` to also check a live BigQuery read. For fast local iteration without GCP credentials, run `.venv/bin/pytest -m "not live"` (unit and mocked-transport integration tests; `@pytest.mark.live` tests hit live GCP and Gemini).
+Run `make smoke` or `make docker-smoke` with `SMOKE_LIVE_DATA=true` to also check a live BigQuery read. For fast local iteration without GCP credentials, run `.venv/bin/pytest -m "not live"` (unit and typed fake-SDK integration tests; `@pytest.mark.live` tests hit live GCP and Gemini).
 
 ### Configuration
 
@@ -157,7 +157,7 @@ CORPUS_PROJECT_ID=<other-project> make dev   # point at another project
 
 The runtime install (`pip install .`, used by the `Dockerfile` and `requirements.txt`) is kept lean. Heavy packages are in optional extras:
 
-- `pip install ".[ingest]"` adds the offline dataset and vector-DB build tools (`edgartools`, `pandas`, `google-cloud-storage`).
+- `pip install ".[ingest]"` adds the offline dataset, vector-DB, and Terraform-bootstrap build tools (`edgartools`, `pandas`, `google-cloud-service-usage`).
 - `pip install ".[dev]"` adds test and lint tooling; `make install` uses this.
 
 The container image packages the runtime library, the built UI, and `prompts/`; corpus data is read from GCP at runtime.
@@ -268,8 +268,8 @@ See [`evals/README.md`](evals/README.md) for the record schema and gate definiti
 │   ├── security/            # Direct IAP / Google Workspace OIDC auth, RBAC, Model Armor, secret scanner
 │   ├── observability/       # OpenTelemetry tracing, structured logging, request middleware
 │   ├── telemetry.py         # BigQuery streaming telemetry and security audit sinks
-│   ├── firestore_stores.py  # Firestore Native REST v1 session memory and analyst feedback stores
-│   ├── gcp/                 # Lightweight GCP REST clients (BigQuery, Firestore, Discovery Engine)
+│   ├── firestore_stores.py  # Cloud Firestore SDK session memory and analyst feedback stores
+│   ├── gcp/                 # Official GCP SDK wrappers, error translation, defaults, and resource path helpers
 │   ├── common/              # Shared helpers: env parsing, domain constants, formatting, caching
 │   ├── dataset/             # Offline 10-K XBRL and Markdown extraction pipeline
 │   ├── vector_db/           # 10-K chunker, Vertex AI embedder, chunk-health monitor

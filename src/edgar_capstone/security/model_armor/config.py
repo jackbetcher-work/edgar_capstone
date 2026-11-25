@@ -205,8 +205,12 @@ class ModelArmorConfig:
         return f"projects/{self.project_id}/locations/{self.location}/templates/{self.template_id}"
 
     @property
+    def regional_api_host(self) -> str:
+        return f"modelarmor.{self.location}.rep.googleapis.com"
+
+    @property
     def regional_api_endpoint(self) -> str:
-        return f"https://modelarmor.{self.location}.rep.googleapis.com"
+        return f"https://{self.regional_api_host}"
 
 
 @dataclass(frozen=True)
@@ -301,141 +305,131 @@ class GuardrailDecision:
         )
 
 
-def _is_matched(val: Any) -> bool:
-    if isinstance(val, int) and not isinstance(val, bool):
-        return val == 2  # FilterMatchState.MATCH_FOUND proto enum int
-    text = str(val or "").upper()
-    return text.endswith("MATCH_FOUND") and not text.endswith("NO_MATCH_FOUND")
+def _enum_name(val: Any, default: str) -> str:
+    if val is None:
+        return default
+    name = getattr(val, "name", None)
+    if isinstance(name, str) and name:
+        return name.upper()
+    return str(val).upper() or default
 
 
-def _sdp_subresult_executed(sub: Any) -> bool:
-    if not isinstance(sub, dict) or not sub:
-        return False
-    exec_state = sub.get("executionState") or sub.get("execution_state")
-    if exec_state is not None:
-        if isinstance(exec_state, int) and not isinstance(exec_state, bool):
-            return exec_state == 1  # EXECUTION_SUCCESS proto enum int
-        return str(exec_state).upper().endswith("EXECUTION_SUCCESS")
-    return bool(sub.get("matchState") or sub.get("match_state"))
+def _is_match_found(state: Any) -> bool:
+    if isinstance(state, int) and not isinstance(state, bool):
+        return state == 2  # FilterMatchState.MATCH_FOUND
+    name = _enum_name(state, "")
+    return name.endswith("MATCH_FOUND") and not name.endswith("NO_MATCH_FOUND")
 
 
-def _extract_filter_result(
-    filter_results: dict[str, Any],
-    key: str,
-    camel_name: str,
-    snake_name: str,
-) -> dict[str, Any]:
-    entry = filter_results.get(key)
-    if not isinstance(entry, dict):
-        return {}
-    nested = entry.get(camel_name) or entry.get(snake_name) or entry
-    return nested if isinstance(nested, dict) else {}
+def _is_execution_success(state: Any) -> bool:
+    if isinstance(state, int) and not isinstance(state, bool):
+        return state == 1  # FilterExecutionState.EXECUTION_SUCCESS
+    return _enum_name(state, "").endswith("EXECUTION_SUCCESS")
 
 
-def _get_match_state(res: dict[str, Any]) -> Any:
-    return res.get("matchState") if "matchState" in res else res.get("match_state")
-
-
-def _parse_pi_filter(filter_results: dict[str, Any]) -> list[str]:
-    pi_res = _extract_filter_result(
-        filter_results,
-        "pi_and_jailbreak",
-        "piAndJailbreakFilterResult",
-        "pi_and_jailbreak_filter_result",
-    )
-    if _is_matched(_get_match_state(pi_res)):
-        conf = pi_res.get("confidenceLevel") or pi_res.get("confidence_level") or "HIGH"
-        return [f"pi_and_jailbreak:{conf}"]
-    return []
-
-
-def _parse_rai_filter(filter_results: dict[str, Any]) -> list[str]:
-    rai_res = _extract_filter_result(filter_results, "rai", "raiFilterResult", "rai_filter_result")
-    if not _is_matched(_get_match_state(rai_res)):
-        return []
-    type_map = rai_res.get("raiFilterTypeResults") or rai_res.get("rai_filter_type_results") or {}
-    if not isinstance(type_map, dict):
-        return ["rai"]
-    subtypes = sorted(
-        str(name)
-        for name, detail in type_map.items()
-        if isinstance(detail, dict) and _is_matched(_get_match_state(detail))
-    )
-    return [f"rai:{sub}" for sub in subtypes] if subtypes else ["rai"]
-
-
-_SIMPLE_FILTER_SPECS: tuple[tuple[str, str, str], ...] = (
-    ("malicious_uris", "maliciousUriFilterResult", "malicious_uri_filter_result"),
-    ("csam", "csamFilterFilterResult", "csam_filter_filter_result"),
-)
-
-
-def _parse_sdp_filter(
-    filter_results: dict[str, Any],
-) -> tuple[bool, bool, list[str], str | None]:
-    sdp_res = _extract_filter_result(filter_results, "sdp", "sdpFilterResult", "sdp_filter_result")
-    if not sdp_res:
-        return False, False, [], None
-
-    insp = sdp_res.get("inspectResult") or sdp_res.get("inspect_result") or {}
-    deid = sdp_res.get("deidentifyResult") or sdp_res.get("deidentify_result") or {}
-    sdp_executed = _sdp_subresult_executed(insp) or _sdp_subresult_executed(deid)
-
-    sdp_matched = False
-    info_types: list[str] = []
-    deid_text: str | None = None
-
-    if isinstance(insp, dict) and _is_matched(_get_match_state(insp)):
-        sdp_matched = True
-        for f_item in insp.get("findings") or []:
-            if isinstance(f_item, dict):
-                it_raw = f_item.get("infoType") or f_item.get("info_type")
-                it_name = it_raw.get("name") if isinstance(it_raw, dict) else it_raw
-                if it_name:
-                    info_types.append(str(it_name))
-
-    if isinstance(deid, dict) and _is_matched(_get_match_state(deid)):
-        sdp_matched = True
-        data_obj = deid.get("data") or {}
-        if isinstance(data_obj, dict) and isinstance(data_obj.get("text"), str):
-            deid_text = data_obj["text"]
-        for it_name in deid.get("infoTypes") or deid.get("info_types") or []:
-            if it_name:
-                info_types.append(str(it_name))
-
-    return sdp_executed, sdp_matched, info_types, deid_text
-
-
-def parse_model_armor_response(
-    payload: dict[str, Any],
+def parse_model_armor_proto(
+    response: Any,
     *,
     backend_used: str = "gcp_model_armor_v1",
 ) -> ModelArmorSanitizationSummary:
-    """Parse Google Cloud Model Armor v1 JSON (`camelCase` or `snake_case`) into structured findings."""
-    sr = payload.get("sanitizationResult") or payload.get("sanitization_result") or payload
-    if not isinstance(sr, dict):
-        sr = {}
+    """Parse a typed ``google.cloud.modelarmor_v1`` sanitize response into structured findings."""
+    sr = getattr(response, "sanitization_result", None)
+    if sr is None:
+        return ModelArmorSanitizationSummary(
+            filter_match_state="FILTER_MATCH_STATE_UNSPECIFIED",
+            blocking_categories=(),
+            sdp_matched=False,
+            sdp_info_types=(),
+            sdp_deidentified_text=None,
+            invocation_result="FAILURE",
+            backend_used=backend_used,
+            raw_response={},
+            sdp_executed=False,
+        )
 
-    match_state = str(
-        sr.get("filterMatchState") or sr.get("filter_match_state") or "NO_MATCH_FOUND"
-    ).upper()
-    inv_result = str(sr.get("invocationResult") or sr.get("invocation_result") or "SUCCESS").upper()
-    filter_results = sr.get("filterResults") or sr.get("filter_results") or {}
-    if not isinstance(filter_results, dict):
-        filter_results = {}
+    match_state = _enum_name(
+        getattr(sr, "filter_match_state", None), "FILTER_MATCH_STATE_UNSPECIFIED"
+    )
+    inv_result = _enum_name(getattr(sr, "invocation_result", None), "INVOCATION_RESULT_UNSPECIFIED")
+    filter_results = getattr(sr, "filter_results", None) or {}
 
     blocking: list[str] = []
-    blocking.extend(_parse_pi_filter(filter_results))
-    blocking.extend(_parse_rai_filter(filter_results))
-    for key, camel_name, snake_name in _SIMPLE_FILTER_SPECS:
-        res = _extract_filter_result(filter_results, key, camel_name, snake_name)
-        if _is_matched(_get_match_state(res)):
-            blocking.append(key)
 
-    sdp_executed, sdp_matched, sdp_info_types, sdp_deid_text = _parse_sdp_filter(filter_results)
+    pi_entry = filter_results.get("pi_and_jailbreak")
+    if pi_entry is not None and "pi_and_jailbreak_filter_result" in pi_entry:
+        pi_res = pi_entry.pi_and_jailbreak_filter_result
+        if _is_match_found(pi_res.match_state):
+            conf = _enum_name(pi_res.confidence_level, "HIGH")
+            if conf == "DETECTION_CONFIDENCE_LEVEL_UNSPECIFIED":
+                conf = "HIGH"
+            blocking.append(f"pi_and_jailbreak:{conf}")
 
-    if _is_matched(match_state) and not blocking and not sdp_matched:
+    rai_entry = filter_results.get("rai")
+    if rai_entry is not None and "rai_filter_result" in rai_entry:
+        rai_res = rai_entry.rai_filter_result
+        if _is_match_found(rai_res.match_state):
+            type_map = getattr(rai_res, "rai_filter_type_results", None) or {}
+            subtypes = sorted(
+                str(name)
+                for name, detail in type_map.items()
+                if _is_match_found(getattr(detail, "match_state", None))
+            )
+            blocking.extend(f"rai:{sub}" for sub in subtypes) if subtypes else blocking.append(
+                "rai"
+            )
+
+    for key, attr_name in (
+        ("malicious_uris", "malicious_uri_filter_result"),
+        ("csam", "csam_filter_filter_result"),
+        ("virus_scan", "virus_scan_filter_result"),
+    ):
+        entry = filter_results.get(key)
+        if entry is not None and attr_name in entry:
+            sub = getattr(entry, attr_name)
+            if _is_match_found(getattr(sub, "match_state", None)):
+                blocking.append(key)
+
+    sdp_executed = False
+    sdp_matched = False
+    sdp_info_types: list[str] = []
+    sdp_deid_text: str | None = None
+
+    sdp_entry = filter_results.get("sdp")
+    if sdp_entry is not None and "sdp_filter_result" in sdp_entry:
+        sdp_res = sdp_entry.sdp_filter_result
+        if "inspect_result" in sdp_res:
+            insp = sdp_res.inspect_result
+            if _is_execution_success(insp.execution_state) or _is_match_found(insp.match_state):
+                sdp_executed = True
+            if _is_match_found(insp.match_state):
+                sdp_matched = True
+                for finding in getattr(insp, "findings", None) or ():
+                    it_name = getattr(finding, "info_type", "")
+                    if it_name:
+                        sdp_info_types.append(str(it_name))
+        if "deidentify_result" in sdp_res:
+            deid = sdp_res.deidentify_result
+            if _is_execution_success(deid.execution_state) or _is_match_found(deid.match_state):
+                sdp_executed = True
+            if _is_match_found(deid.match_state):
+                sdp_matched = True
+                data_obj = getattr(deid, "data", None)
+                if data_obj is not None and isinstance(getattr(data_obj, "text", None), str):
+                    sdp_deid_text = data_obj.text
+                for it_name in getattr(deid, "info_types", None) or ():
+                    if it_name:
+                        sdp_info_types.append(str(it_name))
+
+    if _is_match_found(match_state) and not blocking and not sdp_matched:
         blocking.append("policy_violation")
+
+    raw_dict: dict[str, Any] = {}
+    to_dict_fn = getattr(type(response), "to_dict", None)
+    if callable(to_dict_fn):
+        try:
+            raw_dict = to_dict_fn(response)
+        except Exception:
+            raw_dict = {}
 
     return ModelArmorSanitizationSummary(
         filter_match_state=match_state,
@@ -445,6 +439,6 @@ def parse_model_armor_response(
         sdp_deidentified_text=sdp_deid_text,
         invocation_result=inv_result,
         backend_used=backend_used,
-        raw_response=payload,
+        raw_response=raw_dict,
         sdp_executed=sdp_executed,
     )

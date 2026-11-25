@@ -259,8 +259,8 @@ def test_section_viewer_reuses_section_and_catalog_caches_without_redundant_bigq
     headers = _bearer_headers()
 
     def _bq_and_gcs_counts() -> tuple[int, int]:
-        bq_count = sum(1 for _, url in requests_log if "bigquery.googleapis.com" in url)
-        gcs_count = sum(1 for _, url in requests_log if "storage.googleapis.com" in url)
+        bq_count = sum(1 for _, url in requests_log if url.startswith("bigquery:"))
+        gcs_count = sum(1 for _, url in requests_log if url.startswith("gcs://"))
         return bq_count, gcs_count
 
     # 1. Cold catalog + cold section: 1 targeted BigQuery profile fetch + 1 GCS download (never 2 BQ RPCs).

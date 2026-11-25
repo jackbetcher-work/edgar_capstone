@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
-import httpx
 import pytest
+from google.api_core import exceptions as gcp_exceptions
 
 from edgar_capstone.agents.runtime.context_memory import ConversationMemoryManager
 from edgar_capstone.telemetry import (
@@ -15,66 +14,18 @@ from edgar_capstone.telemetry import (
     TelemetrySinkError,
     session_firestore_doc_id,
 )
-
-
-class _FakeCreds:
-    valid = True
-    token = "fake-firestore-token"
-
-
-def _mock_firestore_transport() -> tuple[
-    httpx.MockTransport, dict[str, dict[str, Any]], list[tuple[str, str]]
-]:
-    docs: dict[str, dict[str, Any]] = {}
-    calls: list[tuple[str, str]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        calls.append((request.method, url))
-        assert request.headers.get("Authorization") == "Bearer fake-firestore-token"
-
-        if request.method == "POST" and url.endswith(":runQuery"):
-            body = json.loads(request.content.decode("utf-8"))
-            target_user = body["structuredQuery"]["where"]["fieldFilter"]["value"]["stringValue"]
-            matched = []
-            for name, raw_fields in docs.items():
-                uid = (raw_fields.get("user_id") or {}).get("stringValue")
-                if uid == target_user:
-                    matched.append({"document": {"name": name, "fields": raw_fields}})
-            return httpx.Response(200, json=matched or [{"readTime": "2026-11-17T00:00:00Z"}])
-
-        doc_key = url.split("/documents/", 1)[1]
-        if request.method == "PATCH":
-            body = json.loads(request.content.decode("utf-8"))
-            docs[doc_key] = body["fields"]
-            return httpx.Response(200, json={"name": doc_key, "fields": body["fields"]})
-        if request.method == "GET":
-            if doc_key not in docs:
-                return httpx.Response(404, json={"error": {"code": 404, "message": "Not found"}})
-            return httpx.Response(200, json={"name": doc_key, "fields": docs[doc_key]})
-        if request.method == "DELETE":
-            if doc_key not in docs:
-                return httpx.Response(404, json={"error": {"code": 404, "message": "Not found"}})
-            del docs[doc_key]
-            return httpx.Response(200, json={})
-        return httpx.Response(500, text=f"Unhandled {request.method} {url}")
-
-    return httpx.MockTransport(handler), docs, calls
+from tests.fake_gcp import FakeFirestoreClient
 
 
 def test_firestore_session_store_crud_and_multi_instance_hydration() -> None:
-    transport, docs, calls = _mock_firestore_transport()
+    fake_fs = FakeFirestoreClient()
     cfg = TelemetryConfig(
         telemetry_backend="local",
         feedback_backend="gcp",
         project_id="iron-radio-514217-q7",
     )
-    store_1 = FirestoreSessionStore(
-        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
-    )
-    store_2 = FirestoreSessionStore(
-        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
-    )
+    store_1 = FirestoreSessionStore(cfg, firestore_client=fake_fs)
+    store_2 = FirestoreSessionStore(cfg, firestore_client=fake_fs)
     assert store_1.is_live_enabled() is True
 
     # Two distinct Cloud Run instances sharing the same Firestore collection
@@ -96,6 +47,7 @@ def test_firestore_session_store_crud_and_multi_instance_hydration() -> None:
     )
     assert persisted["persisted"] is True
     assert persisted["persistence_backend"] == "firestore"
+    docs = fake_fs._collections[store_1.collection_id]
     assert len(docs) == 1
 
     # Instance 2 (cold in-memory cache!) hydrates Alice's session straight from Firestore
@@ -137,8 +89,44 @@ def test_firestore_session_store_crud_and_multi_instance_hydration() -> None:
     meta = mgr_2.persistence_status()
     assert meta["live_firestore_enabled"] is True
     assert meta["reads"] >= 1
-    assert any(m == "PATCH" for m, _ in calls)
-    assert any(m == "DELETE" for m, _ in calls)
+    assert any(m == "TX_SET" for m, _ in fake_fs.calls)
+    assert any(m == "DELETE" for m, _ in fake_fs.calls)
+
+
+def test_firestore_session_store_transactional_save_prevents_stale_overwrite() -> None:
+    """A stale concurrent save with a lower turn_count must not overwrite newer session turns."""
+    fake_fs = FakeFirestoreClient()
+    cfg = TelemetryConfig(telemetry_backend="local", feedback_backend="gcp")
+    store = FirestoreSessionStore(cfg, firestore_client=fake_fs)
+
+    store.save_session(
+        "alice@corp",
+        "race-sess",
+        {
+            "user_id": "alice@corp",
+            "session_id": "race-sess",
+            "turn_count": 3,
+            "remembered_tickers": ["NVDA", "AAPL"],
+            "cited_chunk_ids": ["c1", "c2"],
+        },
+    )
+    # Stale concurrent writer tries to save turn_count=2 with MSFT
+    store.save_session(
+        "alice@corp",
+        "race-sess",
+        {
+            "user_id": "alice@corp",
+            "session_id": "race-sess",
+            "turn_count": 2,
+            "remembered_tickers": ["MSFT"],
+            "cited_chunk_ids": ["c3"],
+        },
+    )
+    loaded = store.load_session("alice@corp", "race-sess")
+    assert loaded is not None
+    assert loaded["turn_count"] == 3
+    assert loaded["remembered_tickers"] == ["NVDA", "AAPL", "MSFT"]
+    assert loaded["cited_chunk_ids"] == ["c1", "c2", "c3"]
 
 
 def test_firestore_session_store_local_noop_and_upstream_error_tracking() -> None:
@@ -152,40 +140,34 @@ def test_firestore_session_store_local_noop_and_upstream_error_tracking() -> Non
     assert local_store.delete_session("alice@corp", "s1") is False
     assert local_store.list_sessions("alice@corp") == []
 
-    fail_client = httpx.Client(
-        transport=httpx.MockTransport(lambda _req: httpx.Response(503, text="unavailable"))
-    )
+    fail_fs = FakeFirestoreClient(error_to_raise=gcp_exceptions.ServiceUnavailable("unavailable"))
     live_store = FirestoreSessionStore(
         TelemetryConfig(telemetry_backend="local", feedback_backend="gcp"),
-        http_client=fail_client,
-        credentials=_FakeCreds(),
+        firestore_client=fail_fs,
     )
-    try:
-        with pytest.raises(TelemetrySinkError):
-            live_store.load_session("alice@corp", "s1")
-        assert live_store.status_metadata()["last_error"]
+    with pytest.raises(TelemetrySinkError):
+        live_store.load_session("alice@corp", "s1")
+    assert live_store.status_metadata()["last_error"]
 
-        with pytest.raises(TelemetrySinkError):
-            live_store.save_session("alice@corp", "s1", {"user_id": "alice@corp"})
-        with pytest.raises(TelemetrySinkError):
-            live_store.delete_session("alice@corp", "s1")
-        with pytest.raises(TelemetrySinkError):
-            live_store.list_sessions("alice@corp")
-    finally:
-        fail_client.close()
+    with pytest.raises(TelemetrySinkError):
+        live_store.save_session("alice@corp", "s1", {"user_id": "alice@corp"})
+    with pytest.raises(TelemetrySinkError):
+        live_store.delete_session("alice@corp", "s1")
+    with pytest.raises(TelemetrySinkError):
+        live_store.list_sessions("alice@corp")
 
 
 def test_record_turn_skips_redundant_firestore_get_after_recall_and_recovers_on_eviction() -> None:
-    """Passing `recalled_prior_memory` avoids a second Firestore GET after TTL expiry, while recovering on LRU eviction."""
-    transport, docs, calls = _mock_firestore_transport()
+    """Passing `recalled_prior_memory` avoids a second outer Firestore GET after TTL expiry, while recovering on LRU eviction."""
+    fake_fs = FakeFirestoreClient()
     cfg = TelemetryConfig(
         telemetry_backend="local",
         feedback_backend="gcp",
         project_id="iron-radio-514217-q7",
     )
-    store = FirestoreSessionStore(
-        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
-    )
+    store = FirestoreSessionStore(cfg, firestore_client=fake_fs)
+    docs = fake_fs._collections[store.collection_id]
+    calls = fake_fs.calls
     # refresh_ttl_seconds=0.0 simulates every live Gemini turn exceeding the 5s L1 refresh TTL.
     mgr = ConversationMemoryManager(
         session_store=store,
@@ -193,7 +175,7 @@ def test_record_turn_skips_redundant_firestore_get_after_recall_and_recovers_on_
         max_local_sessions=1,
     )
 
-    # Turn 1 (brand-new session): recall gets 404 (1 GET), record_turn skips redundant GET -> 1 PATCH.
+    # Turn 1 (brand-new session): recall gets 404 (1 outer GET), record_turn skips redundant outer GET -> transactional save.
     recalled_1 = mgr.recall_session_context("sess-1", user_id="alice@corp")
     assert recalled_1["has_prior_memory"] is False
     assert [m for m, _ in calls] == ["GET"]
@@ -211,9 +193,9 @@ def test_record_turn_skips_redundant_firestore_get_after_recall_and_recovers_on_
         recalled_prior_memory=bool(recalled_1["has_prior_memory"]),
     )
     assert res_1["turn_count"] == 1
-    assert [m for m, _ in calls] == ["PATCH"]
+    assert [m for m, _ in calls] == ["TX_GET", "TX_SET"]
 
-    # Turn 2 (existing session, TTL expired): recall hydrates via 1 GET, record_turn reuses L1 -> 0 GETs, 1 PATCH.
+    # Turn 2 (existing session, TTL expired): recall hydrates via 1 outer GET, record_turn reuses L1 -> 0 outer GETs.
     calls.clear()
     recalled_2 = mgr.recall_session_context("sess-1", user_id="alice@corp")
     assert recalled_2["has_prior_memory"] is True
@@ -233,9 +215,9 @@ def test_record_turn_skips_redundant_firestore_get_after_recall_and_recovers_on_
         recalled_prior_memory=bool(recalled_2["has_prior_memory"]),
     )
     assert res_2["turn_count"] == 2
-    assert [m for m, _ in calls] == ["PATCH"]
+    assert [m for m, _ in calls] == ["TX_GET", "TX_SET"]
 
-    # Turn 3 with mid-turn LRU eviction (`max_local_sessions=1`): safely falls back to 1 remote GET so turns 1-2 aren't lost.
+    # Turn 3 with mid-turn LRU eviction (`max_local_sessions=1`): safely falls back to 1 outer GET so turns 1-2 aren't lost.
     recalled_3 = mgr.recall_session_context("sess-1", user_id="alice@corp")
     assert recalled_3["has_prior_memory"] is True
     assert recalled_3["turn_count"] == 2
@@ -265,27 +247,25 @@ def test_record_turn_skips_redundant_firestore_get_after_recall_and_recovers_on_
         recalled_prior_memory=bool(recalled_3["has_prior_memory"]),
     )
     assert res_3["turn_count"] == 3
-    assert [m for m, _ in calls] == ["GET", "PATCH"]
+    assert [m for m, _ in calls] == ["GET", "TX_GET", "TX_SET"]
     assert len(docs) == 2
 
 
-def test_chat_turn_issues_only_one_firestore_get_and_one_patch_even_past_refresh_ttl(
+def test_chat_turn_issues_only_one_firestore_get_and_one_save_even_past_refresh_ttl(
     fake_gcp_adapters: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end `run_conversational_rag_turn` avoids a redundant Firestore GET on save."""
+    """End-to-end `run_conversational_rag_turn` avoids a redundant outer Firestore GET on save."""
     from edgar_capstone.agents.orchestration import chat_engine
     from tests.structured_report_helpers import ScriptedAnalystLlm
 
-    transport, _docs, calls = _mock_firestore_transport()
+    fake_fs = FakeFirestoreClient()
     cfg = TelemetryConfig(
         telemetry_backend="local",
         feedback_backend="gcp",
         project_id="iron-radio-514217-q7",
     )
-    store = FirestoreSessionStore(
-        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
-    )
+    store = FirestoreSessionStore(cfg, firestore_client=fake_fs)
     mgr = ConversationMemoryManager(session_store=store, refresh_ttl_seconds=0.0)
     monkeypatch.setattr(chat_engine, "get_conversation_memory_manager", lambda: mgr)
 
@@ -296,7 +276,7 @@ def test_chat_turn_issues_only_one_firestore_get_and_one_patch_even_past_refresh
         ),
         start=1,
     ):
-        calls.clear()
+        fake_fs.calls.clear()
         resp = chat_engine.run_conversational_rag_turn(
             query=query,
             session_id="e2e-no-dup-get",
@@ -315,23 +295,19 @@ def test_chat_turn_issues_only_one_firestore_get_and_one_patch_even_past_refresh
         )
         assert resp["status"] == "success"
         assert resp["context_and_memory"]["session_memory"]["persistence"]["turn_count"] == turn_num
-        assert [m for m, _ in calls] == ["GET", "PATCH"]
+        assert [m for m, _ in fake_fs.calls] == ["GET", "TX_GET", "TX_SET"]
 
 
 def test_session_memory_clears_tickers_on_sector_switch_and_isolates_topic_epochs() -> None:
     """Switching from tickers to a sector clears stale tickers, advances topic_epoch, and isolates memory."""
-    transport, _docs, _calls = _mock_firestore_transport()
+    fake_fs = FakeFirestoreClient()
     cfg = TelemetryConfig(
         telemetry_backend="local",
         feedback_backend="gcp",
         project_id="iron-radio-514217-q7",
     )
-    store_1 = FirestoreSessionStore(
-        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
-    )
-    store_2 = FirestoreSessionStore(
-        cfg, http_client=httpx.Client(transport=transport), credentials=_FakeCreds()
-    )
+    store_1 = FirestoreSessionStore(cfg, firestore_client=fake_fs)
+    store_2 = FirestoreSessionStore(cfg, firestore_client=fake_fs)
     mgr_1 = ConversationMemoryManager(session_store=store_1, refresh_ttl_seconds=0.0)
     mgr_2 = ConversationMemoryManager(session_store=store_2, refresh_ttl_seconds=0.0)
 

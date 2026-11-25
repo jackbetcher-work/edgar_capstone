@@ -1,13 +1,10 @@
-"""Offline Google Cloud Model Armor v1 & Cloud DLP v2 wire-protocol emulator (zero regexes)."""
+"""Offline Google Cloud Model Armor v1 typed proto emulator (zero regexes)."""
 
 from __future__ import annotations
 
 import bisect
-import json
 from collections import defaultdict
 from typing import Any
-
-import httpx
 
 from edgar_capstone.security.model_armor.config import (
     _load_guardrail_policy_dict,
@@ -32,11 +29,7 @@ def _matches_ordered_proximity_clause(
     *,
     max_span: int = 8,
 ) -> bool:
-    """Return True if there exists an ordered subsequence `(p_0 < p_1 < ... < p_k)` with `(p_k - p_0) <= max_span`.
-
-    Checks EVERY occurrence of each token (via binary search) so repeated earlier/decoy words
-    such as ``"Instructions for Q1: ignore previous instructions"`` cannot bypass detection.
-    """
+    """Return True if an ordered subsequence `(p_0 < ... < p_k)` exists within `max_span`."""
     if not clause_tokens:
         return False
     first_positions = word_positions.get(clause_tokens[0])
@@ -65,36 +58,17 @@ def _matches_ordered_proximity_clause(
     return False
 
 
-class LocalModelArmorEmulatorTransport(httpx.BaseTransport):
-    """Offline `httpx.BaseTransport` speaking Google Cloud Model Armor v1 & Cloud DLP v2 JSON wire schemas.
+class LocalModelArmorEmulator:
+    """In-process ``modelarmor_v1.ModelArmorClient`` emulator returning real Model Armor protos.
 
-    Used strictly in `EDGAR_MODEL_ARMOR_MODE='auto'` (or `'emulator'`) when GCP Application
-    Default Credentials are absent in local dev / CI environments. Uses lexical token-clause
-    policy evaluation from `prompts/v1/model_armor_policy.yaml` (zero prompt-injection regexes).
+    Used strictly in ``EDGAR_MODEL_ARMOR_MODE='emulator'`` (or ``'auto'`` fallback when ADC is
+    absent in local dev / CI environments). Uses lexical token-clause policy evaluation from
+    ``prompts/v1/model_armor_policy.yaml`` (zero prompt-injection regexes).
     """
 
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        url_str = str(request.url)
-        raw_body = request.content.decode("utf-8") if request.content else "{}"
-        payload = json.loads(raw_body) if raw_body.strip() else {}
+    def _build_sanitization_result(self, text: str, *, is_user_prompt: bool) -> Any:
+        from google.cloud import modelarmor_v1 as ma
 
-        if ":sanitizeUserPrompt" in url_str:
-            text = str((payload.get("userPromptData") or {}).get("text") or "")
-            return httpx.Response(
-                200, json=self._build_sanitization_response(text, is_user_prompt=True)
-            )
-
-        if ":sanitizeModelResponse" in url_str:
-            text = str((payload.get("modelResponseData") or {}).get("text") or "")
-            return httpx.Response(
-                200, json=self._build_sanitization_response(text, is_user_prompt=False)
-            )
-
-        return httpx.Response(
-            404, json={"error": {"code": 404, "message": f"Unknown endpoint: {url_str}"}}
-        )
-
-    def _build_sanitization_response(self, text: str, *, is_user_prompt: bool) -> dict[str, Any]:
         policy = _load_guardrail_policy_dict()
         words = _normalize_words(text)
         word_positions: dict[str, list[int]] = defaultdict(list)
@@ -115,64 +89,82 @@ class LocalModelArmorEmulatorTransport(httpx.BaseTransport):
         spans = _detect_sensitive_spans(text)
         sdp_matched = len(spans) > 0
         redacted_text = _redact_spans(text, spans) if sdp_matched else text
-        sdp_findings = [
-            {"infoType": info_type, "likelihood": "VERY_LIKELY"} for _, _, info_type in spans
-        ]
+        info_types = sorted({info_type for _, _, info_type in spans})
 
-        overall_match = pi_matched or malicious_uri_matched or sdp_matched
-        return {
-            "sanitizationResult": {
-                "filterMatchState": "MATCH_FOUND" if overall_match else "NO_MATCH_FOUND",
-                "invocationResult": "SUCCESS",
-                "filterResults": {
-                    "pi_and_jailbreak": {
-                        "piAndJailbreakFilterResult": {
-                            "executionState": "EXECUTION_SUCCESS",
-                            "matchState": "MATCH_FOUND" if pi_matched else "NO_MATCH_FOUND",
-                            "confidenceLevel": "HIGH" if pi_matched else "LOW",
-                        }
-                    },
-                    "malicious_uris": {
-                        "maliciousUriFilterResult": {
-                            "executionState": "EXECUTION_SUCCESS",
-                            "matchState": (
-                                "MATCH_FOUND" if malicious_uri_matched else "NO_MATCH_FOUND"
-                            ),
-                        }
-                    },
-                    "rai": {
-                        "raiFilterResult": {
-                            "executionState": "EXECUTION_SUCCESS",
-                            "matchState": "NO_MATCH_FOUND",
-                            "raiFilterTypeResults": {
-                                "dangerous": {"matchState": "NO_MATCH_FOUND"},
-                                "harassment": {"matchState": "NO_MATCH_FOUND"},
-                                "hate_speech": {"matchState": "NO_MATCH_FOUND"},
-                                "sexually_explicit": {"matchState": "NO_MATCH_FOUND"},
-                            },
-                        }
-                    },
-                    "csam": {
-                        "csamFilterFilterResult": {
-                            "executionState": "EXECUTION_SUCCESS",
-                            "matchState": "NO_MATCH_FOUND",
-                        }
-                    },
-                    "sdp": {
-                        "sdpFilterResult": {
-                            "inspectResult": {
-                                "executionState": "EXECUTION_SUCCESS",
-                                "matchState": "MATCH_FOUND" if sdp_matched else "NO_MATCH_FOUND",
-                                "findings": sdp_findings,
-                            },
-                            "deidentifyResult": {
-                                "executionState": "EXECUTION_SUCCESS",
-                                "matchState": "MATCH_FOUND" if sdp_matched else "NO_MATCH_FOUND",
-                                "data": {"text": redacted_text},
-                                "infoTypes": sorted({it for _, _, it in spans}),
-                            },
-                        }
-                    },
-                },
-            }
+        any_match = pi_matched or malicious_uri_matched or sdp_matched
+        match_state = (
+            ma.FilterMatchState.MATCH_FOUND if any_match else ma.FilterMatchState.NO_MATCH_FOUND
+        )
+        pi_state = (
+            ma.FilterMatchState.MATCH_FOUND if pi_matched else ma.FilterMatchState.NO_MATCH_FOUND
+        )
+        uri_state = (
+            ma.FilterMatchState.MATCH_FOUND
+            if malicious_uri_matched
+            else ma.FilterMatchState.NO_MATCH_FOUND
+        )
+        sdp_state = (
+            ma.FilterMatchState.MATCH_FOUND if sdp_matched else ma.FilterMatchState.NO_MATCH_FOUND
+        )
+
+        filter_results: dict[str, Any] = {
+            "pi_and_jailbreak": ma.FilterResult(
+                pi_and_jailbreak_filter_result=ma.PiAndJailbreakFilterResult(
+                    execution_state=ma.FilterExecutionState.EXECUTION_SUCCESS,
+                    match_state=pi_state,
+                    confidence_level=(
+                        ma.DetectionConfidenceLevel.HIGH
+                        if pi_matched
+                        else ma.DetectionConfidenceLevel.LOW_AND_ABOVE
+                    ),
+                )
+            ),
+            "malicious_uris": ma.FilterResult(
+                malicious_uri_filter_result=ma.MaliciousUriFilterResult(
+                    execution_state=ma.FilterExecutionState.EXECUTION_SUCCESS,
+                    match_state=uri_state,
+                )
+            ),
+            "rai": ma.FilterResult(
+                rai_filter_result=ma.RaiFilterResult(
+                    execution_state=ma.FilterExecutionState.EXECUTION_SUCCESS,
+                    match_state=ma.FilterMatchState.NO_MATCH_FOUND,
+                )
+            ),
+            "sdp": ma.FilterResult(
+                sdp_filter_result=ma.SdpFilterResult(
+                    deidentify_result=ma.SdpDeidentifyResult(
+                        execution_state=ma.FilterExecutionState.EXECUTION_SUCCESS,
+                        match_state=sdp_state,
+                        data=ma.DataItem(text=redacted_text),
+                        info_types=info_types,
+                    )
+                )
+            ),
         }
+
+        return ma.SanitizationResult(
+            filter_match_state=match_state,
+            invocation_result=ma.InvocationResult.SUCCESS,
+            filter_results=filter_results,
+        )
+
+    def sanitize_user_prompt(self, request: Any, *, timeout: float | None = None) -> Any:
+        from google.cloud import modelarmor_v1 as ma
+
+        _ = timeout
+        data = getattr(request, "user_prompt_data", None)
+        text = str(getattr(data, "text", "") or "")
+        return ma.SanitizeUserPromptResponse(
+            sanitization_result=self._build_sanitization_result(text, is_user_prompt=True)
+        )
+
+    def sanitize_model_response(self, request: Any, *, timeout: float | None = None) -> Any:
+        from google.cloud import modelarmor_v1 as ma
+
+        _ = timeout
+        data = getattr(request, "model_response_data", None)
+        text = str(getattr(data, "text", "") or "")
+        return ma.SanitizeModelResponseResponse(
+            sanitization_result=self._build_sanitization_result(text, is_user_prompt=False)
+        )

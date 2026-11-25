@@ -2,38 +2,34 @@
 
 Two publishing steps, both driven by manifests already staged in the GCS corpus bucket:
 
-1. ``reload_financial_metrics_table``: BigQuery load job from
+1. ``reload_financial_metrics_table``: BigQuery load job via ``google-cloud-bigquery`` from
    ``gs://<bucket>/manifests/bigquery_financials.jsonl`` into the native, partitioned
    ``sec_edgar.financial_metrics`` table, using the explicit schema from
    ``terraform/schemas/financial_metrics.json``.
-2. ``import_vertex_ai_search_documents``: Discovery Engine ``documents:import`` from
-   ``gs://<bucket>/manifests/vertex_ai_search_metadata.jsonl`` into the Vertex AI Search
-   data store, followed by long-running-operation polling. ``search_vertex_ai_datastore``
-   runs a post-import smoke query against the ``default_search`` serving config.
-
-All calls are plain REST over ``httpx`` via `GcpRestClient` with Application Default
-Credentials bearer tokens refreshed on every poll (no extra client libraries required).
+2. ``import_vertex_ai_search_documents``: Discovery Engine ``import_documents`` via
+   ``google-cloud-discoveryengine`` from ``gs://<bucket>/manifests/vertex_ai_search_metadata.jsonl``
+   into the Vertex AI Search data store, using native SDK LRO waiting. ``search_vertex_ai_datastore``
+   runs a post-import smoke query via ``SearchServiceClient``.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
-import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-import httpx
 from google.auth.exceptions import DefaultCredentialsError
 
 from edgar_capstone.dataset.gcs_storage import normalize_bucket_name
 from edgar_capstone.gcp.bigquery import (
-    BIGQUERY_API_ROOT,
+    load_bigquery_schema_fields as _gcp_load_bigquery_schema_fields,
 )
 from edgar_capstone.gcp.bigquery import (
-    load_bigquery_schema_fields as _gcp_load_bigquery_schema_fields,
+    schema_fields_to_bigquery_schema,
 )
 from edgar_capstone.gcp.defaults import (
     DEFAULT_BIGQUERY_DATASET_ID,
@@ -45,19 +41,17 @@ from edgar_capstone.gcp.discovery_engine import (
     DEFAULT_VERTEX_AI_SEARCH_COLLECTION,
     DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID,
     DEFAULT_VERTEX_AI_SEARCH_LOCATION,
-    discovery_engine_root,
+    discovery_engine_host,
 )
 from edgar_capstone.gcp.discovery_engine import (
     vertex_search_datastore_path as _gcp_vertex_search_datastore_path,
 )
-from edgar_capstone.gcp.lro import OperationError, OperationTimeoutError, poll_operation
+from edgar_capstone.gcp.errors import build_client_options
 from edgar_capstone.gcp.paths import resolve_repo_root
-from edgar_capstone.gcp.rest_client import GcpRestClient
 
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = resolve_repo_root()
-DISCOVERY_ENGINE_API_ROOT = discovery_engine_root(DEFAULT_VERTEX_AI_SEARCH_LOCATION)
 
 # --- BigQuery financial_metrics defaults -------------------------------------------------
 DEFAULT_FINANCIAL_METRICS_TABLE_ID = "financial_metrics"
@@ -70,7 +64,7 @@ DEFAULT_FINANCIAL_METRICS_SCHEMA_PATH = (
 # existing spec on a WRITE_TRUNCATE load is a no-op that guarantees the table keeps it.
 FINANCIAL_METRICS_RANGE_PARTITIONING: dict[str, Any] = {
     "field": "fiscal_year",
-    "range": {"start": "2015", "end": "2036", "interval": "1"},
+    "range": {"start": 2015, "end": 2036, "interval": 1},
 }
 FINANCIAL_METRICS_CLUSTERING_FIELDS: tuple[str, ...] = ("gics_sector", "ticker")
 
@@ -96,18 +90,7 @@ class CloudPublishTimeoutError(CloudPublishError):
     """Raised when a job/operation is still running after the polling deadline."""
 
 
-# ------------------------------------------------------------------------------------------
-# Shared REST helpers
-# ------------------------------------------------------------------------------------------
-
-
-def _raise_for_http(resp: httpx.Response, action: str) -> None:
-    if resp.status_code not in (200, 201):
-        raise CloudPublishError(f"{action} failed (HTTP {resp.status_code}): {resp.text[:400]}")
-
-
 def _to_int(value: Any) -> int | None:
-    """Coerce int64 JSON values (which the Google APIs serialize as strings) to `int`."""
     if value is None or value == "":
         return None
     try:
@@ -121,18 +104,33 @@ def gcs_uri(bucket_name: str, blob_path: str) -> str:
     return f"gs://{normalize_bucket_name(bucket_name)}/{blob_path.lstrip('/')}"
 
 
-def _make_rest_client(
+def _build_bq_client(
     *,
-    http_client: httpx.Client | None,
-    credentials: Any | None,
+    project_id: str,
+    location: str,
     quota_project_id: str | None = None,
-) -> GcpRestClient:
-    return GcpRestClient(
-        http_client=http_client,
-        credentials=credentials,
-        default_timeout=60.0,
-        quota_project_id=quota_project_id,
-    )
+    credentials: Any | None = None,
+) -> Any:
+    from google.cloud import bigquery
+
+    opts = build_client_options(quota_project_id=quota_project_id)
+    kwargs: dict[str, Any] = {"project": project_id, "location": location}
+    if credentials is not None:
+        kwargs["credentials"] = credentials
+    if opts is not None:
+        kwargs["client_options"] = opts
+    return bigquery.Client(**kwargs)
+
+
+def _close_quietly(client: Any) -> None:
+    close_fn = getattr(client, "close", None)
+    if callable(close_fn):
+        close_fn()
+        return
+    transport = getattr(client, "transport", None)
+    t_close = getattr(transport, "close", None)
+    if callable(t_close):
+        t_close()
 
 
 # ------------------------------------------------------------------------------------------
@@ -142,7 +140,7 @@ def _make_rest_client(
 
 @dataclass(slots=True)
 class BigQueryLoadJobResult:
-    """Outcome of a BigQuery load job submission (and optional completion polling)."""
+    """Outcome of a BigQuery load job submission (and optional completion wait)."""
 
     job_id: str
     project_id: str
@@ -176,10 +174,7 @@ def load_bigquery_schema_fields(path: Path | str) -> list[dict[str, Any]]:
 
 
 def resolve_schema_path(schema_path: Path | str | None) -> Path | None:
-    """Resolve an explicit (or the default terraform) schema path; `None` if it is absent.
-
-    Relative paths are resolved against the repository root, not the current directory.
-    """
+    """Resolve an explicit (or the default terraform) schema path; `None` if it is absent."""
     if schema_path is None:
         candidate = DEFAULT_FINANCIAL_METRICS_SCHEMA_PATH
         return candidate if candidate.exists() else None
@@ -189,6 +184,20 @@ def resolve_schema_path(schema_path: Path | str | None) -> Path | None:
     if not candidate.exists():
         raise FileNotFoundError(f"BigQuery schema file not found: {candidate}")
     return candidate
+
+
+def _build_range_partitioning(spec: dict[str, Any]) -> Any:
+    from google.cloud import bigquery
+
+    rng = spec.get("range") or {}
+    return bigquery.RangePartitioning(
+        field=str(spec["field"]),
+        range_=bigquery.PartitionRange(
+            start=int(rng["start"]),
+            end=int(rng["end"]),
+            interval=int(rng.get("interval", 1)),
+        ),
+    )
 
 
 def run_bigquery_load_job(
@@ -209,26 +218,14 @@ def run_bigquery_load_job(
     job_id_prefix: str = "load",
     wait: bool = True,
     poll_timeout_seconds: float = 120.0,
-    poll_interval_seconds: float | None = None,
     raise_on_timeout: bool = True,
     quota_project_id: str | None = None,
-    http_client: httpx.Client | None = None,
+    bq_client: Any | None = None,
     credentials: Any | None = None,
 ) -> BigQueryLoadJobResult:
-    """Submit a BigQuery load job via `jobs.insert` and (optionally) poll it until `DONE`.
+    """Submit a BigQuery load job via ``google-cloud-bigquery`` and optionally wait until DONE."""
+    from google.cloud import bigquery
 
-    Acquires a fresh OAuth2 bearer token on every poll via `GcpRestClient` + `poll_operation`,
-    retries only transient 429/5xx/timeout responses, and fails fast on fatal HTTP 4xx errors.
-
-    Raises `CloudPublishError` on submission failure, fatal poll HTTP 4xx, or a terminal
-    `errorResult`, and `CloudPublishTimeoutError` if the job is still running at the deadline
-    (unless `raise_on_timeout=False`, in which case a warning is logged and the pending result
-    is returned).
-
-    BigQuery rejects `schemaUpdateOptions` combined with `WRITE_TRUNCATE` unless the destination
-    is a single partition (`table$partition`); a plain `WRITE_TRUNCATE` with an explicit schema
-    already replaces the table schema, so that combination is refused here up front.
-    """
     update_options = list(schema_update_options or [])
     if update_options and write_disposition == "WRITE_TRUNCATE" and "$" not in table_id:
         raise ValueError(
@@ -237,116 +234,107 @@ def run_bigquery_load_job(
         )
 
     job_id = f"{job_id_prefix}_{uuid.uuid4().hex[:12]}"
-    load_config: dict[str, Any] = {
-        "sourceUris": list(source_uris),
-        "destinationTable": {
-            "projectId": project_id,
-            "datasetId": dataset_id,
-            "tableId": table_id,
-        },
-        "sourceFormat": source_format,
-        "writeDisposition": write_disposition,
+    destination_table = f"{project_id}.{dataset_id}.{table_id}"
+
+    cfg_kwargs: dict[str, Any] = {
+        "source_format": source_format,
+        "write_disposition": write_disposition,
         "autodetect": False,
+        "ignore_unknown_values": ignore_unknown_values,
+        "max_bad_records": max_bad_records,
     }
     if schema_fields is not None:
-        load_config["schema"] = {"fields": schema_fields}
+        cfg_kwargs["schema"] = schema_fields_to_bigquery_schema(schema_fields)
     if update_options:
-        load_config["schemaUpdateOptions"] = update_options
+        cfg_kwargs["schema_update_options"] = update_options
     if range_partitioning is not None:
-        load_config["rangePartitioning"] = range_partitioning
+        cfg_kwargs["range_partitioning"] = _build_range_partitioning(range_partitioning)
     if clustering_fields:
-        load_config["clustering"] = {"fields": list(clustering_fields)}
-    if ignore_unknown_values:
-        load_config["ignoreUnknownValues"] = True
-    if max_bad_records:
-        load_config["maxBadRecords"] = max_bad_records
+        cfg_kwargs["clustering_fields"] = list(clustering_fields)
 
-    payload = {
-        "jobReference": {"projectId": project_id, "jobId": job_id, "location": location},
-        "configuration": {"load": load_config},
-    }
+    job_config = bigquery.LoadJobConfig(**cfg_kwargs)
     result = BigQueryLoadJobResult(
         job_id=job_id,
         project_id=project_id,
         location=location,
-        destination_table=f"{project_id}.{dataset_id}.{table_id}",
+        destination_table=destination_table,
         source_uris=list(source_uris),
         schema_field_count=len(schema_fields) if schema_fields is not None else None,
         schema_update_options=update_options,
     )
 
-    with _make_rest_client(
-        http_client=http_client,
-        credentials=credentials,
-        quota_project_id=quota_project_id,
-    ) as rest:
-        try:
-            resp = rest._raw_request(
-                "POST",
-                f"{BIGQUERY_API_ROOT}/projects/{project_id}/jobs",
-                json_body=payload,
-            )
-        except DefaultCredentialsError as exc:
-            raise CloudPublishError(str(exc)) from exc
+    owns_client = bq_client is None
+    try:
+        client = bq_client or _build_bq_client(
+            project_id=project_id,
+            location=location,
+            quota_project_id=quota_project_id,
+            credentials=credentials,
+        )
+    except DefaultCredentialsError as exc:
+        raise CloudPublishError(str(exc)) from exc
 
-        _raise_for_http(resp, f"BigQuery load job submission ({job_id})")
-        logger.info("Submitted BigQuery load job %s -> %s", job_id, result.destination_table)
+    try:
+        try:
+            job = client.load_table_from_uri(
+                list(source_uris),
+                destination_table,
+                job_id=job_id,
+                location=location,
+                job_config=job_config,
+            )
+        except Exception as exc:
+            raise CloudPublishError(
+                f"BigQuery load job submission ({job_id}) failed: {exc}"
+            ) from exc
+
+        actual_job_id = str(getattr(job, "job_id", "") or job_id)
+        result.job_id = actual_job_id
+        logger.info("Submitted BigQuery load job %s -> %s", actual_job_id, result.destination_table)
+
         if not wait:
-            result.state = str(resp.json().get("status", {}).get("state") or "PENDING")
+            result.state = str(getattr(job, "state", None) or "PENDING")
             return result
 
-        status_url = f"{BIGQUERY_API_ROOT}/projects/{project_id}/jobs/{job_id}"
-        interval = (
-            poll_interval_seconds
-            if poll_interval_seconds is not None
-            else (1.5 if poll_timeout_seconds <= 120 else 5.0)
-        )
-
-        def _poll_job() -> httpx.Response:
-            return rest._raw_request("GET", status_url, params={"location": location})
-
-        def _is_done(job_data: dict[str, Any]) -> bool:
-            status = job_data.get("status") or {}
-            result.state = str(status.get("state") or result.state)
-            return result.done
-
         try:
-            job_data = poll_operation(
-                _poll_job,
-                _is_done,
-                label=f"BigQuery load job {job_id}",
-                timeout_seconds=poll_timeout_seconds,
-                initial_interval_seconds=interval,
-                max_interval_seconds=interval,
-                backoff_multiplier=1.0,
-                sleep_fn=time.sleep,
-            )
-        except OperationTimeoutError as exc:
+            job.result(timeout=poll_timeout_seconds)
+        except (TimeoutError, concurrent.futures.TimeoutError) as exc:
+            result.state = str(getattr(job, "state", None) or "RUNNING")
             message = (
-                f"BigQuery load job {job_id} still running after {poll_timeout_seconds:.0f}s; "
-                f"check `bq show -j --location={location} {job_id}`."
+                f"BigQuery load job {actual_job_id} still running after {poll_timeout_seconds:.0f}s; "
+                f"check `bq show -j --location={location} {actual_job_id}`."
             )
             if raise_on_timeout:
                 raise CloudPublishTimeoutError(message) from exc
             logger.warning(message)
             return result
-        except (OperationError, DefaultCredentialsError) as exc:
-            raise CloudPublishError(str(exc)) from exc
+        except Exception as exc:
+            err_result = getattr(job, "error_result", None)
+            details = getattr(job, "errors", None) or []
+            if err_result:
+                raise CloudPublishError(
+                    f"BigQuery load job {actual_job_id} failed: {err_result}"
+                    + (f" (first errors: {list(details)[:3]})" if details else "")
+                ) from exc
+            raise CloudPublishError(f"BigQuery load job {actual_job_id} failed: {exc}") from exc
 
-        status = job_data.get("status") or {}
-        err = status.get("errorResult")
-        if err:
-            details = status.get("errors") or []
+        err_result = getattr(job, "error_result", None)
+        if err_result:
+            details = getattr(job, "errors", None) or []
             raise CloudPublishError(
-                f"BigQuery load job {job_id} failed: {err}"
-                + (f" (first errors: {details[:3]})" if details else "")
+                f"BigQuery load job {actual_job_id} failed: {err_result}"
+                + (f" (first errors: {list(details)[:3]})" if details else "")
             )
-        load_stats = (job_data.get("statistics") or {}).get("load") or {}
-        result.output_rows = _to_int(load_stats.get("outputRows"))
-        result.input_files = _to_int(load_stats.get("inputFiles"))
-        result.input_file_bytes = _to_int(load_stats.get("inputFileBytes"))
-        result.bad_records = _to_int(load_stats.get("badRecords"))
+
+        result.state = str(getattr(job, "state", None) or "DONE")
+        result.output_rows = _to_int(getattr(job, "output_rows", None))
+        result.input_files = _to_int(getattr(job, "input_files", None))
+        result.input_file_bytes = _to_int(getattr(job, "input_file_bytes", None))
+        result.bad_records = _to_int(getattr(job, "bad_records", None))
         return result
+    finally:
+        if owns_client:
+            _close_quietly(client)
 
 
 def reload_financial_metrics_table(
@@ -365,20 +353,10 @@ def reload_financial_metrics_table(
     ignore_unknown_values: bool = False,
     wait: bool = True,
     timeout_seconds: float = 600.0,
-    poll_interval_seconds: float | None = None,
-    http_client: httpx.Client | None = None,
+    bq_client: Any | None = None,
     credentials: Any | None = None,
 ) -> BigQueryLoadJobResult:
-    """Reload native `sec_edgar.financial_metrics` from the GCS financials manifest.
-
-    The explicit schema from `terraform/schemas/financial_metrics.json` (or `schema_path`) is
-    sent with the job, so newly added NULLABLE columns land without a separate terraform apply:
-
-    * `WRITE_TRUNCATE` (default) replaces both rows and schema with the supplied schema.
-      BigQuery forbids `schemaUpdateOptions` here, so none are sent.
-    * `WRITE_APPEND` sends `schemaUpdateOptions: ["ALLOW_FIELD_ADDITION"]` (when
-      `allow_field_addition`) so the new column is added to the existing table schema.
-    """
+    """Reload native `sec_edgar.financial_metrics` from the GCS financials manifest."""
     uri = source_uri or gcs_uri(bucket_name, FINANCIALS_MANIFEST_BLOB)
     resolved_schema = resolve_schema_path(schema_path) if use_schema_file else None
     schema_fields = load_bigquery_schema_fields(resolved_schema) if resolved_schema else None
@@ -408,10 +386,9 @@ def reload_financial_metrics_table(
         job_id_prefix=f"load_{table_id.split('$', 1)[0]}",
         wait=wait,
         poll_timeout_seconds=timeout_seconds,
-        poll_interval_seconds=poll_interval_seconds,
         raise_on_timeout=True,
         quota_project_id=project_id,
-        http_client=http_client,
+        bq_client=bq_client,
         credentials=credentials,
     )
 
@@ -438,7 +415,7 @@ def vertex_search_datastore_path(
 
 @dataclass(slots=True)
 class VertexSearchImportResult:
-    """Outcome of a Discovery Engine `documents:import` long-running operation."""
+    """Outcome of a Discovery Engine `import_documents` long-running operation."""
 
     operation_name: str
     data_store: str
@@ -456,77 +433,28 @@ class VertexSearchImportResult:
         return asdict(self)
 
 
-def _apply_operation(result: VertexSearchImportResult, operation: dict[str, Any]) -> None:
-    metadata = operation.get("metadata") or {}
-    result.metadata = metadata
-    result.done = bool(operation.get("done"))
-    result.success_count = _to_int(metadata.get("successCount"))
-    result.failure_count = _to_int(metadata.get("failureCount"))
-    result.total_count = _to_int(metadata.get("totalCount"))
-    response = operation.get("response") or {}
-    samples = response.get("errorSamples") or []
-    result.error_samples = [
-        str(s.get("message") or s) if isinstance(s, dict) else str(s) for s in samples[:10]
-    ]
-    gcs_prefix = (response.get("errorConfig") or {}).get("gcsPrefix")
-    if gcs_prefix:
-        result.error_gcs_prefix = gcs_prefix
+def _apply_sdk_operation(
+    result: VertexSearchImportResult,
+    operation: Any,
+    response: Any | None = None,
+) -> None:
+    meta = getattr(operation, "metadata", None)
+    if meta is not None:
+        result.success_count = _to_int(getattr(meta, "success_count", None))
+        result.failure_count = _to_int(getattr(meta, "failure_count", None))
+        result.total_count = _to_int(getattr(meta, "total_count", None))
+        to_dict = getattr(type(meta), "to_dict", None)
+        result.metadata = to_dict(meta) if callable(to_dict) else {}
+    done_fn = getattr(operation, "done", None)
+    result.done = bool(done_fn() if callable(done_fn) else done_fn)
 
-
-def poll_discovery_engine_operation(
-    operation_name: str,
-    *,
-    location: str = DEFAULT_VERTEX_SEARCH_LOCATION,
-    quota_project_id: str | None = None,
-    timeout_seconds: float = 3600.0,
-    initial_interval_seconds: float = 5.0,
-    max_interval_seconds: float = 60.0,
-    backoff_multiplier: float = 1.5,
-    http_client: httpx.Client | None = None,
-    credentials: Any | None = None,
-    on_progress: Callable[[dict[str, Any]], None] | None = None,
-) -> dict[str, Any]:
-    """Poll `GET /v1/{operation_name}` with exponential backoff until `done`.
-
-    Returns the final operation JSON. Raises `CloudPublishError` if the operation finished
-    with an `error`, and `CloudPublishTimeoutError` if it is still running at the deadline.
-    """
-    url = f"{discovery_engine_root(location)}/{operation_name}"
-    with _make_rest_client(
-        http_client=http_client,
-        credentials=credentials,
-        quota_project_id=quota_project_id,
-    ) as rest:
-
-        def _is_done(operation: dict[str, Any]) -> bool:
-            if on_progress is not None:
-                on_progress(operation)
-            return bool(operation.get("done"))
-
-        try:
-            operation = poll_operation(
-                lambda: rest._raw_request("GET", url),
-                _is_done,
-                label=f"Discovery Engine operation {operation_name}",
-                timeout_seconds=timeout_seconds,
-                initial_interval_seconds=initial_interval_seconds,
-                max_interval_seconds=max_interval_seconds,
-                backoff_multiplier=backoff_multiplier,
-                sleep_fn=time.sleep,
-            )
-        except OperationTimeoutError as exc:
-            raise CloudPublishTimeoutError(
-                f"Discovery Engine operation {operation_name} not done after "
-                f"{timeout_seconds:.0f}s; re-poll with GET {url}"
-            ) from exc
-        except (OperationError, DefaultCredentialsError) as exc:
-            raise CloudPublishError(str(exc)) from exc
-
-        if operation.get("error"):
-            raise CloudPublishError(
-                f"Discovery Engine operation {operation_name} failed: {operation['error']}"
-            )
-        return operation
+    if response is not None:
+        samples = getattr(response, "error_samples", None) or ()
+        result.error_samples = [str(getattr(s, "message", None) or s) for s in list(samples)[:10]]
+        err_cfg = getattr(response, "error_config", None)
+        gcs_prefix = getattr(err_cfg, "gcs_prefix", None) if err_cfg is not None else None
+        if gcs_prefix:
+            result.error_gcs_prefix = str(gcs_prefix)
 
 
 def import_vertex_ai_search_documents(
@@ -542,16 +470,12 @@ def import_vertex_ai_search_documents(
     reconciliation_mode: ReconciliationMode = "INCREMENTAL",
     wait: bool = True,
     timeout_seconds: float = 3600.0,
-    initial_poll_interval_seconds: float = 5.0,
-    max_poll_interval_seconds: float = 60.0,
-    http_client: httpx.Client | None = None,
+    document_client: Any | None = None,
     credentials: Any | None = None,
 ) -> VertexSearchImportResult:
-    """Import `vertex_ai_search_metadata.jsonl` documents into the Vertex AI Search data store.
+    """Import `vertex_ai_search_metadata.jsonl` documents via ``DocumentServiceClient``."""
+    from google.cloud import discoveryengine_v1 as de
 
-    Each manifest line is a Discovery Engine `Document`
-    (`{"id", "structData", "content": {"mimeType", "uri"}}`), hence `dataSchema: "document"`.
-    """
     mode = reconciliation_mode.upper()
     if mode not in RECONCILIATION_MODES:
         raise ValueError(f"reconciliation_mode must be one of {RECONCILIATION_MODES}, got {mode}")
@@ -561,27 +485,48 @@ def import_vertex_ai_search_documents(
     data_store = vertex_search_datastore_path(
         project_id=project_id, data_store_id=data_store_id, location=location, collection=collection
     )
-    url = f"{discovery_engine_root(location)}/{data_store}/branches/{branch}/documents:import"
-    payload = {
-        "gcsSource": {"inputUris": uris, "dataSchema": "document"},
-        "reconciliationMode": mode,
-        "errorConfig": {"gcsPrefix": errors_prefix},
-    }
+    parent = f"{data_store}/branches/{branch}"
 
-    with _make_rest_client(
-        http_client=http_client,
-        credentials=credentials,
-        quota_project_id=project_id,
-    ) as rest:
+    reconcile_enum = (
+        de.ImportDocumentsRequest.ReconciliationMode.FULL
+        if mode == "FULL"
+        else de.ImportDocumentsRequest.ReconciliationMode.INCREMENTAL
+    )
+    request = de.ImportDocumentsRequest(
+        parent=parent,
+        gcs_source=de.GcsSource(input_uris=uris, data_schema="document"),
+        reconciliation_mode=reconcile_enum,
+        error_config=de.ImportErrorConfig(gcs_prefix=errors_prefix),
+    )
+
+    owns_client = document_client is None
+    try:
+        if document_client is not None:
+            client = document_client
+        else:
+            opts = build_client_options(
+                api_endpoint=discovery_engine_host(location),
+                quota_project_id=project_id,
+            )
+            kwargs: dict[str, Any] = {"client_options": opts}
+            if credentials is not None:
+                kwargs["credentials"] = credentials
+            client = de.DocumentServiceClient(**kwargs)
+    except DefaultCredentialsError as exc:
+        raise CloudPublishError(str(exc)) from exc
+
+    try:
         try:
-            resp = rest._raw_request("POST", url, json_body=payload)
-        except DefaultCredentialsError as exc:
-            raise CloudPublishError(str(exc)) from exc
-        _raise_for_http(resp, f"Vertex AI Search documents:import into {data_store_id}")
-        operation = resp.json()
-        operation_name = str(operation.get("name") or "")
+            operation = client.import_documents(request=request)
+        except Exception as exc:
+            raise CloudPublishError(
+                f"Vertex AI Search import_documents into {data_store_id} failed: {exc}"
+            ) from exc
+
+        raw_op = getattr(operation, "operation", None)
+        operation_name = str(getattr(raw_op, "name", None) or getattr(operation, "name", "") or "")
         if not operation_name:
-            raise CloudPublishError(f"documents:import returned no operation name: {operation}")
+            raise CloudPublishError("import_documents returned an operation without a name.")
         logger.info("Started Vertex AI Search import operation %s (%s)", operation_name, mode)
 
         result = VertexSearchImportResult(
@@ -591,34 +536,28 @@ def import_vertex_ai_search_documents(
             reconciliation_mode=mode,
             error_gcs_prefix=errors_prefix,
         )
-        if operation.get("done") and operation.get("error"):
-            raise CloudPublishError(
-                f"Discovery Engine operation {operation_name} failed: {operation['error']}"
-            )
-        if wait and not operation.get("done"):
 
-            def _log_progress(op: dict[str, Any]) -> None:
-                meta = op.get("metadata") or {}
-                logger.info(
-                    "Import %s: success=%s failure=%s",
-                    operation_name,
-                    meta.get("successCount", 0),
-                    meta.get("failureCount", 0),
-                )
+        response: Any | None = None
+        if wait:
+            try:
+                response = operation.result(timeout=timeout_seconds)
+            except (TimeoutError, concurrent.futures.TimeoutError) as exc:
+                raise CloudPublishTimeoutError(
+                    f"Discovery Engine operation {operation_name} not done after {timeout_seconds:.0f}s."
+                ) from exc
+            except Exception as exc:
+                raise CloudPublishError(
+                    f"Discovery Engine operation {operation_name} failed: {exc}"
+                ) from exc
+            result.done = True
 
-            operation = poll_discovery_engine_operation(
-                operation_name,
-                location=location,
-                quota_project_id=project_id,
-                timeout_seconds=timeout_seconds,
-                initial_interval_seconds=initial_poll_interval_seconds,
-                max_interval_seconds=max_poll_interval_seconds,
-                http_client=rest._get_http_client(),
-                credentials=credentials,
-                on_progress=_log_progress,
-            )
-        _apply_operation(result, operation)
+        _apply_sdk_operation(result, operation, response)
+        if wait:
+            result.done = True
         return result
+    finally:
+        if owns_client:
+            _close_quietly(client)
 
 
 def search_vertex_ai_datastore(
@@ -630,34 +569,62 @@ def search_vertex_ai_datastore(
     collection: str = DEFAULT_VERTEX_SEARCH_COLLECTION,
     serving_config: str = DEFAULT_VERTEX_SEARCH_SERVING_CONFIG,
     page_size: int = 5,
-    http_client: httpx.Client | None = None,
+    search_client: Any | None = None,
     credentials: Any | None = None,
 ) -> list[str]:
-    """Run a `servingConfigs/default_search:search` query and return the hit document ids."""
+    """Run a ``SearchServiceClient.search`` smoke query and return the hit document IDs."""
+    from google.cloud import discoveryengine_v1 as de
+
     data_store = vertex_search_datastore_path(
         project_id=project_id, data_store_id=data_store_id, location=location, collection=collection
     )
-    url = f"{discovery_engine_root(location)}/{data_store}/servingConfigs/{serving_config}:search"
-    with _make_rest_client(
-        http_client=http_client,
-        credentials=credentials,
-        quota_project_id=project_id,
-    ) as rest:
-        try:
-            resp = rest._raw_request(
-                "POST",
-                url,
-                json_body={"query": query, "pageSize": page_size},
+    serving_config_path = f"{data_store}/servingConfigs/{serving_config}"
+    request = de.SearchRequest(
+        serving_config=serving_config_path,
+        query=query,
+        page_size=page_size,
+    )
+
+    owns_client = search_client is None
+    try:
+        if search_client is not None:
+            client = search_client
+        else:
+            opts = build_client_options(
+                api_endpoint=discovery_engine_host(location),
+                quota_project_id=project_id,
             )
-        except DefaultCredentialsError as exc:
-            raise CloudPublishError(str(exc)) from exc
-        _raise_for_http(resp, f"Vertex AI Search query against {data_store_id}")
+            kwargs: dict[str, Any] = {"client_options": opts}
+            if credentials is not None:
+                kwargs["credentials"] = credentials
+            client = de.SearchServiceClient(**kwargs)
+    except DefaultCredentialsError as exc:
+        raise CloudPublishError(str(exc)) from exc
+
+    try:
+        try:
+            response = client.search(request=request, timeout=30.0)
+        except Exception as exc:
+            raise CloudPublishError(
+                f"Vertex AI Search query against {data_store_id} failed: {exc}"
+            ) from exc
+
+        if hasattr(response, "pages"):
+            first_page = next(iter(response.pages), None)
+            results = list(getattr(first_page, "results", None) or ()) if first_page else []
+        else:
+            results = list(getattr(response, "results", None) or ())
+
         hits: list[str] = []
-        for item in resp.json().get("results") or []:
-            doc_id = item.get("id") or (item.get("document") or {}).get("id")
+        for item in results:
+            doc = getattr(item, "document", None)
+            doc_id = getattr(item, "id", None) or (getattr(doc, "id", None) if doc else None)
             if doc_id:
                 hits.append(str(doc_id))
         return hits
+    finally:
+        if owns_client:
+            _close_quietly(client)
 
 
 __all__ = [
@@ -677,7 +644,6 @@ __all__ = [
     "gcs_uri",
     "import_vertex_ai_search_documents",
     "load_bigquery_schema_fields",
-    "poll_discovery_engine_operation",
     "reload_financial_metrics_table",
     "resolve_schema_path",
     "run_bigquery_load_job",

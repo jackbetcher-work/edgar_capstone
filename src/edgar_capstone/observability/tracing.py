@@ -161,6 +161,8 @@ class TracingConfig:
     agent_engine_telemetry_enabled: bool = True
     excluded_urls: str = DEFAULT_EXCLUDED_URLS
     instrument_httpx: bool = True
+    instrument_requests: bool = True
+    instrument_grpc: bool = True
     instrument_genai: bool = True
 
     @classmethod
@@ -210,6 +212,8 @@ class TracingConfig:
             agent_engine_telemetry_enabled=env_bool(AGENT_ENGINE_ENABLE_TELEMETRY_ENV, True),
             excluded_urls=os.environ.get("EDGAR_TRACE_EXCLUDED_URLS", DEFAULT_EXCLUDED_URLS),
             instrument_httpx=env_bool("EDGAR_TRACE_INSTRUMENT_HTTPX", True),
+            instrument_requests=env_bool("EDGAR_TRACE_INSTRUMENT_REQUESTS", True),
+            instrument_grpc=env_bool("EDGAR_TRACE_INSTRUMENT_GRPC", True),
             instrument_genai=env_bool("EDGAR_TRACE_INSTRUMENT_GENAI", True),
         )
 
@@ -236,6 +240,8 @@ class _TracingState:
         self.otel_logging_enabled: bool = False
         self.fastapi_instrumented: bool = False
         self.httpx_instrumented: bool = False
+        self.requests_instrumented: bool = False
+        self.grpc_instrumented: bool = False
         self.genai_instrumented: bool = False
         self.propagators: tuple[str, ...] = ()
         self.last_error: str | None = None
@@ -388,6 +394,32 @@ def _instrument_httpx(provider: TracerProvider) -> bool:
     return True
 
 
+def _instrument_requests(provider: TracerProvider) -> bool:
+    """Instrument `requests` so BigQuery, Cloud Storage, and Google OAuth HTTP calls emit spans."""
+    try:
+        from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    except ImportError:
+        logger.warning("opentelemetry-instrumentation-requests unavailable; SDK HTTP untraced")
+        return False
+    instrumentor = RequestsInstrumentor()
+    if not instrumentor.is_instrumented_by_opentelemetry:
+        instrumentor.instrument(tracer_provider=provider)
+    return True
+
+
+def _instrument_grpc(provider: TracerProvider) -> bool:
+    """Instrument gRPC clients so Firestore, Model Armor, and Discovery Engine calls emit spans."""
+    try:
+        from opentelemetry.instrumentation.grpc import GrpcInstrumentorClient
+    except ImportError:
+        logger.warning("opentelemetry-instrumentation-grpc unavailable; SDK gRPC untraced")
+        return False
+    instrumentor = GrpcInstrumentorClient()
+    if not instrumentor.is_instrumented_by_opentelemetry:
+        instrumentor.instrument(tracer_provider=provider)
+    return True
+
+
 def _instrument_google_genai(
     provider: TracerProvider,
     logger_provider: LoggerProvider | None,
@@ -495,6 +527,10 @@ def configure_tracing(
         _STATE.propagators = _configure_propagators()
         if cfg.instrument_httpx:
             _STATE.httpx_instrumented = _instrument_httpx(provider)
+        if cfg.instrument_requests:
+            _STATE.requests_instrumented = _instrument_requests(provider)
+        if cfg.instrument_grpc:
+            _STATE.grpc_instrumented = _instrument_grpc(provider)
         if cfg.instrument_genai:
             _STATE.genai_instrumented = _instrument_google_genai(provider, logger_provider)
 
@@ -581,6 +617,8 @@ def tracing_status_metadata() -> dict[str, Any]:
         otel_logging_enabled = _STATE.otel_logging_enabled
         fastapi_instrumented = _STATE.fastapi_instrumented
         httpx_instrumented = _STATE.httpx_instrumented
+        requests_instrumented = _STATE.requests_instrumented
+        grpc_instrumented = _STATE.grpc_instrumented
         genai_instrumented = _STATE.genai_instrumented
         propagators = list(_STATE.propagators)
         last_error = _STATE.last_error
@@ -595,6 +633,8 @@ def tracing_status_metadata() -> dict[str, Any]:
         "project_id": cfg.project_id,
         "fastapi_instrumented": fastapi_instrumented,
         "httpx_instrumented": httpx_instrumented,
+        "requests_instrumented": requests_instrumented,
+        "grpc_instrumented": grpc_instrumented,
         "genai_instrumented": genai_instrumented,
         "capture_message_content": cfg.capture_message_content,
         "capture_message_content_mode": cfg.capture_message_content_mode,

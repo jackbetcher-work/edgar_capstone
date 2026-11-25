@@ -11,15 +11,17 @@ from __future__ import annotations
 import contextvars
 import logging
 import os
+import re
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any
 
-import httpx
+import requests
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import Depends, HTTPException, Request, status
 
@@ -29,15 +31,13 @@ from edgar_capstone.gcp.defaults import DEFAULT_PROJECT_ID, DEFAULT_PROJECT_NAME
 from edgar_capstone.observability.tracing import traced
 from edgar_capstone.security.jwt_codec import (
     PublicKey,
-    b64url_decode,
-    b64url_encode,
+    decode_verified_jwt,
     ec_public_key_to_jwk,
     jwk_to_public_key,
-    parse_jwt_header_and_claims,
+    parse_unverified_jwt,
     rsa_public_key_to_jwk,
     sign_jwt_es256,
     sign_jwt_rs256,
-    verify_jws_signature,
 )
 from edgar_capstone.security.rbac import (
     ANALYST_PERMISSIONS,
@@ -514,9 +514,28 @@ def clear_security_audit_events() -> None:
 # ---------------------------------------------------------------------------
 
 
+_CACHE_CONTROL_MAX_AGE_RE = re.compile(r"(?:^|,)\s*max-age\s*=\s*(\d+)", re.IGNORECASE)
+
+
+def _parse_cache_control_max_age(headers: Any, *, default_ttl: float, min_ttl: float) -> float:
+    """Honor HTTP ``Cache-Control: max-age`` bounded by ``[min_ttl, default_ttl]``."""
+    if headers is None:
+        return default_ttl
+    raw = headers.get("Cache-Control") or headers.get("cache-control") or ""
+    match = _CACHE_CONTROL_MAX_AGE_RE.search(str(raw))
+    if not match:
+        return default_ttl
+    try:
+        seconds = float(int(match.group(1)))
+    except ValueError:
+        return default_ttl
+    return max(min_ttl, min(default_ttl, seconds))
+
+
 @dataclass(frozen=True, slots=True)
 class _ParsedJwksCacheEntry:
     fetched_at: float
+    expires_at: float
     raw_by_kid: dict[str, dict[str, Any]]
     parsed_keys: dict[str, PublicKey]
     parse_errors: dict[str, str]
@@ -530,36 +549,35 @@ class JwksKeyStore:
         *,
         cache_ttl_seconds: float = 300.0,
         min_refresh_interval_seconds: float = 15.0,
-        http_client: httpx.Client | None = None,
+        requests_session: requests.Session | None = None,
+        jwk_fetcher: Callable[[str], dict[str, Any]] | None = None,
         static_jwks_by_uri: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self.cache_ttl_seconds = cache_ttl_seconds
         self.min_refresh_interval_seconds = min_refresh_interval_seconds
-        self._http_client = http_client
-        self._pooled_http_client: httpx.Client | None = None
+        self._requests_session = requests_session
+        self._pooled_session: requests.Session | None = None
+        self._jwk_fetcher = jwk_fetcher
         self._static_jwks: dict[str, dict[str, Any]] = dict(static_jwks_by_uri or {})
         self._cache: dict[str, dict[str, dict[str, Any]]] = {}
         self._parsed_keys: dict[str, _ParsedJwksCacheEntry] = {}
         self._uri_locks: dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
 
-    def _get_http_client(self) -> httpx.Client:
-        if self._http_client is not None:
-            return self._http_client
+    def _get_session(self) -> requests.Session:
+        if self._requests_session is not None:
+            return self._requests_session
         with self._lock:
-            if self._pooled_http_client is None or self._pooled_http_client.is_closed:
-                self._pooled_http_client = httpx.Client(
-                    timeout=5.0,
-                    limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
-                )
-            return self._pooled_http_client
+            if self._pooled_session is None:
+                self._pooled_session = requests.Session()
+            return self._pooled_session
 
     def close(self) -> None:
-        """Close the internally managed pooled ``httpx.Client`` (leaves injected clients open)."""
+        """Close the internally managed ``requests.Session`` (leaves injected sessions open)."""
         with self._lock:
-            if self._pooled_http_client is not None and not self._pooled_http_client.is_closed:
-                self._pooled_http_client.close()
-            self._pooled_http_client = None
+            if self._pooled_session is not None:
+                self._pooled_session.close()
+            self._pooled_session = None
 
     def __enter__(self) -> JwksKeyStore:
         return self
@@ -589,7 +607,7 @@ class JwksKeyStore:
             self._parsed_keys.pop(jwks_uri, None)
 
     @staticmethod
-    def _parse_jwks_payload(payload: Any) -> _ParsedJwksCacheEntry:
+    def _parse_jwks_payload(payload: Any, *, ttl_seconds: float) -> _ParsedJwksCacheEntry:
         if not isinstance(payload, dict):
             raise AuthenticationError("Identity provider returned an empty or invalid JWKS keyset.")
         keys_list = payload.get("keys")
@@ -613,8 +631,10 @@ class JwksKeyStore:
             except (ValueError, KeyError, TypeError) as exc:
                 parse_errors[kid_str] = str(exc)
 
+        now = time.monotonic()
         return _ParsedJwksCacheEntry(
-            fetched_at=time.monotonic(),
+            fetched_at=now,
+            expires_at=now + max(0.0, ttl_seconds),
             raw_by_kid=raw_by_kid,
             parsed_keys=parsed_keys,
             parse_errors=parse_errors,
@@ -624,19 +644,34 @@ class JwksKeyStore:
         with self._lock:
             static_payload = self._static_jwks.get(jwks_uri)
 
+        ttl = self.cache_ttl_seconds
         if static_payload is not None:
             payload: Any = static_payload
+        elif self._jwk_fetcher is not None:
+            try:
+                payload = self._jwk_fetcher(jwks_uri)
+            except AuthenticationError:
+                raise
+            except Exception as exc:
+                raise AuthenticationError(
+                    f"Unable to retrieve JWKS signing keys from identity provider ({type(exc).__name__})."
+                ) from exc
         else:
             try:
-                resp = self._get_http_client().get(jwks_uri)
+                resp = self._get_session().get(jwks_uri, timeout=5.0)
                 resp.raise_for_status()
+                ttl = _parse_cache_control_max_age(
+                    resp.headers,
+                    default_ttl=self.cache_ttl_seconds,
+                    min_ttl=self.min_refresh_interval_seconds,
+                )
                 payload = resp.json()
             except Exception as exc:
                 raise AuthenticationError(
                     f"Unable to retrieve JWKS signing keys from identity provider ({type(exc).__name__})."
                 ) from exc
 
-        return self._parse_jwks_payload(payload)
+        return self._parse_jwks_payload(payload, ttl_seconds=ttl)
 
     @staticmethod
     def _resolve_from_entry(entry: _ParsedJwksCacheEntry, kid: str) -> PublicKey | None:
@@ -659,7 +694,7 @@ class JwksKeyStore:
             cached = self._parsed_keys.get(jwks_uri)
             is_static = jwks_uri in self._static_jwks
 
-        if cached is not None and (now - cached.fetched_at) < self.cache_ttl_seconds:
+        if cached is not None and now < cached.expires_at:
             resolved = self._resolve_from_entry(cached, kid)
             if resolved is not None:
                 return resolved
@@ -673,7 +708,7 @@ class JwksKeyStore:
             with self._lock:
                 cached = self._parsed_keys.get(jwks_uri)
                 is_static = jwks_uri in self._static_jwks
-            if cached is not None and (now - cached.fetched_at) < self.cache_ttl_seconds:
+            if cached is not None and now < cached.expires_at:
                 resolved = self._resolve_from_entry(cached, kid)
                 if resolved is not None:
                     return resolved
@@ -953,9 +988,8 @@ class IAPJwtVerifier:
         if len(parts) != 3 or not all(parts):
             raise AuthenticationError("JWT must contain header, payload, and signature segments.")
 
-        header_b64, payload_b64, sig_b64 = parts
         try:
-            header, claims = parse_jwt_header_and_claims(header_b64, payload_b64)
+            header, unverified_claims = parse_unverified_jwt(token)
         except ValueError as exc:
             raise AuthenticationError(str(exc)) from exc
 
@@ -967,7 +1001,7 @@ class IAPJwtVerifier:
         if not isinstance(kid, str) or not kid.strip():
             raise AuthenticationError("JWT header is missing required 'kid' key identifier.")
 
-        issuer = claims.get("iss")
+        issuer = unverified_claims.get("iss")
         if not isinstance(issuer, str) or not issuer.strip():
             raise AuthenticationError("JWT payload is missing 'iss' claim.")
         if require_iap_issuer and issuer != GOOGLE_IAP_ISSUER:
@@ -979,15 +1013,16 @@ class IAPJwtVerifier:
         if idp == "google_iap" and alg != "ES256":
             raise AuthenticationError("Google Cloud IAP assertions must use ES256.")
 
-        public_key = self.jwks_store.get_public_key(jwks_uri=jwks_uri, kid=kid.strip())
-        signing_input = f"{header_b64}.{payload_b64}".encode("ascii")
+        public_key = self.jwks_store.get_public_key(
+            jwks_uri=jwks_uri,
+            kid=kid.strip(),
+        )
         try:
-            signature_bytes = b64url_decode(sig_b64)
-            verify_jws_signature(
+            claims = decode_verified_jwt(
+                token,
+                public_key,
                 alg=alg,
-                signing_input=signing_input,
-                signature_bytes=signature_bytes,
-                public_key=public_key,
+                leeway_seconds=self.settings.clock_skew_seconds,
             )
         except ValueError as exc:
             raise AuthenticationError(str(exc)) from exc
@@ -1296,10 +1331,9 @@ __all__ = [
     "AuthorizationError",
     "IAPJwtVerifier",
     "JwksKeyStore",
-    "b64url_decode",
-    "b64url_encode",
     "clear_security_audit_events",
     "compute_token_fingerprint",
+    "decode_verified_jwt",
     "ec_public_key_to_jwk",
     "extract_bearer_token_from_request",
     "get_auth_verifier",
@@ -1308,6 +1342,7 @@ __all__ = [
     "is_production_iap_mode",
     "issue_local_dev_workspace_sso_token",
     "jwk_to_public_key",
+    "parse_unverified_jwt",
     "record_security_audit_event",
     "require_authenticated_user",
     "require_permissions",

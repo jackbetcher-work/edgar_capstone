@@ -1,4 +1,4 @@
-"""Unified GCP tool adapter configuration, error translation, and thread-safe registry."""
+"""Unified GCP tool adapter configuration, SDK error translation, and thread-safe registry."""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
-
-import httpx
 
 from edgar_capstone.agents.core.resilience import (
     RateLimitExceededError,
@@ -33,10 +31,12 @@ from edgar_capstone.gcp.discovery_engine import (
     DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID,
     DEFAULT_VERTEX_AI_SEARCH_LOCATION,
 )
-from edgar_capstone.gcp.rest_client import (
+from edgar_capstone.gcp.errors import (
     GcpHttpError,
+    GcpNotFoundError,
     GcpRateLimitError,
     GcpTimeoutError,
+    translate_gcp_sdk_error,
 )
 from edgar_capstone.vector_db.embedder import (
     DEFAULT_EMBEDDING_DIMENSIONS,
@@ -56,10 +56,10 @@ DEFAULT_BQ_CHUNK_HEALTH_VIEW = "v_chunk_health_metrics"
 
 
 class GcpAdapterHttpError(ToolExecutionError):
-    """Raised when a GCP REST API returns a non-retryable HTTP 4xx response."""
+    """Raised when a GCP API returns a non-retryable 4xx/API error."""
 
     def __init__(self, *, status_code: int, url: str, response_text: str) -> None:
-        super().__init__(f"GCP REST request failed (HTTP {status_code}) for {url}: {response_text}")
+        super().__init__(f"GCP API request failed (HTTP {status_code}) for {url}: {response_text}")
         self.status_code = status_code
         self.url = url
         self.response_text = response_text
@@ -69,53 +69,34 @@ class GcpEndpointNotReadyError(ToolExecutionError):
     """Raised when a required Discovery Engine / GCP endpoint is not configured or ready."""
 
 
-class GcpAdapterErrorTranslationMixin:
-    """Translates ``GcpRestClient`` transport errors into ADK tool resilience exceptions.
-
-    Intended to precede ``GcpRestClient`` (or ``BigQueryRestClient``) in a subclass MRO so every
-    ``_send_request`` call raises ``RateLimitExceededError`` (429), ``UpstreamTimeoutError``
-    (timeouts), ``httpx.HTTPStatusError`` (5xx for retry backoff), or ``GcpAdapterHttpError`` (4xx).
-    """
-
-    def _send_request(
-        self,
-        method: str,
-        url: str,
-        *,
-        json_body: dict[str, Any] | None = None,
-        content: bytes | None = None,
-        params: dict[str, Any] | None = None,
-        headers: dict[str, str] | None = None,
-        timeout: float | None = None,
-        quota_project_id: str | None = None,
-        raise_5xx_as_httpx: bool = True,
-        not_found_as_dedicated_error: bool = False,
-    ) -> httpx.Response:
-        try:
-            return super()._send_request(  # type: ignore[misc]
-                method,
-                url,
-                json_body=json_body,
-                content=content,
-                params=params,
-                headers=headers,
-                timeout=timeout,
-                quota_project_id=quota_project_id,
-                raise_5xx_as_httpx=raise_5xx_as_httpx,
-                not_found_as_dedicated_error=not_found_as_dedicated_error,
-            )
-        except GcpRateLimitError as exc:
-            raise RateLimitExceededError(
-                str(exc), retry_after_seconds=exc.retry_after_seconds
-            ) from exc
-        except GcpTimeoutError as exc:
-            raise UpstreamTimeoutError(str(exc)) from exc
-        except GcpHttpError as exc:
-            raise GcpAdapterHttpError(
-                status_code=exc.status_code or 400,
-                url=exc.url,
-                response_text=exc.response_text,
-            ) from exc
+def translate_gcp_adapter_error(
+    exc: BaseException,
+    *,
+    context: str = "GCP API",
+) -> ToolExecutionError:
+    """Translate any GCP SDK or ``GcpClientError`` into an ADK tool resilience exception."""
+    if isinstance(exc, ToolExecutionError):
+        return exc
+    translated = translate_gcp_sdk_error(exc, context=context)
+    if isinstance(translated, GcpRateLimitError):
+        return RateLimitExceededError(
+            str(translated), retry_after_seconds=translated.retry_after_seconds
+        )
+    if isinstance(translated, GcpTimeoutError):
+        return UpstreamTimeoutError(str(translated))
+    if isinstance(translated, GcpNotFoundError):
+        return GcpAdapterHttpError(
+            status_code=404,
+            url=context,
+            response_text=str(translated),
+        )
+    if isinstance(translated, GcpHttpError):
+        return GcpAdapterHttpError(
+            status_code=translated.status_code or 400,
+            url=translated.url,
+            response_text=translated.response_text,
+        )
+    return ToolExecutionError(str(translated))
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +165,7 @@ class GcpToolConfig:
 
 
 class GcpToolAdapters:
-    """Bundle of live GCP tool adapters shared across ADK tool invocations."""
+    """Bundle of live GCP SDK tool adapters shared across ADK tool invocations."""
 
     def __init__(
         self,
@@ -194,7 +175,10 @@ class GcpToolAdapters:
         vertex_ai_search: VertexAISearchAdapter | None = None,
         gcs_corpus: GcsCorpusAdapter | None = None,
         embedder: VertexAIEmbedder | None = None,
-        http_client: httpx.Client | None = None,
+        bq_client: Any | None = None,
+        search_client: Any | None = None,
+        storage_client: Any | None = None,
+        genai_client: Any | None = None,
         credentials: Any | None = None,
     ) -> None:
         from edgar_capstone.agents.adapters.bigquery import BigQueryAdapter as _BQ
@@ -203,13 +187,13 @@ class GcpToolAdapters:
 
         self.config = config or GcpToolConfig.from_env()
         self.bigquery: BigQueryAdapter = bigquery or _BQ(
-            self.config, http_client=http_client, credentials=credentials
+            self.config, bq_client=bq_client, credentials=credentials
         )
         self.vertex_ai_search: VertexAISearchAdapter = vertex_ai_search or _VAIS(
-            self.config, http_client=http_client, credentials=credentials
+            self.config, search_client=search_client, credentials=credentials
         )
         self.gcs_corpus: GcsCorpusAdapter = gcs_corpus or _GCS(
-            self.config, http_client=http_client, credentials=credentials
+            self.config, storage_client=storage_client, credentials=credentials
         )
         self.embedder = embedder or VertexAIEmbedder(
             project_id=self.config.project_id,
@@ -218,7 +202,7 @@ class GcpToolAdapters:
             dimensions=self.config.embedding_dimensions,
             max_retries=1,
             max_workers=4,
-            http_client=http_client,
+            genai_client=genai_client,
             credentials=credentials,
         )
         self._query_embedding_cache: BoundedTTLCache[tuple[str, str], list[float]] = (
@@ -226,17 +210,13 @@ class GcpToolAdapters:
         )
 
     def close(self) -> None:
-        """Close all internally managed pooled ``httpx.Client`` instances."""
+        """Close all internally managed SDK client resources."""
         self.bigquery.close()
         self.vertex_ai_search.close()
         self.gcs_corpus.close()
         embedder_close = getattr(self.embedder, "close", None)
         if callable(embedder_close):
             embedder_close()
-        else:
-            pooled = getattr(self.embedder, "_pooled_http_client", None)
-            if pooled is not None and not getattr(pooled, "is_closed", True):
-                pooled.close()
 
     def __enter__(self) -> GcpToolAdapters:
         return self
@@ -255,7 +235,7 @@ class GcpToolAdapters:
         *,
         task_type: str = "RETRIEVAL_QUERY",
     ) -> list[list[float]]:
-        """Generate 768-d `text-embedding-005` vectors, translating transient 429/timeout errors."""
+        """Generate 768-d `text-embedding-005` vectors via `google-genai`, translating SDK errors."""
         if not texts:
             return []
         if len(texts) == 1:
@@ -266,15 +246,8 @@ class GcpToolAdapters:
 
         try:
             vectors = self.embedder.embed_texts(texts, task_type=task_type)
-        except httpx.TimeoutException as exc:
-            raise UpstreamTimeoutError(f"Timed out generating Vertex AI embeddings: {exc}") from exc
-        except RuntimeError as exc:
-            msg = str(exc)
-            if "HTTP 429" in msg:
-                raise RateLimitExceededError(msg) from exc
-            if any(code in msg for code in ("HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504")):
-                raise UpstreamTimeoutError(msg) from exc
-            raise ToolExecutionError(msg) from exc
+        except Exception as exc:
+            raise translate_gcp_adapter_error(exc, context="Vertex AI embeddings") from exc
 
         if len(texts) == 1 and vectors:
             self._query_embedding_cache[(task_type, texts[0])] = vectors[0]
@@ -306,7 +279,7 @@ def _run_reset_hooks() -> None:
 
 
 def configure_gcp_tool_adapters(adapters: GcpToolAdapters | None) -> None:
-    """Explicitly inject a `GcpToolAdapters` bundle (used for custom transport or integration tests)."""
+    """Explicitly inject a `GcpToolAdapters` bundle (used for typed fakes or integration tests)."""
     global _CUSTOM_GCP_ADAPTERS
     with _ADAPTERS_LOCK:
         _CUSTOM_GCP_ADAPTERS = adapters
@@ -314,7 +287,7 @@ def configure_gcp_tool_adapters(adapters: GcpToolAdapters | None) -> None:
 
 
 def reset_gcp_tool_adapters() -> None:
-    """Clear any injected or cached `GcpToolAdapters` instance and close replaced pooled clients."""
+    """Clear any injected or cached `GcpToolAdapters` instance and close replaced SDK clients."""
     global _CUSTOM_GCP_ADAPTERS, _ENV_GCP_ADAPTERS_CACHE
     old_env: GcpToolAdapters | None = None
     with _ADAPTERS_LOCK:

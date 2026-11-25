@@ -12,9 +12,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from typing import Any
 
-import httpx
-from google.cloud import storage
+from google.api_core import exceptions as gcp_exceptions
+from google.cloud import service_usage_v1, storage
 
 try:
     from scripts._cli import add_gcp_args, configure_script_logging
@@ -28,8 +29,6 @@ from edgar_capstone.gcp.defaults import (
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
 )
-from edgar_capstone.gcp.lro import OperationError, poll_operation
-from edgar_capstone.gcp.rest_client import GcpRestClient, GcpRestError
 
 DEFAULT_TFSTATE_BUCKET = f"{DEFAULT_PROJECT_ID}-tfstate"
 
@@ -38,9 +37,9 @@ def ensure_bootstrap_apis(
     project_id: str = DEFAULT_PROJECT_ID,
     *,
     timeout_seconds: float = 120.0,
+    service_usage_client: Any | None = None,
 ) -> None:
     """Enable Cloud Resource Manager & Service Usage APIs required by Terraform."""
-    url = f"https://serviceusage.googleapis.com/v1/projects/{project_id}/services:batchEnable"
     services = [
         "serviceusage.googleapis.com",
         "cloudresourcemanager.googleapis.com",
@@ -51,30 +50,13 @@ def ensure_bootstrap_apis(
         ", ".join(services),
         project_id,
     )
-    with GcpRestClient(default_timeout=60.0) as rest:
-        payload = rest._request_json("POST", url, json_body={"serviceIds": services})
-        if not isinstance(payload, dict):
-            payload = {}
-        if payload.get("error"):
-            raise OperationError(
-                f"Service Usage batchEnable failed on '{project_id}': {payload['error']}"
-            )
-        op_name = str(payload.get("name") or "")
-        if op_name and not payload.get("done", False):
-            op_url = f"https://serviceusage.googleapis.com/v1/{op_name}"
-            final = poll_operation(
-                lambda: rest._raw_request("GET", op_url, timeout=30.0),
-                lambda data: bool(data.get("done")),
-                label=f"serviceusage batchEnable ({project_id})",
-                timeout_seconds=timeout_seconds,
-                initial_interval_seconds=2.0,
-                max_interval_seconds=10.0,
-            )
-            if final.get("error"):
-                raise OperationError(
-                    f"Service Usage batchEnable operation {op_name} failed on '{project_id}': "
-                    f"{final['error']}"
-                )
+    client = service_usage_client or service_usage_v1.ServiceUsageClient()
+    request = service_usage_v1.BatchEnableServicesRequest(
+        parent=f"projects/{project_id}",
+        service_ids=services,
+    )
+    operation = client.batch_enable_services(request=request)
+    operation.result(timeout=timeout_seconds)
     logging.info("Prerequisite Terraform APIs enabled on '%s'.", project_id)
 
 
@@ -164,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
             bucket_name=args.bucket,
             location=args.location,
         )
-    except (OperationError, GcpRestError, httpx.HTTPError, RuntimeError):
+    except (gcp_exceptions.GoogleAPICallError, TimeoutError, RuntimeError):
         logging.exception("Failed to bootstrap Terraform state bucket.")
         return 1
     return 0

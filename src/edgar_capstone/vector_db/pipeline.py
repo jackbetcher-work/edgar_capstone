@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import google.auth.exceptions
-import httpx
 
 from edgar_capstone.common.domain import normalize_edgar_ticker, sha256_text
 from edgar_capstone.common.jsonl import iter_jsonl, write_json
@@ -276,7 +275,7 @@ def trigger_bigquery_chunks_load_job(
     source_gcs_uri: str,
     location: str = DEFAULT_LOCATION,
     quota_project_id: str | None = None,
-    http_client: httpx.Client | None = None,
+    bq_client: Any | None = None,
     credentials: Any | None = None,
     poll_timeout_seconds: float = 120.0,
 ) -> str:
@@ -296,7 +295,7 @@ def trigger_bigquery_chunks_load_job(
         poll_timeout_seconds=poll_timeout_seconds,
         raise_on_timeout=False,
         quota_project_id=quota_project_id,
-        http_client=http_client,
+        bq_client=bq_client,
         credentials=credentials,
     )
     return result.job_id
@@ -307,7 +306,7 @@ def run_vector_db_pipeline(
     *,
     storage_client: Any | None = None,
     vertex_embedder: VertexAIEmbedder | None = None,
-    http_client: httpx.Client | None = None,
+    bq_client: Any | None = None,
 ) -> tuple[VectorDBBuildSummary, ChunkHealthReport]:
     """Execute end-to-end 10-K chunking, embedding, manifest writing, GCS/BQ sync, and monitoring."""
     bucket_name = normalize_bucket_name(config.bucket_name)
@@ -441,7 +440,7 @@ def run_vector_db_pipeline(
                 source_gcs_uri=source_uri,
                 location=config.location,
                 quota_project_id=config.project_id,
-                http_client=http_client,
+                bq_client=bq_client,
                 poll_timeout_seconds=config.bigquery_load_timeout_seconds,
             )
             summary.loaded_to_bigquery = True

@@ -23,22 +23,27 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
-try:
-    from scripts._cli import add_gcp_args
-except ImportError:  # pragma: no cover - direct script execution without editable install
-    from _cli import add_gcp_args  # type: ignore[import-not-found,no-redef]
+# Disable gRPC C-core fork support before grpc can be imported so local macOS Endpoint
+# Verification (ApiHelper) / subprocess forks do not spam stderr.
+os.environ.setdefault("GRPC_ENABLE_FORK_SUPPORT", "0")
 
-from edgar_capstone.evals.golden import (
+try:
+    from scripts._cli import add_gcp_args  # noqa: E402
+except ImportError:  # pragma: no cover - direct script execution without editable install
+    from _cli import add_gcp_args  # type: ignore[import-not-found,no-redef]  # noqa: E402
+
+from edgar_capstone.evals.golden import (  # noqa: E402
     DEFAULT_GOLDEN_DATASET_PATH,
     REPO_ROOT,
     GoldenDatasetError,
     load_golden_dataset,
     validate_golden_dataset,
 )
-from edgar_capstone.evals.runner import (
+from edgar_capstone.evals.runner import (  # noqa: E402
     DEFAULT_EVAL_CONCURRENCY,
     DEFAULT_THRESHOLDS_PATH,
     EvalThresholds,
@@ -46,7 +51,7 @@ from edgar_capstone.evals.runner import (
     run_golden_evals,
     write_report_json,
 )
-from edgar_capstone.gcp.defaults import (
+from edgar_capstone.gcp.defaults import (  # noqa: E402
     resolve_bq_dataset_id,
     resolve_gcp_location,
     resolve_gcp_project_id,

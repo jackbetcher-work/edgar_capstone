@@ -585,6 +585,8 @@ def test_genai_otel_env_and_gcp_otlp_exporter_auto_config(
     # Active app startup config populates GenAI Inputs/Outputs env vars and instruments GenAI SDK.
     status = tracing_status_metadata()
     assert status["genai_instrumented"] is True
+    assert status["requests_instrumented"] is True
+    assert status["grpc_instrumented"] is True
     assert status["capture_message_content"] is True
     assert status["capture_message_content_mode"] == "SPAN_AND_EVENT"
     assert status["semconv_stability_opt_in"] == "gen_ai_latest_experimental"

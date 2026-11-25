@@ -1,6 +1,6 @@
 # Observability: Cloud Trace, Cloud Logging, Cloud Monitoring & BigQuery
 
-The FastAPI service exports **OpenTelemetry spans to Cloud Trace** and writes **structured JSON logs carrying trace IDs** to stdout. Cloud Run ingests those logs into **Cloud Logging**. A single `/api/v1/chat` request produces one trace covering the Cloud Run front end, FastAPI, guardrails, synthesis steps, tools, ADK model calls, and outbound GCP REST calls. That request's log lines appear grouped under the trace, and its BigQuery telemetry rows carry the same `trace_id`.
+The FastAPI service exports **OpenTelemetry spans to Cloud Trace** and writes **structured JSON logs carrying trace IDs** to stdout. Cloud Run ingests those logs into **Cloud Logging**. A single `/api/v1/chat` request produces one trace covering the Cloud Run front end, FastAPI, guardrails, synthesis steps, tools, ADK model calls, and outbound GCP HTTP/gRPC SDK calls. That request's log lines appear grouped under the trace, and its BigQuery telemetry rows carry the same `trace_id`.
 
 Everything is operated from the **Google Cloud Console**: two Cloud Monitoring dashboards, low-cardinality log-based metrics, alert policies, and BigQuery SQL views queried from BigQuery Studio.
 
@@ -8,7 +8,7 @@ Code lives in [`src/edgar_capstone/observability/`](../src/edgar_capstone/observ
 
 | Module | Responsibility |
 | :-- | :-- |
-| `tracing.py` | `TracerProvider` + `LoggerProvider` exporting over OTLP/HTTP to `telemetry.googleapis.com` via ADK's `google_cloud.get_gcp_exporters(...)` (plus local `console` / `otlp` exporters), GCP resource detection, sampling, propagators (`traceparent` + `X-Cloud-Trace-Context`), FastAPI / Google GenAI SDK / httpx auto-instrumentation, `@traced` / `start_span` helpers |
+| `tracing.py` | `TracerProvider` + `LoggerProvider` exporting over OTLP/HTTP to `telemetry.googleapis.com` via ADK's `google_cloud.get_gcp_exporters(...)` (plus local `console` / `otlp` exporters), GCP resource detection, sampling, propagators (`traceparent` + `X-Cloud-Trace-Context`), FastAPI / Google GenAI SDK / httpx / requests / gRPC auto-instrumentation, `@traced` / `start_span` helpers |
 | `structured_logging.py` | `CloudLoggingJsonFormatter` (Cloud Logging special fields + Error Reporting), local trace-aware text formatter, uvicorn log routing |
 | `middleware.py` | `RequestTelemetryMiddleware`: request log context, `X-Trace-Id` / `X-Request-Id` / `Server-Timing` response headers, one `http_request_completed` access log per request |
 
@@ -19,27 +19,27 @@ flowchart TD
     LB["Cloud Run front end (Direct IAP · traceparent, X-Cloud-Trace-Context)"] --> S["FastAPI server span: POST /api/v1/chat"]
     S --> A["auth.verify_jwt"]
     S --> T["chat.rag_turn"]
-    T --> G["guardrail.inspect_user_prompt (+ Model Armor HTTP span)"]
+    T --> G["guardrail.inspect_user_prompt (+ Model Armor gRPC span)"]
     T --> SC["chat.scope_continuity_llm (parallel with Model Armor on warm unresolved turns)"]
     T --> R["chat.resolve_scope / orchestrator.infer_intent_from_tools"]
     T --> V["tool.calculate_period_variances"]
     T --> AN["anomaly.attach_explanations"]
-    T --> C["chat.retrieve_citations / tool.search_10k_chunks_rag (+ BigQuery, Vertex AI Search HTTP spans)"]
+    T --> C["chat.retrieve_citations / tool.search_10k_chunks_rag (+ BigQuery HTTP, Vertex AI Search gRPC spans)"]
     T --> X["react.execute"]
     X --> E["react.evaluate_variances"]
     X --> Q["tool.query_cached_10k_context"]
     X --> M["sector.map_reduce (for GICS sector thematic queries)"]
     X --> L["adk.run_agent_stream -> ADK invoke_agent / call_llm / execute_tool (+ Vertex AI Gemini HTTP spans)"]
     X -.->|"async background (sampled)"| J["evaluation.narrative_judge -> record_async_evaluation_result"]
-    T --> RG["guardrail.inspect_model_response (+ Model Armor HTTP span)"]
-    T --> B["BigQuery insertAll HTTP spans (async pool -> telemetry + audit sinks)"]
-    T --> FS["Firestore REST spans (analyst_sessions / analyst_feedback)"]
+    T --> RG["guardrail.inspect_model_response (+ Model Armor gRPC span)"]
+    T --> B["BigQuery insert_rows_json HTTP spans (async pool -> telemetry + audit sinks)"]
+    T --> FS["Firestore gRPC spans (analyst_sessions / analyst_feedback)"]
 ```
 
 - **Server span:** `opentelemetry-instrumentation-fastapi`. It continues the upstream W3C `traceparent` (or the legacy `X-Cloud-Trace-Context`), so Cloud Run's own request span and the app spans share one trace. Health probes and static assets are excluded (`EDGAR_TRACE_EXCLUDED_URLS`).
 - **App spans:** `@traced(...)` on the chat engine (`chat.rag_turn`, `chat.resolve_scope`, `chat.scope_continuity_llm`, `chat.retrieve_citations`), intent fallback (`orchestrator.infer_intent_from_tools`; the analyst emits intent in `AnalystReport.intent`), anomaly explanation linker (`anomaly.attach_explanations`), synthesis (`react.execute`, `react.evaluate_variances`), sector map-reduce (`sector.map_reduce`), ADK runner (`adk.run_agent_stream`), Model Armor guardrail, JWT verification, and narrative evaluator (`evaluation.narrative_judge` asynchronously on sampled live turns via `EDGAR_ASYNC_JUDGE_SAMPLE_RATE` and synchronously during `make eval-all`). `with_tool_resilience` wraps every ADK `FunctionTool` in a `tool.<name>` span (returning structured error dicts on failure), while `retry_transient_errors` adds retry spans for propagating internal calls.
 - **Model calls:** ADK's built-in `gcp.vertex.agent` spans (`invoke_agent`, `call_llm`, `execute_tool`) attach to the same global provider. Every recorded model call also adds an `llm.call` span event with `gen_ai.request.model`, input/output/cached/thinking tokens, `edgar.ttft_ms`, latency, and cost.
-- **Outbound HTTP:** `opentelemetry-instrumentation-httpx` creates client spans for Vertex AI (google-genai), BigQuery, Discovery Engine, GCS, Firestore, and Model Armor, and propagates context on them.
+- **Outbound HTTP & gRPC:** `opentelemetry-instrumentation-requests` instruments BigQuery, Cloud Storage, and Google OAuth HTTP calls; `opentelemetry-instrumentation-grpc` instruments Firestore, Model Armor, and Discovery Engine gRPC calls; and `opentelemetry-instrumentation-httpx` instruments `google-genai` (Vertex AI) and SEC EDGAR HTTP calls—propagating trace context across all of them.
 - **Thread hops:** `_run_coro_sync` (persistent background ADK `asyncio` event loop), `POST /api/v1/chat/stream` SSE worker threads, `sector.map_reduce` batch pools, and the async judge pool (`_BackgroundJudgeManager`) all copy `contextvars` (`contextvars.copy_context().run` / `loop.create_task(coro, context=ctx)`), so live ADK runs, map-reduce batches, and async judge evaluations stay correlated under the parent request trace.
 - **Error & mid-stream access logging:** `RequestTelemetryMiddleware` emits `http_request_completed` inside a `finally` block so latency metrics and trace-linked access logs are recorded even when an unhandled exception raises HTTP `500`. If an exception occurs mid-stream after headers are already flushed (e.g., SSE on `/api/v1/chat/stream`), the original HTTP status code is preserved and the log sets `unhandled_exception: true` and `stream_aborted: true` (alongside an `http_request_failed` exception log at `ERROR`).
 - **Shutdown flushing:** FastAPI's lifespan shutdown hook drains pending background judge evaluations (`flush_pending_evaluations`), flushes async BigQuery streaming inserts (`flush_async_writes`), closes telemetry/feedback stores (`reset_telemetry_stores`), and flushes OpenTelemetry trace spans (`flush_tracing`).
@@ -184,7 +184,7 @@ ORDER BY recorded_at DESC;
 ## Correlation walkthrough (one request end-to-end)
 
 1. Send a chat turn and capture the trace ID: `curl -si … /api/v1/chat … | grep -i x-trace-id`. The SSE `connected` event and the response `observability.trace_id` carry the same ID.
-2. **Cloud Trace:** Trace Explorer → filter `service.name: sec-edgar-analyst`, or paste the ID. The waterfall shows the FastAPI server span, `chat.rag_turn`, guardrails, ReAct/tool spans, ADK `call_llm` spans, and httpx calls to Vertex AI / BigQuery / Firestore.
+2. **Cloud Trace:** Trace Explorer → filter `service.name: sec-edgar-analyst`, or paste the ID. The waterfall shows the FastAPI server span, `chat.rag_turn`, guardrails, ReAct/tool spans, ADK `call_llm` spans, and outbound HTTP/gRPC SDK calls to Vertex AI / BigQuery / Discovery Engine / Firestore / Model Armor.
 3. **Cloud Logging:** `trace="projects/iron-radio-514217-q7/traces/<TRACE_ID>"` groups the access log, app logs, and the three telemetry sink records (`jsonPayload.log_sink_target`) under the request. From a trace span, *View logs* opens the same query.
 4. **BigQuery:** join the streamed rows on the same ID:
    ```sql
@@ -204,7 +204,9 @@ ORDER BY recorded_at DESC;
 | `EDGAR_TRACE_SAMPLE_RATIO` | `1.0` | Head sampling ratio. A sampled upstream parent is always honored. |
 | `EDGAR_TRACE_CAPTURE_CONTENT` | `false` | Default for ADK `ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS`. Keeps prompts, 10-K text, and model output out of Cloud Trace. |
 | `EDGAR_TRACE_EXCLUDED_URLS` | health + static assets | Comma-separated regexes that get no server span |
-| `EDGAR_TRACE_INSTRUMENT_HTTPX` | `true` | Outbound httpx client spans |
+| `EDGAR_TRACE_INSTRUMENT_HTTPX` | `true` | Outbound `httpx` client spans (`google-genai`, SEC EDGAR) |
+| `EDGAR_TRACE_INSTRUMENT_REQUESTS` | `true` | Outbound `requests` client spans (BigQuery, GCS, Google OAuth) |
+| `EDGAR_TRACE_INSTRUMENT_GRPC` | `true` | Outbound gRPC client spans (Firestore, Model Armor, Discovery Engine) |
 | `EDGAR_LOG_FORMAT` | `auto` | `json` on Cloud Run, `text` locally |
 | `EDGAR_LOG_LEVEL` | `INFO` | Root log level |
 | `EDGAR_ASYNC_JUDGE_SAMPLE_RATE` | `1.0` | Probability in `[0.0, 1.0]` for running the off-critical-path async LLM-as-a-Judge on verified live turns (`0.0` disables live background judging; `0 < r < 1` samples turns) |

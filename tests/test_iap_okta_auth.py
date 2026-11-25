@@ -8,7 +8,6 @@ import json
 import time
 from typing import Any
 
-import httpx
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi.testclient import TestClient
@@ -60,15 +59,12 @@ def idp_keyring(session_idp_keys: dict[str, Any]):
         },
     }
 
-    def _mock_transport(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
+    def _jwk_fetcher(url: str) -> dict[str, Any]:
         if url in jwks_by_uri:
-            return httpx.Response(200, json=jwks_by_uri[url])
-        return httpx.Response(404, json={"error": "not_found"})
+            return jwks_by_uri[url]
+        raise RuntimeError(f"404 not found: {url}")
 
-    jwks_store = JwksKeyStore(
-        http_client=httpx.Client(transport=httpx.MockTransport(_mock_transport))
-    )
+    jwks_store = JwksKeyStore(jwk_fetcher=_jwk_fetcher)
     settings = AuthSettings(
         audiences=(TEST_IAP_AUDIENCE,),
         google_oauth_client_id=None,
@@ -1017,26 +1013,16 @@ def test_sso_dev_token_emits_audit_events_on_401_and_403(
 def test_jwt_codec_strict_decoding_jwk_and_signature_error_paths(
     session_idp_keys: dict[str, Any],
 ) -> None:
-    """Cover malformed base64url, JWK validation (ValueError, never KeyError), and JWS mismatches."""
+    """Cover malformed JWT parsing, JWK validation (ValueError, never KeyError), and PyJWT mismatches."""
     from edgar_capstone.security.jwt_codec import (
-        b64url_decode,
+        decode_verified_jwt,
         jwk_to_public_key,
-        parse_jwt_header_and_claims,
-        verify_es256_signature,
-        verify_jws_signature,
+        parse_unverified_jwt,
     )
 
-    for bad_seg in ("", "a", "abc!def", "ab=cd"):
+    for bad_token in ("", "not-a-jwt", "a.b", f"{_b64url(b'[]')}.{_b64url(b'[]')}.sig"):
         with pytest.raises(ValueError):
-            b64url_decode(bad_seg)
-    with pytest.raises(ValueError):
-        b64url_decode(123)  # type: ignore[arg-type]
-
-    list_b64 = _b64url(b"[]")
-    with pytest.raises(ValueError):
-        parse_jwt_header_and_claims(list_b64, list_b64)
-    with pytest.raises(ValueError):
-        parse_jwt_header_and_claims(_b64url(b"\xff\xfe"), list_b64)
+            parse_unverified_jwt(bad_token)
 
     for bad_jwk in (
         "not-a-dict",
@@ -1050,27 +1036,18 @@ def test_jwt_codec_strict_decoding_jwk_and_signature_error_paths(
         with pytest.raises(ValueError):
             jwk_to_public_key(bad_jwk)  # type: ignore[arg-type]
 
-    ec_pub = session_idp_keys["iap_ec_key"].public_key()
-    rsa_pub = session_idp_keys["google_rsa_key"].public_key()
-
-    with pytest.raises(ValueError):
-        verify_es256_signature(b"hdr.pay", b"short", ec_pub)
-    with pytest.raises(ValueError):
-        verify_es256_signature(b"hdr.pay", b"\x00" * 64, ec_pub)
+    ec_priv = session_idp_keys["iap_ec_key"]
+    rsa_priv = session_idp_keys["google_rsa_key"]
+    ec_pub = ec_priv.public_key()
+    rsa_pub = rsa_priv.public_key()
+    es_tok = sign_jwt_es256({"sub": "u1"}, ec_priv, kid="k1")
+    rs_tok = sign_jwt_rs256({"sub": "u1"}, rsa_priv, kid="k2")
 
     with pytest.raises(ValueError, match="does not match ES256"):
-        verify_jws_signature(
-            alg="ES256", signing_input=b"a.b", signature_bytes=b"\x01" * 64, public_key=rsa_pub
-        )
+        decode_verified_jwt(es_tok, rsa_pub, alg="ES256")
     with pytest.raises(ValueError, match="does not match RS256"):
-        verify_jws_signature(
-            alg="RS256", signing_input=b"a.b", signature_bytes=b"sig", public_key=ec_pub
-        )
+        decode_verified_jwt(rs_tok, ec_pub, alg="RS256")
     with pytest.raises(ValueError, match="RS256 JWT signature verification failed"):
-        verify_jws_signature(
-            alg="RS256", signing_input=b"a.b", signature_bytes=b"bad" * 64, public_key=rsa_pub
-        )
+        decode_verified_jwt(rs_tok[:-4] + "AAAA", rsa_pub, alg="RS256")
     with pytest.raises(ValueError, match="Unsupported JWT signing algorithm"):
-        verify_jws_signature(
-            alg="HS256", signing_input=b"a.b", signature_bytes=b"sig", public_key=rsa_pub
-        )
+        decode_verified_jwt(rs_tok, rsa_pub, alg="HS256")

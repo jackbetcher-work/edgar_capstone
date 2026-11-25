@@ -1,24 +1,26 @@
-"""Deterministic in-memory GCP adapter bundle backed by `httpx.MockTransport`.
+"""Deterministic in-memory GCP SDK adapter bundle for offline tests.
 
-Exercises the exact production REST clients (`BigQueryAdapter`, `VertexAISearchAdapter`,
+Exercises the exact production SDK adapters (`BigQueryAdapter`, `VertexAISearchAdapter`,
 `GcsCorpusAdapter`, `VertexAIEmbedder`) against a curated synthetic S&P 500 slice with zero
-network traffic. Use `use_fake_gcp_adapters()` (or the `fake_gcp_adapters` pytest fixture)
-to avoid wiping warm live GCP caches when running alongside live smoke tests.
+network traffic, using typed SDK fakes (`FakeBigQueryClient`, `FakeSearchServiceClient`,
+`FakeStorageClient`, `FakeGenAiClient`, `FakeFirestoreClient`).
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 import re
-import urllib.parse
 from collections import defaultdict
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from datetime import UTC, date, datetime
 from typing import Any
 
-import httpx
+from google.api_core import exceptions as gcp_exceptions
+from google.cloud import discoveryengine_v1 as de
+from google.genai import types as genai_types
+from google.protobuf.struct_pb2 import Struct
 
 from edgar_capstone.agents.adapters import registry as adapter_registry
 from edgar_capstone.agents.adapters.registry import GcpToolAdapters, GcpToolConfig
@@ -34,7 +36,7 @@ FAKE_BUCKET = "fde-sec-edgar-sandbox-dev-sec-corpus"
 
 
 class FakeGcpCredentials:
-    """Offline OAuth2 credentials stub for `httpx.MockTransport` tests."""
+    """Offline OAuth2 credentials stub for offline SDK adapter tests."""
 
     def __init__(self, token: str = "fake-gcp-oauth-bearer") -> None:
         self.valid = True
@@ -474,121 +476,18 @@ def _get_synthetic_corpus() -> tuple[list[dict[str, Any]], list[dict[str, Any]],
     return _CACHED_CORPUS
 
 
-_PROFILE_SCHEMA = [
-    {"name": "profile_id", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "ticker", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "cik", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "company_name", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "gics_sector", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "gics_sub_industry", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "fiscal_year", "type": "INTEGER", "mode": "REQUIRED"},
-    {"name": "period_of_report", "type": "DATE", "mode": "NULLABLE"},
-    {"name": "filing_date", "type": "DATE", "mode": "NULLABLE"},
-    {"name": "accession_number", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "currency", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "revenue", "type": "FLOAT", "mode": "NULLABLE"},
-    {"name": "operating_income", "type": "FLOAT", "mode": "NULLABLE"},
-    {"name": "net_income", "type": "FLOAT", "mode": "NULLABLE"},
-    {"name": "research_and_development", "type": "FLOAT", "mode": "NULLABLE"},
-    {
-        "name": "metric_provenance",
-        "type": "RECORD",
-        "mode": "NULLABLE",
-        "fields": [
-            {"name": "revenue", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "operating_income", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "net_income", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "research_and_development", "type": "STRING", "mode": "NULLABLE"},
-            {"name": "notes", "type": "STRING", "mode": "REPEATED"},
-        ],
-    },
-    {"name": "extracted_sections", "type": "STRING", "mode": "REPEATED"},
-    {"name": "unstructured_blob_path", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "structured_blob_path", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "unstructured_gcs_uri", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "structured_gcs_uri", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "sec_filing_url", "type": "STRING", "mode": "NULLABLE"},
-]
-
-_CHUNK_BASE_SCHEMA = [
-    {"name": "chunk_id", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "profile_id", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "ticker", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "company_name", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "gics_sector", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "fiscal_year", "type": "INTEGER", "mode": "REQUIRED"},
-    {"name": "period_of_report", "type": "DATE", "mode": "NULLABLE"},
-    {"name": "filing_date", "type": "DATE", "mode": "NULLABLE"},
-    {"name": "accession_number", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "section_id", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "section_title", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "chunk_index", "type": "INTEGER", "mode": "REQUIRED"},
-    {"name": "chunk_text", "type": "STRING", "mode": "REQUIRED"},
-    {"name": "sec_filing_url", "type": "STRING", "mode": "NULLABLE"},
-    {"name": "unstructured_gcs_uri", "type": "STRING", "mode": "NULLABLE"},
-]
-
-
-def _bq_val(val: Any) -> dict[str, Any]:
-    if val is None:
-        return {"v": None}
-    if isinstance(val, bool):
-        return {"v": "true" if val else "false"}
-    if isinstance(val, list):
-        return {"v": [{"v": str(item) if item is not None else None} for item in val]}
-    return {"v": str(val)}
-
-
-def _encode_profile_row(p: dict[str, Any]) -> dict[str, Any]:
-    prov = p["metric_provenance"]
-    return {
-        "f": [
-            _bq_val(p["profile_id"]),
-            _bq_val(p["ticker"]),
-            _bq_val(p["cik"]),
-            _bq_val(p["company_name"]),
-            _bq_val(p["gics_sector"]),
-            _bq_val(p["gics_sub_industry"]),
-            _bq_val(p["fiscal_year"]),
-            _bq_val(p["period_of_report"]),
-            _bq_val(p["filing_date"]),
-            _bq_val(p["accession_number"]),
-            _bq_val(p["currency"]),
-            _bq_val(p["revenue"]),
-            _bq_val(p["operating_income"]),
-            _bq_val(p["net_income"]),
-            _bq_val(p["research_and_development"]),
-            {
-                "v": {
-                    "f": [
-                        _bq_val(prov.get("revenue")),
-                        _bq_val(prov.get("operating_income")),
-                        _bq_val(prov.get("net_income")),
-                        _bq_val(prov.get("research_and_development")),
-                        _bq_val(prov.get("notes", [])),
-                    ]
-                }
-            },
-            _bq_val(p["extracted_sections"]),
-            _bq_val(p["unstructured_blob_path"]),
-            _bq_val(p["structured_blob_path"]),
-            _bq_val(p["unstructured_gcs_uri"]),
-            _bq_val(p["structured_gcs_uri"]),
-            _bq_val(p["sec_filing_url"]),
-        ]
-    }
-
-
-def _extract_bq_params(body: dict[str, Any]) -> dict[str, Any]:
+def _extract_sdk_bq_params(job_config: Any) -> dict[str, Any]:
     out: dict[str, Any] = {}
-    for param in body.get("queryParameters") or []:
-        name = param.get("name")
-        pval = param.get("parameterValue") or {}
-        ptype = (param.get("parameterType") or {}).get("type", "")
-        if ptype == "ARRAY":
-            out[name] = [item.get("value") for item in (pval.get("arrayValues") or [])]
-        else:
-            out[name] = pval.get("value")
+    if job_config is None:
+        return out
+    for param in getattr(job_config, "query_parameters", None) or ():
+        name = getattr(param, "name", None)
+        if not name:
+            continue
+        if hasattr(param, "values"):
+            out[name] = list(param.values)
+        elif hasattr(param, "value"):
+            out[name] = param.value
     return out
 
 
@@ -650,412 +549,580 @@ def _parse_vais_filter(expr: str) -> dict[str, Any]:
     return params
 
 
-def build_fake_gcp_transport() -> tuple[httpx.MockTransport, list[tuple[str, str]]]:
-    """Return `(MockTransport, request_log)` serving BigQuery, Vertex AI Search, Embeddings, and GCS."""
-    profiles, chunks, markdowns = _get_synthetic_corpus()
-    requests_log: list[tuple[str, str]] = []
+def _dict_to_struct(data: dict[str, Any]) -> Struct:
+    st = Struct()
+    st.update(data)
+    return st
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        requests_log.append((request.method, url))
 
-        # 1. Vertex AI text-embedding-005:predict
-        if "aiplatform.googleapis.com" in url and ":predict" in url:
-            body = json.loads(request.content.decode("utf-8"))
-            preds = [
-                {"embeddings": {"values": mock_embedding_values(inst.get("content", ""))}}
-                for inst in (body.get("instances") or [])
-            ]
-            return httpx.Response(200, json={"predictions": preds})
+class _FakeQueryJob:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
 
-        # 2. Discovery Engine / Vertex AI Search :search
-        if "discoveryengine.googleapis.com" in url and ":search" in url:
-            body = json.loads(request.content.decode("utf-8"))
-            query = str(body.get("query") or "")
-            q_vec = mock_embedding_values(query)
-            filt = _parse_vais_filter(str(body.get("filter") or ""))
-            pool = _filter_items(chunks, filt)
-            ranked = sorted(
-                pool,
-                key=lambda c: _cosine_distance(q_vec, c["embedding"]),
-            )[: int(body.get("pageSize") or 10)]
-            results = []
-            for rank, c in enumerate(ranked):
-                results.append(
-                    {
-                        "id": c["chunk_id"],
-                        "document": {
-                            "id": c["chunk_id"],
-                            "structData": {
-                                "chunk_id": c["chunk_id"],
-                                "profile_id": c["profile_id"],
-                                "ticker": c["ticker"],
-                                "company_name": c["company_name"],
-                                "gics_sector": c["gics_sector"],
-                                "fiscal_year": c["fiscal_year"],
-                                "period_of_report": c["period_of_report"],
-                                "filing_date": c["filing_date"],
-                                "accession_number": c["accession_number"],
-                                "section_id": c["section_id"],
-                                "section_title": c["section_title"],
-                                "sec_filing_url": c["sec_filing_url"],
-                                "unstructured_gcs_uri": c["unstructured_gcs_uri"],
-                                "chunk_text": c["chunk_text"],
-                            },
-                            "derivedStructData": {
-                                "extractive_segments": [
-                                    {
-                                        "content": c["chunk_text"],
-                                        "relevanceScore": max(0.35, 0.92 - 0.04 * rank),
-                                        "section_id": c["section_id"],
-                                        "section_title": c["section_title"],
-                                    }
-                                ]
-                            },
-                        },
-                    }
+    def result(
+        self, *, timeout: float | None = None, max_results: int | None = None
+    ) -> list[dict[str, Any]]:
+        _ = timeout
+        return self._rows[:max_results] if max_results is not None else list(self._rows)
+
+
+class FakeBigQueryClient:
+    """Typed in-memory ``google.cloud.bigquery.Client`` fake serving the synthetic corpus."""
+
+    def __init__(
+        self,
+        profiles: list[dict[str, Any]],
+        chunks: list[dict[str, Any]],
+        requests_log: list[tuple[str, str]],
+    ) -> None:
+        self._profiles = profiles
+        self._chunks = chunks
+        self._log = requests_log
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    def query(
+        self,
+        sql: str,
+        *,
+        job_config: Any | None = None,
+        location: str | None = None,
+        timeout: float | None = None,
+    ) -> _FakeQueryJob:
+        _ = (location, timeout)
+        self._log.append(("POST", "bigquery:query"))
+        params = _extract_sdk_bq_params(job_config)
+
+        # 1. VECTOR_SEARCH or QUALIFY ROW_NUMBER sector vector search
+        if "VECTOR_SEARCH(" in sql or "QUALIFY ROW_NUMBER()" in sql:
+            q_emb = [float(x) for x in (params.get("query_embedding") or [0.0] * EMBEDDING_DIMS)]
+            pool = _filter_items(self._chunks, params)
+            scored = [(c, _cosine_distance(q_emb, c["embedding"])) for c in pool]
+            if "QUALIFY ROW_NUMBER()" in sql:
+                per_cy = int(params.get("per_company_year") or 3)
+                grouped: dict[tuple[str, int], list[tuple[dict[str, Any], float]]] = defaultdict(
+                    list
                 )
-            return httpx.Response(200, json={"results": results, "totalSize": len(results)})
+                for item, dist in scored:
+                    grouped[(item["ticker"], item["fiscal_year"])].append((item, dist))
+                rows_out = []
+                for key in sorted(grouped):
+                    rows_out.extend(sorted(grouped[key], key=lambda x: x[1])[:per_cy])
+            else:
+                top_k = int(params.get("top_k") or 10)
+                rows_out = sorted(scored, key=lambda x: x[1])[:top_k]
 
-        # 3. GCS object read (alt=media)
-        if "storage.googleapis.com" in url and "/o/" in url:
-            encoded_obj = request.url.path.split("/o/", 1)[1]
-            obj_name = urllib.parse.unquote(encoded_obj)
-            if obj_name not in markdowns:
-                return httpx.Response(404, text=f"No such object: {obj_name}")
-            return httpx.Response(200, text=markdowns[obj_name])
-
-        # 4. BigQuery REST v2 queries
-        if "bigquery.googleapis.com" in url and "/queries" in url:
-            body = json.loads(request.content.decode("utf-8"))
-            sql = str(body.get("query") or "")
-            params = _extract_bq_params(body)
-
-            # 4a. VECTOR_SEARCH or QUALIFY ROW_NUMBER sector vector search
-            if "VECTOR_SEARCH(" in sql or "QUALIFY ROW_NUMBER()" in sql:
-                q_emb = [
-                    float(x) for x in (params.get("query_embedding") or [0.0] * EMBEDDING_DIMS)
-                ]
-                pool = _filter_items(chunks, params)
-                scored = [(c, _cosine_distance(q_emb, c["embedding"])) for c in pool]
-                if "QUALIFY ROW_NUMBER()" in sql:
-                    per_cy = int(params.get("per_company_year") or 3)
-                    grouped: dict[tuple[str, int], list[tuple[dict[str, Any], float]]] = (
-                        defaultdict(list)
-                    )
-                    for item, dist in scored:
-                        grouped[(item["ticker"], item["fiscal_year"])].append((item, dist))
-                    rows_out = []
-                    for key in sorted(grouped):
-                        top = sorted(grouped[key], key=lambda x: x[1])[:per_cy]
-                        rows_out.extend(top)
-                else:
-                    top_k = int(params.get("top_k") or 10)
-                    rows_out = sorted(scored, key=lambda x: x[1])[:top_k]
-
-                schema = [*_CHUNK_BASE_SCHEMA, {"name": "distance", "type": "FLOAT"}]
-                bq_rows = [
+            return _FakeQueryJob(
+                [
                     {
-                        "f": [
-                            _bq_val(c["chunk_id"]),
-                            _bq_val(c["profile_id"]),
-                            _bq_val(c["ticker"]),
-                            _bq_val(c["company_name"]),
-                            _bq_val(c["gics_sector"]),
-                            _bq_val(c["fiscal_year"]),
-                            _bq_val(c["period_of_report"]),
-                            _bq_val(c["filing_date"]),
-                            _bq_val(c["accession_number"]),
-                            _bq_val(c["section_id"]),
-                            _bq_val(c["section_title"]),
-                            _bq_val(c["chunk_index"]),
-                            _bq_val(c["chunk_text"]),
-                            _bq_val(c["sec_filing_url"]),
-                            _bq_val(c["unstructured_gcs_uri"]),
-                            _bq_val(dist),
-                        ]
+                        **{k: v for k, v in c.items() if k != "embedding"},
+                        "distance": dist,
                     }
                     for c, dist in rows_out
                 ]
-                return httpx.Response(
-                    200,
-                    json={
-                        "jobComplete": True,
-                        "schema": {"fields": schema},
-                        "rows": bq_rows,
-                    },
-                )
-
-            # 4b. fetch_section_chunks
-            if "filing_chunks" in sql:
-                include_emb = ", embedding" in sql
-                matched = _filter_items(chunks, params)
-                schema = [
-                    {"name": "chunk_id", "type": "STRING"},
-                    {"name": "profile_id", "type": "STRING"},
-                    {"name": "ticker", "type": "STRING"},
-                    {"name": "company_name", "type": "STRING"},
-                    {"name": "gics_sector", "type": "STRING"},
-                    {"name": "fiscal_year", "type": "INTEGER"},
-                    {"name": "period_of_report", "type": "DATE"},
-                    {"name": "filing_date", "type": "DATE"},
-                    {"name": "accession_number", "type": "STRING"},
-                    {"name": "section_id", "type": "STRING"},
-                    {"name": "section_title", "type": "STRING"},
-                    {"name": "chunk_index", "type": "INTEGER"},
-                    {"name": "chunk_text", "type": "STRING"},
-                ]
-                if include_emb:
-                    schema.append({"name": "embedding", "type": "FLOAT", "mode": "REPEATED"})
-                schema.extend(
-                    [
-                        {"name": "sec_filing_url", "type": "STRING"},
-                        {"name": "unstructured_gcs_uri", "type": "STRING"},
-                    ]
-                )
-                bq_rows = []
-                for c in matched:
-                    fields = [
-                        _bq_val(c["chunk_id"]),
-                        _bq_val(c["profile_id"]),
-                        _bq_val(c["ticker"]),
-                        _bq_val(c["company_name"]),
-                        _bq_val(c["gics_sector"]),
-                        _bq_val(c["fiscal_year"]),
-                        _bq_val(c["period_of_report"]),
-                        _bq_val(c["filing_date"]),
-                        _bq_val(c["accession_number"]),
-                        _bq_val(c["section_id"]),
-                        _bq_val(c["section_title"]),
-                        _bq_val(c["chunk_index"]),
-                        _bq_val(c["chunk_text"]),
-                    ]
-                    if include_emb:
-                        fields.append(_bq_val(c["embedding"]))
-                    fields.extend(
-                        [
-                            _bq_val(c["sec_filing_url"]),
-                            _bq_val(c["unstructured_gcs_uri"]),
-                        ]
-                    )
-                    bq_rows.append({"f": fields})
-                return httpx.Response(
-                    200,
-                    json={"jobComplete": True, "schema": {"fields": schema}, "rows": bq_rows},
-                )
-
-            # 4c. v_chunk_health_metrics
-            if "v_chunk_health_metrics" in sql:
-                ch_schema = [
-                    {"name": "gics_sector", "type": "STRING"},
-                    {"name": "section_id", "type": "STRING"},
-                    {"name": "health_status", "type": "STRING"},
-                    {"name": "health_score", "type": "FLOAT"},
-                    {"name": "total_chunks", "type": "INTEGER"},
-                    {"name": "distinct_profiles", "type": "INTEGER"},
-                    {"name": "distinct_tickers", "type": "INTEGER"},
-                    {"name": "valid_embedding_count", "type": "INTEGER"},
-                    {"name": "embedding_coverage_ratio", "type": "FLOAT"},
-                    {"name": "full_section_coverage_ratio", "type": "FLOAT"},
-                    {"name": "avg_char_count", "type": "FLOAT"},
-                    {"name": "avg_token_estimate", "type": "FLOAT"},
-                    {"name": "min_token_estimate", "type": "INTEGER"},
-                    {"name": "max_token_estimate", "type": "INTEGER"},
-                    {"name": "p50_token_estimate", "type": "FLOAT"},
-                    {"name": "p95_token_estimate", "type": "FLOAT"},
-                    {"name": "undersized_chunk_count", "type": "INTEGER"},
-                    {"name": "oversized_chunk_count", "type": "INTEGER"},
-                    {"name": "missing_metadata_count", "type": "INTEGER"},
-                ]
-                total_c = len(chunks)
-                ch_row = {
-                    "f": [
-                        _bq_val("ALL_SECTORS"),
-                        _bq_val("ALL_SECTIONS"),
-                        _bq_val("HEALTHY"),
-                        _bq_val(100.0),
-                        _bq_val(total_c),
-                        _bq_val(len(profiles)),
-                        _bq_val(len(_SYNTHETIC_ISSUERS)),
-                        _bq_val(total_c),
-                        _bq_val(1.0),
-                        _bq_val(1.0),
-                        _bq_val(420.0),
-                        _bq_val(105.0),
-                        _bq_val(40),
-                        _bq_val(260),
-                        _bq_val(100.0),
-                        _bq_val(220.0),
-                        _bq_val(0),
-                        _bq_val(0),
-                        _bq_val(0),
-                    ]
-                }
-                return httpx.Response(
-                    200,
-                    json={"jobComplete": True, "schema": {"fields": ch_schema}, "rows": [ch_row]},
-                )
-
-            # 4d. v_financial_variances_yoy
-            if "v_financial_variances_yoy" in sql:
-                matched = _filter_items(profiles, params)
-                by_t: dict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
-                for p in profiles:
-                    by_t[p["ticker"]][p["fiscal_year"]] = p
-                yoy_schema = [
-                    {"name": "profile_id", "type": "STRING"},
-                    {"name": "ticker", "type": "STRING"},
-                    {"name": "company_name", "type": "STRING"},
-                    {"name": "gics_sector", "type": "STRING"},
-                    {"name": "fiscal_year", "type": "INTEGER"},
-                    {"name": "prev_fiscal_year", "type": "INTEGER"},
-                    {"name": "period_of_report", "type": "DATE"},
-                    {"name": "filing_date", "type": "DATE"},
-                    {"name": "accession_number", "type": "STRING"},
-                    {"name": "revenue", "type": "FLOAT"},
-                    {"name": "revenue_yoy_delta", "type": "FLOAT"},
-                    {"name": "revenue_yoy_pct", "type": "FLOAT"},
-                    {"name": "operating_income", "type": "FLOAT"},
-                    {"name": "operating_income_yoy_delta", "type": "FLOAT"},
-                    {"name": "operating_income_yoy_pct", "type": "FLOAT"},
-                    {"name": "net_income", "type": "FLOAT"},
-                    {"name": "net_income_yoy_delta", "type": "FLOAT"},
-                    {"name": "net_income_yoy_pct", "type": "FLOAT"},
-                    {"name": "research_and_development", "type": "FLOAT"},
-                    {"name": "research_and_development_yoy_delta", "type": "FLOAT"},
-                    {"name": "research_and_development_yoy_pct", "type": "FLOAT"},
-                    {"name": "sec_filing_url", "type": "STRING"},
-                ]
-                bq_rows = []
-                for p in matched:
-                    prev = by_t[p["ticker"]].get(p["fiscal_year"] - 1)
-
-                    def _yoy(cur_v: float | None, prev_v: float | None):
-                        if cur_v is None or prev_v is None:
-                            return None, None
-                        d = cur_v - prev_v
-                        pct = (d / abs(prev_v) * 100.0) if prev_v else None
-                        return d, pct
-
-                    rd_d, rd_p = _yoy(
-                        p["research_and_development"],
-                        prev["research_and_development"] if prev else None,
-                    )
-                    r_d, r_p = _yoy(p["revenue"], prev["revenue"] if prev else None)
-                    o_d, o_p = _yoy(
-                        p["operating_income"], prev["operating_income"] if prev else None
-                    )
-                    n_d, n_p = _yoy(p["net_income"], prev["net_income"] if prev else None)
-                    bq_rows.append(
-                        {
-                            "f": [
-                                _bq_val(p["profile_id"]),
-                                _bq_val(p["ticker"]),
-                                _bq_val(p["company_name"]),
-                                _bq_val(p["gics_sector"]),
-                                _bq_val(p["fiscal_year"]),
-                                _bq_val(prev["fiscal_year"] if prev else None),
-                                _bq_val(p["period_of_report"]),
-                                _bq_val(p["filing_date"]),
-                                _bq_val(p["accession_number"]),
-                                _bq_val(p["revenue"]),
-                                _bq_val(r_d),
-                                _bq_val(r_p),
-                                _bq_val(p["operating_income"]),
-                                _bq_val(o_d),
-                                _bq_val(o_p),
-                                _bq_val(p["net_income"]),
-                                _bq_val(n_d),
-                                _bq_val(n_p),
-                                _bq_val(p["research_and_development"]),
-                                _bq_val(rd_d),
-                                _bq_val(rd_p),
-                                _bq_val(p["sec_filing_url"]),
-                            ]
-                        }
-                    )
-                return httpx.Response(
-                    200,
-                    json={"jobComplete": True, "schema": {"fields": yoy_schema}, "rows": bq_rows},
-                )
-
-            # 4e. sector_benchmarks (GROUP BY 1, 2)
-            if "GROUP BY 1, 2" in sql:
-                matched = _filter_items(profiles, params)
-                buckets: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
-                for p in matched:
-                    buckets[(p["gics_sector"], p["fiscal_year"])].append(p)
-                sb_schema = [
-                    {"name": "gics_sector", "type": "STRING"},
-                    {"name": "fiscal_year", "type": "INTEGER"},
-                    {"name": "company_count", "type": "INTEGER"},
-                    {"name": "tickers", "type": "STRING", "mode": "REPEATED"},
-                    {"name": "total_sector_revenue", "type": "FLOAT"},
-                    {"name": "avg_company_revenue", "type": "FLOAT"},
-                    {"name": "total_sector_operating_income", "type": "FLOAT"},
-                    {"name": "total_sector_net_income", "type": "FLOAT"},
-                    {"name": "total_sector_research_and_development", "type": "FLOAT"},
-                ]
-                bq_rows = []
-                for (sec, fy), items in sorted(buckets.items()):
-                    revs = [i["revenue"] for i in items if i["revenue"] is not None]
-                    ops = [
-                        i["operating_income"] for i in items if i["operating_income"] is not None
-                    ]
-                    nets = [i["net_income"] for i in items if i["net_income"] is not None]
-                    rds = [
-                        i["research_and_development"]
-                        for i in items
-                        if i["research_and_development"] is not None
-                    ]
-                    bq_rows.append(
-                        {
-                            "f": [
-                                _bq_val(sec),
-                                _bq_val(fy),
-                                _bq_val(len(items)),
-                                _bq_val(sorted({i["ticker"] for i in items})),
-                                _bq_val(round(sum(revs), 2)),
-                                _bq_val(round(sum(revs) / len(revs), 2) if revs else 0.0),
-                                _bq_val(round(sum(ops), 2)),
-                                _bq_val(round(sum(nets), 2)),
-                                _bq_val(round(sum(rds), 2) if rds else None),
-                            ]
-                        }
-                    )
-                return httpx.Response(
-                    200,
-                    json={"jobComplete": True, "schema": {"fields": sb_schema}, "rows": bq_rows},
-                )
-
-            # 4f. default: financial_metrics fetch_profiles
-            matched = _filter_items(profiles, params)
-            matched.sort(key=lambda p: (p["ticker"], p["fiscal_year"]))
-            return httpx.Response(
-                200,
-                json={
-                    "jobComplete": True,
-                    "schema": {"fields": _PROFILE_SCHEMA},
-                    "rows": [_encode_profile_row(p) for p in matched],
-                },
             )
 
-        return httpx.Response(404, text=f"Unhandled fake GCP URL: {request.method} {url}")
+        # 2. fetch_section_chunks / batch
+        if "filing_chunks" in sql:
+            include_emb = ", embedding" in sql
+            matched = _filter_items(self._chunks, params)
+            return _FakeQueryJob(
+                [
+                    dict(c) if include_emb else {k: v for k, v in c.items() if k != "embedding"}
+                    for c in matched
+                ]
+            )
 
-    return httpx.MockTransport(handler), requests_log
+        # 3. v_chunk_health_metrics
+        if "v_chunk_health_metrics" in sql:
+            total_c = len(self._chunks)
+            return _FakeQueryJob(
+                [
+                    {
+                        "gics_sector": "ALL_SECTORS",
+                        "section_id": "ALL_SECTIONS",
+                        "health_status": "HEALTHY",
+                        "health_score": 100.0,
+                        "total_chunks": total_c,
+                        "distinct_profiles": len(self._profiles),
+                        "distinct_tickers": len(_SYNTHETIC_ISSUERS),
+                        "valid_embedding_count": total_c,
+                        "embedding_coverage_ratio": 1.0,
+                        "full_section_coverage_ratio": 1.0,
+                        "avg_char_count": 420.0,
+                        "avg_token_estimate": 105.0,
+                        "min_token_estimate": 40,
+                        "max_token_estimate": 260,
+                        "p50_token_estimate": 100.0,
+                        "p95_token_estimate": 220.0,
+                        "undersized_chunk_count": 0,
+                        "oversized_chunk_count": 0,
+                        "missing_metadata_count": 0,
+                    }
+                ]
+            )
+
+        # 4. v_financial_variances_yoy
+        if "v_financial_variances_yoy" in sql:
+            matched = _filter_items(self._profiles, params)
+            by_t: dict[str, dict[int, dict[str, Any]]] = defaultdict(dict)
+            for p in self._profiles:
+                by_t[p["ticker"]][p["fiscal_year"]] = p
+
+            def _yoy(
+                cur_v: float | None, prev_v: float | None
+            ) -> tuple[float | None, float | None]:
+                if cur_v is None or prev_v is None:
+                    return None, None
+                d = cur_v - prev_v
+                pct = (d / abs(prev_v) * 100.0) if prev_v else None
+                return d, pct
+
+            out_rows: list[dict[str, Any]] = []
+            for p in matched:
+                prev = by_t[p["ticker"]].get(p["fiscal_year"] - 1)
+                r_d, r_p = _yoy(p["revenue"], prev["revenue"] if prev else None)
+                o_d, o_p = _yoy(p["operating_income"], prev["operating_income"] if prev else None)
+                n_d, n_p = _yoy(p["net_income"], prev["net_income"] if prev else None)
+                rd_d, rd_p = _yoy(
+                    p["research_and_development"],
+                    prev["research_and_development"] if prev else None,
+                )
+                out_rows.append(
+                    {
+                        "profile_id": p["profile_id"],
+                        "ticker": p["ticker"],
+                        "company_name": p["company_name"],
+                        "gics_sector": p["gics_sector"],
+                        "fiscal_year": p["fiscal_year"],
+                        "prev_fiscal_year": prev["fiscal_year"] if prev else None,
+                        "period_of_report": date.fromisoformat(p["period_of_report"]),
+                        "filing_date": date.fromisoformat(p["filing_date"]),
+                        "accession_number": p["accession_number"],
+                        "revenue": p["revenue"],
+                        "revenue_yoy_delta": r_d,
+                        "revenue_yoy_pct": r_p,
+                        "operating_income": p["operating_income"],
+                        "operating_income_yoy_delta": o_d,
+                        "operating_income_yoy_pct": o_p,
+                        "net_income": p["net_income"],
+                        "net_income_yoy_delta": n_d,
+                        "net_income_yoy_pct": n_p,
+                        "research_and_development": p["research_and_development"],
+                        "research_and_development_yoy_delta": rd_d,
+                        "research_and_development_yoy_pct": rd_p,
+                        "sec_filing_url": p["sec_filing_url"],
+                    }
+                )
+            return _FakeQueryJob(out_rows)
+
+        # 5. sector_benchmarks (GROUP BY 1, 2)
+        if "GROUP BY 1, 2" in sql:
+            matched = _filter_items(self._profiles, params)
+            buckets: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+            for p in matched:
+                buckets[(p["gics_sector"], p["fiscal_year"])].append(p)
+            out_rows = []
+            for (sec, fy), items in sorted(buckets.items()):
+                revs = [i["revenue"] for i in items if i["revenue"] is not None]
+                ops = [i["operating_income"] for i in items if i["operating_income"] is not None]
+                nets = [i["net_income"] for i in items if i["net_income"] is not None]
+                rds = [
+                    i["research_and_development"]
+                    for i in items
+                    if i["research_and_development"] is not None
+                ]
+                out_rows.append(
+                    {
+                        "gics_sector": sec,
+                        "fiscal_year": fy,
+                        "company_count": len(items),
+                        "tickers": sorted({i["ticker"] for i in items}),
+                        "total_sector_revenue": round(sum(revs), 2),
+                        "avg_company_revenue": round(sum(revs) / len(revs), 2) if revs else 0.0,
+                        "total_sector_operating_income": round(sum(ops), 2),
+                        "total_sector_net_income": round(sum(nets), 2),
+                        "total_sector_research_and_development": (
+                            round(sum(rds), 2) if rds else None
+                        ),
+                    }
+                )
+            return _FakeQueryJob(out_rows)
+
+        # 6. Default: financial_metrics fetch_profiles (returns native date/datetime types!)
+        matched = _filter_items(self._profiles, params)
+        matched.sort(key=lambda p: (p["ticker"], p["fiscal_year"]))
+        return _FakeQueryJob(
+            [
+                {
+                    **p,
+                    "period_of_report": date.fromisoformat(p["period_of_report"]),
+                    "filing_date": date.fromisoformat(p["filing_date"]),
+                    "ingested_at": datetime(2026, 1, 15, 0, 0, 0, tzinfo=UTC),
+                }
+                for p in matched
+            ]
+        )
+
+
+class FakeSearchServiceClient:
+    """Typed in-memory ``discoveryengine_v1.SearchServiceClient`` fake returning real protos."""
+
+    def __init__(self, chunks: list[dict[str, Any]], requests_log: list[tuple[str, str]]) -> None:
+        self._chunks = chunks
+        self._log = requests_log
+
+    def search(self, *, request: Any, timeout: float | None = None) -> de.SearchResponse:
+        _ = timeout
+        serving_config = str(getattr(request, "serving_config", ""))
+        self._log.append(("POST", f"discoveryengine:search:{serving_config}"))
+        query = str(getattr(request, "query", "") or "")
+        q_vec = mock_embedding_values(query)
+        filt = _parse_vais_filter(str(getattr(request, "filter", "") or ""))
+        page_size = int(getattr(request, "page_size", 10) or 10)
+        pool = _filter_items(self._chunks, filt)
+        ranked = sorted(pool, key=lambda c: _cosine_distance(q_vec, c["embedding"]))[:page_size]
+
+        results = []
+        for rank, c in enumerate(ranked):
+            struct_data = _dict_to_struct(
+                {
+                    "chunk_id": c["chunk_id"],
+                    "profile_id": c["profile_id"],
+                    "ticker": c["ticker"],
+                    "company_name": c["company_name"],
+                    "gics_sector": c["gics_sector"],
+                    "fiscal_year": c["fiscal_year"],
+                    "period_of_report": c["period_of_report"],
+                    "filing_date": c["filing_date"],
+                    "accession_number": c["accession_number"],
+                    "section_id": c["section_id"],
+                    "section_title": c["section_title"],
+                    "sec_filing_url": c["sec_filing_url"],
+                    "unstructured_gcs_uri": c["unstructured_gcs_uri"],
+                    "chunk_text": c["chunk_text"],
+                }
+            )
+            derived_data = _dict_to_struct(
+                {
+                    "extractive_segments": [
+                        {
+                            "content": c["chunk_text"],
+                            "relevanceScore": max(0.35, 0.92 - 0.04 * rank),
+                            "section_id": c["section_id"],
+                            "section_title": c["section_title"],
+                        }
+                    ]
+                }
+            )
+            results.append(
+                de.SearchResponse.SearchResult(
+                    id=c["chunk_id"],
+                    document=de.Document(
+                        id=c["chunk_id"],
+                        struct_data=struct_data,
+                        derived_struct_data=derived_data,
+                    ),
+                )
+            )
+        return de.SearchResponse(results=results, total_size=len(results))
+
+
+class _FakeBlob:
+    def __init__(
+        self,
+        bucket: str,
+        name: str,
+        markdowns: dict[str, str],
+        requests_log: list[tuple[str, str]],
+    ) -> None:
+        self._bucket = bucket
+        self._name = name
+        self._markdowns = markdowns
+        self._log = requests_log
+
+    def download_as_text(
+        self,
+        *,
+        encoding: str = "utf-8",
+        retry: Any = None,
+        timeout: float | None = None,
+    ) -> str:
+        _ = (encoding, retry, timeout)
+        self._log.append(("GET", f"gcs://{self._bucket}/{self._name}"))
+        if self._name not in self._markdowns:
+            raise gcp_exceptions.NotFound(f"No such object: {self._name}")
+        return self._markdowns[self._name]
+
+
+class _FakeBucket:
+    def __init__(
+        self, name: str, markdowns: dict[str, str], requests_log: list[tuple[str, str]]
+    ) -> None:
+        self._name = name
+        self._markdowns = markdowns
+        self._log = requests_log
+
+    def blob(self, object_name: str) -> _FakeBlob:
+        return _FakeBlob(self._name, object_name, self._markdowns, self._log)
+
+
+class FakeStorageClient:
+    """Typed in-memory ``google.cloud.storage.Client`` fake serving synthetic 10-K Markdown."""
+
+    def __init__(self, markdowns: dict[str, str], requests_log: list[tuple[str, str]]) -> None:
+        self._markdowns = markdowns
+        self._log = requests_log
+
+    def bucket(self, name: str) -> _FakeBucket:
+        return _FakeBucket(name, self._markdowns, self._log)
+
+
+class _FakeGenAiModels:
+    def __init__(self, requests_log: list[tuple[str, str]]) -> None:
+        self._log = requests_log
+
+    def embed_content(
+        self,
+        *,
+        model: str,
+        contents: Sequence[str] | str,
+        config: Any | None = None,
+    ) -> genai_types.EmbedContentResponse:
+        self._log.append(("POST", f"genai:embed_content:{model}"))
+        items = [contents] if isinstance(contents, str) else list(contents)
+        dims = int(getattr(config, "output_dimensionality", None) or EMBEDDING_DIMS)
+        return genai_types.EmbedContentResponse(
+            embeddings=[
+                genai_types.ContentEmbedding(values=mock_embedding_values(str(t), dims=dims))
+                for t in items
+            ]
+        )
+
+
+class FakeGenAiClient:
+    """Typed in-memory ``google.genai.Client`` fake for deterministic embeddings."""
+
+    def __init__(self, requests_log: list[tuple[str, str]]) -> None:
+        self.models = _FakeGenAiModels(requests_log)
+
+
+# ---------------------------------------------------------------------------
+# Reusable in-memory Firestore SDK fake (feedback + transactional sessions)
+# ---------------------------------------------------------------------------
+
+
+class _FakeDocSnapshot:
+    def __init__(self, doc_id: str, data: dict[str, Any] | None) -> None:
+        self.id = doc_id
+        self._data = dict(data) if data is not None else None
+        self.exists = data is not None
+
+    def to_dict(self) -> dict[str, Any] | None:
+        return dict(self._data) if self._data is not None else None
+
+
+class _FakeFirestoreTransaction:
+    """Minimal ``google.cloud.firestore.Transaction`` compatible with ``@firestore.transactional``."""
+
+    def __init__(self, client: FakeFirestoreClient) -> None:
+        self._client = client
+        self._id: bytes | None = None
+        self._max_attempts = 5
+        self._read_only = False
+        self._writes: list[tuple[str, str, dict[str, Any]]] = []
+
+    @property
+    def in_progress(self) -> bool:
+        return self._id is not None
+
+    def _begin(self, retry_id: bytes | None = None) -> None:
+        _ = retry_id
+        self._id = b"fake-tx"
+        self._writes.clear()
+
+    def _rollback(self) -> None:
+        self._writes.clear()
+        self._id = None
+
+    def _commit(self) -> list[Any]:
+        for coll, doc_id, data in self._writes:
+            self._client._collections[coll][doc_id] = dict(data)
+            self._client.calls.append(("TX_SET", f"{coll}/{doc_id}"))
+        self._writes.clear()
+        self._id = None
+        return []
+
+    def _clean_up(self) -> None:
+        self._writes.clear()
+        self._id = None
+
+    def set(self, doc_ref: _FakeFirestoreDocRef, document_data: dict[str, Any]) -> None:
+        self._writes.append((doc_ref._collection_name, doc_ref.id, dict(document_data)))
+
+
+class _FakeFirestoreDocRef:
+    def __init__(self, client: FakeFirestoreClient, collection_name: str, doc_id: str) -> None:
+        self._client = client
+        self._collection_name = collection_name
+        self.id = doc_id
+
+    def create(self, document_data: dict[str, Any], *, timeout: float | None = None) -> None:
+        _ = timeout
+        self._client._maybe_raise("create")
+        store = self._client._collections[self._collection_name]
+        if self.id in store:
+            raise gcp_exceptions.AlreadyExists(f"Document {self.id} already exists")
+        store[self.id] = dict(document_data)
+        self._client.calls.append(("CREATE", f"{self._collection_name}/{self.id}"))
+
+    def set(
+        self,
+        document_data: dict[str, Any],
+        *,
+        merge: bool = False,
+        timeout: float | None = None,
+    ) -> None:
+        _ = timeout
+        self._client._maybe_raise("set")
+        store = self._client._collections[self._collection_name]
+        if merge and self.id in store:
+            store[self.id] = {**store[self.id], **document_data}
+        else:
+            store[self.id] = dict(document_data)
+        self._client.calls.append(("SET", f"{self._collection_name}/{self.id}"))
+
+    def get(
+        self,
+        *,
+        transaction: Any | None = None,
+        timeout: float | None = None,
+    ) -> _FakeDocSnapshot:
+        _ = timeout
+        self._client._maybe_raise("get")
+        verb = "TX_GET" if transaction is not None else "GET"
+        self._client.calls.append((verb, f"{self._collection_name}/{self.id}"))
+        data = self._client._collections[self._collection_name].get(self.id)
+        return _FakeDocSnapshot(self.id, data)
+
+    def delete(self, *, timeout: float | None = None) -> None:
+        _ = timeout
+        self._client._maybe_raise("delete")
+        self._client.calls.append(("DELETE", f"{self._collection_name}/{self.id}"))
+        self._client._collections[self._collection_name].pop(self.id, None)
+
+
+class _FakeFirestoreQuery:
+    def __init__(
+        self,
+        client: FakeFirestoreClient,
+        collection_name: str,
+        *,
+        filters: list[tuple[str, str, Any]] | None = None,
+        order_field: str | None = None,
+        descending: bool = False,
+        limit_val: int | None = None,
+    ) -> None:
+        self._client = client
+        self._collection_name = collection_name
+        self._filters = list(filters or [])
+        self._order_field = order_field
+        self._descending = descending
+        self._limit = limit_val
+
+    def where(self, *, filter: Any) -> _FakeFirestoreQuery:  # noqa: A002
+        return _FakeFirestoreQuery(
+            self._client,
+            self._collection_name,
+            filters=[*self._filters, (filter.field_path, filter.op_string, filter.value)],
+            order_field=self._order_field,
+            descending=self._descending,
+            limit_val=self._limit,
+        )
+
+    def order_by(self, field_path: str, *, direction: str = "ASCENDING") -> _FakeFirestoreQuery:
+        return _FakeFirestoreQuery(
+            self._client,
+            self._collection_name,
+            filters=self._filters,
+            order_field=field_path,
+            descending=str(direction).upper() == "DESCENDING",
+            limit_val=self._limit,
+        )
+
+    def limit(self, count: int) -> _FakeFirestoreQuery:
+        return _FakeFirestoreQuery(
+            self._client,
+            self._collection_name,
+            filters=self._filters,
+            order_field=self._order_field,
+            descending=self._descending,
+            limit_val=count,
+        )
+
+    def stream(self, *, timeout: float | None = None) -> list[_FakeDocSnapshot]:
+        _ = timeout
+        self._client._maybe_raise("stream")
+        self._client.calls.append(("STREAM", self._collection_name))
+        items = list(self._client._collections[self._collection_name].items())
+        for field_path, op, val in self._filters:
+            if op == "==":
+                items = [(doc_id, data) for doc_id, data in items if data.get(field_path) == val]
+        if self._order_field:
+            items.sort(
+                key=lambda pair: pair[1].get(self._order_field) or 0,
+                reverse=self._descending,
+            )
+        if self._limit is not None:
+            items = items[: self._limit]
+        return [_FakeDocSnapshot(doc_id, data) for doc_id, data in items]
+
+
+class _FakeFirestoreCollection(_FakeFirestoreQuery):
+    def document(self, doc_id: str) -> _FakeFirestoreDocRef:
+        return _FakeFirestoreDocRef(self._client, self._collection_name, doc_id)
+
+
+class FakeFirestoreClient:
+    """In-memory ``google.cloud.firestore.Client`` fake with queries and transactions."""
+
+    def __init__(self, *, error_to_raise: Exception | None = None) -> None:
+        self._collections: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
+        self.calls: list[tuple[str, str]] = []
+        self.error_to_raise = error_to_raise
+
+    def _maybe_raise(self, op: str) -> None:
+        _ = op
+        if self.error_to_raise is not None:
+            raise self.error_to_raise
+
+    def collection(self, name: str) -> _FakeFirestoreCollection:
+        return _FakeFirestoreCollection(self, name)
+
+    def transaction(self) -> _FakeFirestoreTransaction:
+        return _FakeFirestoreTransaction(self)
 
 
 def create_fake_gcp_adapters() -> tuple[GcpToolAdapters, list[tuple[str, str]]]:
-    """Create a `GcpToolAdapters` instance wired to the deterministic `MockTransport`."""
-    transport, log = build_fake_gcp_transport()
-    client = httpx.Client(transport=transport)
+    """Create a `GcpToolAdapters` instance wired to deterministic typed SDK fakes."""
+    profiles, chunks, markdowns = _get_synthetic_corpus()
+    log: list[tuple[str, str]] = []
     cfg = GcpToolConfig(
         project_id="iron-radio-514217-q7",
         location="us-central1",
         bq_dataset_id="sec_edgar",
         sec_corpus_bucket=FAKE_BUCKET,
     )
-    adapters = GcpToolAdapters(cfg, http_client=client, credentials=FakeGcpCredentials())
+    adapters = GcpToolAdapters(
+        cfg,
+        bq_client=FakeBigQueryClient(profiles, chunks, log),
+        search_client=FakeSearchServiceClient(chunks, log),
+        storage_client=FakeStorageClient(markdowns, log),
+        genai_client=FakeGenAiClient(log),
+        credentials=FakeGcpCredentials(),
+    )
     return adapters, log
 
 

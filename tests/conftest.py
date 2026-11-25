@@ -1,7 +1,7 @@
 """Shared pytest configuration and reusable fixtures.
 
 Default runs exercise both fast, deterministic unit/integration tests (using scripted ADK
-`BaseLlm`s, `httpx.MockTransport` GCP adapters, and the local Model Armor emulator) AND a
+`BaseLlm`s, typed fake GCP SDK adapters, and the local Model Armor emulator) AND a
 small `@pytest.mark.live` smoke suite that hits real GCP services (BigQuery, Vertex AI Search,
 Vertex AI embeddings, GCS, Model Armor, and Gemini on Vertex AI).
 
@@ -84,7 +84,7 @@ def session_idp_keys() -> dict[str, Any]:
 
 @pytest.fixture()
 def fake_gcp_adapters() -> Iterator[tuple[GcpToolAdapters, list[tuple[str, str]]]]:
-    """Temporarily install deterministic `httpx.MockTransport` GCP adapters without wiping live caches."""
+    """Temporarily install deterministic typed fake GCP SDK adapters without wiping live caches."""
     with use_fake_gcp_adapters() as bundle:
         yield bundle
 

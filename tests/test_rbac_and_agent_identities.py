@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -47,12 +46,12 @@ def rbac_test_env(session_idp_keys: dict[str, Any], fake_gcp_adapters: Any):
     ec_signing_key = session_idp_keys["iap_ec_key"]
     jwks_payload = {"keys": [ec_public_key_to_jwk(ec_signing_key.public_key(), kid="iap-rbac-k1")]}
 
-    def _transport(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == GOOGLE_IAP_JWKS_URI:
-            return httpx.Response(200, json=jwks_payload)
-        return httpx.Response(404, json={"error": "not_found"})
+    def _jwk_fetcher(url: str) -> dict[str, Any]:
+        if url == GOOGLE_IAP_JWKS_URI:
+            return jwks_payload
+        raise RuntimeError(f"404 not found: {url}")
 
-    jwks_store = JwksKeyStore(http_client=httpx.Client(transport=httpx.MockTransport(_transport)))
+    jwks_store = JwksKeyStore(jwk_fetcher=_jwk_fetcher)
     settings = AuthSettings(
         audiences=(TEST_IAP_AUDIENCE,),
         google_oauth_client_id=None,

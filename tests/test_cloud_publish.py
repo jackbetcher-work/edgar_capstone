@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-import httpx
 import pytest
+from google.api_core import exceptions as gcp_exceptions
+from google.cloud import discoveryengine_v1 as de
 
-from edgar_capstone.dataset import cloud_publish
 from edgar_capstone.dataset.cloud_publish import (
     DEFAULT_FINANCIAL_METRICS_SCHEMA_PATH,
     CloudPublishError,
@@ -32,28 +33,6 @@ DS_PATH = (
 )
 
 
-class _FakeCredentials:
-    def __init__(self) -> None:
-        self.valid = True
-        self.token = "fake-token"
-        self.refresh_calls = 0
-
-    def refresh(self, request: Any) -> None:
-        self.refresh_calls += 1
-        self.valid = True
-
-
-@pytest.fixture(autouse=True)
-def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    sleeps: list[float] = []
-    monkeypatch.setattr(cloud_publish.time, "sleep", lambda s: sleeps.append(s))
-    return sleeps
-
-
-def _client(handler: Any) -> httpx.Client:
-    return httpx.Client(transport=httpx.MockTransport(handler))
-
-
 @pytest.fixture
 def schema_file(tmp_path: Path) -> Path:
     path = tmp_path / "financial_metrics.json"
@@ -70,22 +49,72 @@ def schema_file(tmp_path: Path) -> Path:
     return path
 
 
-class _BigQueryFake:
-    """Records `jobs.insert` payloads and serves a scripted sequence of job states."""
+class _FakeLoadJob:
+    def __init__(
+        self,
+        job_id: str,
+        *,
+        state: str = "RUNNING",
+        output_rows: int | None = None,
+        input_files: int | None = None,
+        bad_records: int | None = None,
+        error_result: dict[str, Any] | None = None,
+        errors: list[dict[str, Any]] | None = None,
+        result_error: Exception | None = None,
+    ) -> None:
+        self.job_id = job_id
+        self.state = state
+        self.output_rows = output_rows
+        self.input_files = input_files
+        self.input_file_bytes = None
+        self.bad_records = bad_records
+        self.error_result = error_result
+        self.errors = errors
+        self._result_error = result_error
+        self.result_timeouts: list[float | None] = []
 
-    def __init__(self, poll_states: list[dict[str, Any]]) -> None:
-        self.poll_states = list(poll_states)
-        self.inserted: list[dict[str, Any]] = []
-        self.requests: list[httpx.Request] = []
+    def result(self, *, timeout: float | None = None) -> None:
+        self.result_timeouts.append(timeout)
+        if self._result_error is not None:
+            raise self._result_error
+        self.state = "DONE"
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
-        self.requests.append(request)
-        if request.method == "POST":
-            body = json.loads(request.content)
-            self.inserted.append(body)
-            return httpx.Response(200, json={**body, "status": {"state": "RUNNING"}})
-        state = self.poll_states.pop(0) if len(self.poll_states) > 1 else self.poll_states[0]
-        return httpx.Response(200, json=state)
+
+class _FakeBigQueryClient:
+    def __init__(
+        self,
+        *,
+        job_kwargs: dict[str, Any] | None = None,
+        submit_error: Exception | None = None,
+    ) -> None:
+        self._job_kwargs = dict(job_kwargs or {})
+        self._submit_error = submit_error
+        self.calls: list[dict[str, Any]] = []
+        self.jobs: list[_FakeLoadJob] = []
+
+    def load_table_from_uri(
+        self,
+        source_uris: list[str],
+        destination: str,
+        *,
+        job_id: str,
+        location: str,
+        job_config: Any,
+    ) -> _FakeLoadJob:
+        self.calls.append(
+            {
+                "source_uris": source_uris,
+                "destination": destination,
+                "job_id": job_id,
+                "location": location,
+                "job_config": job_config,
+            }
+        )
+        if self._submit_error is not None:
+            raise self._submit_error
+        job = _FakeLoadJob(job_id, **self._job_kwargs)
+        self.jobs.append(job)
+        return job
 
 
 # --- BigQuery ------------------------------------------------------------------------------
@@ -103,25 +132,13 @@ def test_default_schema_file_is_resolved_from_repo_root() -> None:
         resolve_schema_path("does/not/exist.json")
 
 
-def test_reload_financial_metrics_payload_polls_to_done(schema_file: Path) -> None:
-    fake = _BigQueryFake(
-        [
-            {"status": {"state": "PENDING"}},
-            {"status": {"state": "RUNNING"}},
-            {
-                "status": {"state": "DONE"},
-                "statistics": {
-                    "load": {"outputRows": "3022", "inputFiles": "1", "badRecords": "0"}
-                },
-            },
-        ]
-    )
+def test_reload_financial_metrics_payload_waits_to_done(schema_file: Path) -> None:
+    fake = _FakeBigQueryClient(job_kwargs={"output_rows": 3022, "input_files": 1, "bad_records": 0})
     result = reload_financial_metrics_table(
         project_id=PROJECT,
         bucket_name=BUCKET,
         schema_path=schema_file,
-        http_client=_client(fake),
-        credentials=_FakeCredentials(),
+        bq_client=fake,
         timeout_seconds=30,
     )
 
@@ -129,104 +146,69 @@ def test_reload_financial_metrics_payload_polls_to_done(schema_file: Path) -> No
     assert result.job_id.startswith("load_financial_metrics_")
     assert result.destination_table == f"{PROJECT}.sec_edgar.financial_metrics"
 
-    body = fake.inserted[0]
-    assert body["jobReference"] == {
-        "projectId": PROJECT,
-        "jobId": result.job_id,
-        "location": "us-central1",
-    }
-    load = body["configuration"]["load"]
-    assert load["sourceUris"] == [f"gs://{BUCKET}/manifests/bigquery_financials.jsonl"]
-    assert load["destinationTable"] == {
-        "projectId": PROJECT,
-        "datasetId": "sec_edgar",
-        "tableId": "financial_metrics",
-    }
-    assert load["sourceFormat"] == "NEWLINE_DELIMITED_JSON"
-    assert load["writeDisposition"] == "WRITE_TRUNCATE"
-    assert load["autodetect"] is False
-    assert [f["name"] for f in load["schema"]["fields"]][-1] == "research_and_development"
-    # BigQuery rejects schemaUpdateOptions with WRITE_TRUNCATE on a whole table; the explicit
-    # schema alone replaces the table schema, so the option must not be sent here.
-    assert "schemaUpdateOptions" not in load
-    assert load["rangePartitioning"]["field"] == "fiscal_year"
-    assert load["clustering"] == {"fields": ["gics_sector", "ticker"]}
-
-    insert_req, *polls = fake.requests
-    assert (
-        str(insert_req.url)
-        == f"https://bigquery.googleapis.com/bigquery/v2/projects/{PROJECT}/jobs"
-    )
-    assert insert_req.headers["Authorization"] == "Bearer fake-token"
-    assert insert_req.headers["x-goog-user-project"] == PROJECT
-    assert len(polls) == 3
-    assert polls[0].url.path.endswith(f"/jobs/{result.job_id}")
-    assert polls[0].url.params["location"] == "us-central1"
+    call = fake.calls[0]
+    assert call["source_uris"] == [f"gs://{BUCKET}/manifests/bigquery_financials.jsonl"]
+    assert call["destination"] == f"{PROJECT}.sec_edgar.financial_metrics"
+    assert call["location"] == "us-central1"
+    cfg = call["job_config"]
+    assert cfg.source_format == "NEWLINE_DELIMITED_JSON"
+    assert cfg.write_disposition == "WRITE_TRUNCATE"
+    assert cfg.autodetect is False
+    assert [f.name for f in cfg.schema][-1] == "research_and_development"
+    assert not cfg.schema_update_options
+    assert cfg.range_partitioning.field == "fiscal_year"
+    assert cfg.clustering_fields == ["gics_sector", "ticker"]
+    assert fake.jobs[0].result_timeouts == [30]
 
 
 def test_reload_financial_metrics_write_append_allows_field_addition(schema_file: Path) -> None:
-    fake = _BigQueryFake([{"status": {"state": "DONE"}, "statistics": {"load": {}}}])
+    fake = _FakeBigQueryClient()
     result = reload_financial_metrics_table(
         schema_path=schema_file,
         write_disposition="WRITE_APPEND",
         source_uri="gs://other/x.jsonl",
-        http_client=_client(fake),
-        credentials=_FakeCredentials(),
+        bq_client=fake,
     )
-    load = fake.inserted[0]["configuration"]["load"]
-    assert load["schemaUpdateOptions"] == ["ALLOW_FIELD_ADDITION"]
-    assert load["writeDisposition"] == "WRITE_APPEND"
-    assert load["sourceUris"] == ["gs://other/x.jsonl"]
+    cfg = fake.calls[0]["job_config"]
+    assert cfg.schema_update_options == ["ALLOW_FIELD_ADDITION"]
+    assert cfg.write_disposition == "WRITE_APPEND"
+    assert fake.calls[0]["source_uris"] == ["gs://other/x.jsonl"]
     assert result.schema_update_options == ["ALLOW_FIELD_ADDITION"]
     assert result.output_rows is None
 
 
 def test_reload_financial_metrics_without_schema_file() -> None:
-    fake = _BigQueryFake([{"status": {"state": "DONE"}}])
-    reload_financial_metrics_table(
-        use_schema_file=False, http_client=_client(fake), credentials=_FakeCredentials()
-    )
-    load = fake.inserted[0]["configuration"]["load"]
-    assert "schema" not in load and "schemaUpdateOptions" not in load
+    fake = _FakeBigQueryClient()
+    reload_financial_metrics_table(use_schema_file=False, bq_client=fake)
+    cfg = fake.calls[0]["job_config"]
+    assert cfg.schema is None and not cfg.schema_update_options
 
 
 def test_load_job_error_result_raises(schema_file: Path) -> None:
-    fake = _BigQueryFake(
-        [
-            {
-                "status": {
-                    "state": "DONE",
-                    "errorResult": {"reason": "invalid", "message": "No such field: foo"},
-                    "errors": [{"message": "No such field: foo"}],
-                }
-            }
-        ]
+    fake = _FakeBigQueryClient(
+        job_kwargs={
+            "error_result": {"reason": "invalid", "message": "No such field: foo"},
+            "errors": [{"message": "No such field: foo"}],
+        }
     )
     with pytest.raises(CloudPublishError, match="No such field: foo"):
-        reload_financial_metrics_table(
-            schema_path=schema_file, http_client=_client(fake), credentials=_FakeCredentials()
-        )
+        reload_financial_metrics_table(schema_path=schema_file, bq_client=fake)
 
 
-def test_load_job_submission_http_error_raises() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(403, json={"error": {"message": "denied"}})
-
-    with pytest.raises(CloudPublishError, match="HTTP 403"):
+def test_load_job_submission_error_raises() -> None:
+    fake = _FakeBigQueryClient(submit_error=gcp_exceptions.Forbidden("denied"))
+    with pytest.raises(CloudPublishError, match="denied"):
         run_bigquery_load_job(
             project_id=PROJECT,
             dataset_id="sec_edgar",
             table_id="t",
             source_uris=["gs://b/x"],
-            http_client=_client(handler),
-            credentials=_FakeCredentials(),
+            bq_client=fake,
         )
 
 
-def test_load_job_timeout_and_invalid_option_combo(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = _BigQueryFake([{"status": {"state": "RUNNING"}}])
-    clock = iter(range(0, 10_000, 50))
-    monkeypatch.setattr(cloud_publish.time, "monotonic", lambda: float(next(clock)))
+def test_load_job_timeout_and_invalid_option_combo() -> None:
+    fake = _FakeBigQueryClient(job_kwargs={"result_error": TimeoutError("still running")})
     with pytest.raises(CloudPublishTimeoutError):
         run_bigquery_load_job(
             project_id=PROJECT,
@@ -234,8 +216,7 @@ def test_load_job_timeout_and_invalid_option_combo(monkeypatch: pytest.MonkeyPat
             table_id="t",
             source_uris=["gs://b/x"],
             poll_timeout_seconds=120,
-            http_client=_client(fake),
-            credentials=_FakeCredentials(),
+            bq_client=fake,
         )
     with pytest.raises(ValueError, match="WRITE_APPEND"):
         run_bigquery_load_job(
@@ -245,114 +226,109 @@ def test_load_job_timeout_and_invalid_option_combo(monkeypatch: pytest.MonkeyPat
             source_uris=["gs://b/x"],
             schema_update_options=["ALLOW_FIELD_ADDITION"],
             write_disposition="WRITE_TRUNCATE",
-            credentials=_FakeCredentials(),
         )
 
 
 def test_load_job_no_wait_returns_after_submission() -> None:
-    fake = _BigQueryFake([{"status": {"state": "DONE"}}])
-    result = reload_financial_metrics_table(
-        wait=False, use_schema_file=False, http_client=_client(fake), credentials=_FakeCredentials()
-    )
+    fake = _FakeBigQueryClient(job_kwargs={"state": "RUNNING"})
+    result = reload_financial_metrics_table(wait=False, use_schema_file=False, bq_client=fake)
     assert result.state == "RUNNING" and not result.done
-    assert len(fake.requests) == 1
+    assert fake.jobs[0].result_timeouts == []
 
 
 def test_chunks_load_job_wrapper_keeps_behavior() -> None:
-    fake = _BigQueryFake([{"status": {"state": "RUNNING"}}, {"status": {"state": "DONE"}}])
+    fake = _FakeBigQueryClient()
     job_id = trigger_bigquery_chunks_load_job(
         project_id=PROJECT,
         dataset_id="sec_edgar",
         table_id="filing_chunks",
         source_gcs_uri=f"gs://{BUCKET}/manifests/bigquery_filing_chunks.jsonl",
-        http_client=_client(fake),
-        credentials=_FakeCredentials(),
+        bq_client=fake,
     )
     assert job_id.startswith("load_filing_chunks_")
-    load = fake.inserted[0]["configuration"]["load"]
-    assert load["writeDisposition"] == "WRITE_TRUNCATE"
-    assert load["autodetect"] is False
-    assert "schema" not in load and "schemaUpdateOptions" not in load
-    assert "x-goog-user-project" not in fake.requests[0].headers
+    cfg = fake.calls[0]["job_config"]
+    assert cfg.write_disposition == "WRITE_TRUNCATE"
+    assert cfg.autodetect is False
+    assert cfg.schema is None and not cfg.schema_update_options
 
-    failing = _BigQueryFake([{"status": {"state": "DONE", "errorResult": {"reason": "x"}}}])
+    failing = _FakeBigQueryClient(job_kwargs={"error_result": {"reason": "x"}})
     with pytest.raises(RuntimeError, match="failed"):
         trigger_bigquery_chunks_load_job(
             project_id=PROJECT,
             dataset_id="sec_edgar",
             table_id="filing_chunks",
             source_gcs_uri="gs://b/x",
-            http_client=_client(failing),
-            credentials=_FakeCredentials(),
+            bq_client=failing,
         )
 
 
 # --- Vertex AI Search ----------------------------------------------------------------------
 
 
-class _DiscoveryEngineFake:
-    def __init__(self, operations: list[dict[str, Any]]) -> None:
-        self.operations = list(operations)
-        self.requests: list[httpx.Request] = []
-        self.import_body: dict[str, Any] | None = None
+class _FakeImportOperation:
+    def __init__(
+        self,
+        name: str,
+        *,
+        metadata: Any | None = None,
+        response: Any | None = None,
+        result_error: Exception | None = None,
+    ) -> None:
+        self.operation = SimpleNamespace(name=name)
+        self.metadata = metadata
+        self._response = response
+        self._result_error = result_error
+        self._done = False
+        self.timeouts: list[float | None] = []
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def done(self) -> bool:
+        return self._done
+
+    def result(self, *, timeout: float | None = None) -> Any:
+        self.timeouts.append(timeout)
+        if self._result_error is not None:
+            raise self._result_error
+        self._done = True
+        return self._response
+
+
+class _FakeDocumentServiceClient:
+    def __init__(self, operation: _FakeImportOperation) -> None:
+        self._operation = operation
+        self.requests: list[de.ImportDocumentsRequest] = []
+
+    def import_documents(self, *, request: de.ImportDocumentsRequest) -> _FakeImportOperation:
         self.requests.append(request)
-        if request.method == "POST" and request.url.path.endswith("documents:import"):
-            self.import_body = json.loads(request.content)
-            return httpx.Response(
-                200,
-                json={"name": f"{DS_PATH}/branches/0/operations/import-documents-123"},
-            )
-        op = self.operations.pop(0) if len(self.operations) > 1 else self.operations[0]
-        return httpx.Response(200, json=op)
+        return self._operation
 
 
-def test_import_documents_payload_and_polling(_no_sleep: list[float]) -> None:
-    fake = _DiscoveryEngineFake(
-        [
-            {"name": "op", "metadata": {"successCount": "10"}},
-            {"name": "op", "metadata": {"successCount": "60", "failureCount": "1"}},
-            {
-                "name": "op",
-                "done": True,
-                "metadata": {"successCount": "113", "failureCount": "1", "totalCount": "114"},
-                "response": {
-                    "errorSamples": [{"code": 3, "message": "gs://bad/doc.md not found"}],
-                    "errorConfig": {
-                        "gcsPrefix": f"gs://{BUCKET}/vertex_ai_search/import_errors/123/"
-                    },
-                },
-            },
-        ]
+def test_import_documents_payload_and_lro_result() -> None:
+    op = _FakeImportOperation(
+        f"{DS_PATH}/branches/0/operations/import-documents-123",
+        metadata=de.ImportDocumentsMetadata(success_count=113, failure_count=1, total_count=114),
+        response=de.ImportDocumentsResponse(
+            error_samples=[{"code": 3, "message": "gs://bad/doc.md not found"}],
+            error_config=de.ImportErrorConfig(
+                gcs_prefix=f"gs://{BUCKET}/vertex_ai_search/import_errors/123/"
+            ),
+        ),
     )
+    fake = _FakeDocumentServiceClient(op)
     result = import_vertex_ai_search_documents(
         project_id=PROJECT,
         bucket_name=BUCKET,
-        http_client=_client(fake),
-        credentials=_FakeCredentials(),
-        initial_poll_interval_seconds=2.0,
-        max_poll_interval_seconds=3.0,
+        document_client=fake,
+        timeout_seconds=1800,
     )
 
-    assert fake.import_body == {
-        "gcsSource": {
-            "inputUris": [f"gs://{BUCKET}/manifests/vertex_ai_search_metadata.jsonl"],
-            "dataSchema": "document",
-        },
-        "reconciliationMode": "INCREMENTAL",
-        "errorConfig": {"gcsPrefix": f"gs://{BUCKET}/vertex_ai_search/import_errors/"},
-    }
-    import_req, *polls = fake.requests
-    assert str(import_req.url) == (
-        f"https://discoveryengine.googleapis.com/v1/{DS_PATH}/branches/default_branch/documents:import"
-    )
-    assert import_req.headers["x-goog-user-project"] == PROJECT
-    assert len(polls) == 3
-    assert str(polls[0].url) == (
-        f"https://discoveryengine.googleapis.com/v1/{DS_PATH}/branches/0/operations/import-documents-123"
-    )
-    assert _no_sleep == [2.0, 3.0]  # exponential backoff capped at max interval
+    req = fake.requests[0]
+    assert req.parent == f"{DS_PATH}/branches/default_branch"
+    assert list(req.gcs_source.input_uris) == [
+        f"gs://{BUCKET}/manifests/vertex_ai_search_metadata.jsonl"
+    ]
+    assert req.gcs_source.data_schema == "document"
+    assert req.reconciliation_mode == de.ImportDocumentsRequest.ReconciliationMode.INCREMENTAL
+    assert op.timeouts == [1800]
 
     assert result.done
     assert (result.success_count, result.failure_count, result.total_count) == (113, 1, 114)
@@ -362,57 +338,57 @@ def test_import_documents_payload_and_polling(_no_sleep: list[float]) -> None:
 
 
 def test_import_documents_full_mode_no_wait() -> None:
-    fake = _DiscoveryEngineFake([{"done": True}])
+    op = _FakeImportOperation(f"{DS_PATH}/branches/0/operations/import-full")
+    fake = _FakeDocumentServiceClient(op)
     result = import_vertex_ai_search_documents(
         reconciliation_mode="FULL",
         wait=False,
-        http_client=_client(fake),
-        credentials=_FakeCredentials(),
+        document_client=fake,
     )
-    assert fake.import_body is not None and fake.import_body["reconciliationMode"] == "FULL"
-    assert len(fake.requests) == 1
+    assert fake.requests[0].reconciliation_mode == de.ImportDocumentsRequest.ReconciliationMode.FULL
+    assert op.timeouts == []
     assert not result.done and result.success_count is None
     with pytest.raises(ValueError):
         import_vertex_ai_search_documents(reconciliation_mode="BOGUS")  # type: ignore[arg-type]
 
 
 def test_import_documents_operation_error_raises() -> None:
-    fake = _DiscoveryEngineFake(
-        [{"name": "op", "done": True, "error": {"code": 7, "message": "permission denied"}}]
+    op = _FakeImportOperation(
+        f"{DS_PATH}/branches/0/operations/op",
+        result_error=gcp_exceptions.PermissionDenied("permission denied"),
     )
     with pytest.raises(CloudPublishError, match="permission denied"):
-        import_vertex_ai_search_documents(http_client=_client(fake), credentials=_FakeCredentials())
+        import_vertex_ai_search_documents(document_client=_FakeDocumentServiceClient(op))
 
 
 def test_search_helper_parses_hit_ids() -> None:
-    seen: dict[str, Any] = {}
+    seen: list[de.SearchRequest] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["url"] = str(request.url)
-        seen["body"] = json.loads(request.content)
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    {"id": "A_2024_10K", "document": {"id": "A_2024_10K"}},
-                    {"document": {"id": "A_2023_10K"}},
-                    {"document": {}},
+    class _FakeSearchClient:
+        def search(
+            self, *, request: de.SearchRequest, timeout: float | None = None
+        ) -> de.SearchResponse:
+            _ = timeout
+            seen.append(request)
+            return de.SearchResponse(
+                results=[
+                    de.SearchResponse.SearchResult(
+                        id="A_2024_10K", document=de.Document(id="A_2024_10K")
+                    ),
+                    de.SearchResponse.SearchResult(document=de.Document(id="A_2023_10K")),
+                    de.SearchResponse.SearchResult(document=de.Document()),
                 ],
-                "totalSize": 2,
-            },
-        )
+                total_size=2,
+            )
 
     hits = search_vertex_ai_datastore(
         "Agilent risk factors",
         page_size=3,
-        http_client=_client(handler),
-        credentials=_FakeCredentials(),
+        search_client=_FakeSearchClient(),
     )
     assert hits == ["A_2024_10K", "A_2023_10K"]
-    assert seen["url"] == (
-        f"https://discoveryengine.googleapis.com/v1/{DS_PATH}/servingConfigs/default_search:search"
-    )
-    assert seen["body"] == {"query": "Agilent risk factors", "pageSize": 3}
+    assert seen[0].serving_config == f"{DS_PATH}/servingConfigs/default_search"
+    assert seen[0].query == "Agilent risk factors" and seen[0].page_size == 3
 
 
 # --- CLI -----------------------------------------------------------------------------------
@@ -500,13 +476,9 @@ def test_cli_all_runs_both_steps(
     assert calls["search"]["query"] == "Agilent risk factors"
 
 
-def test_cloud_publish_timeout_non_raising_and_discovery_engine_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Covers `run_bigquery_load_job(raise_on_timeout=False)` and Discovery Engine LRO timeout + retry."""
-    fake_bq = _BigQueryFake([{"status": {"state": "RUNNING"}}])
-    clock_bq = iter(range(0, 10_000, 60))
-    monkeypatch.setattr(cloud_publish.time, "monotonic", lambda: float(next(clock_bq)))
+def test_cloud_publish_timeout_non_raising_and_discovery_engine_timeout() -> None:
+    """Covers `run_bigquery_load_job(raise_on_timeout=False)` and Discovery Engine LRO timeout."""
+    fake_bq = _FakeBigQueryClient(job_kwargs={"result_error": TimeoutError("still running")})
     res = run_bigquery_load_job(
         project_id=PROJECT,
         dataset_id="sec_edgar",
@@ -516,35 +488,30 @@ def test_cloud_publish_timeout_non_raising_and_discovery_engine_timeout(
         max_bad_records=5,
         poll_timeout_seconds=100,
         raise_on_timeout=False,
-        http_client=_client(fake_bq),
-        credentials=_FakeCredentials(),
+        bq_client=fake_bq,
     )
     assert not res.done and res.state == "RUNNING"
-    load_cfg = fake_bq.inserted[0]["configuration"]["load"]
-    assert load_cfg["ignoreUnknownValues"] is True and load_cfg["maxBadRecords"] == 5
+    cfg = fake_bq.calls[0]["job_config"]
+    assert cfg.ignore_unknown_values is True and cfg.max_bad_records == 5
 
-    # `trigger_bigquery_chunks_load_job` returns the job_id without raising on timeout (`raise_on_timeout=False`)
-    clock_chunks = iter(range(0, 10_000, 60))
-    monkeypatch.setattr(cloud_publish.time, "monotonic", lambda: float(next(clock_chunks)))
     job_id = trigger_bigquery_chunks_load_job(
         project_id=PROJECT,
         dataset_id="sec_edgar",
         table_id="filing_chunks",
         source_gcs_uri=f"gs://{BUCKET}/manifests/bigquery_filing_chunks.jsonl",
         poll_timeout_seconds=100,
-        http_client=_client(_BigQueryFake([{"status": {"state": "RUNNING"}}])),
-        credentials=_FakeCredentials(),
+        bq_client=_FakeBigQueryClient(job_kwargs={"result_error": TimeoutError("slow")}),
     )
     assert job_id.startswith("load_filing_chunks_")
 
-    # Discovery Engine LRO poll timeout raises CloudPublishTimeoutError
-    clock_de = iter(range(0, 10_000, 50))
-    monkeypatch.setattr(cloud_publish.time, "monotonic", lambda: float(next(clock_de)))
+    timeout_op = _FakeImportOperation(
+        f"{DS_PATH}/branches/0/operations/op",
+        result_error=TimeoutError("still importing"),
+    )
     with pytest.raises(CloudPublishTimeoutError):
         import_vertex_ai_search_documents(
             project_id=PROJECT,
             bucket_name=BUCKET,
             timeout_seconds=100,
-            http_client=_client(_DiscoveryEngineFake([{"name": "op", "done": False}])),
-            credentials=_FakeCredentials(),
+            document_client=_FakeDocumentServiceClient(timeout_op),
         )

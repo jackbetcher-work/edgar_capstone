@@ -12,7 +12,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-import httpx
 import pytest
 
 from edgar_capstone.evals.bigquery_io import EvalBigQueryClient, load_schema_fields
@@ -1081,71 +1080,67 @@ def test_eval_report_formatting_json_export_env_and_lazy_package_exports(
 
 
 # ---------------------------------------------------------------------------------------------
-# BigQuery I/O (mocked REST)
+# BigQuery I/O (typed SDK fake)
 # ---------------------------------------------------------------------------------------------
 
 
-class _FakeCreds:
-    valid = True
-    token = "fake-token"
-
-
-def _bq_value(value: Any, field: dict[str, Any]) -> Any:
-    """Encode a python value the way tabledata.list returns it."""
-    if field.get("mode") == "REPEATED":
-        inner = {**field, "mode": "NULLABLE"}
-        return [{"v": _bq_value(v, inner)} for v in value or []]
-    if value is None:
-        return None
-    if field["type"] == "RECORD":
-        return {"f": [{"v": _bq_value(value.get(f["name"]), f)} for f in field["fields"]]}
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
-
-
 def test_bigquery_load_read_and_stream_round_trip(golden_items: list[GoldenEvalItem]) -> None:
-    schema = load_schema_fields("golden_eval_set")
     captured: dict[str, Any] = {"loaded_rows": []}
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        assert request.headers["Authorization"] == "Bearer fake-token"
-        if "/upload/bigquery/v2/" in url:
-            assert "uploadType=multipart" in url
-            body = request.content.decode()
-            config = json.loads(body.split("\r\n\r\n", 2)[1].split("\r\n--", 1)[0])
-            assert config["configuration"]["load"]["writeDisposition"] == "WRITE_TRUNCATE"
-            ndjson = body.split("application/octet-stream\r\n\r\n", 1)[1].rsplit("\r\n--", 1)[0]
-            captured["loaded_rows"] = [json.loads(line) for line in ndjson.splitlines()]
-            captured["job_id"] = config["jobReference"]["jobId"]
-            return httpx.Response(200, json={"status": {"state": "RUNNING"}})
-        if "/jobs/" in url:
-            return httpx.Response(
-                200,
-                json={
-                    "status": {"state": "DONE"},
-                    "statistics": {"load": {"outputRows": str(len(captured["loaded_rows"]))}},
-                },
-            )
-        if url.endswith("/tables/golden_eval_set"):
-            return httpx.Response(200, json={"schema": {"fields": schema}})
-        if "/tables/golden_eval_set/data" in url:
-            rows = [
-                {"f": [{"v": _bq_value(r.get(f["name"]), f)} for f in schema]}
-                for r in captured["loaded_rows"]
-            ]
-            return httpx.Response(200, json={"rows": rows})
-        if url.endswith("/tables/eval_results/insertAll"):
-            payload = json.loads(request.content)
-            captured["insert"] = payload
-            return httpx.Response(200, json={})
-        return httpx.Response(404, text=f"unexpected {url}")
+    class _FakeLoadJob:
+        def __init__(self, job_id: str, row_count: int) -> None:
+            self.job_id = job_id
+            self.state = "DONE"
+            self.error_result = None
+            self.errors = None
+            self.output_rows = row_count
+
+        def result(self, *, timeout: float | None = None) -> None:
+            _ = timeout
+
+    class _FakeEvalBqClient:
+        def load_table_from_file(
+            self,
+            file_obj: Any,
+            destination: str,
+            *,
+            job_id: str,
+            location: str,
+            job_config: Any,
+        ) -> _FakeLoadJob:
+            _ = (destination, location)
+            assert job_config.write_disposition == "WRITE_TRUNCATE"
+            ndjson = file_obj.read().decode("utf-8")
+            captured["loaded_rows"] = [json.loads(line) for line in ndjson.splitlines() if line]
+            captured["job_id"] = job_id
+            return _FakeLoadJob(job_id, len(captured["loaded_rows"]))
+
+        def list_rows(
+            self, table_fqn: str, *, page_size: int = 1000, timeout: float | None = None
+        ) -> list[dict[str, Any]]:
+            _ = (table_fqn, page_size, timeout)
+            return list(captured["loaded_rows"])
+
+        def insert_rows_json(
+            self,
+            table_fqn: str,
+            rows: list[dict[str, Any]],
+            *,
+            row_ids: list[str] | None = None,
+            **kwargs: Any,
+        ) -> list[Any]:
+            _ = (table_fqn, kwargs)
+            captured["insert"] = {
+                "rows": [
+                    {"insertId": rid, "json": r}
+                    for rid, r in zip(row_ids or [], rows, strict=False)
+                ]
+            }
+            return []
 
     client = EvalBigQueryClient(
         project_id="test-project",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-        credentials=_FakeCreds(),
+        bq_client=_FakeEvalBqClient(),
     )
     result = client.load_golden_dataset(golden_items)
     assert result["rows_loaded"] == len(golden_items)
@@ -1268,3 +1263,30 @@ def test_run_evals_cli_rejects_missing_dataset_and_validates_concurrency(tmp_pat
     assert parse_args(["-j", "6"]).concurrency == 6
     assert main(["--concurrency", "0"]) == 2
     assert main(["--dataset", str(tmp_path / "missing.jsonl"), "--output-dir", str(tmp_path)]) == 2
+
+
+def test_run_golden_evals_detects_commit_sha_before_running_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """detect_commit_sha() runs before any turn opens gRPC channels (avoids post-gRPC fork)."""
+    from edgar_capstone.evals import runner as eval_runner
+
+    call_order: list[str] = []
+
+    def fake_detect_commit_sha() -> str:
+        call_order.append("detect_commit_sha")
+        return "deadbeef1234"
+
+    def fake_turn(**_: Any) -> dict[str, Any]:
+        call_order.append("turn_fn")
+        return _response()
+
+    monkeypatch.setattr(eval_runner, "detect_commit_sha", fake_detect_commit_sha)
+    report = run_golden_evals(
+        [_scored_item()],
+        turn_fn=fake_turn,
+        judge_fn=_perfect_judge,
+        max_workers=1,
+    )
+    assert report.commit_sha == "deadbeef1234"
+    assert call_order == ["detect_commit_sha", "turn_fn"]

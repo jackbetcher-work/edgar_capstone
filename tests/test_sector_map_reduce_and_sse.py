@@ -7,7 +7,6 @@ from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import patch
 
-import httpx
 import pytest
 from fastapi.testclient import TestClient
 from google.adk.models.llm_request import LlmRequest
@@ -111,124 +110,103 @@ def _profile(ticker: str, name: str, fy: int) -> FinancialDataProfile:
 
 def test_sector_map_reduce_batches_emits_progress_and_verifies_quotes() -> None:
     sql_queries: list[str] = []
+    rows = [
+        (
+            "NVDA_2024_item_1a_0001",
+            "NVDA_2024",
+            "NVDA",
+            "NVIDIA CORP",
+            2024,
+            "item_1a",
+            "Item 1A. Risk Factors",
+            1,
+            "Initial generative AI adoption presents competition risks in FY2024.",
+            0.22,
+        ),
+        (
+            "NVDA_2026_item_1a_0001",
+            "NVDA_2026",
+            "NVDA",
+            "NVIDIA CORP",
+            2026,
+            "item_1a",
+            "Item 1A. Risk Factors",
+            1,
+            "Generative AI regulation and export controls could materially impact demand.",
+            0.10,
+        ),
+        (
+            "AAPL_2024_item_1a_0001",
+            "AAPL_2024",
+            "AAPL",
+            "Apple Inc.",
+            2024,
+            "item_1a",
+            "Item 1A. Risk Factors",
+            1,
+            "General technology competition could affect future product margins.",
+            0.28,
+        ),
+        (
+            "AAPL_2026_item_1a_0001",
+            "AAPL_2026",
+            "AAPL",
+            "Apple Inc.",
+            2026,
+            "item_1a",
+            "Item 1A. Risk Factors",
+            1,
+            "Deploying generative AI features creates privacy and reputational risk.",
+            0.15,
+        ),
+    ]
+    decoded_rows = [
+        {
+            "chunk_id": cid,
+            "profile_id": pid,
+            "ticker": tk,
+            "company_name": cname,
+            "gics_sector": "Information Technology",
+            "fiscal_year": fy,
+            "period_of_report": f"{fy}-01-25",
+            "filing_date": f"{fy}-02-25",
+            "accession_number": f"0001045810-{str(fy)[-2:]}-000021",
+            "section_id": sec,
+            "section_title": stitle,
+            "chunk_index": cidx,
+            "chunk_text": txt,
+            "sec_filing_url": f"https://www.sec.gov/{tk.lower()}-{fy}.htm",
+            "unstructured_gcs_uri": f"gs://bucket/{tk}/{fy}.md",
+            "distance": dist,
+        }
+        for cid, pid, tk, cname, fy, sec, stitle, cidx, txt, dist in rows
+    ]
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        url = str(request.url)
-        body = json.loads(request.content.decode("utf-8")) if request.content else {}
-        if ":predict" in url and "text-embedding-005" in url:
-            return httpx.Response(
-                200, json={"predictions": [{"embeddings": {"values": [0.1] * 8}}]}
+    class _FakeBqJob:
+        def result(self, **_kw: Any) -> list[dict[str, Any]]:
+            return list(decoded_rows)
+
+    class _FakeBq:
+        def query(self, sql: str, **_kw: Any) -> _FakeBqJob:
+            sql_queries.append(sql)
+            return _FakeBqJob()
+
+    class _FakeModels:
+        def embed_content(self, **_kw: Any) -> genai_types.EmbedContentResponse:
+            return genai_types.EmbedContentResponse(
+                embeddings=[genai_types.ContentEmbedding(values=[0.1] * 8)]
             )
-        if "bigquery.googleapis.com" in url:
-            sql_queries.append(body["query"])
-            rows = [
-                (
-                    "NVDA_2024_item_1a_0001",
-                    "NVDA_2024",
-                    "NVDA",
-                    "NVIDIA CORP",
-                    "2024",
-                    "item_1a",
-                    "Item 1A. Risk Factors",
-                    "1",
-                    "Initial generative AI adoption presents competition risks in FY2024.",
-                    "0.22",
-                ),
-                (
-                    "NVDA_2026_item_1a_0001",
-                    "NVDA_2026",
-                    "NVDA",
-                    "NVIDIA CORP",
-                    "2026",
-                    "item_1a",
-                    "Item 1A. Risk Factors",
-                    "1",
-                    "Generative AI regulation and export controls could materially impact demand.",
-                    "0.10",
-                ),
-                (
-                    "AAPL_2024_item_1a_0001",
-                    "AAPL_2024",
-                    "AAPL",
-                    "Apple Inc.",
-                    "2024",
-                    "item_1a",
-                    "Item 1A. Risk Factors",
-                    "1",
-                    "General technology competition could affect future product margins.",
-                    "0.28",
-                ),
-                (
-                    "AAPL_2026_item_1a_0001",
-                    "AAPL_2026",
-                    "AAPL",
-                    "Apple Inc.",
-                    "2026",
-                    "item_1a",
-                    "Item 1A. Risk Factors",
-                    "1",
-                    "Deploying generative AI features creates privacy and reputational risk.",
-                    "0.15",
-                ),
-            ]
-            return httpx.Response(
-                200,
-                json={
-                    "jobComplete": True,
-                    "schema": {
-                        "fields": [
-                            {"name": "chunk_id", "type": "STRING"},
-                            {"name": "profile_id", "type": "STRING"},
-                            {"name": "ticker", "type": "STRING"},
-                            {"name": "company_name", "type": "STRING"},
-                            {"name": "gics_sector", "type": "STRING"},
-                            {"name": "fiscal_year", "type": "INTEGER"},
-                            {"name": "period_of_report", "type": "STRING"},
-                            {"name": "filing_date", "type": "STRING"},
-                            {"name": "accession_number", "type": "STRING"},
-                            {"name": "section_id", "type": "STRING"},
-                            {"name": "section_title", "type": "STRING"},
-                            {"name": "chunk_index", "type": "INTEGER"},
-                            {"name": "chunk_text", "type": "STRING"},
-                            {"name": "sec_filing_url", "type": "STRING"},
-                            {"name": "unstructured_gcs_uri", "type": "STRING"},
-                            {"name": "distance", "type": "FLOAT"},
-                        ]
-                    },
-                    "rows": [
-                        {
-                            "f": [
-                                {"v": cid},
-                                {"v": pid},
-                                {"v": tk},
-                                {"v": cname},
-                                {"v": "Information Technology"},
-                                {"v": fy},
-                                {"v": f"{fy}-01-25"},
-                                {"v": f"{fy}-02-25"},
-                                {"v": f"0001045810-{fy[-2:]}-000021"},
-                                {"v": sec},
-                                {"v": stitle},
-                                {"v": cidx},
-                                {"v": txt},
-                                {"v": f"https://www.sec.gov/{tk.lower()}-{fy}.htm"},
-                                {"v": f"gs://bucket/{tk}/{fy}.md"},
-                                {"v": dist},
-                            ]
-                        }
-                        for cid, pid, tk, cname, fy, sec, stitle, cidx, txt, dist in rows
-                    ],
-                },
-            )
-        return httpx.Response(404, text=url)
+
+    class _FakeGenAi:
+        models = _FakeModels()
 
     progress_events: list[tuple[str, str, dict[str, Any] | None]] = []
     with preserve_gcp_caches():
         configure_gcp_tool_adapters(
             GcpToolAdapters(
                 GcpToolConfig(project_id="iron-radio-514217-q7", embedding_dimensions=8),
-                http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-                credentials=_FakeCreds(),
+                bq_client=_FakeBq(),
+                genai_client=_FakeGenAi(),
             )
         )
         profiles = [

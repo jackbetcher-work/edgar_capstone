@@ -8,12 +8,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import httpx
 import numpy as np
 
 from edgar_capstone.common.formatting import utc_now_iso
 from edgar_capstone.dataset.models import FinancialDataProfile
-from edgar_capstone.gcp.bigquery import BigQueryRestClient
+from edgar_capstone.gcp.bigquery import BigQueryClientWrapper
 from edgar_capstone.gcp.defaults import (
     DEFAULT_BIGQUERY_DATASET_ID,
     DEFAULT_LOCATION,
@@ -585,37 +584,40 @@ def evaluate_chunk_health_from_bigquery(
     filing_coverage_view: str = "v_filing_chunk_coverage",
     expected_embedding_dim: int = 768,
     embedding_model: str = "text-embedding-005",
-    bq_client: BigQueryRestClient | None = None,
-    http_client: httpx.Client | None = None,
+    bq_client: Any | None = None,
     credentials: Any | None = None,
 ) -> ChunkHealthReport:
     """Evaluate a live `ChunkHealthReport` directly from BigQuery health & coverage views."""
-    owns_client = bq_client is None
-    client = bq_client or BigQueryRestClient(
-        project_id=project_id,
-        dataset_id=dataset_id,
-        location=location,
-        http_client=http_client,
-        credentials=credentials,
-        default_timeout=60.0,
-        quota_project_id=project_id,
+    owns_wrapper = not callable(getattr(bq_client, "run_query", None))
+    wrapper = (
+        bq_client
+        if callable(getattr(bq_client, "run_query", None))
+        else BigQueryClientWrapper(
+            project_id=project_id,
+            dataset_id=dataset_id,
+            location=location,
+            bq_client=bq_client,
+            credentials=credentials,
+            default_timeout=60.0,
+            quota_project_id=project_id,
+        )
     )
     try:
-        health_rows = client.run_query(
-            f"SELECT * FROM {client.table_ref(chunk_health_view)} "
+        health_rows = wrapper.run_query(
+            f"SELECT * FROM {wrapper.table_ref(chunk_health_view)} "
             "ORDER BY gics_sector ASC, section_id ASC",
-            timeout_ms=60000,
+            timeout=60.0,
         )
-        coverage_rows = client.run_query(
+        coverage_rows = wrapper.run_query(
             f"SELECT profile_id, filing_chunk_status "
-            f"FROM {client.table_ref(filing_coverage_view)} "
+            f"FROM {wrapper.table_ref(filing_coverage_view)} "
             "WHERE filing_chunk_status IN ('UNINDEXED', 'PARTIAL_SECTIONS') "
             "ORDER BY profile_id ASC",
-            timeout_ms=60000,
+            timeout=60.0,
         )
     finally:
-        if owns_client:
-            client.close()
+        if owns_wrapper:
+            wrapper.close()
 
     if not health_rows:
         raise RuntimeError(

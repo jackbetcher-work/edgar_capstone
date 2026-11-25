@@ -5,10 +5,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
+from google.api_core import exceptions as gcp_exceptions
 
-from edgar_capstone.gcp.lro import OperationError
 from scripts import bootstrap_tfstate_bucket as bootstrap_mod
 from scripts.bootstrap_tfstate_bucket import (
     ensure_bootstrap_apis,
@@ -85,48 +84,31 @@ def test_bootstrap_patches_existing_bucket_only_when_hardening_missing() -> None
     existing.patch.assert_not_called()
 
 
-def test_ensure_bootstrap_apis_polls_lro_and_handles_errors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, str]] = []
+def test_ensure_bootstrap_apis_uses_service_usage_sdk_and_handles_errors() -> None:
+    mock_op = MagicMock()
+    mock_op.result.return_value = SimpleNamespace(services=[])
+    mock_su = MagicMock()
+    mock_su.batch_enable_services.return_value = mock_op
 
-    def _handler(request: httpx.Request) -> httpx.Response:
-        calls.append((request.method, str(request.url)))
-        if request.method == "POST":
-            return httpx.Response(200, json={"name": "operations/batch-1", "done": False})
-        return httpx.Response(200, json={"name": "operations/batch-1", "done": True})
-
-    fake_creds = MagicMock(valid=True, token="tok")
-    real_cls = bootstrap_mod.GcpRestClient
-
-    def _make_rest(*, default_timeout: float = 60.0) -> object:
-        return real_cls(
-            http_client=httpx.Client(transport=httpx.MockTransport(_handler)),
-            credentials=fake_creds,
-            default_timeout=default_timeout,
-        )
-
-    monkeypatch.setattr(bootstrap_mod, "GcpRestClient", _make_rest)
-    ensure_bootstrap_apis(project_id="test-proj", timeout_seconds=10.0)
-    assert len(calls) == 2
-    assert calls[0][0] == "POST" and calls[0][1].endswith(":batchEnable")
-    assert calls[1][0] == "GET" and calls[1][1].endswith("/operations/batch-1")
-
-    # Operation payload error raises OperationError
-    def _err_handler(_req: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"error": {"code": 7, "message": "denied"}})
-
-    monkeypatch.setattr(
-        bootstrap_mod,
-        "GcpRestClient",
-        lambda *, default_timeout=60.0: real_cls(
-            http_client=httpx.Client(transport=httpx.MockTransport(_err_handler)),
-            credentials=fake_creds,
-            default_timeout=default_timeout,
-        ),
+    ensure_bootstrap_apis(
+        project_id="test-proj",
+        timeout_seconds=10.0,
+        service_usage_client=mock_su,
     )
-    with pytest.raises(OperationError, match="denied"):
-        ensure_bootstrap_apis(project_id="test-proj")
+    mock_su.batch_enable_services.assert_called_once()
+    req = mock_su.batch_enable_services.call_args.kwargs["request"]
+    assert req.parent == "projects/test-proj"
+    assert list(req.service_ids) == [
+        "serviceusage.googleapis.com",
+        "cloudresourcemanager.googleapis.com",
+        "iam.googleapis.com",
+    ]
+    mock_op.result.assert_called_once_with(timeout=10.0)
+
+    # SDK permission error propagates cleanly
+    mock_op.result.side_effect = gcp_exceptions.PermissionDenied("denied")
+    with pytest.raises(gcp_exceptions.PermissionDenied, match="denied"):
+        ensure_bootstrap_apis(project_id="test-proj", service_usage_client=mock_su)
 
 
 def test_bootstrap_cli_defaults_and_main_error_exit(monkeypatch: pytest.MonkeyPatch) -> None:

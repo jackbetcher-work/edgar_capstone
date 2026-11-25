@@ -2,7 +2,7 @@
 
 One semantic-similarity test (`@pytest.mark.live`) calls live Vertex AI `text-embedding-005` with ADC.
 All format, chunking, retry, checkpointing, health monitoring, and staged pipeline tests run offline
-against `httpx.MockTransport` over the real `VertexAIEmbedder`.
+against typed `google-genai` fakes over the real `VertexAIEmbedder`.
 """
 
 from __future__ import annotations
@@ -11,9 +11,8 @@ import json
 import math
 import os
 from pathlib import Path
-from unittest.mock import MagicMock
+from typing import Any
 
-import httpx
 import numpy as np
 import pytest
 
@@ -350,36 +349,44 @@ def _mock_vertex_embedder(
     fail_after: int | None = None,
     **kwargs: object,
 ) -> VertexAIEmbedder:
-    """Build a VertexAIEmbedder backed by an httpx MockTransport."""
+    """Build a VertexAIEmbedder backed by a typed fake ``google-genai`` client."""
+    from google.genai import errors as genai_errors
+    from google.genai import types as genai_types
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content.decode("utf-8"))
-        n = len(body["instances"])
-        if reject_over is not None and n > reject_over:
-            return httpx.Response(
-                400,
-                json={
-                    "error": {
-                        "message": "Unable to submit request because the input token count is 25000 but the model supports up to 20000."
-                    }
-                },
+    class _FakeModels:
+        def embed_content(
+            self, *, model: str, contents: list[str], config: Any = None
+        ) -> genai_types.EmbedContentResponse:
+            _ = (model, config)
+            n = len(contents)
+            if reject_over is not None and n > reject_over:
+                raise genai_errors.ClientError(
+                    400,
+                    {
+                        "error": {
+                            "code": 400,
+                            "message": "Unable to submit request because the input token count is 25000 but the model supports up to 20000.",
+                        }
+                    },
+                )
+            if fail_after is not None and len(requests_seen) >= fail_after:
+                raise genai_errors.ClientError(403, {"error": {"code": 403, "message": "quota"}})
+            requests_seen.append(n)
+            return genai_types.EmbedContentResponse(
+                embeddings=[
+                    genai_types.ContentEmbedding(
+                        values=[0.123456789] * DEFAULT_EMBEDDING_DIMENSIONS
+                    )
+                    for _ in range(n)
+                ]
             )
-        if fail_after is not None and len(requests_seen) >= fail_after:
-            return httpx.Response(403, json={"error": {"message": "quota"}})
-        requests_seen.append(n)
-        preds = [
-            {"embeddings": {"values": [0.123456789] * DEFAULT_EMBEDDING_DIMENSIONS}}
-            for _ in range(n)
-        ]
-        return httpx.Response(200, json={"predictions": preds})
 
-    creds = MagicMock()
-    creds.valid = True
-    creds.token = "fake-oauth-token"
+    class _FakeGenAi:
+        models = _FakeModels()
+
     return VertexAIEmbedder(
         project_id="iron-radio-514217-q7",
-        http_client=httpx.Client(transport=httpx.MockTransport(handler)),
-        credentials=creds,
+        genai_client=_FakeGenAi(),
         **kwargs,  # type: ignore[arg-type]
     )
 
@@ -621,46 +628,55 @@ def test_monitoring_edge_cases_embedder_retries_and_lazy_package_exports(
     rep = evaluate_chunk_health([chunks[0]], profiles=[prof])
     assert rep.anomalies.non_finite_embedding == 1 and rep.anomalies.oversized_chunk == 1
 
-    # Embedder retry on httpx.TransportError, HTTP 429, and mismatched count error
+    # Embedder retry on transient timeout, HTTP 429, and mismatched count error
     monkeypatch.setattr(time, "sleep", lambda _s: None)
+    from google.genai import errors as genai_errors
+    from google.genai import types as genai_types
+
     calls = {"n": 0}
 
-    def retry_handler(request: httpx.Request) -> httpx.Response:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise httpx.ConnectError("transient network drop", request=request)
-        if calls["n"] == 2:
-            return httpx.Response(429, text="rate limited")
-        return httpx.Response(
-            200,
-            json={"predictions": [{"embeddings": {"values": [0.25] * 4}}]},
-        )
+    class _RetryingModels:
+        def embed_content(
+            self, *, model: str, contents: list[str], config: Any = None
+        ) -> genai_types.EmbedContentResponse:
+            _ = (model, contents, config)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise TimeoutError("transient network drop")
+            if calls["n"] == 2:
+                raise genai_errors.ClientError(
+                    429, {"error": {"code": 429, "message": "rate limited"}}
+                )
+            return genai_types.EmbedContentResponse(
+                embeddings=[genai_types.ContentEmbedding(values=[0.25] * 4)]
+            )
 
-    creds = MagicMock()
-    creds.valid = True
-    creds.token = "tok"
+    class _RetryingGenAi:
+        models = _RetryingModels()
+
     emb = VertexAIEmbedder(
         project_id="p",
         dimensions=4,
         max_retries=3,
-        http_client=httpx.Client(transport=httpx.MockTransport(retry_handler)),
-        credentials=creds,
+        genai_client=_RetryingGenAi(),
     )
     vecs = emb.embed_texts(["hello"], titles=["Title"])
     assert vecs == [[0.25, 0.25, 0.25, 0.25]]
     assert calls["n"] == 3
 
     # Mismatched prediction count raises RuntimeError
+    class _EmptyModels:
+        def embed_content(self, **_kw: Any) -> genai_types.EmbedContentResponse:
+            return genai_types.EmbedContentResponse(embeddings=[])
+
+    class _EmptyGenAi:
+        models = _EmptyModels()
+
     bad_count_emb = VertexAIEmbedder(
         project_id="p",
         dimensions=4,
         max_retries=1,
-        http_client=httpx.Client(
-            transport=httpx.MockTransport(
-                lambda _req: httpx.Response(200, json={"predictions": []})
-            )
-        ),
-        credentials=creds,
+        genai_client=_EmptyGenAi(),
     )
     with pytest.raises(RuntimeError, match="returned 0 embeddings"):
         bad_count_emb.embed_texts(["one"])

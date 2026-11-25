@@ -12,7 +12,12 @@ from typing import Any, ParamSpec, TypeVar
 
 import httpx
 
-from edgar_capstone.gcp.rest_client import GcpRateLimitError, GcpTimeoutError, parse_retry_after
+from edgar_capstone.gcp.errors import (
+    GcpRateLimitError,
+    GcpTimeoutError,
+    parse_retry_after,
+    translate_gcp_sdk_error,
+)
 from edgar_capstone.observability.tracing import (
     add_span_event,
     mark_span_error,
@@ -57,6 +62,13 @@ def _is_retryable_exception(exc: BaseException) -> tuple[bool, float | None]:
         status = exc.response.status_code
         if status in (429, 500, 502, 503, 504):
             return True, parse_retry_after(exc.response)
+    exc_module = type(exc).__module__ or ""
+    if exc_module.startswith(("google.api_core", "google.genai", "requests.exceptions")):
+        translated = translate_gcp_sdk_error(exc)
+        if isinstance(translated, GcpRateLimitError):
+            return True, translated.retry_after_seconds
+        if isinstance(translated, GcpTimeoutError):
+            return True, None
     return False, None
 
 

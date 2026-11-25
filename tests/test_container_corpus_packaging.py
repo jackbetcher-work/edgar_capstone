@@ -158,13 +158,19 @@ def test_dockerfile_dockerignore_and_gitignore_exclude_corpus_and_credentials() 
 
 
 def test_runtime_dependencies_exclude_dev_and_ingest_packages() -> None:
-    """Keep heavy ingestion / dev SDKs out of runtime `requirements.txt` and core deps."""
+    """Keep ingestion-only & dev SDKs out of runtime `requirements.txt` and core deps."""
     req_lines = [
         line.strip().lower()
         for line in (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    for forbidden_pkg in ("pytest", "ruff", "pandas", "edgartools", "google-cloud-storage"):
+    for forbidden_pkg in (
+        "pytest",
+        "ruff",
+        "pandas",
+        "edgartools",
+        "google-cloud-service-usage",
+    ):
         assert not any(line.startswith(forbidden_pkg) for line in req_lines), (
             f"{forbidden_pkg} should not be in runtime requirements.txt"
         )
@@ -172,9 +178,18 @@ def test_runtime_dependencies_exclude_dev_and_ingest_packages() -> None:
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     runtime_deps = [d.lower() for d in pyproject["project"]["dependencies"]]
     ingest_deps = [d.lower() for d in pyproject["project"]["optional-dependencies"]["ingest"]]
-    for pkg in ("edgartools", "pandas", "google-cloud-storage"):
+    for pkg in ("edgartools", "pandas", "google-cloud-service-usage"):
         assert not any(d.startswith(pkg) for d in runtime_deps)
         assert any(d.startswith(pkg) for d in ingest_deps)
+    for runtime_sdk in (
+        "google-cloud-bigquery",
+        "google-cloud-storage",
+        "google-cloud-firestore",
+        "google-cloud-modelarmor",
+        "google-cloud-discoveryengine",
+        "pyjwt",
+    ):
+        assert any(d.startswith(runtime_sdk) for d in runtime_deps)
 
 
 def _run_isolated_import(code: str) -> dict[str, Any]:

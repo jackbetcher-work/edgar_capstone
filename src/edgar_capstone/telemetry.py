@@ -3,16 +3,13 @@
 Implements:
 1. Streaming LLM token/cost/latency telemetry (`llm_telemetry_events`), conversational session &
    tool-usage analytics (`session_telemetry_events`), async LLM-as-a-Judge evaluation updates,
-   and 10-K security/access audit trails (`security_audit_logs`) to Google BigQuery sink tables
-   via REST v2 `tabledata.insertAll` plus structured Cloud Logging JSON emission (the source of
-   the `sec_edgar/*` log-based metrics and the `google_logging_project_sink` ops-log export).
+   and 10-K security/access audit trails (`security_audit_logs`) to Google BigQuery via
+   `google-cloud-bigquery` plus structured Cloud Logging JSON emission.
 2. Persistent analyst feedback (`analyst_feedback`) and multi-instance conversational session
-   storage (`analyst_sessions`) backed by Google Cloud Firestore Native REST v1
-   (`documents` & `:runQuery`) built on the shared `FirestoreCollectionStore` transport.
+   storage (`analyst_sessions`) backed by `google-cloud-firestore`.
 3. Sink selection (`auto` | `gcp` | `local`): Cloud Run streams to BigQuery & Firestore, while
    `local` keeps telemetry and feedback in memory so test and developer runs don't write to the
    production telemetry tables.
-4. Backward-compatible re-exports of the Firestore wire codec (`edgar_capstone.gcp.firestore`).
 """
 
 from __future__ import annotations
@@ -25,18 +22,18 @@ import threading
 import time
 import uuid
 from collections import Counter, OrderedDict, defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
-import httpx
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
 
 from edgar_capstone.common.env import TRUTHY_ENV_VALUES, env_bool
 from edgar_capstone.common.formatting import percentile, utc_now_iso
 from edgar_capstone.firestore_stores import (
+    DEFAULT_FIRESTORE_DATABASE_ID,
     DEFAULT_FIRESTORE_FEEDBACK_COLLECTION,
     DEFAULT_FIRESTORE_SESSION_COLLECTION,
     FirestoreFeedbackStore,
@@ -44,9 +41,8 @@ from edgar_capstone.firestore_stores import (
     session_firestore_doc_id,
 )
 from edgar_capstone.gcp.bigquery import (
-    BIGQUERY_API_ROOT,
-    bq_scalar_param,
-    decode_bq_rows,
+    BigQueryClientWrapper,
+    make_scalar_param,
     validate_bq_identifier,
 )
 from edgar_capstone.gcp.defaults import (
@@ -57,18 +53,10 @@ from edgar_capstone.gcp.defaults import (
     resolve_gcp_location,
     resolve_gcp_project_id,
 )
-from edgar_capstone.gcp.firestore import (
-    DEFAULT_FIRESTORE_DATABASE_ID,
-    decode_firestore_document,
-    decode_firestore_value,
-    encode_firestore_fields,
-    encode_firestore_value,
-)
-from edgar_capstone.gcp.rest_client import (
+from edgar_capstone.gcp.errors import (
+    GcpClientError,
     GcpNotFoundError,
     GcpRateLimitError,
-    GcpRestClient,
-    GcpRestError,
     GcpTimeoutError,
     parse_retry_after,
 )
@@ -114,11 +102,7 @@ __all__ = [
     "TelemetryTimeoutError",
     "cloud_sink_logger",
     "configure_telemetry_stores",
-    "decode_firestore_document",
-    "decode_firestore_value",
     "emit_cloud_logging_sink_record",
-    "encode_firestore_fields",
-    "encode_firestore_value",
     "get_feedback_store",
     "get_telemetry_sink",
     "parse_retry_after",
@@ -127,7 +111,7 @@ __all__ = [
 ]
 
 
-class TelemetrySinkError(GcpRestError):
+class TelemetrySinkError(GcpClientError):
     """Raised when streaming or persisting telemetry/feedback to GCP fails."""
 
 
@@ -139,16 +123,16 @@ class TelemetryRateLimitError(TelemetrySinkError, GcpRateLimitError):
     """Raised when BigQuery or Firestore returns HTTP 429 Too Many Requests."""
 
     def __init__(self, message: str, retry_after_seconds: float | None = None) -> None:
-        GcpRestError.__init__(self, message, status_code=429)
+        GcpClientError.__init__(self, message, status_code=429)
         self.retry_after_seconds = retry_after_seconds
 
 
 class TelemetryTimeoutError(TelemetrySinkError, GcpTimeoutError):
-    """Raised when a BigQuery or Firestore REST request times out."""
+    """Raised when a BigQuery or Firestore request times out."""
 
 
-def _translate_gcp_error(exc: GcpRestError) -> TelemetrySinkError:
-    """Translate `GcpRestError` subclasses into matching `Telemetry*Error` instances."""
+def _translate_gcp_error(exc: GcpClientError) -> TelemetrySinkError:
+    """Translate `GcpClientError` subclasses into matching `Telemetry*Error` instances."""
     if isinstance(exc, TelemetrySinkError):
         return exc
     if isinstance(exc, GcpTimeoutError):
@@ -275,9 +259,8 @@ def _should_fallback_to_local(exc: BaseException, *, strict_gcp: bool) -> bool:
         (
             DefaultCredentialsError,
             RefreshError,
-            GcpRestError,
+            GcpClientError,
             TelemetrySinkError,
-            httpx.HTTPError,
             OSError,
         ),
     )
@@ -296,28 +279,27 @@ class _SessionCumulativeTracker:
     reports_generated: int = 0
 
 
-class BigQueryTelemetrySink(GcpRestClient):
+class BigQueryTelemetrySink(BigQueryClientWrapper):
     """Streams LLM token/cost/latency events, session analytics, and audit logs to BigQuery."""
 
     def __init__(
         self,
         config: TelemetryConfig | None = None,
         *,
-        http_client: httpx.Client | None = None,
+        bq_client: Any | None = None,
         credentials: Any | None = None,
         max_local_records: int = DEFAULT_MAX_LOCAL_RECORDS,
         max_sessions: int = DEFAULT_MAX_TRACKED_SESSIONS,
     ) -> None:
-        super().__init__(
-            http_client=http_client,
-            credentials=credentials,
-            default_timeout=15.0,
-            max_connections=32,
-            max_keepalive_connections=16,
-        )
         self.config = config or TelemetryConfig.from_env()
-        self.project_id = validate_bq_identifier(self.config.project_id, "project_id")
-        self.dataset_id = validate_bq_identifier(self.config.bq_dataset_id, "dataset_id")
+        super().__init__(
+            project_id=self.config.project_id,
+            dataset_id=self.config.bq_dataset_id,
+            location=self.config.location,
+            bq_client=bq_client,
+            credentials=credentials,
+            default_timeout=20.0,
+        )
         self.llm_table = validate_bq_identifier(
             self.config.bq_llm_telemetry_table, "llm_telemetry_table"
         )
@@ -343,32 +325,10 @@ class BigQueryTelemetrySink(GcpRestClient):
         self._last_streamed_at: str | None = None
         self._last_error: str | None = None
         self._closed = False
-        # Non-blocking background streaming pool for live BigQuery insertAll when no test client
-        # is injected; Cloud Logging JSON sink emission remains synchronous for trace correlation.
+        # Non-blocking background streaming pool for live BigQuery insert_rows_json when no test
+        # client is injected; Cloud Logging JSON sink emission remains synchronous for trace link.
         self._async_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="edgar-bq-sink")
         self._pending_writes: list[Future[Any]] = []
-
-    def _request_json(
-        self,
-        method: str,
-        url: str,
-        *,
-        json_body: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        try:
-            resp = self._send_request(
-                method,
-                url,
-                json_body=json_body,
-                params=params,
-                not_found_as_dedicated_error=True,
-                **kwargs,
-            )
-        except GcpRestError as exc:
-            raise _translate_gcp_error(exc) from exc
-        return resp.json() if resp.content else {}
 
     def flush_async_writes(self, timeout: float = 10.0) -> int:
         """Wait for any in-flight background BigQuery streaming writes to complete."""
@@ -424,25 +384,26 @@ class BigQueryTelemetrySink(GcpRestClient):
         table_id: str,
         rows: list[tuple[str, dict[str, Any]]],
     ) -> dict[str, Any]:
-        """Stream rows to BigQuery REST v2 `tabledata.insertAll` with deterministic `insertId`s."""
+        """Stream rows via ``google-cloud-bigquery`` ``insert_rows_json`` with deterministic IDs."""
         if not rows:
             return {"inserted": 0, "table_id": table_id}
         safe_table = validate_bq_identifier(table_id, "table_id")
-        url = (
-            f"{BIGQUERY_API_ROOT}/projects/{self.project_id}"
-            f"/datasets/{self.dataset_id}/tables/{safe_table}/insertAll"
-        )
-        payload = {
-            "kind": "bigquery#tableDataInsertAllRequest",
-            "skipInvalidRows": False,
-            "ignoreUnknownValues": True,
-            "rows": [{"insertId": insert_id, "json": row_data} for insert_id, row_data in rows],
-        }
-        resp_data = self._request_json("POST", url, json_body=payload)
-        insert_errors = resp_data.get("insertErrors") if isinstance(resp_data, dict) else None
+        row_ids = [insert_id for insert_id, _ in rows]
+        json_rows = [row_data for _, row_data in rows]
+        try:
+            insert_errors = self.insert_rows_json(
+                safe_table,
+                json_rows,
+                row_ids=row_ids,
+                skip_invalid_rows=False,
+                ignore_unknown_values=True,
+                timeout=15.0,
+            )
+        except GcpClientError as exc:
+            raise _translate_gcp_error(exc) from exc
         if insert_errors:
             raise TelemetrySinkError(
-                f"BigQuery insertAll rejected rows for {self.dataset_id}.{safe_table}: "
+                f"BigQuery insert_rows_json rejected rows for {self.dataset_id}.{safe_table}: "
                 f"{json.dumps(insert_errors)[:400]}"
             )
         now_iso = utc_now_iso()
@@ -460,21 +421,21 @@ class BigQueryTelemetrySink(GcpRestClient):
     def run_query(
         self,
         sql: str,
-        query_parameters: list[dict[str, Any]] | None = None,
+        query_parameters: Sequence[Any] | None = None,
+        *,
+        timeout: float | None = 20.0,
+        max_results: int | None = None,
     ) -> list[dict[str, Any]]:
         """Execute a parameterized Standard SQL query against BigQuery sink tables/views."""
-        url = f"{BIGQUERY_API_ROOT}/projects/{self.project_id}/queries"
-        payload: dict[str, Any] = {
-            "query": sql,
-            "useLegacySql": False,
-            "location": self.config.location,
-            "timeoutMs": 20000,
-        }
-        if query_parameters:
-            payload["parameterMode"] = "NAMED"
-            payload["queryParameters"] = query_parameters
-        data = self._request_json("POST", url, json_body=payload)
-        return decode_bq_rows(data if isinstance(data, dict) else {})
+        try:
+            return super().run_query(
+                sql,
+                query_parameters=query_parameters,
+                timeout=timeout,
+                max_results=max_results,
+            )
+        except GcpClientError as exc:
+            raise _translate_gcp_error(exc) from exc
 
     def _query_filtered_table(
         self,
@@ -491,11 +452,11 @@ class BigQueryTelemetrySink(GcpRestClient):
         """Query a BigQuery sink table with optional equality filter and local deque fallback."""
         bounded = max(1, min(int(limit), 500))
         cleaned_val = filter_value.strip() if filter_value and filter_value.strip() else None
-        params = [bq_scalar_param("limit", "INT64", bounded)]
+        params: list[Any] = [make_scalar_param("limit", "INT64", bounded)]
         where_sql = ""
         if filter_column and cleaned_val:
             where_sql = f"WHERE {filter_column} = @{filter_column} "
-            params.append(bq_scalar_param(filter_column, "STRING", cleaned_val))
+            params.append(make_scalar_param(filter_column, "STRING", cleaned_val))
         sql = (
             f"SELECT {select_columns} "
             f"FROM {self._table_ref(table_id)} "
@@ -582,7 +543,7 @@ class BigQueryTelemetrySink(GcpRestClient):
         *,
         operation_name: str,
         sql: str,
-        query_parameters: list[dict[str, Any]],
+        query_parameters: Sequence[Any],
         local_fallback: Callable[[], list[dict[str, Any]]],
     ) -> list[dict[str, Any]]:
         """Execute a BigQuery query when GCP is enabled, falling back locally in auto mode."""
@@ -661,9 +622,9 @@ class BigQueryTelemetrySink(GcpRestClient):
         if not attempt_gcp:
             return "local_buffer"
 
-        # When running live (no injected test http_client or credentials), stream BigQuery insertAll
+        # When running live (no injected test bq_client or credentials), stream BigQuery rows
         # off the request thread so interactive /api/v1/chat latency is never blocked by telemetry I/O.
-        if self._http_client is None and self._credentials is None:
+        if self._injected_client is None and self._credentials is None:
             with self._lock:
                 if self._closed:
                     self._fallback_counts[table_id] += 1
@@ -1201,7 +1162,7 @@ class BigQueryTelemetrySink(GcpRestClient):
         return self._query_with_local_fallback(
             operation_name="query_llm_telemetry_explore",
             sql=sql,
-            query_parameters=[bq_scalar_param("limit", "INT64", bounded)],
+            query_parameters=[make_scalar_param("limit", "INT64", bounded)],
             local_fallback=_local_aggregate,
         )
 

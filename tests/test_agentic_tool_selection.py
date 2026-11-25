@@ -5,8 +5,8 @@ pre-computed. Tool outputs are hydrated from ADK `session_state` before claim ve
 Markdown rendering, and the numeric fact-check, and only the payloads the agent produced are
 returned with the turn (and rendered as cards by the UI).
 
-Runs deterministically offline via `use_fake_gcp_adapters()` (`httpx.MockTransport` over the real
-GCP REST adapters) and scripted ADK `BaseLlm`s with `skip_background_judge=True`.
+Runs deterministically offline via `use_fake_gcp_adapters()` (typed fake GCP SDK clients over the
+real GCP adapters) and scripted ADK `BaseLlm`s with `skip_background_judge=True`.
 """
 
 from __future__ import annotations

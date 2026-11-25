@@ -1,67 +1,144 @@
-"""Google Cloud Firestore Native REST v1 stores for analyst feedback and session memory."""
+"""Google Cloud Firestore SDK stores for analyst feedback and multi-instance session memory."""
 
 from __future__ import annotations
 
 import hashlib
 import logging
 import os
+import threading
 import time
 import uuid
 from collections import deque
+from datetime import UTC, datetime
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal
 
-import httpx
-
 from edgar_capstone.common.formatting import utc_now_iso
-from edgar_capstone.gcp.firestore import (
-    DEFAULT_FIRESTORE_DATABASE_ID,
-    FirestoreCollectionStore,
-    encode_firestore_fields,
-)
-from edgar_capstone.gcp.rest_client import GcpRestError
+from edgar_capstone.gcp.bigquery import validate_bq_identifier
+from edgar_capstone.gcp.errors import translate_gcp_sdk_error
 
 if TYPE_CHECKING:
     from edgar_capstone.telemetry import TelemetryConfig
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_FIRESTORE_DATABASE_ID = "(default)"
 DEFAULT_FIRESTORE_FEEDBACK_COLLECTION = "analyst_feedback"
 DEFAULT_FIRESTORE_SESSION_COLLECTION = "analyst_sessions"
 DEFAULT_MAX_LOCAL_RECORDS = 500
 
 
-class _TelemetryFirestoreStore(FirestoreCollectionStore):
-    """`FirestoreCollectionStore` subclass translating `GcpRestError` into `Telemetry*Error`."""
+def _normalize_firestore_dict(
+    data: dict[str, Any], *, doc_name: str | None = None
+) -> dict[str, Any]:
+    """Normalize Firestore SDK document values (converting ``datetime`` to UTC ISO-8601)."""
+    out: dict[str, Any] = {}
+    for k, v in data.items():
+        if isinstance(v, datetime):
+            dt = v.astimezone(UTC) if v.tzinfo is not None else v.replace(tzinfo=UTC)
+            out[str(k)] = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        elif isinstance(v, dict):
+            out[str(k)] = _normalize_firestore_dict(v)
+        elif isinstance(v, list):
+            out[str(k)] = [
+                _normalize_firestore_dict(item) if isinstance(item, dict) else item for item in v
+            ]
+        else:
+            out[str(k)] = v
+    if doc_name and "document_name" not in out:
+        out["document_name"] = doc_name
+    return out
 
-    def _firestore_request_json(
+
+class _FirestoreSdkBase:
+    """Shared lazy ``google.cloud.firestore.Client`` lifecycle and error translation base."""
+
+    def __init__(
         self,
-        method: str,
-        url: str,
         *,
-        json_body: dict[str, Any] | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> Any:
+        project_id: str,
+        database_id: str = DEFAULT_FIRESTORE_DATABASE_ID,
+        collection_id: str,
+        firestore_client: Any | None = None,
+        credentials: Any | None = None,
+        default_timeout: float = 15.0,
+    ) -> None:
+        self.project_id = validate_bq_identifier(project_id, "project_id")
+        self.database_id = (database_id or DEFAULT_FIRESTORE_DATABASE_ID).strip()
+        self.collection_id = collection_id.strip()
+        self._injected_client = firestore_client
+        self._owned_client: Any | None = None
+        self._credentials = credentials
+        self._default_timeout = float(default_timeout)
+        self._client_lock = threading.Lock()
+        self._lock = threading.Lock()
+        self._last_error: str | None = None
+
+    def _get_client(self) -> Any:
+        if self._injected_client is not None:
+            return self._injected_client
+        with self._client_lock:
+            if self._owned_client is None:
+                from google.cloud import firestore
+
+                kwargs: dict[str, Any] = {
+                    "project": self.project_id,
+                    "database": self.database_id,
+                }
+                if self._credentials is not None:
+                    kwargs["credentials"] = self._credentials
+                self._owned_client = firestore.Client(**kwargs)
+            return self._owned_client
+
+    def close(self) -> None:
+        """Close the internally managed ``firestore.Client`` (leaves injected clients open)."""
+        with self._client_lock:
+            if self._owned_client is not None:
+                close_fn = getattr(self._owned_client, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                self._owned_client = None
+
+    def __enter__(self) -> _FirestoreSdkBase:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def _collection(self) -> Any:
+        return self._get_client().collection(self.collection_id)
+
+    def _doc_path(self, doc_id: str) -> str:
+        return (
+            f"projects/{self.project_id}/databases/{self.database_id}"
+            f"/documents/{self.collection_id}/{doc_id}"
+        )
+
+    def _translate_error(self, exc: BaseException, *, action: str) -> Exception:
+        from google.auth.exceptions import DefaultCredentialsError, RefreshError
+
         from edgar_capstone.telemetry import _translate_gcp_error
 
-        try:
-            return super()._firestore_request_json(
-                method,
-                url,
-                json_body=json_body,
-                params=params,
-            )
-        except GcpRestError as exc:
-            raise _translate_gcp_error(exc) from exc
+        if isinstance(exc, (DefaultCredentialsError, RefreshError)):
+            return exc
+        return _translate_gcp_error(
+            translate_gcp_sdk_error(exc, context=f"Firestore {action} ({self.collection_id})")
+        )
 
 
-class FirestoreFeedbackStore(_TelemetryFirestoreStore):
+class FirestoreFeedbackStore(_FirestoreSdkBase):
     """Persists analyst thumbs-up/down ratings and audit comments to Google Cloud Firestore."""
 
     def __init__(
         self,
         config: TelemetryConfig | None = None,
         *,
-        http_client: httpx.Client | None = None,
+        firestore_client: Any | None = None,
         credentials: Any | None = None,
         max_local_records: int = DEFAULT_MAX_LOCAL_RECORDS,
     ) -> None:
@@ -72,7 +149,7 @@ class FirestoreFeedbackStore(_TelemetryFirestoreStore):
             project_id=self.config.project_id,
             database_id=self.config.firestore_database_id,
             collection_id=self.config.firestore_feedback_collection,
-            http_client=http_client,
+            firestore_client=firestore_client,
             credentials=credentials,
             default_timeout=15.0,
         )
@@ -106,6 +183,7 @@ class FirestoreFeedbackStore(_TelemetryFirestoreStore):
             emit_cloud_logging_sink_record,
         )
 
+        now_dt = datetime.now(UTC)
         now_epoch = round(time.time(), 3)
         now_iso = utc_now_iso()
         feedback_id = f"fbk-{uuid.uuid4().hex[:12]}"
@@ -128,33 +206,25 @@ class FirestoreFeedbackStore(_TelemetryFirestoreStore):
 
         emit_cloud_logging_sink_record(self.collection_id, entry)
 
-        document_name = (
-            f"projects/{self.project_id}/databases/{self.database_id}"
-            f"/documents/{self.collection_id}/{feedback_id}"
-        )
+        document_name = self._doc_path(feedback_id)
         backend_used = "local_memory"
         attempt_gcp, strict_gcp = self._should_attempt_gcp()
 
         if attempt_gcp:
-            doc_body = {"fields": encode_firestore_fields(entry)}
+            firestore_doc = {**entry, "recorded_at": now_dt}
             try:
-                created_doc = self._firestore_request_json(
-                    "POST",
-                    self.collection_url(),
-                    json_body=doc_body,
-                    params={"documentId": feedback_id},
-                )
-                if isinstance(created_doc, dict) and created_doc.get("name"):
-                    document_name = str(created_doc["name"])
+                doc_ref = self._collection().document(feedback_id)
+                doc_ref.create(firestore_doc, timeout=self._default_timeout)
                 backend_used = "firestore"
                 with self._lock:
                     self._persisted_firestore_count += 1
                     self._last_error = None
-            except Exception as exc:
+            except Exception as raw_exc:
+                exc = self._translate_error(raw_exc, action="create feedback")
                 with self._lock:
                     self._last_error = str(exc)
                 if not _should_fallback_to_local(exc, strict_gcp=strict_gcp):
-                    raise
+                    raise exc from raw_exc
                 logger.warning(
                     "Firestore feedback write failed in auto mode (%s); persisting in local buffer.",
                     exc,
@@ -180,7 +250,10 @@ class FirestoreFeedbackStore(_TelemetryFirestoreStore):
         limit: int = 50,
         rating: Literal["up", "down"] | None = None,
     ) -> dict[str, Any]:
-        """List persisted analyst feedback entries from Firestore `:runQuery` or local buffer."""
+        """List persisted analyst feedback entries from Firestore or local buffer."""
+        from google.cloud import firestore
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
         from edgar_capstone.telemetry import _should_fallback_to_local
 
         bounded = max(1, min(int(limit), 500))
@@ -189,32 +262,29 @@ class FirestoreFeedbackStore(_TelemetryFirestoreStore):
         source = "local_memory"
 
         if attempt_gcp:
-            structured_query: dict[str, Any] = {
-                "from": [{"collectionId": self.collection_id}],
-                "orderBy": [
-                    {
-                        "field": {"fieldPath": "recorded_at_epoch"},
-                        "direction": "DESCENDING",
-                    }
-                ],
-                "limit": bounded,
-            }
-            if rating in ("up", "down"):
-                structured_query["where"] = {
-                    "fieldFilter": {
-                        "field": {"fieldPath": "rating"},
-                        "op": "EQUAL",
-                        "value": {"stringValue": rating},
-                    }
-                }
             try:
-                items = self.run_structured_query(structured_query)
+                query = self._collection()
+                if rating in ("up", "down"):
+                    query = query.where(filter=FieldFilter("rating", "==", rating))
+                query = query.order_by(
+                    "recorded_at_epoch", direction=firestore.Query.DESCENDING
+                ).limit(bounded)
+                snapshots = query.stream(timeout=self._default_timeout)
+                items = [
+                    _normalize_firestore_dict(
+                        snap.to_dict() or {},
+                        doc_name=self._doc_path(snap.id),
+                    )
+                    for snap in snapshots
+                    if getattr(snap, "exists", True)
+                ]
                 source = "firestore"
-            except Exception as exc:
+            except Exception as raw_exc:
+                exc = self._translate_error(raw_exc, action="query feedback")
                 with self._lock:
                     self._last_error = str(exc)
                 if not _should_fallback_to_local(exc, strict_gcp=strict_gcp):
-                    raise
+                    raise exc from raw_exc
                 logger.warning(
                     "Firestore feedback query failed in auto mode (%s); reading local buffer.",
                     exc,
@@ -273,14 +343,37 @@ def session_firestore_doc_id(user_id: str, session_id: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
 
-class FirestoreSessionStore(_TelemetryFirestoreStore):
-    """Durable, user-isolated conversational session store backed by Cloud Firestore Native REST v1."""
+def _merge_session_payload(
+    existing: dict[str, Any] | None,
+    incoming: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge an incoming session payload against a concurrent Firestore snapshot without losing turns."""
+    if not existing:
+        return dict(incoming)
+    existing_turns = int(existing.get("turn_count") or 0)
+    incoming_turns = int(incoming.get("turn_count") or 0)
+    if existing_turns > incoming_turns:
+        # Preserve the newer concurrent state while unioning remembered tickers/sections if present.
+        merged = dict(existing)
+        for list_field in ("remembered_tickers", "cited_chunk_ids"):
+            if isinstance(existing.get(list_field), list) and isinstance(
+                incoming.get(list_field), list
+            ):
+                merged[list_field] = list(
+                    dict.fromkeys([*existing[list_field], *incoming[list_field]])
+                )
+        return merged
+    return dict(incoming)
+
+
+class FirestoreSessionStore(_FirestoreSdkBase):
+    """Durable, user-isolated conversational session store backed by ``google-cloud-firestore``."""
 
     def __init__(
         self,
         config: TelemetryConfig | None = None,
         *,
-        http_client: httpx.Client | None = None,
+        firestore_client: Any | None = None,
         credentials: Any | None = None,
         collection_id: str | None = None,
     ) -> None:
@@ -296,7 +389,7 @@ class FirestoreSessionStore(_TelemetryFirestoreStore):
             project_id=self.config.project_id,
             database_id=self.config.firestore_database_id or DEFAULT_FIRESTORE_DATABASE_ID,
             collection_id=effective_collection,
-            http_client=http_client,
+            firestore_client=firestore_client,
             credentials=credentials,
             default_timeout=15.0,
         )
@@ -309,7 +402,7 @@ class FirestoreSessionStore(_TelemetryFirestoreStore):
 
         override = os.environ.get("EDGAR_SESSION_BACKEND", "").strip()
         mode = _resolve_backend_mode(override) if override else self.config.feedback_backend
-        if self._http_client is not None:
+        if self._injected_client is not None:
             return mode != "local"
         if mode == "local":
             return False
@@ -317,80 +410,109 @@ class FirestoreSessionStore(_TelemetryFirestoreStore):
             return True
         return self.config.gcp_auto_triggered
 
-    def _doc_url(self, user_id: str, session_id: str) -> str:
-        return self.document_url(session_firestore_doc_id(user_id, session_id))
-
     def load_session(self, user_id: str, session_id: str) -> dict[str, Any] | None:
-        """Load a persisted session document for `(user_id, session_id)` (None if 404)."""
+        """Load a persisted session document for `(user_id, session_id)` (None if absent)."""
         if not self.is_live_enabled():
             return None
         doc_id = session_firestore_doc_id(user_id, session_id)
         try:
-            doc = self.get_document(doc_id)
-            if doc is not None:
-                with self._lock:
-                    self._reads += 1
-            return doc
-        except Exception as exc:
-            with self._lock:
-                self._last_error = str(exc)
-            raise
-
-    def save_session(self, user_id: str, session_id: str, payload: dict[str, Any]) -> None:
-        """Upsert a session document via Firestore REST v1 `PATCH`."""
-        if not self.is_live_enabled():
-            return
-        fields = encode_firestore_fields(payload)
-        try:
-            self._firestore_request_json(
-                "PATCH",
-                self._doc_url(user_id, session_id),
-                json_body={"fields": fields},
+            snap = self._collection().document(doc_id).get(timeout=self._default_timeout)
+            if not getattr(snap, "exists", False):
+                return None
+            doc = _normalize_firestore_dict(
+                snap.to_dict() or {},
+                doc_name=self._doc_path(doc_id),
             )
             with self._lock:
-                self._writes += 1
-        except Exception as exc:
+                self._reads += 1
+            return doc
+        except Exception as raw_exc:
+            exc = self._translate_error(raw_exc, action="load_session")
             with self._lock:
                 self._last_error = str(exc)
-            raise
+            raise exc from raw_exc
+
+    def save_session(self, user_id: str, session_id: str, payload: dict[str, Any]) -> None:
+        """Transactionally upsert a session document so concurrent writes never clobber turns."""
+        if not self.is_live_enabled():
+            return
+        doc_id = session_firestore_doc_id(user_id, session_id)
+        client = self._get_client()
+        doc_ref = self._collection().document(doc_id)
+        try:
+            transaction_fn = getattr(client, "transaction", None)
+            if callable(transaction_fn):
+                from google.cloud import firestore
+
+                transaction = transaction_fn()
+
+                @firestore.transactional
+                def _upsert(tx: Any) -> None:
+                    snap = doc_ref.get(transaction=tx, timeout=self._default_timeout)
+                    existing = (
+                        _normalize_firestore_dict(snap.to_dict() or {})
+                        if getattr(snap, "exists", False)
+                        else None
+                    )
+                    merged = _merge_session_payload(existing, payload)
+                    tx.set(doc_ref, merged)
+
+                _upsert(transaction)
+            else:
+                doc_ref.set(dict(payload), timeout=self._default_timeout)
+            with self._lock:
+                self._writes += 1
+        except Exception as raw_exc:
+            exc = self._translate_error(raw_exc, action="save_session")
+            with self._lock:
+                self._last_error = str(exc)
+            raise exc from raw_exc
 
     def delete_session(self, user_id: str, session_id: str) -> bool:
         """Delete a persisted session document for `(user_id, session_id)`."""
-        from edgar_capstone.telemetry import TelemetryNotFoundError
-
         if not self.is_live_enabled():
             return False
+        doc_id = session_firestore_doc_id(user_id, session_id)
         try:
-            self._firestore_request_json("DELETE", self._doc_url(user_id, session_id))
+            doc_ref = self._collection().document(doc_id)
+            snap = doc_ref.get(timeout=self._default_timeout)
+            if not getattr(snap, "exists", False):
+                return False
+            doc_ref.delete(timeout=self._default_timeout)
             return True
-        except TelemetryNotFoundError:
-            return False
-        except Exception as exc:
+        except Exception as raw_exc:
+            exc = self._translate_error(raw_exc, action="delete_session")
             with self._lock:
                 self._last_error = str(exc)
-            raise
+            raise exc from raw_exc
 
     def list_sessions(self, user_id: str, *, limit: int = 25) -> list[dict[str, Any]]:
         """List recent sessions belonging to `user_id`."""
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
         if not self.is_live_enabled():
             return []
-        structured_query: dict[str, Any] = {
-            "from": [{"collectionId": self.collection_id}],
-            "where": {
-                "fieldFilter": {
-                    "field": {"fieldPath": "user_id"},
-                    "op": "EQUAL",
-                    "value": {"stringValue": user_id.strip().lower()},
-                }
-            },
-            "limit": max(1, min(int(limit), 100)),
-        }
+        bounded = max(1, min(int(limit), 100))
         try:
-            items = self.run_structured_query(structured_query)
-        except Exception as exc:
+            query = (
+                self._collection()
+                .where(filter=FieldFilter("user_id", "==", user_id.strip().lower()))
+                .limit(bounded)
+            )
+            snapshots = query.stream(timeout=self._default_timeout)
+            items = [
+                _normalize_firestore_dict(
+                    snap.to_dict() or {},
+                    doc_name=self._doc_path(snap.id),
+                )
+                for snap in snapshots
+                if getattr(snap, "exists", True)
+            ]
+        except Exception as raw_exc:
+            exc = self._translate_error(raw_exc, action="list_sessions")
             with self._lock:
                 self._last_error = str(exc)
-            raise
+            raise exc from raw_exc
         items.sort(key=lambda d: str(d.get("updated_at") or ""), reverse=True)
         return items[:limit]
 
@@ -415,6 +537,7 @@ class FirestoreSessionStore(_TelemetryFirestoreStore):
 
 
 __all__ = [
+    "DEFAULT_FIRESTORE_DATABASE_ID",
     "DEFAULT_FIRESTORE_FEEDBACK_COLLECTION",
     "DEFAULT_FIRESTORE_SESSION_COLLECTION",
     "FirestoreFeedbackStore",

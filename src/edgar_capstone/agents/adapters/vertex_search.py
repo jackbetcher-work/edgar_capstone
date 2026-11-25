@@ -1,19 +1,18 @@
-"""Live Vertex AI Search (Discovery Engine) hybrid search adapter."""
+"""Live Vertex AI Search (Discovery Engine) hybrid search SDK adapter."""
 
 from __future__ import annotations
 
 import logging
 import re
 import threading
+from types import TracebackType
 from typing import Any
 
-import httpx
-
 from edgar_capstone.agents.adapters.registry import (
-    GcpAdapterErrorTranslationMixin,
     GcpAdapterHttpError,
     GcpEndpointNotReadyError,
     GcpToolConfig,
+    translate_gcp_adapter_error,
 )
 from edgar_capstone.common.domain import (
     SECTION_TITLES,
@@ -24,13 +23,20 @@ from edgar_capstone.common.domain import (
 from edgar_capstone.gcp.discovery_engine import (
     DEFAULT_VERTEX_AI_SEARCH_COLLECTION,
     DEFAULT_VERTEX_AI_SEARCH_LOCATION,
-    discovery_engine_root,
+    discovery_engine_host,
+    vertex_search_datastore_path,
+    vertex_search_engine_path,
 )
-from edgar_capstone.gcp.rest_client import GcpRestClient
+from edgar_capstone.gcp.errors import build_client_options
 
 logger = logging.getLogger(__name__)
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _escape_filter_literal(value: str) -> str:
+    """Escape backslashes and double quotes for Discovery Engine filter string literals."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _normalize_section_id(
@@ -70,6 +76,38 @@ def _default_section_title(sec_id: SectionId) -> str:
     return SECTION_TITLES[sec_id]
 
 
+def _proto_struct_to_dict(obj: Any) -> dict[str, Any]:
+    """Convert a protobuf ``Struct`` / ``MapComposite`` / ``dict`` into a plain Python ``dict``."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    try:
+        from google.protobuf.json_format import MessageToDict
+
+        pb = getattr(obj, "_pb", obj)
+        if hasattr(pb, "DESCRIPTOR"):
+            return dict(MessageToDict(pb))
+    except Exception:
+        pass
+    try:
+        return {str(k): _proto_value_to_python(v) for k, v in obj.items()}
+    except Exception:
+        return {}
+
+
+def _proto_value_to_python(val: Any) -> Any:
+    if isinstance(val, dict):
+        return {str(k): _proto_value_to_python(v) for k, v in val.items()}
+    if hasattr(val, "items"):
+        return {str(k): _proto_value_to_python(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)) or (
+        hasattr(val, "__iter__") and not isinstance(val, (str, bytes))
+    ):
+        return [_proto_value_to_python(item) for item in val]
+    return val
+
+
 def _collect_extracted_candidates(
     derived: dict[str, Any],
     struct_data: dict[str, Any],
@@ -81,7 +119,11 @@ def _collect_extracted_candidates(
     candidates: list[tuple[str, float, str | None, str | None]] = []
     for seg in derived.get("extractive_segments") or []:
         if isinstance(seg, dict) and seg.get("content"):
-            rel = float(seg.get("relevanceScore") or max(0.35, 0.92 - 0.05 * doc_rank))
+            rel = float(
+                seg.get("relevanceScore")
+                or seg.get("relevance_score")
+                or max(0.35, 0.92 - 0.05 * doc_rank)
+            )
             candidates.append(
                 (
                     str(seg["content"]).strip(),
@@ -119,39 +161,85 @@ def _collect_extracted_candidates(
     return candidates
 
 
-class VertexAISearchAdapter(GcpAdapterErrorTranslationMixin, GcpRestClient):
-    """Live Discovery Engine (`servingConfigs/default_search:search`) hybrid search adapter."""
+class VertexAISearchAdapter:
+    """Live ``google-cloud-discoveryengine`` (``SearchServiceClient``) hybrid search adapter."""
 
     def __init__(
         self,
         config: GcpToolConfig,
         *,
-        http_client: httpx.Client | None = None,
+        search_client: Any | None = None,
         credentials: Any | None = None,
     ) -> None:
-        super().__init__(http_client=http_client, credentials=credentials, default_timeout=30.0)
         self.project_id = config.project_id
         self.location = config.vais_location or DEFAULT_VERTEX_AI_SEARCH_LOCATION
         self.collection_id = config.vais_collection_id or DEFAULT_VERTEX_AI_SEARCH_COLLECTION
         self.engine_id = config.vais_engine_id
         self.datastore_id = config.vais_datastore_id
-        self._resolved_url: str | None = None
+        self._injected_client = search_client
+        self._owned_client: Any | None = None
+        self._credentials = credentials
+        self._client_lock = threading.Lock()
+        self._resolved_serving_config: str | None = None
         self._url_lock = threading.Lock()
 
-    def _serving_config_urls(self) -> list[str]:
-        root = discovery_engine_root(self.location)
-        prefix = (
-            f"{root}/projects/{self.project_id}/locations/{self.location}/"
-            f"collections/{self.collection_id}"
-        )
-        urls: list[str] = []
+    def _get_client(self) -> Any:
+        if self._injected_client is not None:
+            return self._injected_client
+        with self._client_lock:
+            if self._owned_client is None:
+                from google.cloud import discoveryengine_v1
+
+                opts = build_client_options(
+                    api_endpoint=discovery_engine_host(self.location),
+                    quota_project_id=self.project_id,
+                )
+                kwargs: dict[str, Any] = {"client_options": opts}
+                if self._credentials is not None:
+                    kwargs["credentials"] = self._credentials
+                self._owned_client = discoveryengine_v1.SearchServiceClient(**kwargs)
+            return self._owned_client
+
+    def close(self) -> None:
+        """Close the internally managed SDK transport (leaves injected clients open)."""
+        with self._client_lock:
+            if self._owned_client is not None:
+                transport = getattr(self._owned_client, "transport", None)
+                close_fn = getattr(transport, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                self._owned_client = None
+
+    def __enter__(self) -> VertexAISearchAdapter:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
+
+    def _serving_config_paths(self) -> list[str]:
+        paths: list[str] = []
         if self.engine_id:
-            urls.append(f"{prefix}/engines/{self.engine_id}/servingConfigs/default_search:search")
-        if self.datastore_id:
-            urls.append(
-                f"{prefix}/dataStores/{self.datastore_id}/servingConfigs/default_search:search"
+            engine = vertex_search_engine_path(
+                self.project_id,
+                engine_id=self.engine_id,
+                location=self.location,
+                collection=self.collection_id,
             )
-        return urls
+            paths.append(f"{engine}/servingConfigs/default_search")
+        if self.datastore_id:
+            ds = vertex_search_datastore_path(
+                self.project_id,
+                data_store_id=self.datastore_id,
+                location=self.location,
+                collection=self.collection_id,
+            )
+            paths.append(f"{ds}/servingConfigs/default_search")
+        return paths
 
     @staticmethod
     def build_filter_expression(
@@ -168,47 +256,92 @@ class VertexAISearchAdapter(GcpAdapterErrorTranslationMixin, GcpRestClient):
             f"fiscal_year <= {int(end_year)}",
         ]
         if tickers:
-            quoted_tickers = ", ".join(f'"{t.replace(chr(34), "")}"' for t in sorted(tickers))
+            quoted_tickers = ", ".join(f'"{_escape_filter_literal(t)}"' for t in sorted(tickers))
             clauses.append(f"ticker: ANY({quoted_tickers})")
         canon_sector = canonicalize_gics_sector(gics_sector)
         if canon_sector:
-            safe_sec = canon_sector.replace('"', '\\"')
+            safe_sec = _escape_filter_literal(canon_sector)
             clauses.append(f'gics_sector: ANY("{safe_sec}")')
         if section_id in ("item_1a", "item_7"):
             clauses.append(f'section_id: ANY("{section_id}")')
         return " AND ".join(clauses)
 
-    def _post_with_url_fallback(
-        self, urls: list[str], payload: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        """POST search payload across engine/datastore URLs, caching the first working URL."""
+    def _search_with_fallback(
+        self,
+        serving_configs: list[str],
+        *,
+        query: str,
+        filter_expr: str,
+        page_size: int,
+    ) -> list[Any]:
+        """Execute ``SearchServiceClient.search`` across engine/datastore paths, caching the winner."""
+        from google.cloud import discoveryengine_v1 as de
+
         with self._url_lock:
-            cached_url = self._resolved_url
-        candidate_urls = [cached_url, *(u for u in urls if u != cached_url)] if cached_url else urls
+            cached = self._resolved_serving_config
+        candidates = (
+            [cached, *(p for p in serving_configs if p != cached)] if cached else serving_configs
+        )
+        client = self._get_client()
         last_err: Exception | None = None
-        for idx, url in enumerate(candidate_urls):
+
+        for idx, serving_config in enumerate(candidates):
+            req = de.SearchRequest(
+                serving_config=serving_config,
+                query=query,
+                filter=filter_expr or "",
+                page_size=max(1, min(int(page_size), 25)),
+                query_expansion_spec=de.SearchRequest.QueryExpansionSpec(
+                    condition=de.SearchRequest.QueryExpansionSpec.Condition.AUTO
+                ),
+                spell_correction_spec=de.SearchRequest.SpellCorrectionSpec(
+                    mode=de.SearchRequest.SpellCorrectionSpec.Mode.AUTO
+                ),
+                content_search_spec=de.SearchRequest.ContentSearchSpec(
+                    snippet_spec=de.SearchRequest.ContentSearchSpec.SnippetSpec(
+                        return_snippet=True,
+                        max_snippet_count=3,
+                    ),
+                    extractive_content_spec=de.SearchRequest.ContentSearchSpec.ExtractiveContentSpec(
+                        max_extractive_segment_count=5,
+                        max_extractive_answer_count=3,
+                        return_extractive_segment_score=True,
+                    ),
+                ),
+            )
             try:
-                data = self._request_json("POST", url, json_body=payload)
-                if url != cached_url:
+                response = client.search(request=req, timeout=30.0)
+                if serving_config != cached:
                     with self._url_lock:
-                        self._resolved_url = url
-                return data if isinstance(data, dict) else {"items": data}
-            except GcpAdapterHttpError as exc:
-                last_err = exc
-                if exc.status_code == 404 and idx + 1 < len(candidate_urls):
+                        self._resolved_serving_config = serving_config
+                if hasattr(response, "pages"):
+                    first_page = next(iter(response.pages), None)
+                    return list(getattr(first_page, "results", None) or ()) if first_page else []
+                return list(getattr(response, "results", None) or ())
+            except Exception as raw_exc:
+                err = translate_gcp_adapter_error(
+                    raw_exc, context=f"Vertex AI Search ({serving_config})"
+                )
+                last_err = err
+                if (
+                    isinstance(err, GcpAdapterHttpError)
+                    and err.status_code == 404
+                    and idx + 1 < len(candidates)
+                ):
                     logger.info(
-                        "Vertex AI Search endpoint returned 404; caching next servingConfig endpoint."
+                        "Vertex AI Search servingConfig returned 404; trying next servingConfig."
                     )
                     continue
-                raise
+                raise err from raw_exc
+
         if last_err is not None:
             raise last_err
-        return None
+        return []
 
     def _extract_document_passages(
         self,
         doc_rank: int,
-        item: dict[str, Any],
+        item: Any,
         *,
         tickers: set[str],
         gics_sector: str | None,
@@ -216,12 +349,21 @@ class VertexAISearchAdapter(GcpAdapterErrorTranslationMixin, GcpRestClient):
         start_year: int,
         end_year: int,
     ) -> list[dict[str, Any]]:
-        """Normalize a single Discovery Engine result item into passage dicts."""
-        doc = item.get("document") or {}
-        doc_id = str(doc.get("id") or f"vais_doc_{doc_rank}")
-        struct_data = doc.get("structData") or {}
-        derived = doc.get("derivedStructData") or {}
-        content_obj = doc.get("content") or {}
+        """Normalize a single Discovery Engine ``SearchResult`` into passage dicts."""
+        doc = item.get("document") if isinstance(item, dict) else getattr(item, "document", None)
+        if doc is None:
+            return []
+        if isinstance(doc, dict):
+            doc_id = str(doc.get("id") or f"vais_doc_{doc_rank}")
+            struct_data = doc.get("structData") or doc.get("struct_data") or {}
+            derived = doc.get("derivedStructData") or doc.get("derived_struct_data") or {}
+            content_uri = str((doc.get("content") or {}).get("uri") or "")
+        else:
+            doc_id = str(getattr(doc, "id", "") or f"vais_doc_{doc_rank}")
+            struct_data = _proto_struct_to_dict(getattr(doc, "struct_data", None))
+            derived = _proto_struct_to_dict(getattr(doc, "derived_struct_data", None))
+            content_obj = getattr(doc, "content", None)
+            content_uri = str(getattr(content_obj, "uri", "") or "")
 
         ticker = str(struct_data.get("ticker") or "").strip().upper()
         fy_raw = struct_data.get("fiscal_year")
@@ -246,10 +388,7 @@ class VertexAISearchAdapter(GcpAdapterErrorTranslationMixin, GcpRestClient):
         company_name = str(struct_data.get("company_name") or ticker)
         sec_url = str(struct_data.get("sec_filing_url") or "")
         gcs_uri = str(
-            content_obj.get("uri")
-            or derived.get("link")
-            or struct_data.get("unstructured_gcs_uri")
-            or ""
+            content_uri or derived.get("link") or struct_data.get("unstructured_gcs_uri") or ""
         )
 
         passages: list[dict[str, Any]] = []
@@ -302,8 +441,8 @@ class VertexAISearchAdapter(GcpAdapterErrorTranslationMixin, GcpRestClient):
         page_size: int = 10,
     ) -> list[dict[str, Any]]:
         """Execute a metadata-filtered hybrid search against Vertex AI Search (Discovery Engine)."""
-        urls = self._serving_config_urls()
-        if not urls:
+        serving_configs = self._serving_config_paths()
+        if not serving_configs:
             raise GcpEndpointNotReadyError(
                 "Neither VERTEX_AI_SEARCH_ENGINE_ID nor VERTEX_AI_SEARCH_DATASTORE_ID is configured."
             )
@@ -315,29 +454,14 @@ class VertexAISearchAdapter(GcpAdapterErrorTranslationMixin, GcpRestClient):
             start_year=start_year,
             end_year=end_year,
         )
-        payload: dict[str, Any] = {
-            "query": query,
-            "pageSize": max(1, min(int(page_size), 25)),
-            "queryExpansionSpec": {"condition": "AUTO"},
-            "spellCorrectionSpec": {"mode": "AUTO"},
-            "contentSearchSpec": {
-                "snippetSpec": {"returnSnippet": True, "maxSnippetCount": 3},
-                "extractiveContentSpec": {
-                    "maxExtractiveSegmentCount": 5,
-                    "maxExtractiveAnswerCount": 3,
-                    "returnExtractiveSegmentScore": True,
-                },
-            },
-        }
-        if filter_expr:
-            payload["filter"] = filter_expr
-
-        data = self._post_with_url_fallback(urls, payload)
-        if not data:
-            return []
-
+        results = self._search_with_fallback(
+            serving_configs,
+            query=query,
+            filter_expr=filter_expr,
+            page_size=page_size,
+        )
         passages: list[dict[str, Any]] = []
-        for doc_rank, item in enumerate(data.get("results") or []):
+        for doc_rank, item in enumerate(results):
             passages.extend(
                 self._extract_document_passages(
                     doc_rank,

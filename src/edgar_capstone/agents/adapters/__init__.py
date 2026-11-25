@@ -1,4 +1,4 @@
-"""GCP tool adapters package (BigQuery, Vertex AI Search, GCS, and registry)."""
+"""GCP SDK tool adapters package (BigQuery, Vertex AI Search, GCS, and registry)."""
 
 from edgar_capstone.agents.adapters.bigquery import BigQueryAdapter
 from edgar_capstone.agents.adapters.gcs import GcsCorpusAdapter
@@ -7,7 +7,6 @@ from edgar_capstone.agents.adapters.registry import (
     DEFAULT_BQ_FILING_CHUNKS_TABLE,
     DEFAULT_BQ_FINANCIAL_METRICS_TABLE,
     DEFAULT_BQ_YOY_VARIANCES_VIEW,
-    GcpAdapterErrorTranslationMixin,
     GcpAdapterHttpError,
     GcpEndpointNotReadyError,
     GcpToolAdapters,
@@ -18,6 +17,7 @@ from edgar_capstone.agents.adapters.registry import (
     get_gcp_adapters_status_metadata,
     register_adapter_reset_hook,
     reset_gcp_tool_adapters,
+    translate_gcp_adapter_error,
 )
 from edgar_capstone.agents.adapters.vertex_search import (
     VertexAISearchAdapter,
@@ -31,7 +31,6 @@ __all__ = [
     "DEFAULT_BQ_FILING_CHUNKS_TABLE",
     "DEFAULT_BQ_FINANCIAL_METRICS_TABLE",
     "DEFAULT_BQ_YOY_VARIANCES_VIEW",
-    "GcpAdapterErrorTranslationMixin",
     "GcpAdapterHttpError",
     "GcpEndpointNotReadyError",
     "GcpToolAdapters",
@@ -46,4 +45,5 @@ __all__ = [
     "get_gcp_adapters_status_metadata",
     "register_adapter_reset_hook",
     "reset_gcp_tool_adapters",
+    "translate_gcp_adapter_error",
 ]

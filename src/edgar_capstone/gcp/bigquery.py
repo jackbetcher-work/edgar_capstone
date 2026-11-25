@@ -1,11 +1,15 @@
-"""Shared BigQuery REST v2 wire encoding/decoding, schema loading, and client utilities."""
+"""Shared BigQuery SDK wrapper, identifier validation, and schema loading utilities."""
 
 from __future__ import annotations
 
 import json
 import re
-import time
+import threading
+from collections.abc import Mapping, Sequence
+from datetime import UTC, date, datetime, time
+from decimal import Decimal
 from pathlib import Path
+from types import TracebackType
 from typing import Any
 
 from edgar_capstone.gcp.defaults import (
@@ -13,11 +17,9 @@ from edgar_capstone.gcp.defaults import (
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
 )
+from edgar_capstone.gcp.errors import build_client_options, translate_gcp_sdk_error
 from edgar_capstone.gcp.paths import resolve_asset_dir
-from edgar_capstone.gcp.rest_client import GcpRestClient, GcpRestError
 
-BIGQUERY_API_ROOT = "https://bigquery.googleapis.com/bigquery/v2"
-BIGQUERY_UPLOAD_ROOT = "https://bigquery.googleapis.com/upload/bigquery/v2"
 SAFE_BQ_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
@@ -27,100 +29,6 @@ def validate_bq_identifier(value: str, label: str) -> str:
     if not cleaned or not SAFE_BQ_IDENTIFIER_RE.match(cleaned):
         raise ValueError(f"Unsafe BigQuery {label} identifier: {value!r}")
     return cleaned
-
-
-def bq_scalar_param(name: str, bq_type: str, value: Any) -> dict[str, Any]:
-    """Construct a named scalar QueryParameter for BigQuery REST v2."""
-    return {
-        "name": name,
-        "parameterType": {"type": bq_type},
-        "parameterValue": {"value": None if value is None else str(value)},
-    }
-
-
-def bq_array_param(name: str, elem_type: str, values: list[Any]) -> dict[str, Any]:
-    """Construct a named ARRAY QueryParameter for BigQuery REST v2."""
-    return {
-        "name": name,
-        "parameterType": {
-            "type": "ARRAY",
-            "arrayType": {"type": elem_type},
-        },
-        "parameterValue": {
-            "arrayValues": [{"value": None if v is None else str(v)} for v in values]
-        },
-    }
-
-
-def decode_bq_cell(raw_val: Any, field_schema: dict[str, Any]) -> Any:
-    """Recursively decode a BigQuery REST v2 wire cell (``f``/``v``) into native Python types.
-
-    Supports ``REPEATED`` arrays, nested ``RECORD``/``STRUCT`` rows, ``INTEGER``/``INT64``,
-    ``FLOAT``/``FLOAT64``/``NUMERIC``/``BIGNUMERIC``, ``BOOLEAN``/``BOOL``, and ``STRING``.
-    """
-    mode = str(field_schema.get("mode") or "NULLABLE").upper()
-    field_type = str(field_schema.get("type") or "STRING").upper()
-
-    if mode == "REPEATED":
-        if raw_val is None:
-            return []
-        elem_schema = {**field_schema, "mode": "NULLABLE"}
-        decoded_items: list[Any] = []
-        if isinstance(raw_val, list):
-            for item in raw_val:
-                inner = item.get("v") if isinstance(item, dict) and "v" in item else item
-                decoded_items.append(decode_bq_cell(inner, elem_schema))
-        return decoded_items
-
-    if raw_val is None:
-        return None
-
-    if field_type in ("RECORD", "STRUCT"):
-        subfields = field_schema.get("fields") or []
-        if isinstance(raw_val, dict) and "f" in raw_val and isinstance(raw_val["f"], list):
-            return decode_bq_row(raw_val, subfields)
-        if isinstance(raw_val, dict):
-            return raw_val
-        return {}
-
-    if field_type in ("INTEGER", "INT64"):
-        return int(raw_val)
-    if field_type in ("FLOAT", "FLOAT64", "NUMERIC", "BIGNUMERIC"):
-        return float(raw_val)
-    if field_type in ("BOOLEAN", "BOOL"):
-        if isinstance(raw_val, bool):
-            return raw_val
-        return str(raw_val).strip().lower() == "true"
-    return str(raw_val)
-
-
-def decode_bq_row(row_obj: dict[str, Any], schema_fields: list[dict[str, Any]]) -> dict[str, Any]:
-    """Decode a single BigQuery ``{"f": [{"v": ...}, ...]}`` row using ``schema.fields``."""
-    cells = row_obj.get("f")
-    if not isinstance(cells, list):
-        return dict(row_obj)
-    decoded: dict[str, Any] = {}
-    for idx, field_schema in enumerate(schema_fields):
-        col_name = str(field_schema.get("name") or f"col_{idx}")
-        cell = cells[idx] if idx < len(cells) else {"v": None}
-        raw_val = cell.get("v") if isinstance(cell, dict) and "v" in cell else cell
-        decoded[col_name] = decode_bq_cell(raw_val, field_schema)
-    return decoded
-
-
-def decode_bq_rows(
-    payload: dict[str, Any],
-    *,
-    schema_fields: list[dict[str, Any]] | None = None,
-) -> list[dict[str, Any]]:
-    """Decode all rows from a BigQuery ``queries`` / ``tabledata.list`` response payload."""
-    fields = (
-        schema_fields
-        if schema_fields is not None
-        else ((payload.get("schema") or {}).get("fields") or [])
-    )
-    raw_rows = payload.get("rows") or []
-    return [decode_bq_row(row, fields) for row in raw_rows if isinstance(row, dict)]
 
 
 def load_bigquery_schema_fields(
@@ -140,8 +48,63 @@ def load_bigquery_schema_fields(
     return fields
 
 
-class BigQueryRestClient(GcpRestClient):
-    """Reusable BigQuery REST v2 client with query polling, pagination, and ``insertAll``."""
+def schema_fields_to_bigquery_schema(fields: Sequence[dict[str, Any]]) -> list[Any]:
+    """Convert JSON ``TableFieldSchema`` dicts into ``google.cloud.bigquery.SchemaField`` objects."""
+    from google.cloud import bigquery
+
+    return [bigquery.SchemaField.from_api_repr(f) for f in fields]
+
+
+def normalize_bq_value(value: Any) -> Any:
+    """Normalize native ``google-cloud-bigquery`` cell types to JSON-friendly Python values.
+
+    - ``datetime`` -> ISO-8601 UTC ``YYYY-MM-DDTHH:MM:SSZ`` string
+    - ``date`` / ``time`` -> ISO-8601 string
+    - ``Decimal`` -> ``float``
+    - Nested ``Mapping`` / ``list`` -> recursively normalized
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(value, (date, time)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Mapping):
+        return {str(k): normalize_bq_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [normalize_bq_value(item) for item in value]
+    return value
+
+
+def normalize_bq_row(row: Any) -> dict[str, Any]:
+    """Convert a ``bigquery.Row`` (or dict) into a normalized plain Python ``dict``."""
+    if isinstance(row, Mapping):
+        return {str(k): normalize_bq_value(v) for k, v in row.items()}
+    items = getattr(row, "items", None)
+    if callable(items):
+        return {str(k): normalize_bq_value(v) for k, v in items()}
+    return dict(row)
+
+
+def make_scalar_param(name: str, bq_type: str, value: Any) -> Any:
+    """Construct a ``google.cloud.bigquery.ScalarQueryParameter``."""
+    from google.cloud import bigquery
+
+    return bigquery.ScalarQueryParameter(name, bq_type, value)
+
+
+def make_array_param(name: str, elem_type: str, values: Sequence[Any]) -> Any:
+    """Construct a ``google.cloud.bigquery.ArrayQueryParameter``."""
+    from google.cloud import bigquery
+
+    return bigquery.ArrayQueryParameter(name, elem_type, list(values))
+
+
+class BigQueryClientWrapper:
+    """Thread-safe lazy wrapper around the official ``google.cloud.bigquery.Client``."""
 
     def __init__(
         self,
@@ -149,109 +112,150 @@ class BigQueryRestClient(GcpRestClient):
         project_id: str = DEFAULT_PROJECT_ID,
         dataset_id: str = DEFAULT_BIGQUERY_DATASET_ID,
         location: str = DEFAULT_LOCATION,
-        http_client: Any | None = None,
+        bq_client: Any | None = None,
         credentials: Any | None = None,
         default_timeout: float = 30.0,
         quota_project_id: str | None = None,
     ) -> None:
-        super().__init__(
-            http_client=http_client,
-            credentials=credentials,
-            default_timeout=default_timeout,
-            quota_project_id=quota_project_id,
-        )
         self.project_id = validate_bq_identifier(project_id, "project_id")
         self.dataset_id = validate_bq_identifier(dataset_id, "dataset_id")
         self.location = location.strip() or DEFAULT_LOCATION
+        self._injected_client = bq_client
+        self._owned_client: Any | None = None
+        self._credentials = credentials
+        self._default_timeout = float(default_timeout)
+        self._quota_project_id = (quota_project_id or "").strip() or None
+        self._client_lock = threading.Lock()
+
+    def _get_client(self) -> Any:
+        if self._injected_client is not None:
+            return self._injected_client
+        with self._client_lock:
+            if self._owned_client is None:
+                from google.cloud import bigquery
+
+                opts = build_client_options(quota_project_id=self._quota_project_id)
+                kwargs: dict[str, Any] = {
+                    "project": self.project_id,
+                    "location": self.location,
+                }
+                if self._credentials is not None:
+                    kwargs["credentials"] = self._credentials
+                if opts is not None:
+                    kwargs["client_options"] = opts
+                self._owned_client = bigquery.Client(**kwargs)
+            return self._owned_client
+
+    def close(self) -> None:
+        """Close the internally managed ``bigquery.Client`` (leaves injected clients open)."""
+        with self._client_lock:
+            if self._owned_client is not None:
+                close_fn = getattr(self._owned_client, "close", None)
+                if callable(close_fn):
+                    close_fn()
+                self._owned_client = None
+
+    def __enter__(self) -> BigQueryClientWrapper:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
 
     def table_ref(self, table_id: str) -> str:
         safe_table = validate_bq_identifier(table_id, "table_id")
         return f"`{self.project_id}.{self.dataset_id}.{safe_table}`"
 
+    def full_table_id(self, table_id: str) -> str:
+        safe_table = validate_bq_identifier(table_id, "table_id")
+        return f"{self.project_id}.{self.dataset_id}.{safe_table}"
+
     def run_query(
         self,
         sql: str,
         *,
-        query_parameters: list[dict[str, Any]] | None = None,
-        timeout_ms: int = 30000,
-        max_results: int = 10000,
-        max_polls: int = 20,
-        poll_interval_seconds: float = 0.5,
+        query_parameters: Sequence[Any] | None = None,
+        timeout: float | None = None,
+        max_results: int | None = None,
     ) -> list[dict[str, Any]]:
-        """Execute a parameterized Standard SQL query, polling if incomplete and paging all rows."""
-        url = f"{BIGQUERY_API_ROOT}/projects/{self.project_id}/queries"
-        body: dict[str, Any] = {
-            "query": sql,
-            "useLegacySql": False,
-            "location": self.location,
-            "timeoutMs": timeout_ms,
-            "maxResults": max_results,
-        }
-        if query_parameters:
-            body["parameterMode"] = "NAMED"
-            body["queryParameters"] = query_parameters
+        """Execute a parameterized Standard SQL query and return normalized Python row dicts."""
+        from google.cloud import bigquery
 
-        payload = self._request_json("POST", url, json_body=body)
-        if not isinstance(payload, dict):
-            return []
-
-        job_ref = payload.get("jobReference") or {}
-        job_id = str(job_ref.get("jobId") or "")
-        job_location = str(job_ref.get("location") or self.location)
-
-        polls = 0
-        while not payload.get("jobComplete", True) and job_id and polls < max_polls:
-            time.sleep(poll_interval_seconds)
-            polls += 1
-            results_url = f"{BIGQUERY_API_ROOT}/projects/{self.project_id}/queries/{job_id}"
-            payload = self._request_json(
-                "GET",
-                results_url,
-                params={"location": job_location, "maxResults": max_results},
+        eff_timeout = self._default_timeout if timeout is None else float(timeout)
+        client = self._get_client()
+        job_config = bigquery.QueryJobConfig(
+            use_legacy_sql=False,
+            query_parameters=list(query_parameters or ()),
+        )
+        try:
+            job = client.query(
+                sql,
+                job_config=job_config,
+                location=self.location,
+                timeout=eff_timeout,
             )
+            result_kwargs: dict[str, Any] = {"timeout": eff_timeout}
+            if max_results is not None:
+                result_kwargs["max_results"] = max_results
+            rows_iter = job.result(**result_kwargs)
+            return [normalize_bq_row(row) for row in rows_iter]
+        except Exception as exc:
+            from google.auth.exceptions import DefaultCredentialsError, RefreshError
 
-        if not payload.get("jobComplete", True):
-            raise GcpRestError(
-                f"BigQuery query job {job_id!r} did not complete after {polls} polls."
-            )
+            if isinstance(exc, (DefaultCredentialsError, RefreshError)):
+                raise
+            raise translate_gcp_sdk_error(
+                exc, context=f"BigQuery query ({self.project_id})"
+            ) from exc
 
-        schema_fields = (payload.get("schema") or {}).get("fields") or []
-        all_rows = decode_bq_rows(payload, schema_fields=schema_fields)
-        page_token = payload.get("pageToken")
-
-        while page_token and job_id:
-            results_url = f"{BIGQUERY_API_ROOT}/projects/{self.project_id}/queries/{job_id}"
-            page_payload = self._request_json(
-                "GET",
-                results_url,
-                params={
-                    "location": job_location,
-                    "pageToken": page_token,
-                    "maxResults": max_results,
-                },
-            )
-            all_rows.extend(decode_bq_rows(page_payload, schema_fields=schema_fields))
-            page_token = page_payload.get("pageToken")
-
-        return all_rows
-
-    def insert_all(
+    def insert_rows_json(
         self,
         table_id: str,
-        rows: list[dict[str, Any]],
+        rows: Sequence[dict[str, Any]],
         *,
+        row_ids: Sequence[str] | None = None,
         skip_invalid_rows: bool = False,
         ignore_unknown_values: bool = False,
-    ) -> dict[str, Any]:
-        """Stream rows via BigQuery REST v2 ``tabledata.insertAll``."""
-        safe_table = validate_bq_identifier(table_id, "table_id")
-        url = (
-            f"{BIGQUERY_API_ROOT}/projects/{self.project_id}"
-            f"/datasets/{self.dataset_id}/tables/{safe_table}/insertAll"
-        )
-        payload = {
-            "skipInvalidRows": skip_invalid_rows,
-            "ignoreUnknownValues": ignore_unknown_values,
-            "rows": rows,
-        }
-        return self._request_json("POST", url, json_body=payload)
+        timeout: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Stream rows via ``bigquery.Client.insert_rows_json``; returns any per-row error dicts."""
+        if not rows:
+            return []
+        table_fqn = self.full_table_id(table_id)
+        eff_timeout = self._default_timeout if timeout is None else float(timeout)
+        client = self._get_client()
+        try:
+            errors = client.insert_rows_json(
+                table_fqn,
+                list(rows),
+                row_ids=list(row_ids) if row_ids is not None else None,
+                skip_invalid_rows=skip_invalid_rows,
+                ignore_unknown_values=ignore_unknown_values,
+                timeout=eff_timeout,
+            )
+            return list(errors or ())
+        except Exception as exc:
+            from google.auth.exceptions import DefaultCredentialsError, RefreshError
+
+            if isinstance(exc, (DefaultCredentialsError, RefreshError)):
+                raise
+            raise translate_gcp_sdk_error(
+                exc, context=f"BigQuery insert_rows_json ({table_fqn})"
+            ) from exc
+
+
+__all__ = [
+    "BigQueryClientWrapper",
+    "SAFE_BQ_IDENTIFIER_RE",
+    "load_bigquery_schema_fields",
+    "make_array_param",
+    "make_scalar_param",
+    "normalize_bq_row",
+    "normalize_bq_value",
+    "schema_fields_to_bigquery_schema",
+    "validate_bq_identifier",
+]

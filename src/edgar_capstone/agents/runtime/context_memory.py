@@ -2,7 +2,7 @@
 
 Configures ADK `ContextCacheConfig`, token-triggered `EventsCompactionConfig`, bounded
 `InMemorySessionService` / `BoundedInMemoryMemoryService`, and tenant-isolated multi-turn
-conversational memory backed by `SessionStoreProtocol` (Firestore REST v1 in production).
+conversational memory backed by `SessionStoreProtocol` (Cloud Firestore SDK in production).
 Model tier routing lives in `runtime/model_config.py`; latency/cost attribution lives in
 `runtime/latency_tracker.py`.
 """
