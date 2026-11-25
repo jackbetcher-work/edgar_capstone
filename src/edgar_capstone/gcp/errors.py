@@ -62,6 +62,48 @@ def parse_retry_after(resp_or_headers: Any) -> float | None:
         return None
 
 
+def resolve_quota_project_id(
+    quota_project_id: str | None,
+    *,
+    credentials: Any | None = None,
+) -> str | None:
+    """Return ``quota_project_id`` only when active credentials are user OAuth ADC.
+
+    Passing ``ClientOptions(quota_project_id=...)`` causes Google Cloud SDKs to call
+    ``credentials.with_quota_project(qp)``:
+    - For Workload Identity Federation (``google.auth.external_account.Credentials``),
+      ``google-auth`` copies ``quota_project_id`` onto the pre-impersonation STS
+      ``source_credentials``, injecting ``x-goog-user-project`` into the
+      ``iamcredentials.googleapis.com`` token exchange as the federated principal and
+      triggering ``403 USER_PROJECT_DENIED``.
+    - For service account / Cloud Run metadata credentials, quota already bills to the
+      service account's own project without requiring ``serviceusage.services.use``.
+    - Only end-user OAuth ADC (``google.oauth2.credentials.Credentials`` /
+      ``UserAccessTokenCredentials``) needs an explicit quota project override.
+    """
+    qp = (quota_project_id or "").strip() or None
+    if not qp:
+        return None
+
+    creds = credentials
+    if creds is None:
+        try:
+            import google.auth
+
+            creds, _ = google.auth.default()
+        except Exception:
+            return None
+
+    from google.oauth2 import credentials as oauth2_credentials
+
+    if isinstance(
+        creds,
+        (oauth2_credentials.Credentials, oauth2_credentials.UserAccessTokenCredentials),
+    ):
+        return qp
+    return None
+
+
 def build_client_options(
     *,
     api_endpoint: str | None = None,
@@ -175,6 +217,16 @@ def translate_gcp_sdk_error(
     status_code, grpc_name = _extract_status_info(exc)
     retry_after = parse_retry_after(getattr(exc, "response", None))
 
+    # gRPC surfaces AuthMetadataPlugin RefreshErrors as 503 UNAVAILABLE (which
+    # google-api-core RetryError may then wrap after retrying). Map embedded 401/403
+    # credential errors to non-retryable GcpHttpError instead of retryable GcpTimeoutError.
+    msg_text = str(exc)
+    if "Getting metadata from plugin failed" in msg_text:
+        if "PERMISSION_DENIED" in msg_text or '"code": 403' in msg_text:
+            return GcpHttpError(status_code=403, url=context, response_text=msg_text[:500])
+        if "UNAUTHENTICATED" in msg_text or '"code": 401' in msg_text:
+            return GcpHttpError(status_code=401, url=context, response_text=msg_text[:500])
+
     # google.api_core.exceptions, google.genai.errors.APIError, & raw grpc.RpcError
     if exc_type_name in ("TooManyRequests", "ResourceExhausted") or status_code == 429:
         return GcpRateLimitError(
@@ -215,5 +267,6 @@ __all__ = [
     "GcpTimeoutError",
     "build_client_options",
     "parse_retry_after",
+    "resolve_quota_project_id",
     "translate_gcp_sdk_error",
 ]

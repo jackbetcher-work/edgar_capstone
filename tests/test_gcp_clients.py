@@ -36,6 +36,7 @@ from edgar_capstone.gcp.errors import (
     GcpTimeoutError,
     build_client_options,
     parse_retry_after,
+    resolve_quota_project_id,
     translate_gcp_sdk_error,
 )
 
@@ -128,6 +129,116 @@ def test_gcp_sdk_error_translation_and_client_options() -> None:
     )
     assert opts.api_endpoint == "modelarmor.us-central1.rep.googleapis.com"
     assert opts.quota_project_id == "my-proj"
+
+
+def test_resolve_quota_project_id_only_applies_to_user_oauth_adc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only end-user OAuth ADC receives quota_project_id; WIF/SA/GCE credentials omit it."""
+    import google.auth
+    from google.auth import compute_engine, identity_pool
+    from google.oauth2 import credentials as oauth2_creds
+    from google.oauth2 import service_account
+
+    user_creds = oauth2_creds.Credentials(token="tok")
+    user_access_creds = object.__new__(oauth2_creds.UserAccessTokenCredentials)
+    gce_creds = compute_engine.Credentials()
+    wif_creds = object.__new__(identity_pool.Credentials)
+    sa_creds = object.__new__(service_account.Credentials)
+
+    assert resolve_quota_project_id("", credentials=user_creds) is None
+    assert resolve_quota_project_id(None, credentials=user_creds) is None
+    assert resolve_quota_project_id("my-proj", credentials=user_creds) == "my-proj"
+    assert resolve_quota_project_id("my-proj", credentials=user_access_creds) == "my-proj"
+    assert resolve_quota_project_id("my-proj", credentials=wif_creds) is None
+    assert resolve_quota_project_id("my-proj", credentials=gce_creds) is None
+    assert resolve_quota_project_id("my-proj", credentials=sa_creds) is None
+
+    # Ambient ADC lookup when credentials=None
+    monkeypatch.setattr(google.auth, "default", lambda: (wif_creds, "my-proj"))
+    assert resolve_quota_project_id("my-proj") is None
+
+    monkeypatch.setattr(google.auth, "default", lambda: (user_creds, "my-proj"))
+    assert resolve_quota_project_id("my-proj") == "my-proj"
+
+    def _no_adc() -> Any:
+        raise DefaultCredentialsError("missing adc")
+
+    monkeypatch.setattr(google.auth, "default", _no_adc)
+    assert resolve_quota_project_id("my-proj") is None
+
+    # Regression check: Discovery Engine and Model Armor SDK clients omit quota_project_id under WIF
+    from google.cloud import discoveryengine_v1, modelarmor_v1
+
+    from edgar_capstone.agents.adapters.registry import GcpToolConfig
+    from edgar_capstone.agents.adapters.vertex_search import VertexAISearchAdapter
+    from edgar_capstone.security.model_armor.client import ModelArmorClient
+    from edgar_capstone.security.model_armor.config import ModelArmorConfig
+
+    captured_opts: list[tuple[str, Any]] = []
+
+    class _SpySearchClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_opts.append(("vais", kwargs.get("client_options")))
+
+    class _SpyModelArmorClient:
+        def __init__(self, **kwargs: Any) -> None:
+            captured_opts.append(("model_armor", kwargs.get("client_options")))
+
+    monkeypatch.setattr(discoveryengine_v1, "SearchServiceClient", _SpySearchClient)
+    monkeypatch.setattr(modelarmor_v1, "ModelArmorClient", _SpyModelArmorClient)
+
+    monkeypatch.setattr(google.auth, "default", lambda: (wif_creds, "iron-radio-514217-q7"))
+    VertexAISearchAdapter(GcpToolConfig(project_id="iron-radio-514217-q7"))._get_client()
+    ModelArmorClient(ModelArmorConfig(project_id="iron-radio-514217-q7"))._get_sdk_client()
+
+    monkeypatch.setattr(google.auth, "default", lambda: (user_creds, "iron-radio-514217-q7"))
+    VertexAISearchAdapter(GcpToolConfig(project_id="iron-radio-514217-q7"))._get_client()
+    ModelArmorClient(ModelArmorConfig(project_id="iron-radio-514217-q7"))._get_sdk_client()
+
+    assert captured_opts[0][0] == "vais" and captured_opts[0][1].quota_project_id is None
+    assert captured_opts[1][0] == "model_armor" and captured_opts[1][1].quota_project_id is None
+    assert (
+        captured_opts[2][0] == "vais"
+        and captured_opts[2][1].quota_project_id == "iron-radio-514217-q7"
+    )
+    assert (
+        captured_opts[3][0] == "model_armor"
+        and captured_opts[3][1].quota_project_id == "iron-radio-514217-q7"
+    )
+
+
+def test_translate_gcp_sdk_error_auth_plugin_401_403_is_non_retryable() -> None:
+    """gRPC 503 / RetryError wrapping AuthMetadataPlugin 403/401 maps to GcpHttpError, not retryable timeout."""
+    denied = gcp_exceptions.ServiceUnavailable(
+        'Getting metadata from plugin failed with error: ("Unable to acquire impersonated '
+        'credentials", \'{"error": {"code": 403, "status": "PERMISSION_DENIED"}}\')'
+    )
+    t_denied = translate_gcp_sdk_error(denied, context="Vertex AI Search")
+    assert isinstance(t_denied, GcpHttpError)
+    assert t_denied.status_code == 403
+
+    wrapped_retry = gcp_exceptions.RetryError(
+        "Timeout of 60.0s exceeded, last exception: 503 Getting metadata from plugin failed "
+        'with error: {"error": {"code": 403, "status": "PERMISSION_DENIED"}}',
+        cause=denied,
+    )
+    t_retry = translate_gcp_sdk_error(wrapped_retry, context="Model Armor")
+    assert isinstance(t_retry, GcpHttpError)
+    assert t_retry.status_code == 403
+
+    unauth = gcp_exceptions.ServiceUnavailable(
+        'Getting metadata from plugin failed with error: {"error": {"code": 401, "status": "UNAUTHENTICATED"}}'
+    )
+    t_unauth = translate_gcp_sdk_error(unauth, context="Model Armor")
+    assert isinstance(t_unauth, GcpHttpError)
+    assert t_unauth.status_code == 401
+
+    transient_plugin = gcp_exceptions.ServiceUnavailable(
+        "Getting metadata from plugin failed with error: connection reset by peer"
+    )
+    t_transient = translate_gcp_sdk_error(transient_plugin, context="Model Armor")
+    assert isinstance(t_transient, GcpTimeoutError)
 
 
 def test_grpc_rpc_error_status_code_translation() -> None:

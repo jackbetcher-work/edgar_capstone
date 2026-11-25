@@ -17,7 +17,11 @@ from edgar_capstone.gcp.defaults import (
     DEFAULT_LOCATION,
     DEFAULT_PROJECT_ID,
 )
-from edgar_capstone.gcp.errors import build_client_options, translate_gcp_sdk_error
+from edgar_capstone.gcp.errors import (
+    build_client_options,
+    resolve_quota_project_id,
+    translate_gcp_sdk_error,
+)
 from edgar_capstone.gcp.paths import resolve_asset_dir
 
 SAFE_BQ_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -134,7 +138,11 @@ class BigQueryClientWrapper:
             if self._owned_client is None:
                 from google.cloud import bigquery
 
-                opts = build_client_options(quota_project_id=self._quota_project_id)
+                opts = build_client_options(
+                    quota_project_id=resolve_quota_project_id(
+                        self._quota_project_id, credentials=self._credentials
+                    )
+                )
                 kwargs: dict[str, Any] = {
                     "project": self.project_id,
                     "location": self.location,

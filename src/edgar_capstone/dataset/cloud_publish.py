@@ -46,7 +46,7 @@ from edgar_capstone.gcp.discovery_engine import (
 from edgar_capstone.gcp.discovery_engine import (
     vertex_search_datastore_path as _gcp_vertex_search_datastore_path,
 )
-from edgar_capstone.gcp.errors import build_client_options
+from edgar_capstone.gcp.errors import build_client_options, resolve_quota_project_id
 from edgar_capstone.gcp.paths import resolve_repo_root
 
 logger = logging.getLogger(__name__)
@@ -113,7 +113,9 @@ def _build_bq_client(
 ) -> Any:
     from google.cloud import bigquery
 
-    opts = build_client_options(quota_project_id=quota_project_id)
+    opts = build_client_options(
+        quota_project_id=resolve_quota_project_id(quota_project_id, credentials=credentials)
+    )
     kwargs: dict[str, Any] = {"project": project_id, "location": location}
     if credentials is not None:
         kwargs["credentials"] = credentials
@@ -506,7 +508,7 @@ def import_vertex_ai_search_documents(
         else:
             opts = build_client_options(
                 api_endpoint=discovery_engine_host(location),
-                quota_project_id=project_id,
+                quota_project_id=resolve_quota_project_id(project_id, credentials=credentials),
             )
             kwargs: dict[str, Any] = {"client_options": opts}
             if credentials is not None:
@@ -592,7 +594,7 @@ def search_vertex_ai_datastore(
         else:
             opts = build_client_options(
                 api_endpoint=discovery_engine_host(location),
-                quota_project_id=project_id,
+                quota_project_id=resolve_quota_project_id(project_id, credentials=credentials),
             )
             kwargs: dict[str, Any] = {"client_options": opts}
             if credentials is not None:

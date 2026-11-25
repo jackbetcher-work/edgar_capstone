@@ -13,6 +13,7 @@ from edgar_capstone.gcp.errors import (
     GcpRateLimitError,
     GcpTimeoutError,
     build_client_options,
+    resolve_quota_project_id,
     translate_gcp_sdk_error,
 )
 from edgar_capstone.security.model_armor.config import (
@@ -86,7 +87,9 @@ class ModelArmorClient:
 
                 opts = build_client_options(
                     api_endpoint=self.config.regional_api_host,
-                    quota_project_id=self.config.project_id,
+                    quota_project_id=resolve_quota_project_id(
+                        self.config.project_id, credentials=self._credentials
+                    ),
                 )
                 kwargs: dict[str, Any] = {"client_options": opts}
                 if self._credentials is not None:

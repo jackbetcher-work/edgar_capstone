@@ -27,7 +27,7 @@ from edgar_capstone.gcp.discovery_engine import (
     vertex_search_datastore_path,
     vertex_search_engine_path,
 )
-from edgar_capstone.gcp.errors import build_client_options
+from edgar_capstone.gcp.errors import build_client_options, resolve_quota_project_id
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +188,9 @@ class VertexAISearchAdapter:
 
                 opts = build_client_options(
                     api_endpoint=discovery_engine_host(self.location),
-                    quota_project_id=self.project_id,
+                    quota_project_id=resolve_quota_project_id(
+                        self.project_id, credentials=self._credentials
+                    ),
                 )
                 kwargs: dict[str, Any] = {"client_options": opts}
                 if self._credentials is not None:
