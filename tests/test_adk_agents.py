@@ -678,11 +678,174 @@ def test_retrieval_instructions_state_citation_coverage_without_extra_calls() ->
     )
     assert "at least one cited finding for each of DAL, UAL, LUV" in peer
     assert "FY2022 and the FY2024 filings" in peer
+    assert "each company's FY2024 filing" in peer
+    assert "intermediate fiscal year" in peer
 
     single_year = build_retrieval_instructions(
         {"tickers": ["NVDA"], "start_year": 2026, "end_year": 2026}, []
     )
     assert "Citation coverage" not in single_year
+
+
+def test_hybrid_rag_lexical_rd_expansion_and_pure_table_damping() -> None:
+    """Acronym expansion + canonical bonus beat generic VAIS; table damping favors driver prose."""
+    from edgar_capstone.agents.tools.hybrid_rag import (
+        _rerank_and_build_citations,
+        extract_lexical_terms,
+    )
+
+    terms = extract_lexical_terms("Compare Merck and Pfizer's R&D spending from 2022 to 2024.")
+    assert {"r&d", "research", "development", "merck", "pfizer", "spending"} <= terms
+    assert "2022" not in terms and "2024" not in terms and "from" not in terms
+
+    # Canonical BigQuery R&D chunk beats generic VAIS chunk that merely mentions 2022/2024
+    fused_rd = {
+        "PFE_2023_item_7_0037": {
+            "chunk_id": "PFE_2023_item_7_0037",
+            "profile_id": "PFE_2023",
+            "ticker": "PFE",
+            "company_name": "Pfizer",
+            "gics_sector": "Health Care",
+            "fiscal_year": 2023,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "chunk_text": (
+                "[PFE (PFIZER INC) | FY2023 Form 10-K | Item 7. MD&A — Research and Development Expenses]\n"
+                "Research and development expenses decreased $749 million in 2023 on lower spending."
+            ),
+            "sec_filing_url": "https://www.sec.gov/pfe-2023",
+            "unstructured_gcs_uri": "",
+            "rrf_score": 1.0 / 65.0,
+            "max_similarity": 0.697,
+        },
+        "PFE_2023_item_7_vais_0000": {
+            "chunk_id": "PFE_2023_item_7_vais_0000",
+            "profile_id": "PFE_2023",
+            "ticker": "PFE",
+            "company_name": "Pfizer",
+            "gics_sector": "Health Care",
+            "fiscal_year": 2023,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "chunk_text": (
+                "In December 2023, Pfizer completed its Seagen acquisition. At the beginning of 2024, "
+                "we reorganized commercial divisions after 2022 changes and aligned R&D teams."
+            ),
+            "sec_filing_url": "https://www.sec.gov/pfe-2023",
+            "unstructured_gcs_uri": "",
+            "rrf_score": 1.0 / 65.0,
+            "max_similarity": 0.725,
+        },
+    }
+    ranked_rd = _rerank_and_build_citations(
+        fused_rd,
+        query="Compare Merck and Pfizer's R&D spending from 2022 to 2024.",
+        effective_top_k=1,
+        slices=[("PFE", 2023)],
+    )
+    assert ranked_rd[0]["chunk_id"] == "PFE_2023_item_7_0037"
+
+    # Pure Markdown table is damped relative to narrative driver prose in the same slice
+    fused_ual = {
+        "UAL_2024_item_7_0007": {
+            "chunk_id": "UAL_2024_item_7_0007",
+            "profile_id": "UAL_2024",
+            "ticker": "UAL",
+            "company_name": "United Airlines",
+            "gics_sector": "Industrials",
+            "fiscal_year": 2024,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "chunk_text": (
+                "[UAL | FY2024 Form 10-K | Item 7. MD&A]\n"
+                "| (in millions) | 2024 | 2023 | 2022 |\n"
+                "| --- | --- | --- | --- |\n"
+                "| Operating revenue | $ | 57,063 | $ | 53,717 | $ | 44,955 |\n"
+                "| Operating income | 5,096 | 4,211 | 2,337 |\n"
+                "| Net income | $ | 3,149 | $ | 2,618 | $ | 737 |"
+            ),
+            "sec_filing_url": "https://www.sec.gov/ual-2024",
+            "unstructured_gcs_uri": "",
+            "rrf_score": 1.0 / 65.0,
+            "max_similarity": 0.76,
+        },
+        "UAL_2024_item_7_0010": {
+            "chunk_id": "UAL_2024_item_7_0010",
+            "profile_id": "UAL_2024",
+            "ticker": "UAL",
+            "company_name": "United Airlines",
+            "gics_sector": "Industrials",
+            "fiscal_year": 2024,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "chunk_text": (
+                "[UAL | FY2024 Form 10-K | Item 7. MD&A — Results of Operations]\n"
+                "United Airlines operating income and net income expanded in 2024 as passenger "
+                "revenue rose 5.7% on a 6.8% capacity increase, stronger international demand, "
+                "and higher co-branded credit card mileage revenue."
+            ),
+            "sec_filing_url": "https://www.sec.gov/ual-2024",
+            "unstructured_gcs_uri": "",
+            "rrf_score": 1.0 / 65.0,
+            "max_similarity": 0.74,
+        },
+    }
+    ranked_ual = _rerank_and_build_citations(
+        fused_ual,
+        query="Compare operating income and net income for Delta, United, and Southwest.",
+        effective_top_k=1,
+        slices=[("UAL", 2024)],
+    )
+    assert ranked_ual[0]["chunk_id"] == "UAL_2024_item_7_0010"
+
+
+def test_compact_evidence_leads_centers_on_query_terms_and_preserves_short_tables() -> None:
+    """Long chunks center on matching subsections (e.g. R&D after SG&A); ~682-char tables stay intact."""
+    from edgar_capstone.agents.prompts.builders import compact_evidence_leads
+
+    mrk_text = (
+        "[MRK (Merck & Co., Inc.) | FY2023 Form 10-K | Item 7. MD&A — Costs, Expenses and Other] "
+        + ("Gross margin and selling, general and administrative expense details. " * 14)
+        + "*Research and Development* Research and development (R&D) expenses were $30.5 billion "
+        "in 2023 compared with $13.5 billion in 2022, including $10.2 billion for Prometheus "
+        "and $5.5 billion for Daiichi Sankyo. "
+        + ("Additional business development and clinical trial spending notes. " * 8)
+    )
+    ual_table = (
+        "[UAL | FY2024 Form 10-K | Item 7. MD&A — Results of Operations] "
+        + ("| Operating revenue | 57,063 | 53,717 | 44,955 | " * 14)
+        + "| Net income | $ | 3,149 | $ | 2,618 | $ | 737 |"
+    )
+    assert len(mrk_text) > 1400
+    assert 650 < len(ual_table) < 1200
+
+    leads = compact_evidence_leads(
+        [],
+        [
+            {
+                "chunk_id": "MRK_2023_item_7_0029",
+                "ticker": "MRK",
+                "fiscal_year": 2023,
+                "section_id": "item_7",
+                "section_title": "Item 7. MD&A",
+                "excerpt": mrk_text,
+            },
+            {
+                "chunk_id": "UAL_2024_item_7_0007",
+                "ticker": "UAL",
+                "fiscal_year": 2024,
+                "section_id": "item_7",
+                "section_title": "Item 7. MD&A",
+                "excerpt": ual_table,
+            },
+        ],
+        query="Compare Merck and Pfizer's R&D spending from 2022 to 2024.",
+    )
+    by_id = {lead["chunk_id"]: lead["excerpt"] for lead in leads}
+    assert by_id["MRK_2023_item_7_0029"].startswith("[MRK (Merck & Co., Inc.)")
+    assert "$30.5 billion" in by_id["MRK_2023_item_7_0029"]
+    assert "Prometheus" in by_id["MRK_2023_item_7_0029"]
+    assert "| Net income | $ | 3,149 | $ | 2,618 | $ | 737 |" in by_id["UAL_2024_item_7_0007"]
 
 
 def test_agents_subpackages_import_cleanly() -> None:

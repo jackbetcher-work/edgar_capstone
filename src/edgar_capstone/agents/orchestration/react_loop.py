@@ -600,34 +600,48 @@ def _missing_scope_coverage(
     *,
     scope: dict[str, Any],
     citations: list[dict[str, Any]],
-) -> tuple[list[str], list[int]]:
-    """Return `(missing_tickers, missing_boundary_years)` absent from verified findings.
+) -> tuple[list[str], list[int], list[tuple[str, int]]]:
+    """Return `(missing_tickers, missing_boundary_years, missing_peer_end_years)`.
 
-    Only reports a ticker or boundary fiscal year as missing when retrieved `citations`
-    actually contain at least one passage for it, so unavailable filings never trigger a
-    pointless repair pass.
+    Only reports a ticker, boundary fiscal year, or peer `(ticker, end_year)` pair as missing
+    when retrieved `citations` actually contain at least one passage for it, so unavailable
+    filings never trigger a pointless repair pass.
     """
     by_id = {str(c.get("chunk_id")): c for c in citations if c.get("chunk_id")}
     cited_tickers: set[str] = set()
     cited_years: set[int] = set()
+    cited_pairs: set[tuple[str, int]] = set()
     for f in verified.report.findings:
-        if f.ticker:
-            cited_tickers.add(normalize_edgar_ticker(f.ticker))
-        if f.fiscal_year:
-            cited_years.add(int(f.fiscal_year))
+        f_tk = normalize_edgar_ticker(f.ticker) if f.ticker else ""
+        f_fy = int(f.fiscal_year) if f.fiscal_year else 0
+        if f_tk:
+            cited_tickers.add(f_tk)
+        if f_fy:
+            cited_years.add(f_fy)
+        if f_tk and f_fy:
+            cited_pairs.add((f_tk, f_fy))
         for cid in f.chunk_ids:
             c = by_id.get(cid)
             if c is None:
                 continue
-            if c.get("ticker"):
-                cited_tickers.add(normalize_edgar_ticker(str(c["ticker"])))
-            if c.get("fiscal_year") is not None:
-                cited_years.add(int(c["fiscal_year"]))
+            c_tk = normalize_edgar_ticker(str(c["ticker"])) if c.get("ticker") else ""
+            c_fy = int(c["fiscal_year"]) if c.get("fiscal_year") is not None else 0
+            if c_tk:
+                cited_tickers.add(c_tk)
+            if c_fy:
+                cited_years.add(c_fy)
+            if c_tk and c_fy:
+                cited_pairs.add((c_tk, c_fy))
 
     available_tickers = {
         normalize_edgar_ticker(str(c["ticker"])) for c in citations if c.get("ticker")
     }
     available_years = {int(c["fiscal_year"]) for c in citations if c.get("fiscal_year") is not None}
+    available_pairs = {
+        (normalize_edgar_ticker(str(c["ticker"])), int(c["fiscal_year"]))
+        for c in citations
+        if c.get("ticker") and c.get("fiscal_year") is not None
+    }
 
     scope_tickers = [
         normalize_edgar_ticker(str(t)) for t in (scope.get("tickers") or []) if str(t).strip()
@@ -639,6 +653,7 @@ def _missing_scope_coverage(
         ]
 
     missing_years: list[int] = []
+    missing_peer_end_years: list[tuple[str, int]] = []
     if 1 <= len(scope_tickers) <= 6:
         start_y = scope.get("start_year")
         end_y = scope.get("end_year")
@@ -646,8 +661,18 @@ def _missing_scope_coverage(
             for by in (int(start_y), int(end_y)):
                 if by in available_years and by not in cited_years:
                     missing_years.append(by)
+            if 2 <= len(scope_tickers) <= 6:
+                end_int = int(end_y)
+                missing_tk_set = set(missing_tickers)
+                missing_peer_end_years = [
+                    (tk, end_int)
+                    for tk in scope_tickers
+                    if tk not in missing_tk_set
+                    and (tk, end_int) in available_pairs
+                    and (tk, end_int) not in cited_pairs
+                ]
 
-    return missing_tickers, missing_years
+    return missing_tickers, missing_years, missing_peer_end_years
 
 
 def _is_retry_improvement(
@@ -662,10 +687,14 @@ def _is_retry_improvement(
         return True
     if not candidate.verification.usable:
         return False
-    orig_tk, orig_yr = _missing_scope_coverage(original, scope=scope, citations=citations)
-    cand_tk, cand_yr = _missing_scope_coverage(candidate, scope=scope, citations=citations)
-    orig_gaps = len(orig_tk) + len(orig_yr)
-    cand_gaps = len(cand_tk) + len(cand_yr)
+    orig_tk, orig_yr, orig_pairs = _missing_scope_coverage(
+        original, scope=scope, citations=citations
+    )
+    cand_tk, cand_yr, cand_pairs = _missing_scope_coverage(
+        candidate, scope=scope, citations=citations
+    )
+    orig_gaps = len(orig_tk) + len(orig_yr) + len(orig_pairs)
+    cand_gaps = len(cand_tk) + len(cand_yr) + len(cand_pairs)
     if cand_gaps < orig_gaps:
         return True
     return (
@@ -828,13 +857,14 @@ class StructuredReActExecutor:
         """
         if self.reasoning_llm is not None:
             return verified, live_stream_result, tool_outputs, None
-        missing_tickers, missing_years = _missing_scope_coverage(
+        missing_tickers, missing_years, missing_peer_end_years = _missing_scope_coverage(
             verified, scope=req.scope, citations=req.merged_citations
         )
         partial_coverage_gap = verified.verification.findings_rejected > 0 and (
             bool(missing_tickers) or bool(missing_years)
         )
-        if verified.verification.usable and not partial_coverage_gap:
+        peer_end_year_gap = bool(missing_peer_end_years)
+        if verified.verification.usable and not partial_coverage_gap and not peer_end_year_gap:
             return verified, live_stream_result, tool_outputs, None
 
         draft_findings = structured.findings
@@ -850,7 +880,7 @@ class StructuredReActExecutor:
                     )
                 else:
                     feedback_lines.append(f"- Finding {fv.index}: {'; '.join(fv.reasons)}")
-        if partial_coverage_gap:
+        if partial_coverage_gap or peer_end_year_gap:
             gap_parts: list[str] = []
             if missing_tickers:
                 gap_parts.append(f"in-scope ticker(s) {', '.join(missing_tickers)}")
@@ -858,11 +888,24 @@ class StructuredReActExecutor:
                 gap_parts.append(
                     f"boundary fiscal year(s) {', '.join(f'FY{y}' for y in missing_years)}"
                 )
+            if missing_peer_end_years:
+                pair_labels: list[str] = []
+                for tk, fy in missing_peer_end_years:
+                    pair_cids = [
+                        str(c.get("chunk_id"))
+                        for c in req.merged_citations
+                        if normalize_edgar_ticker(str(c.get("ticker") or "")) == tk
+                        and int(c.get("fiscal_year") or 0) == fy
+                        and c.get("chunk_id")
+                    ][:2]
+                    suffix = f" (chunks: {', '.join(pair_cids)})" if pair_cids else ""
+                    pair_labels.append(f"{tk} FY{fy}{suffix}")
+                gap_parts.append(f"peer end-year filing(s) {', '.join(pair_labels)}")
             kept_cids = sorted(
                 {cid for f in verified.report.findings for cid in f.chunk_ids if cid}
             )
             feedback_lines.append(
-                "- Coverage gap after dropping rejected findings: missing "
+                "- Coverage gap: missing "
                 + " and ".join(gap_parts)
                 + ". Keep your valid findings"
                 + (f" (chunks: {', '.join(kept_cids)})" if kept_cids else "")
@@ -872,12 +915,14 @@ class StructuredReActExecutor:
 
         logger.info(
             "Verification repair triggered (usable=%s, rejected=%d/%d, missing_tickers=%s, "
-            "missing_years=%s); running one tool-less low-thinking regeneration pass.",
+            "missing_years=%s, missing_peer_end_years=%s); running one tool-less low-thinking "
+            "regeneration pass.",
             verified.verification.usable,
             verified.verification.findings_rejected,
             verified.verification.findings_total,
             missing_tickers,
             missing_years,
+            missing_peer_end_years,
         )
         try:
             # The retry is seeded with every deterministic output and citation already retrieved

@@ -9,12 +9,71 @@ from typing import Any
 from edgar_capstone.common.domain import CORE_METRICS
 
 # Evidence lead budget: generous enough that the analyst can extract verbatim quotes directly
-# without burning extra ReAct tool round-trips for passages already retrieved, while keeping
-# prompt prefill lean for sub-3s TTFT.
-_EVIDENCE_LEAD_EXCERPT_CHARS = 650
+# without burning extra ReAct tool round-trips for passages already retrieved (or truncating
+# mid-chunk subsections / tables), while keeping prompt prefill lean for sub-3s TTFT.
+_EVIDENCE_LEAD_EXCERPT_CHARS = 1200
 _MAX_EVIDENCE_LEADS = 12
-_REPAIR_EVIDENCE_LEAD_EXCERPT_CHARS = 1400
+_REPAIR_EVIDENCE_LEAD_EXCERPT_CHARS = 1600
 _REPAIR_MAX_EVIDENCE_LEADS = 18
+_LEAD_HEADER_RE = re.compile(r"^\[[^\]]{1,180}\]\s*")
+_LEAD_WORD_RE = re.compile(r"[a-z0-9]+&[a-z0-9]+|[a-z0-9]{2,}")
+_LEAD_YEAR_RE = re.compile(r"^(?:19\d{2}|20\d{2})$")
+_LEAD_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "between",
+        "by",
+        "compare",
+        "compared",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "how",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "over",
+        "that",
+        "the",
+        "their",
+        "them",
+        "they",
+        "this",
+        "through",
+        "to",
+        "vs",
+        "was",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "why",
+        "with",
+    }
+)
+_LEAD_ACRONYM_EXPANSIONS: dict[str, tuple[str, ...]] = {
+    "r&d": ("r&d", "research", "development"),
+    "sg&a": ("sg&a", "selling", "administrative"),
+    "md&a": ("md&a",),
+}
 _FEEDBACK_CHUNK_ID_RE = re.compile(
     r"\b[A-Z][A-Z0-9.\-]{0,6}_\d{4}_(?:item_1a|item_7)_(?:vais_)?\d+\b"
 )
@@ -127,11 +186,86 @@ def _group_citations_by_ticker_year(
     return grouped, ticker_order
 
 
+def _extract_lead_query_terms(query: str) -> set[str]:
+    """Extract domain-relevant query terms for centering evidence lead excerpts."""
+    raw = _LEAD_WORD_RE.findall((query or "").lower())
+    terms: set[str] = set()
+    for tok in raw:
+        if tok in _LEAD_ACRONYM_EXPANSIONS:
+            terms.update(_LEAD_ACRONYM_EXPANSIONS[tok])
+            continue
+        if tok in _LEAD_STOPWORDS or _LEAD_YEAR_RE.match(tok):
+            continue
+        terms.add(tok)
+    return terms
+
+
+def _extract_query_centered_excerpt(text: str, query: str, max_chars: int) -> str:
+    """Return a whitespace-collapsed excerpt up to `max_chars`, centered on query term matches.
+
+    When a chunk fits inside `max_chars`, it is returned untouched. Otherwise, any leading
+    bracketed chunk header (`[TICKER ...]`) is preserved and the body window is centered on
+    the highest query-term-density region so mid-chunk subsections (e.g. R&D after SG&A) are
+    not hidden behind an unrelated prefix. Every returned span remains verbatim in the chunk.
+    """
+    collapsed = " ".join(str(text or "").split())
+    if len(collapsed) <= max_chars:
+        return collapsed
+    terms = _extract_lead_query_terms(query)
+    if not terms:
+        return collapsed[:max_chars]
+
+    header_match = _LEAD_HEADER_RE.match(collapsed)
+    header = header_match.group(0) if header_match else ""
+    body = collapsed[len(header) :]
+    body_budget = max_chars - len(header)
+    if body_budget < 120:
+        return collapsed[:max_chars]
+
+    body_lower = body.lower()
+    hit_positions: list[int] = []
+    for term in terms:
+        pos = body_lower.find(term)
+        while pos != -1:
+            hit_positions.append(pos)
+            pos = body_lower.find(term, pos + len(term))
+    if not hit_positions:
+        return collapsed[:max_chars]
+
+    candidate_starts = [0]
+    for pos in sorted(set(hit_positions)):
+        start = max(0, pos - 120)
+        if start > 0:
+            ws = body.find(" ", start)
+            if ws != -1 and ws < pos:
+                start = ws + 1
+        if start not in candidate_starts:
+            candidate_starts.append(start)
+
+    best_start = 0
+    best_score: tuple[int, int, int] = (-1, -1, 0)
+    for start in candidate_starts:
+        window = body_lower[start : start + body_budget]
+        distinct = sum(1 for term in terms if term in window)
+        total = sum(window.count(term) for term in terms)
+        score = (distinct, total, -start)
+        if score > best_score:
+            best_score = score
+            best_start = start
+
+    if best_start == 0:
+        return f"{header}{body[:body_budget]}"
+    prefix = "... "
+    snippet = body[best_start : best_start + max(0, body_budget - len(prefix))]
+    return f"{header}{prefix}{snippet}"
+
+
 def compact_evidence_leads(
     cached_explanations: list[dict[str, Any]],
     citations: list[dict[str, Any]],
     *,
     scope: dict[str, Any] | None = None,
+    query: str = "",
     priority_chunk_ids: set[str] | None = None,
     max_leads: int = _MAX_EVIDENCE_LEADS,
     excerpt_chars: int = _EVIDENCE_LEAD_EXCERPT_CHARS,
@@ -197,7 +331,9 @@ def compact_evidence_leads(
             "period_of_report": c.get("period_of_report"),
             "section_id": c.get("section_id"),
             "section_title": c.get("section_title"),
-            "excerpt": " ".join(str(c.get("excerpt") or "").split())[:excerpt_chars],
+            "excerpt": _extract_query_centered_excerpt(
+                str(c.get("excerpt") or ""), query, excerpt_chars
+            ),
         }
         for c in ordered
     ]
@@ -253,7 +389,15 @@ def _citation_coverage_line(scope: dict[str, Any]) -> str | None:
     if multi_company:
         parts.append(f"at least one cited finding for each of {', '.join(tickers)}")
     if multi_year:
-        parts.append(f"findings citing both the FY{years[0]} and the FY{years[1]} filings")
+        yr_clause = f"findings citing both the FY{years[0]} and the FY{years[1]} filings"
+        if multi_company:
+            yr_clause += f" (including each company's FY{years[1]} filing)"
+        if abs(years[1] - years[0]) >= 2:
+            yr_clause += (
+                ", plus any intermediate fiscal year where `annual_series` shows a major "
+                "spike, drop, or reversal in the requested metric"
+            )
+        parts.append(yr_clause)
     return (
         "- Citation coverage for this question: "
         + " and ".join(parts)
@@ -615,12 +759,13 @@ def build_financial_reasoning_prompt(
             cached_explanations,
             citations,
             scope=scope,
+            query=query,
             priority_chunk_ids=feedback_chunk_ids or None,
             max_leads=_REPAIR_MAX_EVIDENCE_LEADS,
             excerpt_chars=_REPAIR_EVIDENCE_LEAD_EXCERPT_CHARS,
         )
     else:
-        leads = compact_evidence_leads(cached_explanations, citations, scope=scope)
+        leads = compact_evidence_leads(cached_explanations, citations, scope=scope, query=query)
     if leads:
         sections.append(
             "## 10-K Evidence Leads (pre-retrieved passages — cite directly or extend with tools)\n"
@@ -654,9 +799,9 @@ def build_financial_reasoning_prompt(
     sections.append(
         "## Output Reminder\n"
         "Return a valid `AnalystReport` JSON (`intent`, `headline`, `key_metrics`, `findings`) "
-        f"citing both `FY{scope.get('start_year')}` and `FY{scope.get('end_year')}` when available "
-        "in multi-year or peer queries, with verbatim `evidence_quote` snippets and only requested "
-        "`key_metrics`."
+        f"citing each company's `FY{scope.get('end_year')}` filing, `FY{scope.get('start_year')}`, "
+        "and any major intermediate-year inflection when available in multi-year or peer queries, "
+        "with verbatim `evidence_quote` snippets and only requested `key_metrics`."
     )
     return "\n\n".join(sections)
 

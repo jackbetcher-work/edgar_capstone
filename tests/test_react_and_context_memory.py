@@ -1284,6 +1284,153 @@ def test_partial_rejection_coverage_gap_triggers_repair_and_never_regresses(
     assert long_ual[:900] in repair_prompt
 
 
+def test_missing_peer_end_year_triggers_repair_even_without_rejections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In multi-company multi-year queries, citing UAL FY2023 while omitting available UAL FY2024 triggers repair."""
+    from edgar_capstone.agents.orchestration import react_loop
+    from edgar_capstone.agents.runtime.live_runtime import AdkStreamResult
+
+    dal_2024 = (
+        "Delta operating income rose to $6.0 billion in 2024 on international and premium demand."
+    )
+    ual_2023 = (
+        "United cargo revenue decreased in 2023 while co-branded credit card mileage revenue rose."
+    )
+    ual_2024 = "United Airlines capacity grew 6.8% in 2024 alongside higher cargo and co-brand card revenue."
+    dal_2022 = "Delta salaries and related costs rose in 2022 as capacity recovered."
+    citations = [
+        {
+            "chunk_id": "DAL_2024_item_7_0001",
+            "ticker": "DAL",
+            "company_name": "Delta Air Lines",
+            "fiscal_year": 2024,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "sec_filing_url": "https://www.sec.gov/dal-2024",
+            "excerpt": dal_2024,
+            "score": 0.94,
+        },
+        {
+            "chunk_id": "DAL_2022_item_7_0010",
+            "ticker": "DAL",
+            "company_name": "Delta Air Lines",
+            "fiscal_year": 2022,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "sec_filing_url": "https://www.sec.gov/dal-2022",
+            "excerpt": dal_2022,
+            "score": 0.85,
+        },
+        {
+            "chunk_id": "UAL_2023_item_7_0010",
+            "ticker": "UAL",
+            "company_name": "United Airlines",
+            "fiscal_year": 2023,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "sec_filing_url": "https://www.sec.gov/ual-2023",
+            "excerpt": ual_2023,
+            "score": 0.89,
+        },
+        {
+            "chunk_id": "UAL_2024_item_7_0010",
+            "ticker": "UAL",
+            "company_name": "United Airlines",
+            "fiscal_year": 2024,
+            "section_id": "item_7",
+            "section_title": "Item 7. MD&A",
+            "sec_filing_url": "https://www.sec.gov/ual-2024",
+            "excerpt": ual_2024,
+            "score": 0.87,
+        },
+    ]
+
+    # Draft 1 verifies cleanly (0 rejections) and covers DAL, UAL, 2022, 2024 — but misses (UAL, 2024)
+    draft_missing_ual_2024 = {
+        "headline": "Delta and United expanded earnings from 2022 to 2024.",
+        "intent": "multi_company_peer_comparison",
+        "key_metrics": [],
+        "findings": [
+            {
+                "statement": "Delta grew operating income in 2024 on international and premium demand.",
+                "ticker": "DAL",
+                "fiscal_year": 2024,
+                "chunk_ids": ["DAL_2024_item_7_0001"],
+                "evidence_quote": dal_2024,
+            },
+            {
+                "statement": "Delta saw higher salaries and related costs during the 2022 recovery.",
+                "ticker": "DAL",
+                "fiscal_year": 2022,
+                "chunk_ids": ["DAL_2022_item_7_0010"],
+                "evidence_quote": dal_2022,
+            },
+            {
+                "statement": "United grew co-branded credit card mileage revenue in 2023.",
+                "ticker": "UAL",
+                "fiscal_year": 2023,
+                "chunk_ids": ["UAL_2023_item_7_0010"],
+                "evidence_quote": ual_2023,
+            },
+        ],
+    }
+    repaired_with_ual_2024 = {
+        **draft_missing_ual_2024,
+        "findings": [
+            *draft_missing_ual_2024["findings"],
+            {
+                "statement": "United expanded capacity by 6.8% in 2024 alongside higher cargo and card revenue.",
+                "ticker": "UAL",
+                "fiscal_year": 2024,
+                "chunk_ids": ["UAL_2024_item_7_0010"],
+                "evidence_quote": ual_2024,
+            },
+        ],
+    }
+
+    captured: list[dict[str, Any]] = []
+
+    def _invoke(self, **kwargs: Any) -> AdkStreamResult:
+        captured.append(dict(kwargs))
+        payload = draft_missing_ual_2024 if len(captured) == 1 else repaired_with_ual_2024
+        return AdkStreamResult(
+            agent_name="FinancialAnalystAgent",
+            app_name="edgar_chat_app",
+            session_id="sess-peer-end-year-repair",
+            backend="vertex_ai",
+            final_text=json.dumps(payload),
+            observed_ttft_ms=35.0,
+            session_state={"financial_analyst_report": payload},
+        )
+
+    monkeypatch.setattr(react_loop.StructuredReActExecutor, "_invoke_financial_reasoning", _invoke)
+    res = react_loop.StructuredReActExecutor().execute_post_retrieval_reasoning(
+        query="Compare Delta and United operating income from 2022 to 2024.",
+        intent="multi_company_peer_comparison",
+        scope={
+            "tickers": ["DAL", "UAL"],
+            "tickers_csv": "DAL,UAL",
+            "gics_sector": "ALL",
+            "section_id": "item_7",
+            "start_year": 2022,
+            "end_year": 2024,
+        },
+        variance_reports=[],
+        citations=citations,
+        sector_benchmarks=[],
+        chunk_health=None,
+        skip_background_judge=True,
+    )
+    assert len(captured) == 2
+    feedback = captured[1].get("verification_feedback") or ""
+    assert "UAL FY2024" in feedback
+    assert "UAL_2024_item_7_0010" in feedback
+    assert captured[1].get("enable_tools") is False and captured[1].get("low_thinking") is True
+    assert res["answer_verified"] is True
+    assert "UAL_2024_item_7_0010" in res["answer_markdown"]
+
+
 def test_financial_reasoning_model_pricing_and_runtime_prompt_rendering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

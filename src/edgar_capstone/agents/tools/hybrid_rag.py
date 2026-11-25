@@ -101,11 +101,10 @@ def _is_pure_table_chunk(text: str) -> bool:
         return False
     body = _CHUNK_HEADER_PREFIX_RE.sub("", text.strip(), count=1)
     prose_chars = sum(
-        len(line.strip())
-        for line in body.splitlines()
-        if line.strip() and "|" not in line
+        len(line.strip()) for line in body.splitlines() if line.strip() and "|" not in line
     )
     return prose_chars < 160
+
 
 # Coverage-aware retrieval: when a ticker-scoped search spans several company-years, every
 # `(ticker, fiscal_year)` slice gets at least one passage before the remaining slots are filled

@@ -668,8 +668,10 @@ def flag_material_variances(
     """Deterministically flags material financial variances (anomalies) that need a 10-K explanation.
 
     Call this ONLY when the question asks about anomalies: unusual swings, inflections, profit
-    or loss sign reversals (e.g. net income turning negative), margin shifts, or why a figure
-    spiked or collapsed. Do not call it for plain metric lookups or qualitative questions.
+    or loss sign reversals (e.g. net income turning negative, or cumulative net losses followed
+    by a return to profit / profitability recovery), margin shifts, or why a figure spiked or
+    collapsed — even if the question also asks for a total or recovery timeframe. Do not call
+    it for plain growth/comparison lookups or qualitative questions.
 
     Rules: large YoY changes in Revenue, Operating Income, Net Income, or R&D; operating or net
     income sign reversals; large operating-margin, net-margin, or R&D-intensity shifts (bps);
