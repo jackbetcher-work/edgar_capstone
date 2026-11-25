@@ -1,4 +1,4 @@
-"""ADK tools: MetricFetchTool, AnalyticsViewQueryTool, VarianceCalculationTool, HybridSearchTool, and ContextCacheTool.
+"""ADK tools: AnalyticsViewQueryTool, VarianceCalculationTool, HybridSearchTool, and QueryCached10KTool.
 
 Every tool reads live GCP data through the modular client adapters under
 `edgar_capstone.agents.adapters`: BigQuery (`financial_metrics`, `filing_chunks`,
@@ -18,27 +18,13 @@ from typing import Any
 import numpy as np
 from google.adk.tools import FunctionTool, ToolContext
 
-from edgar_capstone.agents.adapters import (
-    DEFAULT_BQ_CHUNK_HEALTH_VIEW,
-    DEFAULT_BQ_FILING_CHUNKS_TABLE,
-    DEFAULT_BQ_FINANCIAL_METRICS_TABLE,
-    DEFAULT_BQ_YOY_VARIANCES_VIEW,
-    BigQueryAdapter,
-    GcpAdapterHttpError,
-    GcpEndpointNotReadyError,
-    GcpToolAdapters,
-    GcpToolConfig,
-    GcsCorpusAdapter,
-    VertexAISearchAdapter,
-    _default_section_title,
+from edgar_capstone.agents.adapters.registry import (
     _gcp_adapters,
-    _normalize_section_id,
-    configure_gcp_tool_adapters,
     get_active_gcp_tool_adapters,
     get_gcp_adapters_status_metadata,
     register_adapter_reset_hook,
-    reset_gcp_tool_adapters,
 )
+from edgar_capstone.agents.adapters.vertex_search import _normalize_section_id
 from edgar_capstone.agents.core.citations import merge_citations
 from edgar_capstone.agents.core.resilience import with_tool_resilience
 from edgar_capstone.agents.core.schemas import GroundedCitation
@@ -52,13 +38,7 @@ from edgar_capstone.agents.tools.runtime import (
     cached_turn_profiles,
     variance_map,
 )
-from edgar_capstone.agents.tools.variance_engine import (
-    _build_variance_reports_from_profiles,
-    _compute_single_metric_variance,
-    _numeric_citation_for_profile,
-    _profile_to_metric_record,
-    _xbrl_concept_for_metric,
-)
+from edgar_capstone.agents.tools.variance_engine import _build_variance_reports_from_profiles
 from edgar_capstone.common.cache import (
     BoundedTTLCache,
     CacheMetrics,
@@ -70,13 +50,6 @@ from edgar_capstone.common.domain import (
     normalize_edgar_ticker,
 )
 from edgar_capstone.common.env import env_positive_float, env_positive_int
-from edgar_capstone.gcp.defaults import DEFAULT_BIGQUERY_DATASET_ID
-from edgar_capstone.gcp.discovery_engine import (
-    DEFAULT_VERTEX_AI_SEARCH_COLLECTION,
-    DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID,
-    DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID,
-    DEFAULT_VERTEX_AI_SEARCH_LOCATION,
-)
 from edgar_capstone.vector_db.chunker import (
     estimate_token_count,
     extract_sections_from_combined_markdown,
@@ -181,30 +154,6 @@ _SECTION_CHUNKS_CACHE: _TrackedSectionCache = _TrackedSectionCache(
 _CONTEXT_CACHE_STATS = _ContextCacheRuntimeStats()
 
 register_adapter_reset_hook(_SECTION_CHUNKS_CACHE.clear)
-
-
-def _record_gcp_backend_invocation(
-    tool_context: ToolContext | None,
-    *,
-    tool_name: str,
-    data_source: str,
-    services_hit: list[str],
-) -> None:
-    """Record which GCP services were invoked on ADK `tool_context.state`."""
-    if tool_context is None or not hasattr(tool_context, "state"):
-        return
-    try:
-        entries = list(tool_context.state.get("gcp_backend_calls", []))
-        entries.append(
-            {
-                "tool_name": tool_name,
-                "data_source": data_source,
-                "services_hit": list(services_hit),
-            }
-        )
-        tool_context.state["gcp_backend_calls"] = entries
-    except Exception as exc:
-        logger.debug("Skipping gcp_backend_calls telemetry update: %s", exc)
 
 
 def get_context_cache_runtime_stats() -> dict[str, Any]:
@@ -320,57 +269,6 @@ def _query_bigquery_explore(
 # ---------------------------------------------------------------------------
 
 
-@with_tool_resilience(tool_name="fetch_financial_metrics")
-def fetch_financial_metrics(
-    tickers: str,
-    start_year: int,
-    end_year: int,
-    gics_sector: str,
-    tool_context: ToolContext | None = None,
-) -> dict[str, Any]:
-    """Retrieves raw structured SEC 10-K financial metrics (Revenue, Operating Income, Net Income, R&D expense, margins, and filing URLs).
-
-    Args:
-        tickers: Comma-separated ticker symbols (e.g., 'NVDA,AAPL,MSFT') or 'ALL' for all companies.
-        start_year: Earliest fiscal year to retrieve (inclusive, e.g., 2024).
-        end_year: Latest fiscal year to retrieve (inclusive, e.g., 2026).
-        gics_sector: Optional GICS Sector filter (e.g., 'Information Technology') or 'ALL' for any sector.
-
-    Returns:
-        Dictionary with 'status', 'record_count', and 'metrics' list of structured financial records.
-    """
-    ticker_filter = _parse_ticker_list(tickers)
-    sector_norm = _normalize_sector_filter(gics_sector)
-
-    adapters = _gcp_adapters()
-    bq_profiles = adapters.bigquery.fetch_profiles(
-        tickers=ticker_filter,
-        start_year=start_year,
-        end_year=end_year,
-        gics_sector=sector_norm,
-    )
-    records = [_profile_to_metric_record(p).model_dump(mode="json") for p in bq_profiles]
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="fetch_financial_metrics",
-        data_source="gcp",
-        services_hit=["bigquery"],
-    )
-
-    if tool_context is not None and hasattr(tool_context, "state"):
-        existing = list(tool_context.state.get("fetched_metrics", []))
-        existing.extend(records)
-        tool_context.state["fetched_metrics"] = existing
-
-    return {
-        "status": "success",
-        "record_count": len(records),
-        "tickers_found": sorted({r["ticker"] for r in records}),
-        "fiscal_years": sorted({r["fiscal_year"] for r in records}),
-        "metrics": records,
-    }
-
-
 @with_tool_resilience(tool_name="query_analytics_view")
 def query_analytics_view(
     explore_name: str,
@@ -410,12 +308,6 @@ def query_analytics_view(
         sector_norm=_normalize_sector_filter(gics_sector),
         start_year=start_year,
         end_year=end_year,
-    )
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="query_analytics_view",
-        data_source="gcp",
-        services_hit=["bigquery"],
     )
 
     if tool_context is not None and hasattr(tool_context, "state"):
@@ -476,12 +368,6 @@ def calculate_period_variances(
             start_year=lo_year,
             end_year=end_year,
         )
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="calculate_period_variances",
-        data_source="gcp",
-        services_hit=["bigquery"],
-    )
 
     reports, missing_tickers = _build_variance_reports_from_profiles(
         profiles,
@@ -565,12 +451,6 @@ def search_10k_chunks_rag(
     if tool_context is not None and hasattr(tool_context, "state"):
         existing_cits = list(tool_context.state.get("retrieved_citations", []))
         tool_context.state["retrieved_citations"] = merge_citations(existing_cits, gcp_citations)
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="search_10k_chunks_rag",
-        data_source="gcp",
-        services_hit=services_hit,
-    )
     if not gcp_citations:
         return {
             "status": "success",
@@ -632,7 +512,6 @@ def load_cached_10k_section(
             ),
             None,
         )
-        profile_from_cache = matched_prof is not None
         if matched_prof is None:
             bq_profiles = adapters.bigquery.fetch_profiles(
                 tickers={norm_ticker},
@@ -647,12 +526,6 @@ def load_cached_10k_section(
             }
         gcs_target = matched_prof.unstructured_gcs_uri or matched_prof.unstructured_blob_path
         md_content = adapters.gcs_corpus.fetch_markdown(gcs_target)
-        _record_gcp_backend_invocation(
-            tool_context,
-            tool_name="load_cached_10k_section",
-            data_source="gcp",
-            services_hit=["gcs"] if profile_from_cache else ["bigquery", "gcs"],
-        )
 
         sections = extract_sections_from_combined_markdown(md_content)
         sec_text = sections.get(sec_key, "")
@@ -879,22 +752,13 @@ def query_cached_10k_context(
     eff_limit = max(1, min(int(max_passages), 10))
     top_scored = scored[:eff_limit]
 
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="query_cached_10k_context",
-        data_source="gcp",
-        services_hit=services_hit,
-    )
-
     matched_chunk_ids: list[str] = []
     matched_citations: list[dict[str, Any]] = []
     passages: list[dict[str, Any]] = []
-    top_passages: list[str] = []
 
     for score_val, chunk in top_scored:
         cid = str(chunk["chunk_id"])
         chunk_text = str(chunk.get("chunk_text") or "").strip()
-        top_passages.append(chunk_text)
         passages.append(
             {
                 "text": chunk_text,
@@ -962,71 +826,32 @@ def query_cached_10k_context(
         "content_source": "bigquery_filing_chunks",
         "embedding_source": cached_chunks_entry["emb_source"],
         "passages": passages,
-        "explanations": top_passages,
         "matched_chunk_ids": matched_chunk_ids,
         "matched_citations": matched_citations,
     }
 
 
-# Explicit ADK FunctionTool instances matching project_reference.md naming
-MetricFetchTool = FunctionTool(fetch_financial_metrics)
 AnalyticsViewQueryTool = FunctionTool(query_analytics_view)
-LookerQueryTool = AnalyticsViewQueryTool  # backward-compatible deprecated alias
 VarianceCalculationTool = FunctionTool(calculate_period_variances)
 HybridSearchTool = FunctionTool(search_10k_chunks_rag)
-ContextCacheTool = FunctionTool(load_cached_10k_section)
 QueryCached10KTool = FunctionTool(query_cached_10k_context)
 
 __all__ = [
     "AnalyticsViewQueryTool",
-    "BigQueryAdapter",
-    "ContextCacheTool",
-    "DEFAULT_10K_SECTION_CACHE_MAX_ENTRIES",
-    "DEFAULT_10K_SECTION_CACHE_TTL_SECONDS",
-    "DEFAULT_BIGQUERY_DATASET_ID",
-    "DEFAULT_BQ_CHUNK_HEALTH_VIEW",
-    "DEFAULT_BQ_FILING_CHUNKS_TABLE",
-    "DEFAULT_BQ_FINANCIAL_METRICS_TABLE",
-    "DEFAULT_BQ_YOY_VARIANCES_VIEW",
-    "DEFAULT_VERTEX_AI_SEARCH_COLLECTION",
-    "DEFAULT_VERTEX_AI_SEARCH_DATASTORE_ID",
-    "DEFAULT_VERTEX_AI_SEARCH_ENGINE_ID",
-    "DEFAULT_VERTEX_AI_SEARCH_LOCATION",
-    "GcpAdapterHttpError",
-    "GcpEndpointNotReadyError",
-    "GcpToolAdapters",
-    "GcpToolConfig",
-    "GcsCorpusAdapter",
     "HybridSearchTool",
-    "LookerQueryTool",
-    "MetricFetchTool",
     "QueryCached10KTool",
     "VarianceCalculationTool",
-    "VertexAISearchAdapter",
     "_SECTION_CHUNKS_CACHE",
     "_SESSION_10K_CONTEXT_CACHE",
-    "_build_variance_reports_from_profiles",
-    "_compute_single_metric_variance",
-    "_default_section_title",
-    "_execute_live_gcp_hybrid_rag",
     "_gcp_adapters",
-    "_normalize_section_id",
-    "_numeric_citation_for_profile",
     "_parse_ticker_list",
-    "_profile_to_metric_record",
-    "_record_gcp_backend_invocation",
-    "_xbrl_concept_for_metric",
     "calculate_period_variances",
-    "configure_gcp_tool_adapters",
-    "fetch_financial_metrics",
     "get_active_gcp_tool_adapters",
     "get_context_cache_runtime_stats",
     "get_full_10k_section",
     "get_gcp_adapters_status_metadata",
     "load_cached_10k_section",
-    "parse_10k_cache_key",
     "query_analytics_view",
     "query_cached_10k_context",
-    "reset_gcp_tool_adapters",
     "search_10k_chunks_rag",
 ]

@@ -18,10 +18,6 @@ SP500_UPSTREAM_CSV_URL = (
     "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 )
 
-# Retained for backward compatibility; call sites passing `None` resolve dynamically via
-# `resolve_sp500_constituents_csv()` so runtime `EDGAR_DATA_ROOT` changes are honored.
-DEFAULT_SP500_CSV_PATH = resolve_sp500_constituents_csv()
-
 # 18 flagship S&P 500 companies spanning key GICS sectors (including NVDA & AAPL
 # highlighted in the project reference, tech peers, banks, healthcare, energy, retail).
 CURATED_STARTER_TICKERS: tuple[str, ...] = (
@@ -160,7 +156,6 @@ def load_constituents(
 
 __all__ = [
     "CURATED_STARTER_TICKERS",
-    "DEFAULT_SP500_CSV_PATH",
     "SP500_UPSTREAM_CSV_URL",
     "format_cik",
     "load_constituents",

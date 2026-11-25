@@ -33,7 +33,6 @@ _PERCENT_RE = re.compile(r"([+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?|[+-]?\d+(?:\.\d+)?
 _XBRL_TAG_RE = re.compile(
     r"\[([A-Z][A-Z0-9.\-]{0,6})\s+FY(\d{4})\s*\|\s*XBRL\s+([^|\]]+?)\s*\|\s*acc:([^\]]+?)\]"
 )
-_NOTES_SECTION_MARKER = "#### Notes (not source-verified)"
 _KEY_METRICS_MARKER = "#### Key Metrics"
 
 PCT_ENGINE_TOLERANCE = 0.01
@@ -512,13 +511,9 @@ def score_selective_display(
 
 
 def score_unsupported_claims(response: dict[str, Any]) -> tuple[int, list[str]]:
-    """Deterministic count of unsupported claims / uncited notes sections in the released answer."""
+    """Deterministic count of unsupported claims reported by structured report verification."""
     reasons: list[str] = []
     count = 0
-    answer = response.get("answer_markdown") or ""
-    if _NOTES_SECTION_MARKER in answer:
-        count += 1
-        reasons.append("answer contains unverified Notes section")
     rv = response.get("report_verification") or {}
     rv_unsup = int(rv.get("unsupported_claims_count") or 0)
     if rv_unsup > 0:

@@ -9,7 +9,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from google.api_core import exceptions as gcp_exceptions
 from google.auth import exceptions as auth_exceptions
+from google.cloud import storage
+from google.cloud.storage.retry import DEFAULT_RETRY
 
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.gcp.defaults import (
@@ -18,37 +21,17 @@ from edgar_capstone.gcp.defaults import (
     DEFAULT_PROJECT_ID,
 )
 
-try:
-    from google.api_core import exceptions as gcp_exceptions
-    from google.cloud import storage
-    from google.cloud.storage.retry import DEFAULT_RETRY
-except ImportError:  # pragma: no cover - optional `[ingest]` extra
-    gcp_exceptions = None  # type: ignore[assignment]
-    storage = None  # type: ignore[assignment]
-    DEFAULT_RETRY = None  # type: ignore[assignment]
-
 logger = logging.getLogger(__name__)
 
 
 class GCSAccessError(RuntimeError):
-    """Raised when GCS credentials, IAM permissions, or optional dependencies prevent access."""
-
-
-def _require_storage_sdk() -> Any:
-    """Return the `google.cloud.storage` module or raise a clear `[ingest]` install error."""
-    if storage is None:
-        raise GCSAccessError(
-            "google-cloud-storage is not installed. Install the optional ingestion dependencies "
-            "with: pip install -e '.[ingest]'"
-        )
-    return storage
+    """Raised when GCS credentials or IAM permissions prevent bucket access."""
 
 
 def create_storage_client(*, project_id: str = DEFAULT_PROJECT_ID) -> Any:
-    """Create a `google.cloud.storage.Client` with friendly credential/dependency errors."""
-    sdk = _require_storage_sdk()
+    """Create a `google.cloud.storage.Client` with friendly credential errors."""
     try:
-        return sdk.Client(project=project_id)
+        return storage.Client(project=project_id)
     except auth_exceptions.DefaultCredentialsError as exc:
         raise GCSAccessError(
             f"Google Cloud Application Default Credentials not found for project '{project_id}': "
@@ -210,15 +193,12 @@ def ensure_gcs_bucket(
 ) -> Any:
     """Look up the target GCS bucket, creating it in `location` with uniform access if missing."""
     normalized = normalize_bucket_name(bucket_name)
-    auth_errors: tuple[type[BaseException], ...] = (auth_exceptions.DefaultCredentialsError,)
-    conflict_errors: tuple[type[BaseException], ...] = ()
-    if gcp_exceptions is not None:
-        auth_errors = (
-            auth_exceptions.DefaultCredentialsError,
-            gcp_exceptions.Forbidden,
-            gcp_exceptions.Unauthorized,
-        )
-        conflict_errors = (gcp_exceptions.Conflict,)
+    auth_errors: tuple[type[BaseException], ...] = (
+        auth_exceptions.DefaultCredentialsError,
+        gcp_exceptions.Forbidden,
+        gcp_exceptions.Unauthorized,
+    )
+    conflict_errors: tuple[type[BaseException], ...] = (gcp_exceptions.Conflict,)
 
     try:
         existing = client.lookup_bucket(normalized)

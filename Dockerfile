@@ -36,8 +36,8 @@ RUN python -m venv /opt/venv && \
 
 # ==============================================================================
 # Stage 2: Runtime — Minimal non-root container for Google Cloud Run
-# No secrets or keys are baked into this image; all sensitive credentials are
-# injected at runtime from Google Cloud Secret Manager.
+# No secrets or keys are baked into this image; GCP access uses the Cloud Run
+# runtime service account identity via ADC.
 # ==============================================================================
 FROM python:3.11-slim AS runtime
 

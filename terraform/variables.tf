@@ -45,12 +45,6 @@ variable "sec_corpus_bucket_versioning" {
   default     = true
 }
 
-variable "vertex_connection_id" {
-  description = "BigQuery Cloud Resource Connection ID for Vertex AI embeddings & GCS Object Tables."
-  type        = string
-  default     = "vertex-ai-rag-conn"
-}
-
 variable "analyst_service_account_id" {
   description = "Account ID for the custom SEC Analyst runtime service account (sec-analyst-sa@<project>.iam.gserviceaccount.com)."
   type        = string
@@ -78,12 +72,6 @@ variable "seed_native_filing_chunks" {
   description = "Whether to trigger a BigQuery load job seeding native filing_chunks from GCS manifests/bigquery_filing_chunks.jsonl (enable once vector manifests are uploaded, or populate via scripts/build_vector_db.py)."
   type        = bool
   default     = false
-}
-
-variable "embedding_model" {
-  description = "Vertex AI embedding model used for 10-K chunk embeddings."
-  type        = string
-  default     = "text-embedding-005"
 }
 
 variable "financial_reasoning_model" {

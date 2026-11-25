@@ -51,7 +51,6 @@ from edgar_capstone.agents.tools.runtime import (
 from edgar_capstone.agents.tools.sec_tools import (
     _gcp_adapters,
     _parse_ticker_list,
-    _record_gcp_backend_invocation,
     get_full_10k_section,
     search_10k_chunks_rag,
 )
@@ -744,30 +743,21 @@ def build_company_evolution(
 # ---------------------------------------------------------------------------
 
 
-def _section_chunks(ticker: str, fiscal_year: int, section_id: str) -> list[dict[str, Any]]:
-    return _gcp_adapters().bigquery.fetch_section_chunks(
-        ticker=normalize_edgar_ticker(ticker),
-        fiscal_year=int(fiscal_year),
-        section_id=section_id,
-        include_embedding=False,
-    )
-
-
 def _load_section_material(
     ticker: str, company_name: str, fiscal_year: int, section_id: str
 ) -> SectionMaterial | None:
+    """Load full 10-K section markdown from GCS when BigQuery had zero chunks for the slice."""
     norm_ticker = normalize_edgar_ticker(ticker)
     entry = get_full_10k_section(f"{norm_ticker}_{fiscal_year}_{section_id}")
-    chunks = _section_chunks(norm_ticker, fiscal_year, section_id)
-    if entry is None and not chunks:
+    if entry is None:
         return None
     return SectionMaterial(
         ticker=norm_ticker,
-        company_name=str((entry or {}).get("company_name") or company_name),
+        company_name=str(entry.get("company_name") or company_name),
         fiscal_year=int(fiscal_year),
         section_id=section_id,
-        full_text=str((entry or {}).get("full_text") or ""),
-        chunks=chunks,
+        full_text=str(entry.get("full_text") or ""),
+        chunks=[],
     )
 
 
@@ -841,7 +831,6 @@ def _retrieve_passages_and_materials(
 ) -> tuple[
     dict[tuple[str, int], list[dict[str, Any]]],
     dict[tuple[str, int, str], SectionMaterial | None],
-    bool,
 ]:
     """Retrieve theme passages and section chunks in parallel with a single batched BQ section query.
 
@@ -930,7 +919,6 @@ def _retrieve_passages_and_materials(
         else:
             missing_keys.append((tk, fy, sec))
 
-    used_gcs_fallback = False
     if missing_keys:
 
         def _load_fallback(item: tuple[str, int, str]) -> SectionMaterial | None:
@@ -940,10 +928,8 @@ def _retrieve_passages_and_materials(
         fallback_list = run_parallel_with_context(missing_keys, _load_fallback, max_workers=8)
         for key, mat in zip(missing_keys, fallback_list, strict=True):
             materials[key] = mat
-            if mat is not None and mat.full_text:
-                used_gcs_fallback = True
 
-    return passages, materials, used_gcs_fallback
+    return passages, materials
 
 
 @with_tool_resilience(tool_name="compare_disclosures_across_years")
@@ -1008,7 +994,7 @@ def compare_disclosures_across_years(
     window = list(range(start_year, end_year + 1))
     company_meta = _company_years(selected, start_year, end_year)
     resolved_terms = resolve_theme_terms(theme, theme_terms)
-    passages, materials, used_gcs_fallback = _retrieve_passages_and_materials(
+    passages, materials = _retrieve_passages_and_materials(
         theme=theme,
         selected=selected,
         company_meta=company_meta,
@@ -1068,25 +1054,9 @@ def compare_disclosures_across_years(
             )
             tool_context.state[STATE_DISCLOSURE_DELTAS] = merged
             tool_context.state[STATE_DISCLOSURE_DELTA_SUMMARY] = (merged or result)["summary"]
-    services_hit = ["vertex_ai_search", "bigquery"]
-    if used_gcs_fallback:
-        services_hit.append("gcs")
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="compare_disclosures_across_years",
-        data_source="gcp",
-        services_hit=services_hit,
-    )
     if tool_context is not None and hasattr(tool_context, "state"):
         return compact_disclosure_deltas_for_tool(result)
     return result
-
-
-def disclosure_delta_citations(result: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """Citations referenced by a Disclosure Delta result (empty when absent or failed)."""
-    if not result or result.get("status") != "success":
-        return []
-    return list(result.get("citations") or [])
 
 
 DisclosureDeltaTool = FunctionTool(compare_disclosures_across_years)

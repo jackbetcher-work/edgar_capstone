@@ -262,7 +262,6 @@ def test_deterministic_continuity_fallback_blocks_false_carryover_on_new_subject
         explicit_tickers=[],
         unknown_entities=robotics["unknown_entities"],
         catalog=catalog,
-        memory_context=lly_mem,
     )
     assert val_rob["action"] == "clarification"
 
@@ -290,7 +289,6 @@ def test_deterministic_continuity_fallback_blocks_false_carryover_on_new_subject
         explicit_tickers=[],
         unknown_entities=[],
         catalog=catalog,
-        memory_context=lly_mem,
     )
     assert val_tar["action"] == "proceed"
 
@@ -366,7 +364,6 @@ def test_flash_lite_scope_classifier_validates_against_catalog_and_handles_outag
         explicit_tickers=[],
         unknown_entities=scope_unk["unknown_entities"],
         catalog=catalog,
-        memory_context=lly_mem,
     )
     assert val_unk["action"] == "out_of_corpus"
     assert val_unk["reason"] == "non_sp500_issuer"

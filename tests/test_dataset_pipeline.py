@@ -1411,9 +1411,6 @@ def test_extractor_retry_company_fallback_constituents_gcs_and_lazy_exports(
     cat = const_mod.load_sp500_catalog(csv_path=out_csv)
     assert cat["NVDA"].cik == "0001045810"
 
-    # gcs_storage helpers: content_type_for_path fallback & missing optional SDK error
+    # gcs_storage helpers: content_type_for_path fallback
     assert gcs_mod.content_type_for_path(Path("x.bin")) == "application/octet-stream"
     assert gcs_mod.content_type_for_path(Path("x.jsonl")) == "application/x-ndjson; charset=utf-8"
-    monkeypatch.setattr(gcs_mod, "storage", None)
-    with pytest.raises(GCSAccessError, match="google-cloud-storage is not installed"):
-        gcs_mod.create_storage_client(project_id="p")

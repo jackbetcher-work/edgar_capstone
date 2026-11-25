@@ -11,21 +11,9 @@ from importlib import metadata
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
 from edgar_capstone.agents.orchestration.react_loop import flush_pending_evaluations
-from edgar_capstone.api.dependencies import (
-    LiveRuntimeUnavailableError,
-    register_exception_handlers,
-)
+from edgar_capstone.api.dependencies import register_exception_handlers
 from edgar_capstone.api.routers import ALL_ROUTERS
-from edgar_capstone.api.routers.spa import _resolve_frontend_dist_dir
-from edgar_capstone.api.schemas import (
-    ChatQueryRequest,
-    DevWorkspaceSsoLoginRequest,
-    FeedbackRequest,
-    FilingScopeMixin,
-    SsoTokenExchangeRequest,
-)
 from edgar_capstone.observability import (
     REQUEST_ID_HEADER,
     TRACE_ID_HEADER,
@@ -143,14 +131,6 @@ def create_app() -> FastAPI:
 app = create_app()
 
 __all__ = [
-    "ChatQueryRequest",
-    "DevWorkspaceSsoLoginRequest",
-    "FeedbackRequest",
-    "FilingScopeMixin",
-    "LiveRuntimeUnavailableError",
-    "SsoTokenExchangeRequest",
-    "_resolve_frontend_dist_dir",
     "app",
     "create_app",
-    "run_conversational_rag_turn",
 ]

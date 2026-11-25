@@ -61,7 +61,6 @@ def before_agent_telemetry_callback(
     """Initialize per-invocation telemetry and tool session state keys."""
     state = callback_context.state
     state.setdefault("calculated_variances", {})
-    state.setdefault("fetched_metrics", [])
     state.setdefault("retrieved_citations", [])
     state.setdefault(
         "context_cache_stats",
@@ -113,7 +112,6 @@ _AGENT_TOOL_PROGRESS_LABELS: dict[str, str] = {
     "compare_disclosures_across_years": "Comparing 10-K disclosure wording across fiscal years",
     "sector_thematic_map_reduce": "Running full-sector thematic map-reduce",
     "query_analytics_view": "Querying BigQuery analytics view",
-    "fetch_financial_metrics": "Fetching structured XBRL financial metrics",
     "search_10k_chunks_rag": "Searching 10-K passages",
     "query_cached_10k_context": "Reading cached 10-K section passages",
 }
@@ -199,11 +197,7 @@ def before_model_telemetry_callback(
     callback_context: CallbackContext,
     llm_request: LlmRequest,
 ) -> LlmResponse | None:
-    """Quantify input context components and start timing timers before a model call.
-
-    Prompt Model Armor / SDP guardrails are enforced at the ADK plugin layer by
-    `ModelArmorSafetyPlugin`, keeping this callback focused on context telemetry.
-    """
+    """Quantify input context components and start timing timers before a model call."""
     _, prep_start = _seed_before_model_telemetry(callback_context, llm_request)
     _finalize_before_model_timing(callback_context.state, prep_start)
     return None
@@ -420,15 +414,11 @@ def _record_model_telemetry(
     active_task = _resolve_task_category(state.get("last_model_task_category"), task_category)
 
     raw_breakdown = state.get("last_model_context_breakdown")
-    if isinstance(raw_breakdown, dict):
-        base_breakdown = ContextBreakdown.model_validate(raw_breakdown)
-    else:
-        fallback_toks = int(state.get("last_model_context_tokens", 0) or 0)
-        base_breakdown = ContextBreakdown(
-            user_prompt_tokens=fallback_toks,
-            total_context_tokens=fallback_toks,
-            uncached_context_tokens=fallback_toks,
-        )
+    base_breakdown = (
+        ContextBreakdown.model_validate(raw_breakdown)
+        if isinstance(raw_breakdown, dict)
+        else ContextBreakdown()
+    )
 
     reconciled_breakdown, output_tokens, thoughts_tokens = reconcile_breakdown_with_usage_metadata(
         base_breakdown, llm_response

@@ -87,7 +87,7 @@ export function CitationsTab({
     return groups.filter((g) => g.primary.section_id === sectionFilter)
   }, [groups, sectionFilter])
 
-  const duplicatesMerged = citations.length - groups.length
+  const duplicatesMerged = groups.reduce((total, g) => total + g.duplicates.length, 0)
   const isExpanded = (id: string) => expandedIds.has(id) || focusedId === id
   const anyExpanded = filteredGroups.some((g) => isExpanded(g.primary.chunk_id))
 

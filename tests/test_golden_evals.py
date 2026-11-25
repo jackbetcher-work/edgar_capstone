@@ -576,8 +576,8 @@ def test_new_phase6_scorers_numeric_xbrl_filters_precision_deltas_flags_scope() 
     assert score_anomaly_flags(flag_item, _response())[0] == 0
 
     assert score_unsupported_claims(resp) == (0, [])
-    bad_notes = _response(answer_markdown="### Title\n\n#### Notes (not source-verified)\nOops")
-    assert score_unsupported_claims(bad_notes)[0] == 1
+    bad_rv = _response(report_verification={"unsupported_claims_count": 2})
+    assert score_unsupported_claims(bad_rv)[0] == 2
 
     scope_item = GoldenEvalItem(
         id="oos_rivian_unit",
@@ -1006,10 +1006,6 @@ def test_eval_report_formatting_json_export_env_and_lazy_package_exports(
         _ = evals_pkg.nonexistent_eval_symbol
 
     # Environment and commit SHA detection branches
-    monkeypatch.setenv("BUILD_ID", "b-1")
-    monkeypatch.setenv("PROJECT_ID", "p-1")
-    assert detect_environment() == "cloud_build"
-    monkeypatch.delenv("BUILD_ID")
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     assert detect_environment() == "github_actions"
     monkeypatch.delenv("GITHUB_ACTIONS")

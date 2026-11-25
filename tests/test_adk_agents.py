@@ -31,14 +31,10 @@ from edgar_capstone.agents.tools.disclosure_deltas import DisclosureDeltaTool
 from edgar_capstone.agents.tools.material_variances import AnomalyFlagTool
 from edgar_capstone.agents.tools.sec_tools import (
     AnalyticsViewQueryTool,
-    ContextCacheTool,
     HybridSearchTool,
-    LookerQueryTool,
-    MetricFetchTool,
     QueryCached10KTool,
     VarianceCalculationTool,
     calculate_period_variances,
-    fetch_financial_metrics,
     get_active_gcp_tool_adapters,
     load_cached_10k_section,
     query_analytics_view,
@@ -73,13 +69,10 @@ def test_adk_agent_factories_and_tool_registration() -> None:
     assert evaluator.after_model_callback is after_model_telemetry_callback
 
     # Verify explicit ADK FunctionTool wrappers
-    assert LookerQueryTool is AnalyticsViewQueryTool
     for tool_obj in (
-        MetricFetchTool,
         AnalyticsViewQueryTool,
         VarianceCalculationTool,
         HybridSearchTool,
-        ContextCacheTool,
         QueryCached10KTool,
         AnomalyFlagTool,
         DisclosureDeltaTool,
@@ -151,24 +144,6 @@ def test_intent_is_agent_emitted_with_non_lexical_tool_fallback() -> None:
     assert infer_intent_from_tool_calls(single, [{"name": "calculate_period_variances"}]) == (
         "longitudinal_single_company"
     )
-
-
-@pytest.mark.live
-def test_metric_fetch_tool_on_curated_dataset() -> None:
-    ctx = _dummy_tool_context()
-    res = fetch_financial_metrics(
-        tickers="NVDA,AAPL",
-        start_year=2024,
-        end_year=2026,
-        gics_sector="Information Technology",
-        tool_context=ctx,  # type: ignore[arg-type]
-    )
-    assert res["status"] == "success"
-    assert res["record_count"] == 6  # NVDA (2024,2025,2026) + AAPL (2024,2025,2026)
-    assert res["tickers_found"] == ["AAPL", "NVDA"]
-    assert len(ctx.state["fetched_metrics"]) == 6
-    assert ctx.state["tool_telemetry"][0]["tool_name"] == "fetch_financial_metrics"
-    assert ctx.state["tool_telemetry"][0]["status"] == "success"
 
 
 @pytest.mark.live
@@ -390,21 +365,6 @@ def test_resilience_rate_limit_retries_and_model_armor_callbacks() -> None:
     assert len(eval_ctx.state["latency_metrics"]) == 1
     assert eval_ctx.state["latency_metrics"][0]["model_name"] == "gemini-3.5-flash"
     assert "fact_check_report" not in eval_ctx.state
-
-
-def test_financial_analyst_module_exports() -> None:
-    """Verify the `edgar_capstone.agents.runtime.financial_analyst` entrypoint re-exports expected symbols."""
-    from edgar_capstone.agents.runtime import financial_analyst
-    from edgar_capstone.agents.runtime.model_config import FINANCIAL_REASONING_MODEL
-
-    assert financial_analyst.DEFAULT_ANALYST_MODEL == FINANCIAL_REASONING_MODEL
-    assert financial_analyst.DEFAULT_ANALYST_PROMPT_VERSION
-    assert financial_analyst.create_financial_analyst_agent is create_financial_analyst_agent
-    assert set(financial_analyst.__all__) == {
-        "DEFAULT_ANALYST_MODEL",
-        "DEFAULT_ANALYST_PROMPT_VERSION",
-        "create_financial_analyst_agent",
-    }
 
 
 def test_hybrid_rag_parallel_branch_partial_failure_and_rrf_filtering() -> None:
@@ -820,7 +780,6 @@ def test_compact_evidence_leads_centers_on_query_terms_and_preserves_short_table
     assert 650 < len(ual_table) < 1200
 
     leads = compact_evidence_leads(
-        [],
         [
             {
                 "chunk_id": "MRK_2023_item_7_0029",

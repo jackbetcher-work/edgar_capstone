@@ -278,7 +278,6 @@ def test_prompt_carries_tool_selection_policy_and_no_precomputed_payloads() -> N
         scope=scope,
         variance_reports=[],
         variance_evaluations=[],
-        cached_explanations=[],
         citations=[],
         sector_benchmarks=[],
         chunk_health=None,

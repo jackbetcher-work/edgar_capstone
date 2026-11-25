@@ -7,14 +7,11 @@ import re
 from typing import Any
 
 from edgar_capstone.agents.adapters.registry import GcpToolAdapters
-from edgar_capstone.agents.adapters.vertex_search import (
-    _default_section_title,
-    _normalize_section_id,
-)
+from edgar_capstone.agents.adapters.vertex_search import _normalize_section_id
 from edgar_capstone.agents.core.resilience import ToolExecutionError, _is_retryable_exception
 from edgar_capstone.agents.core.schemas import GroundedCitation
 from edgar_capstone.common.concurrency import run_parallel_with_context
-from edgar_capstone.common.domain import normalize_edgar_ticker
+from edgar_capstone.common.domain import SECTION_TITLES, normalize_edgar_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -334,7 +331,7 @@ def _upsert_canonical_hit(
         "filing_date": str(hit.get("filing_date") or "") or None,
         "accession_number": str(hit.get("accession_number") or "") or None,
         "section_id": resolved_sec,
-        "section_title": str(hit.get("section_title") or _default_section_title(resolved_sec)),
+        "section_title": str(hit.get("section_title") or SECTION_TITLES[resolved_sec]),
         "chunk_text": text,
         "sec_filing_url": str(hit.get("sec_filing_url") or ""),
         "unstructured_gcs_uri": str(hit.get("unstructured_gcs_uri") or ""),

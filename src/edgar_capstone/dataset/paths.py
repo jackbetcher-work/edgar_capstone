@@ -7,8 +7,8 @@ publishing them to GCS, BigQuery, and Vertex AI Search. The serving runtime neve
 this directory; it queries those GCP services directly.
 
 The data root is resolved from (in order) the `EDGAR_DATA_ROOT` override, the source
-checkout (`<repo>/data`), `/app/data`, or `<cwd>/data`, so the scripts work from an
-editable install, a non-editable install, or an arbitrary working directory.
+checkout (`<repo>/data`), or `<cwd>/data`, so the scripts work from an editable install,
+a non-editable install, or an arbitrary working directory.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-CONTAINER_DATA_ROOT = Path("/app/data")
 CURATED_DATASET_DIRNAME = "curated_dataset"
 SP500_CONSTITUENTS_FILENAME = "sp500_constituents.csv"
 
@@ -32,9 +31,8 @@ def resolve_data_root() -> Path:
     Resolution order:
       1. `EDGAR_DATA_ROOT` environment override.
       2. Source checkout (`<repo>/data`) when it exists.
-      3. Container layout (`/app/data`) when it exists.
-      4. `<cwd>/data` when it exists.
-      5. Fall back to the source-tree location (created on demand by build scripts).
+      3. `<cwd>/data` when it exists.
+      4. Fall back to the source-tree location (created on demand by build scripts).
     """
     env_root = os.environ.get("EDGAR_DATA_ROOT", "").strip()
     if env_root:
@@ -44,9 +42,9 @@ def resolve_data_root() -> Path:
     if source_root.is_dir():
         return source_root
 
-    for candidate in (CONTAINER_DATA_ROOT, Path.cwd() / "data"):
-        if candidate.is_dir():
-            return candidate.resolve()
+    cwd_data = Path.cwd() / "data"
+    if cwd_data.is_dir():
+        return cwd_data.resolve()
 
     return source_root
 

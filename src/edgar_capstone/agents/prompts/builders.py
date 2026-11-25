@@ -261,7 +261,6 @@ def _extract_query_centered_excerpt(text: str, query: str, max_chars: int) -> st
 
 
 def compact_evidence_leads(
-    cached_explanations: list[dict[str, Any]],
     citations: list[dict[str, Any]],
     *,
     scope: dict[str, Any] | None = None,
@@ -337,11 +336,6 @@ def compact_evidence_leads(
         }
         for c in ordered
     ]
-    sections_queried = sorted(
-        {str(e.get("cache_key")) for e in cached_explanations if e.get("cache_key")}
-    )
-    if sections_queried:
-        leads.append({"pre_queried_sections": sections_queried})
     return leads
 
 
@@ -670,7 +664,6 @@ def build_financial_reasoning_prompt(
     scope: dict[str, Any],
     variance_reports: list[dict[str, Any]],
     variance_evaluations: list[dict[str, Any]],
-    cached_explanations: list[dict[str, Any]],
     citations: list[dict[str, Any]],
     sector_benchmarks: list[dict[str, Any]],
     chunk_health: dict[str, Any] | None,
@@ -756,7 +749,6 @@ def build_financial_reasoning_prompt(
     if verification_feedback:
         feedback_chunk_ids = set(_FEEDBACK_CHUNK_ID_RE.findall(verification_feedback))
         leads = compact_evidence_leads(
-            cached_explanations,
             citations,
             scope=scope,
             query=query,
@@ -765,7 +757,7 @@ def build_financial_reasoning_prompt(
             excerpt_chars=_REPAIR_EVIDENCE_LEAD_EXCERPT_CHARS,
         )
     else:
-        leads = compact_evidence_leads(cached_explanations, citations, scope=scope, query=query)
+        leads = compact_evidence_leads(citations, scope=scope, query=query)
     if leads:
         sections.append(
             "## 10-K Evidence Leads (pre-retrieved passages — cite directly or extend with tools)\n"
@@ -848,7 +840,6 @@ def build_narrative_evaluation_prompt(
     response_markdown: str,
     variance_reports: list[dict[str, Any]],
     judge_citations: list[dict[str, Any]],
-    cached_explanations_count: int = 0,
     reference_explanation: str | None = None,
 ) -> str:
     """Assemble the evaluation prompt for `NarrativeEvaluatorAgent` (Gemini 3.8 Flash, low thinking)."""
@@ -876,7 +867,7 @@ def build_narrative_evaluation_prompt(
         "(integer count of narrative claims not supported by the cited passage or deterministic payload).\n\n"
         f"### Analyst Query\n{query}\n\n"
         f"{variance_block}"
-        f"### Retrieved 10-K Citations (cached_explanations_count={cached_explanations_count})\n"
+        "### Retrieved 10-K Citations\n"
         f"```json\n{json.dumps(judge_citations, default=str)}\n```\n\n"
         f"### Synthesized Narrative Report Under Evaluation\n{response_markdown}\n"
     )

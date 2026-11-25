@@ -18,10 +18,10 @@ Examples:
   # Against a running container (`make docker-smoke` does this for you)
   python scripts/container_smoke_test.py --base-url http://127.0.0.1:8080 --wait-seconds 60
 
-  # Inside the image, in-process (Cloud Build / GitHub Actions after `docker build`)
+  # Inside the image, in-process (GitHub Actions after `docker build`)
   docker run --rm --entrypoint python IMAGE -m scripts.container_smoke_test --in-process
 
-  # Also read live BigQuery data (needs ADC, e.g. `--network=cloudbuild` in Cloud Build)
+  # Also read live BigQuery data (needs ADC)
   python scripts/container_smoke_test.py --in-process --live-data
 """
 

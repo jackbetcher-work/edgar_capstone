@@ -13,8 +13,7 @@ from edgar_capstone.common.models import FilingMetadataBase
 class FilingChunk(FilingMetadataBase):
     """Single metadata-tagged 10-K text chunk and dense vector embedding.
 
-    Aligns 1:1 with `terraform/schemas/filing_chunks.json` for BigQuery `VECTOR_SEARCH`
-    and serializes to Vertex AI Vector Search batch/stream JSONL format.
+    Aligns 1:1 with `terraform/schemas/filing_chunks.json` for BigQuery `VECTOR_SEARCH`.
     """
 
     chunk_id: str = Field(..., description="Unique chunk identifier (e.g., NVDA_2026_item_1a_0000)")
@@ -176,8 +175,6 @@ class ChunkHealthReport(BaseModel):
         default=0.0, description="Composite 0-100 health score of the chunk database"
     )
     health_status: Literal["HEALTHY", "DEGRADED", "UNHEALTHY"] = "UNHEALTHY"
-    published_to_cloud_monitoring: bool = False
-    published_timeseries_count: int = 0
 
 
 class VectorDBBuildSummary(BaseModel):
@@ -200,7 +197,6 @@ class VectorDBBuildSummary(BaseModel):
     health_report_path: str
     uploaded_to_gcs: bool = False
     loaded_to_bigquery: bool = False
-    published_monitoring_metrics: bool = False
     health_score: float = 0.0
     health_status: Literal["HEALTHY", "DEGRADED", "UNHEALTHY"] = "UNHEALTHY"
     warnings: list[str] = Field(default_factory=list)

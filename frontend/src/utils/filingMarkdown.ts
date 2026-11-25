@@ -324,13 +324,3 @@ export function filingHighlightAnchor(raw: string): string {
   )
   return prose ?? paragraphs[0] ?? body
 }
-
-/** Lowercase word tokens of a passage with header, escapes and markup removed. */
-export function passageWordTokens(raw: string): string[] {
-  const text = stripInlineMarkdown(unescapeFilingMarkdown(stripChunkContextHeader(raw)))
-    .split('\n')
-    .filter((line) => !isNoiseLine(line.trim()))
-    .join(' ')
-    .toLowerCase()
-  return text.match(/[a-z0-9]+/g) ?? []
-}

@@ -612,11 +612,7 @@ def test_model_armor_uses_single_rpc_and_allows_10k_project_queries() -> None:
             )
 
     svc = configure_model_armor_guardrail(
-        config=ModelArmorConfig(
-            mode="gcp",
-            sdp_inspect_template_id="sec-edgar-sdp-inspect",
-            sdp_deidentify_template_id="sec-edgar-sdp-deidentify",
-        ),
+        config=ModelArmorConfig(mode="gcp"),
         sdk_client=_SingleRpcClient(),
         credentials=FakeGcpCredentials("valid-adc-token"),
     )
@@ -734,7 +730,6 @@ def test_model_armor_retries_429_and_redacts_local_pii_without_dlp_hop(
         mode="gcp",
         project_id="p1",
         location="us-central1",
-        sdp_inspect_template_id="sec-edgar-inspect",
     )
     svc = ModelArmorGuardrailService(
         client=ModelArmorClient(

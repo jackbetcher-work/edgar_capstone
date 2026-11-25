@@ -48,7 +48,7 @@ from edgar_capstone.agents.tools.disclosure_deltas import (
 )
 from edgar_capstone.agents.tools.sec_tools import _gcp_adapters
 from edgar_capstone.common.concurrency import run_parallel_with_context
-from edgar_capstone.common.domain import normalize_edgar_ticker, sha256_text
+from edgar_capstone.common.domain import normalize_edgar_ticker
 from edgar_capstone.common.formatting import normalize_quote_text, parse_model_output
 from edgar_capstone.dataset.models import FinancialDataProfile
 from edgar_capstone.observability.tracing import set_span_attributes, traced
@@ -227,7 +227,6 @@ def _summarize_batch_via_flash(
         user_id="sector_mapper",
         session_id=f"sector-map-{batch_index}-{uuid.uuid4().hex[:8]}",
         app_name="edgar_sector_map_app",
-        state_delta={"_model_armor_verified_prompt_sha256": sha256_text(prompt)},
         use_adk_app=False,
         backend=resolved.backend,
         max_llm_calls=2,

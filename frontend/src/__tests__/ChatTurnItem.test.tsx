@@ -159,7 +159,6 @@ function buildResponse(overrides: Partial<ChatTurnResponse> = {}): ChatTurnRespo
     status: 'success',
     model_armor_blocked: false,
     intent: 'longitudinal_single_company',
-    intent_source: 'agent',
     orchestrator: 'RootOrchestrator',
     resolved_scope: {
       tickers: ['NVDA'],
@@ -352,7 +351,6 @@ describe('ChatTurnItem — agent-invoked deterministic evidence', () => {
     renderTurn(
       buildTurn(null, {
         isLoading: true,
-        progressStage: 'agent_tool',
         progressMessage: 'Agent invoked calculate_period_variances',
         progressMeta: { tool: 'calculate_period_variances' },
       })
@@ -365,7 +363,6 @@ describe('ChatTurnItem — agent-invoked deterministic evidence', () => {
       <ChatTurnItem
         turn={buildTurn(null, {
           isLoading: true,
-          progressStage: 'sector_map_progress',
           progressMessage: '38/76 Information Technology companies analyzed (batch 3/6)',
           progressMeta: {
             analyzed: 38,

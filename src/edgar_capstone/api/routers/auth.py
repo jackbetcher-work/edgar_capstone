@@ -1,8 +1,7 @@
-"""Authentication, IAP/Okta SSO token brokerage, RBAC governance, and Secret Manager status routes."""
+"""Authentication, IAP/Okta SSO token brokerage, and RBAC governance routes."""
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -32,8 +31,6 @@ from edgar_capstone.security.auth import (
     revoke_bearer_token,
 )
 from edgar_capstone.security.rbac import Permission, RuntimeServiceAccountConfig
-
-_ = logging
 
 router = APIRouter(tags=["Authentication & RBAC"])
 

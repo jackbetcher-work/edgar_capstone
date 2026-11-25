@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, status
@@ -12,7 +11,7 @@ from fastapi.responses import FileResponse
 router = APIRouter(include_in_schema=False)
 
 
-def _default_resolve_frontend_dist_dir() -> Path | None:
+def _resolve_frontend_dist_dir() -> Path | None:
     """Locate the compiled frontend bundle (`frontend/dist/index.html`)."""
     candidates: list[Path] = []
     env_override = os.environ.get("FRONTEND_DIST_DIR", "").strip()
@@ -28,21 +27,6 @@ def _default_resolve_frontend_dist_dir() -> Path | None:
     return None
 
 
-_resolve_frontend_dist_dir = _default_resolve_frontend_dist_dir
-
-
-def _get_frontend_dist_dir() -> Path | None:
-    """Resolve `frontend/dist`, honoring monkeypatches on either `spa` or `edgar_capstone.server`."""
-    if _resolve_frontend_dist_dir is not _default_resolve_frontend_dist_dir:
-        return _resolve_frontend_dist_dir()
-    server_mod = sys.modules.get("edgar_capstone.server")
-    if server_mod is not None:
-        server_fn = getattr(server_mod, "_resolve_frontend_dist_dir", None)
-        if callable(server_fn) and server_fn is not _default_resolve_frontend_dist_dir:
-            return server_fn()
-    return _resolve_frontend_dist_dir()
-
-
 @router.get("/{full_path:path}", include_in_schema=False)
 @router.get("/", include_in_schema=False)
 def serve_terminal_ui(full_path: str = "") -> FileResponse:
@@ -51,7 +35,7 @@ def serve_terminal_ui(full_path: str = "") -> FileResponse:
     if normalized == "api" or normalized.startswith("api/") or normalized == "healthz":
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
 
-    dist_dir = _get_frontend_dist_dir()
+    dist_dir = _resolve_frontend_dist_dir()
     if dist_dir is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

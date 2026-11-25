@@ -9,8 +9,6 @@ locals {
     "aiplatform.googleapis.com",
     "artifactregistry.googleapis.com",
     "bigquery.googleapis.com",
-    "bigqueryconnection.googleapis.com",
-    "bigquerystorage.googleapis.com",
     "cloudtrace.googleapis.com",
     "discoveryengine.googleapis.com",
     "dlp.googleapis.com",

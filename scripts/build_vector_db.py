@@ -67,8 +67,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Chunk curated SEC 10-K Markdown filings (Item 1A & Item 7), generate dense "
-            "vector embeddings with metadata tags for BigQuery and Vertex AI Vector Search, "
-            "and publish chunk health metrics to Google Cloud Monitoring."
+            "vector embeddings with metadata tags for BigQuery VECTOR_SEARCH, "
+            "and write a chunk health report."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -195,7 +195,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Stage JSONL manifests and the chunk health report locally without publishing to "
-            "GCS/BigQuery/Cloud Monitoring. Embeddings still come from Vertex AI."
+            "GCS or BigQuery. Embeddings still come from Vertex AI."
         ),
     )
     mode_group.add_argument(
@@ -203,8 +203,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help=(
             "Skip chunking/embedding and only publish already-staged vector DB artifacts "
-            "(bigquery_filing_chunks.jsonl, chunks_embeddings.json, chunk health report, catalog) "
-            "to GCS."
+            "(bigquery_filing_chunks.jsonl, chunk health report, catalog) to GCS."
         ),
     )
     parser.add_argument(

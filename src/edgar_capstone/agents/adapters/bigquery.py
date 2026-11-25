@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Sequence
 from typing import Any
 
@@ -88,36 +87,6 @@ def _chunk_health_summary_entry(group_key: str, row: dict[str, Any]) -> dict[str
     }
 
 
-def _rollup_section_cells(sec_id: str, cells: list[dict[str, Any]]) -> dict[str, Any]:
-    tot_chunks = sum(int(c.get("total_chunks") or 0) for c in cells)
-    valid_embs = sum(int(c.get("valid_embedding_count") or 0) for c in cells)
-    weighted_chars = sum(
-        float(c.get("avg_char_count") or 0.0) * int(c.get("total_chunks") or 0) for c in cells
-    )
-    weighted_tokens = sum(
-        float(c.get("avg_token_estimate") or 0.0) * int(c.get("total_chunks") or 0) for c in cells
-    )
-    return {
-        "group_key": sec_id,
-        "total_chunks": tot_chunks,
-        "distinct_profiles": sum(int(c.get("distinct_profiles") or 0) for c in cells),
-        "distinct_tickers": sum(int(c.get("distinct_tickers") or 0) for c in cells),
-        "valid_embedding_count": valid_embs,
-        "embedding_coverage_ratio": (round(valid_embs / tot_chunks, 4) if tot_chunks > 0 else 0.0),
-        "avg_char_count": (round(weighted_chars / tot_chunks, 2) if tot_chunks > 0 else 0.0),
-        "avg_token_estimate": (round(weighted_tokens / tot_chunks, 2) if tot_chunks > 0 else 0.0),
-        "min_token_estimate": min(
-            (int(c.get("min_token_estimate") or 0) for c in cells), default=0
-        ),
-        "max_token_estimate": max(
-            (int(c.get("max_token_estimate") or 0) for c in cells), default=0
-        ),
-        "undersized_chunk_count": sum(int(c.get("undersized_chunk_count") or 0) for c in cells),
-        "oversized_chunk_count": sum(int(c.get("oversized_chunk_count") or 0) for c in cells),
-        "missing_metadata_count": sum(int(c.get("missing_metadata_count") or 0) for c in cells),
-    }
-
-
 class BigQueryAdapter(BigQueryClientWrapper):
     """Live BigQuery SDK adapter for SEC 10-K metrics, BI views, and `VECTOR_SEARCH`."""
 
@@ -148,9 +117,6 @@ class BigQueryAdapter(BigQueryClientWrapper):
         )
         self.sec_corpus_bucket = config.sec_corpus_bucket
         self.embedding_dimensions = config.embedding_dimensions
-
-    def _table_ref(self, table_or_view: str) -> str:
-        return self.table_ref(table_or_view)
 
     def run_query(
         self,
@@ -243,7 +209,7 @@ class BigQueryAdapter(BigQueryClientWrapper):
             gics_sectors=gics_sectors,
         )
         sql = (
-            f"SELECT * FROM {self._table_ref(self.financial_metrics_table)} "
+            f"SELECT * FROM {self.table_ref(self.financial_metrics_table)} "
             f"WHERE {' AND '.join(clauses)} "
             f"ORDER BY ticker ASC, fiscal_year ASC"
         )
@@ -274,7 +240,7 @@ class BigQueryAdapter(BigQueryClientWrapper):
             "net_income, net_income_yoy_delta, net_income_yoy_pct, "
             "research_and_development, research_and_development_yoy_delta, "
             "research_and_development_yoy_pct, sec_filing_url "
-            f"FROM {self._table_ref(self.yoy_view)} "
+            f"FROM {self.table_ref(self.yoy_view)} "
             f"WHERE {' AND '.join(clauses)} "
             "ORDER BY ticker ASC, fiscal_year ASC"
         )
@@ -344,7 +310,7 @@ class BigQueryAdapter(BigQueryClientWrapper):
             "ROUND(SUM(operating_income), 2) AS total_sector_operating_income, "
             "ROUND(SUM(net_income), 2) AS total_sector_net_income, "
             "ROUND(SUM(research_and_development), 2) AS total_sector_research_and_development "
-            f"FROM {self._table_ref(self.financial_metrics_table)} "
+            f"FROM {self.table_ref(self.financial_metrics_table)} "
             f"WHERE {' AND '.join(clauses)} "
             "GROUP BY 1, 2 "
             "ORDER BY gics_sector ASC, fiscal_year ASC"
@@ -370,7 +336,7 @@ class BigQueryAdapter(BigQueryClientWrapper):
     def query_chunk_health(self) -> dict[str, Any]:
         """Query `sec_edgar.v_chunk_health_metrics` and format Looker `chunk_health` response."""
         sql = (
-            f"SELECT * FROM {self._table_ref(self.chunk_health_view)} "
+            f"SELECT * FROM {self.table_ref(self.chunk_health_view)} "
             "ORDER BY gics_sector ASC, section_id ASC"
         )
         rows = self.run_query(sql)
@@ -382,7 +348,6 @@ class BigQueryAdapter(BigQueryClientWrapper):
         overall: dict[str, Any] = {}
         by_sector: dict[str, dict[str, Any]] = {}
         by_section: dict[str, dict[str, Any]] = {}
-        section_cells: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
         for r in rows:
             sec_sector = str(r.get("gics_sector") or "")
@@ -393,12 +358,6 @@ class BigQueryAdapter(BigQueryClientWrapper):
                 by_sector[sec_sector] = _chunk_health_summary_entry(sec_sector, r)
             elif sec_sector == "ALL_SECTORS" and sec_id != "ALL_SECTIONS":
                 by_section[sec_id] = _chunk_health_summary_entry(sec_id, r)
-            elif sec_sector != "ALL_SECTORS" and sec_id != "ALL_SECTIONS":
-                section_cells[sec_id].append(r)
-
-        if not by_section and section_cells:
-            for sec_id, cells in sorted(section_cells.items()):
-                by_section[sec_id] = _rollup_section_cells(sec_id, cells)
 
         if not overall:
             overall = rows[0]
@@ -410,10 +369,7 @@ class BigQueryAdapter(BigQueryClientWrapper):
             "health_score": overall.get("health_score"),
             "total_chunks": overall.get("total_chunks"),
             "embedding_coverage_ratio": overall.get("embedding_coverage_ratio"),
-            "full_section_coverage_ratio": overall.get(
-                "full_section_coverage_ratio",
-                overall.get("filing_coverage_ratio"),
-            ),
+            "full_section_coverage_ratio": overall.get("full_section_coverage_ratio"),
             "by_section": by_section,
             "by_sector": by_sector,
         }
@@ -458,7 +414,7 @@ class BigQueryAdapter(BigQueryClientWrapper):
             "           fiscal_year, period_of_report, filing_date, accession_number, "
             "           section_id, section_title, chunk_index, "
             "           chunk_text, embedding, sec_filing_url, unstructured_gcs_uri "
-            f"   FROM {self._table_ref(self.filing_chunks_table)} "
+            f"   FROM {self.table_ref(self.filing_chunks_table)} "
             f"   WHERE {' AND '.join(clauses)}"
             "  ), "
             "  'embedding', "
@@ -571,7 +527,7 @@ class BigQueryAdapter(BigQueryClientWrapper):
             "period_of_report, filing_date, accession_number, section_id, section_title, "
             "chunk_index, chunk_text, sec_filing_url, unstructured_gcs_uri, "
             "ML.DISTANCE(embedding, @query_embedding, 'COSINE') AS distance "
-            f"FROM {self._table_ref(self.filing_chunks_table)} "
+            f"FROM {self.table_ref(self.filing_chunks_table)} "
             f"WHERE {' AND '.join(clauses)} "
             "QUALIFY ROW_NUMBER() OVER ("
             "  PARTITION BY ticker, fiscal_year "
@@ -604,7 +560,7 @@ class BigQueryAdapter(BigQueryClientWrapper):
             "fiscal_year, period_of_report, filing_date, accession_number, "
             f"section_id, section_title, chunk_index, chunk_text{emb_col}, "
             "sec_filing_url, unstructured_gcs_uri "
-            f"FROM {self._table_ref(self.filing_chunks_table)} "
+            f"FROM {self.table_ref(self.filing_chunks_table)} "
             "WHERE UPPER(REPLACE(ticker, '.', '-')) = @ticker "
             "  AND fiscal_year = @fiscal_year "
             "  AND LOWER(section_id) = @section_id "
@@ -646,7 +602,7 @@ class BigQueryAdapter(BigQueryClientWrapper):
             "fiscal_year, period_of_report, filing_date, accession_number, "
             f"section_id, section_title, chunk_index, chunk_text{emb_col}, "
             "sec_filing_url, unstructured_gcs_uri "
-            f"FROM {self._table_ref(self.filing_chunks_table)} "
+            f"FROM {self.table_ref(self.filing_chunks_table)} "
             f"WHERE {' AND '.join(clauses)} "
             "ORDER BY ticker ASC, fiscal_year ASC, section_id ASC, chunk_index ASC"
         )

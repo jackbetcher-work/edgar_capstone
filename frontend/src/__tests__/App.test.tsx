@@ -319,8 +319,6 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
     expect(headings).toHaveLength(1)
     expect(headings[0].textContent).toBe('EDGAR Analyst')
 
-    expect(document.documentElement.getAttribute('data-theme')).toBe('terminal')
-
     expect(
       await screen.findByText(/Query audited financials and grounded 10-K disclosures/i)
     ).toBeTruthy()
@@ -652,7 +650,7 @@ describe('EDGAR <GO> Financial Terminal Workspace', () => {
       if (url.includes('/api/v1/chat/stream')) {
         const body = JSON.parse(String(init?.body ?? '{}')) as { session_id?: string }
         if (body.session_id) seenChatSessionIds.push(body.session_id)
-        return json(CHAT_RESPONSE)
+        return sse([{ event: 'result', data: CHAT_RESPONSE }])
       }
       if (url.includes('/api/v1/sessions/') && method === 'DELETE') {
         deletedSessionPaths.push(url)

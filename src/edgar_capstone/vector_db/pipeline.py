@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import google.auth.exceptions
+from google.cloud import storage
 
 from edgar_capstone.common.domain import normalize_edgar_ticker, sha256_text
 from edgar_capstone.common.jsonl import iter_jsonl, write_json
@@ -16,7 +17,6 @@ from edgar_capstone.dataset.cloud_publish import run_bigquery_load_job
 from edgar_capstone.dataset.gcs_storage import (
     DEFAULT_RETRY,
     GCSAccessError,
-    content_type_for_path,
     ensure_gcs_bucket,
     normalize_bucket_name,
     upload_files_to_bucket,
@@ -44,11 +44,6 @@ from edgar_capstone.vector_db.models import (
 )
 from edgar_capstone.vector_db.monitoring import evaluate_chunk_health
 
-try:
-    from google.cloud import storage
-except ImportError:  # pragma: no cover - optional `[ingest]` extra
-    storage = None  # type: ignore[assignment]
-
 logger = logging.getLogger(__name__)
 
 
@@ -57,7 +52,7 @@ VECTOR_DB_ARTIFACT_PATHS: tuple[str, ...] = (
     "manifests/chunk_health_report.json",
     "manifests/vector_db_catalog.json",
 )
-# Small files rewritten after GCS/BigQuery/Monitoring sync so their published flags persist.
+# Small files rewritten after GCS/BigQuery sync so their published flags persist.
 _VECTOR_DB_STATUS_PATHS = [
     "manifests/chunk_health_report.json",
     "manifests/vector_db_catalog.json",
@@ -90,7 +85,7 @@ class VectorDBBuildConfig:
     overlap_chunk_chars: int = 200
     skip_existing_embeddings: bool = True
     # Stage manifests and the health report locally (still embedding with Vertex AI) without
-    # publishing to GCS, BigQuery, or Cloud Monitoring.
+    # publishing to GCS or BigQuery.
     local_only: bool = False
     load_bigquery: bool = True
     create_bucket_if_missing: bool = True
@@ -201,12 +196,6 @@ def _write_vector_db_artifacts(
     return bq_chunks_path, health_path, catalog_path
 
 
-def _vector_artifact_content_type(local_path: Path, blob_path: str) -> str:
-    """Resolve HTTP Content-Type for vector DB artifacts."""
-    _ = blob_path
-    return content_type_for_path(local_path)
-
-
 def upload_vector_db_artifacts_to_gcs(
     *,
     output_dir: Path,
@@ -217,18 +206,13 @@ def upload_vector_db_artifacts_to_gcs(
     storage_client: Any | None = None,
     rel_paths: list[str] | None = None,
 ) -> int:
-    """Upload the vector database manifests and Vertex AI Vector Search files to GCS.
+    """Upload the vector database manifests and health artifacts to GCS.
 
     `rel_paths` limits the upload to a subset of `VECTOR_DB_ARTIFACT_PATHS`.
     """
     if storage_client is not None:
         client = storage_client
     else:
-        if storage is None:
-            raise GCSAccessError(
-                "google-cloud-storage is not installed. Install the optional ingestion "
-                "dependencies with: pip install -e '.[ingest]'"
-            )
         try:
             client = storage.Client(project=project_id)
         except google.auth.exceptions.DefaultCredentialsError as exc:
@@ -256,7 +240,6 @@ def upload_vector_db_artifacts_to_gcs(
         max_workers=1,
         timeout=300.0,
         retry=DEFAULT_RETRY,
-        content_type_fn=_vector_artifact_content_type,
     )
 
     logger.info(

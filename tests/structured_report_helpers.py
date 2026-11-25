@@ -230,7 +230,7 @@ def patch_http_chat_llms(
     """Inject scripted ADK LLM(s) into `POST /api/v1/chat` & `/chat/stream` without mocking the pipeline."""
     from edgar_capstone.api.routers import chat as chat_router
 
-    real_fn = chat_router._default_run_conversational_rag_turn
+    real_fn = chat_router.run_conversational_rag_turn
 
     def _wrapped(**kwargs: Any) -> dict[str, Any]:
         kwargs.setdefault("reasoning_llm", reasoning_llm)

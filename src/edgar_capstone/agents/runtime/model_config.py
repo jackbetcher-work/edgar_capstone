@@ -32,7 +32,6 @@ DEFAULT_CONTEXT_CACHE_INTERVALS: int = 10
 DEFAULT_COMPACTION_TOKEN_THRESHOLD: int = 32000
 DEFAULT_COMPACTION_RETENTION_SIZE: int = 5
 DEFAULT_MAX_LOCAL_SESSIONS: int = 500
-DEFAULT_MAX_ADK_MEMORY_SESSIONS: int = 200
 
 EPHEMERAL_AGENT_NAMES: frozenset[str] = frozenset(
     {
@@ -165,9 +164,7 @@ TASK_TO_MODEL_TIER: dict[ModelTaskCategory, str] = {
 }
 
 AGENT_DEFAULT_TASK_CATEGORY: dict[str, ModelTaskCategory] = {
-    "RootOrchestrator": "orchestration",
     "FinancialAnalystAgent": "financial_reasoning",
-    "ContextCacheManager": "context_cache_warmup",
     "NarrativeEvaluatorAgent": "evaluation",
     "SectorMapSummarizerAgent": "context_compaction",
     "ScopeContinuityAgent": "context_compaction",

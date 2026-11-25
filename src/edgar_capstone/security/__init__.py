@@ -94,7 +94,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "edgar_capstone.security.model_armor",
         "reset_model_armor_guardrail",
     ),
-    "schema_safe_block_text": ("edgar_capstone.security.model_armor", "schema_safe_block_text"),
     # rbac
     "ADMIN_PERMISSIONS": ("edgar_capstone.security.rbac", "ADMIN_PERMISSIONS"),
     "ANALYST_PERMISSIONS": ("edgar_capstone.security.rbac", "ANALYST_PERMISSIONS"),

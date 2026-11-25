@@ -31,7 +31,6 @@ if TYPE_CHECKING:
     )
     from edgar_capstone.vector_db.monitoring import (
         evaluate_chunk_health,
-        evaluate_chunk_health_from_bigquery,
     )
     from edgar_capstone.vector_db.pipeline import (
         VectorDBBuildConfig,
@@ -56,10 +55,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "chunk_filing_document": ("edgar_capstone.vector_db.chunker", "chunk_filing_document"),
     "estimate_token_count": ("edgar_capstone.vector_db.chunker", "estimate_token_count"),
     "evaluate_chunk_health": ("edgar_capstone.vector_db.monitoring", "evaluate_chunk_health"),
-    "evaluate_chunk_health_from_bigquery": (
-        "edgar_capstone.vector_db.monitoring",
-        "evaluate_chunk_health_from_bigquery",
-    ),
     "extract_sections_from_combined_markdown": (
         "edgar_capstone.vector_db.chunker",
         "extract_sections_from_combined_markdown",
@@ -93,7 +88,6 @@ __all__ = [
     "chunk_filing_document",
     "estimate_token_count",
     "evaluate_chunk_health",
-    "evaluate_chunk_health_from_bigquery",
     "extract_sections_from_combined_markdown",
     "populate_chunk_embeddings",
     "run_vector_db_pipeline",

@@ -20,14 +20,6 @@ QueryIntentType = Literal[
 ]
 
 
-class AgentReportTelemetryMixin(BaseModel):
-    """Shared context/latency telemetry fields attached to agent evaluation & report outputs."""
-
-    context_tokens: int = 0
-    context_latency_ms: float = 0.0
-    total_latency_ms: float = 0.0
-
-
 class MetricRecord(FilingMetadataBase):
     """Structured financial metric record for a single company and fiscal year."""
 
@@ -525,24 +517,6 @@ class VarianceEvaluationItem(BaseModel):
     targeted_10k_queries: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class Cached10KExplanation(BaseModel):
-    """Grounded explanation extracted from cached 10-K section context during ReAct execution."""
-
-    cache_key: str
-    cache_hit: bool
-    ticker: str
-    company_name: str
-    fiscal_year: int
-    section_id: SectionId
-    section_title: str
-    variance_driver_focus: str
-    extracted_explanations: list[str] = Field(default_factory=list)
-    matched_chunk_ids: list[str] = Field(default_factory=list)
-    token_estimate: int = 0
-    lookup_latency_ms: float = 0.0
-    sec_filing_url: str = ""
-
-
 # ---------------------------------------------------------------------------
 # Deterministic anomaly flagging (`flag_material_variances`)
 # ---------------------------------------------------------------------------
@@ -697,9 +671,12 @@ class ReActStep(BaseModel):
     status: Literal["completed", "warning", "blocked"] = "completed"
 
 
-class NarrativeEvaluationReport(AgentReportTelemetryMixin):
+class NarrativeEvaluationReport(BaseModel):
     """LLM-as-a-Judge / rubric evaluation output powered by Gemini 3.8 Flash (low thinking)."""
 
+    context_tokens: int = 0
+    context_latency_ms: float = 0.0
+    total_latency_ms: float = 0.0
     evaluator_model: str = "gemini-3.8-flash"
     task_category: Literal["evaluation", "llm_as_judge"] = "evaluation"
     grade: Literal["pass", "needs_revision", "fail", "pending"] = "pass"

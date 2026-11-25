@@ -49,9 +49,6 @@ from edgar_capstone.vector_db.chunker import extract_sections_from_combined_mark
 
 logger = logging.getLogger(__name__)
 
-# Retained for backward compatibility; DatasetBuildConfig resolves dynamically at instantiation.
-DEFAULT_OUTPUT_DIR = resolve_curated_dataset_dir()
-
 _CACHED_MD_SPLIT_RE = re.compile(
     r"^## Item 1A\. Risk Factors\n(.*?)\n---\n\n"
     r"## Item 7\. Management's Discussion and Analysis of Financial Condition and Results of Operations\n(.*)$",
@@ -341,14 +338,6 @@ def collect_staged_profiles(
     return profiles
 
 
-def _collect_all_staged_profiles(
-    output_dir: Path,
-    bucket_name: str,
-) -> list[FinancialDataProfile]:
-    """Backward-compatible alias for `collect_staged_profiles(..., update_uris_on_disk=True)`."""
-    return collect_staged_profiles(output_dir, bucket_name=bucket_name, update_uris_on_disk=True)
-
-
 def write_dataset_catalog_only(output_dir: Path, summary: DatasetBuildSummary) -> Path:
     """Write only `manifests/dataset_catalog.json` (used after upload status flips)."""
     catalog_path = output_dir / "manifests" / "dataset_catalog.json"
@@ -382,9 +371,6 @@ def write_manifests(
         (prof.model_dump(mode="json") for prof in profiles),
     )
     write_dataset_catalog_only(output_dir, summary)
-
-
-_write_manifests = write_manifests
 
 
 def run_dataset_pipeline(

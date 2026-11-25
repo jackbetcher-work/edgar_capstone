@@ -79,7 +79,7 @@ filterwarnings = [
 ]
 
 # ------------------------------------------------------------------------------
-# Ruff lint + format gate (`make lint`, Cloud Build `lint-python`, GitHub Actions)
+# Ruff lint + format gate (`make lint`, GitHub Actions)
 # ------------------------------------------------------------------------------
 [tool.ruff]
 target-version = "py311"

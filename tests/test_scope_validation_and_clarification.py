@@ -153,7 +153,6 @@ def test_validate_scope_catches_out_of_corpus_and_clarification_without_false_po
         explicit_tickers=s1.get("explicit_tickers", []),
         unknown_entities=s1.get("unknown_entities", []),
         catalog=catalog,
-        memory_context={"has_prior_memory": False},
     )
     assert v1["action"] == "out_of_corpus"
     assert v1["reason"] == "non_sp500_issuer"
@@ -167,7 +166,6 @@ def test_validate_scope_catches_out_of_corpus_and_clarification_without_false_po
         explicit_tickers=s2.get("explicit_tickers", []),
         unknown_entities=s2.get("unknown_entities", []),
         catalog=catalog,
-        memory_context={"has_prior_memory": False},
     )
     assert v2["action"] == "out_of_corpus"
     assert v2["reason"] == "unsupported_filing_type"
@@ -182,7 +180,6 @@ def test_validate_scope_catches_out_of_corpus_and_clarification_without_false_po
         explicit_tickers=s3.get("explicit_tickers", []),
         unknown_entities=s3.get("unknown_entities", []),
         catalog=catalog,
-        memory_context={"has_prior_memory": False},
     )
     assert v3["action"] == "out_of_corpus"
     assert v3["reason"] == "unsupported_metric"
@@ -198,7 +195,6 @@ def test_validate_scope_catches_out_of_corpus_and_clarification_without_false_po
         explicit_tickers=s4.get("explicit_tickers", []),
         unknown_entities=s4.get("unknown_entities", []),
         catalog=catalog,
-        memory_context={"has_prior_memory": False},
     )
     assert v4["action"] == "proceed"
 
@@ -210,7 +206,6 @@ def test_validate_scope_catches_out_of_corpus_and_clarification_without_false_po
         explicit_tickers=s5.get("explicit_tickers", []),
         unknown_entities=s5.get("unknown_entities", []),
         catalog=catalog,
-        memory_context={"has_prior_memory": False},
     )
     assert v5["action"] == "out_of_corpus"
     assert v5["reason"] == "out_of_range_year"
@@ -223,7 +218,6 @@ def test_validate_scope_catches_out_of_corpus_and_clarification_without_false_po
         explicit_tickers=[],
         unknown_entities=[],
         catalog=catalog,
-        memory_context={"has_prior_memory": False},
     )
     assert v6["action"] == "clarification"
     assert v6["reason"] == "ambiguous_scope"
@@ -667,7 +661,6 @@ def test_subject_change_detection_sector_inheritance_and_clarification_gate() ->
         explicit_tickers=[],
         unknown_entities=[],
         catalog=catalog,
-        memory_context=nvda_mem,
     )
     assert val["action"] == "clarification"
     assert val["reason"] == "ambiguous_scope"

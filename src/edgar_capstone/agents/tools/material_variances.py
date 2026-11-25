@@ -47,7 +47,6 @@ from edgar_capstone.agents.tools.runtime import (
 from edgar_capstone.agents.tools.sec_tools import (
     _gcp_adapters,
     _parse_ticker_list,
-    _record_gcp_backend_invocation,
     query_cached_10k_context,
 )
 from edgar_capstone.common.concurrency import run_parallel_with_context
@@ -549,7 +548,6 @@ def _load_profiles(
     ticker_filter: set[str],
     start_year: int,
     end_year: int,
-    tool_context: ToolContext | None,
 ) -> tuple[list[FinancialDataProfile], list[FinancialDataProfile]]:
     """Return (company profiles, sector peer profiles) from BigQuery (1 batched peer query)."""
     adapters = _gcp_adapters()
@@ -572,12 +570,6 @@ def _load_profiles(
             end_year=end_year,
             gics_sectors=set(sectors),
         )
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="flag_material_variances",
-        data_source="gcp",
-        services_hit=["bigquery"],
-    )
     return profiles, sector_profiles
 
 
@@ -701,14 +693,8 @@ def flag_material_variances(
         result = flag_material_variances_from_cached_profiles(
             cached, tickers=tickers, start_year=eff_start, end_year=eff_end
         )
-        _record_gcp_backend_invocation(
-            tool_context,
-            tool_name="flag_material_variances",
-            data_source="gcp",
-            services_hit=["bigquery"],
-        )
     else:
-        profiles, sector_profiles = _load_profiles(ticker_filter, eff_start, eff_end, tool_context)
+        profiles, sector_profiles = _load_profiles(ticker_filter, eff_start, eff_end)
         result = _compute_and_annotate_missing(
             profiles,
             sector_profiles,

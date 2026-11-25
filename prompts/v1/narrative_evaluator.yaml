@@ -6,10 +6,6 @@ model: "gemini-3.8-flash"
 description: >
   System instruction for NarrativeEvaluatorAgent performing LLM-as-a-Judge
   rubric scoring on synthesized SEC 10-K variance reports.
-safety_policy:
-  model_armor_template: "sec-edgar-analyst-armor"
-  enforce_sdp_filter: true
-  enforce_projection_filter: true
 variables:
   flash_model: "gemini-3.8-flash"
 template: |

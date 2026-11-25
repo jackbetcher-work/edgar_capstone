@@ -35,9 +35,7 @@ from edgar_capstone.security.jwt_codec import (
     ec_public_key_to_jwk,
     jwk_to_public_key,
     parse_unverified_jwt,
-    rsa_public_key_to_jwk,
     sign_jwt_es256,
-    sign_jwt_rs256,
 )
 from edgar_capstone.security.rbac import (
     ANALYST_PERMISSIONS,
@@ -88,18 +86,14 @@ _AUTH_ENV_KEYS: tuple[str, ...] = (
     "ALLOWED_WORKSPACE_DOMAINS",
     "REQUIRED_ANALYST_GROUPS",
     "ADMIN_CLOUD_IDENTITY_GROUPS",
-    "ADMIN_WORKSPACE_GROUPS",
     "ANALYST_CLOUD_IDENTITY_GROUPS",
-    "ANALYST_WORKSPACE_GROUPS",
     "VIEWER_CLOUD_IDENTITY_GROUPS",
-    "VIEWER_WORKSPACE_GROUPS",
     "CLOUD_IDENTITY_DOMAIN",
     "ALLOWED_CUSTOM_SERVICE_ACCOUNTS",
     "ALLOW_GCP_SERVICE_ACCOUNTS",
     "IAP_ASSERTION_DEFAULT_ROLE",
     "GCP_PROJECT_ID",
     "GOOGLE_CLOUD_PROJECT",
-    "GCLOUD_PROJECT",
     "EDGAR_GCP_PROJECT_ID",
     "GCP_PROJECT_NAME",
     "RUNTIME_SERVICE_ACCOUNT_ID",
@@ -206,7 +200,6 @@ class AuthSettings:
             g.lower()
             for g in (
                 split_csv_env(os.environ.get("ADMIN_CLOUD_IDENTITY_GROUPS"))
-                or split_csv_env(os.environ.get("ADMIN_WORKSPACE_GROUPS"))
                 or ("sec-edgar-admins", "gcp-security-admins", "okta-sec-admins")
             )
         )
@@ -214,7 +207,6 @@ class AuthSettings:
             g.lower()
             for g in (
                 split_csv_env(os.environ.get("ANALYST_CLOUD_IDENTITY_GROUPS"))
-                or split_csv_env(os.environ.get("ANALYST_WORKSPACE_GROUPS"))
                 or ("sec-edgar-analysts", "financial-analysts")
             )
         )
@@ -222,7 +214,6 @@ class AuthSettings:
             g.lower()
             for g in (
                 split_csv_env(os.environ.get("VIEWER_CLOUD_IDENTITY_GROUPS"))
-                or split_csv_env(os.environ.get("VIEWER_WORKSPACE_GROUPS"))
                 or ("sec-edgar-viewers", "sec-edgar-auditors", "compliance-auditors")
             )
         )
@@ -497,11 +488,7 @@ def record_security_audit_event(
 def get_security_audit_events(limit: int = 50) -> list[dict[str, Any]]:
     """Return the most recent structured security and 10-K access audit events."""
     bounded = max(1, min(limit, 500))
-    sink = get_telemetry_sink()
-    events = sink.query_security_audit_logs(limit=bounded)
-    if events or not sink.is_gcp_enabled():
-        return events
-    return []
+    return get_telemetry_sink().query_security_audit_logs(limit=bounded)
 
 
 def clear_security_audit_events() -> None:
@@ -536,7 +523,6 @@ def _parse_cache_control_max_age(headers: Any, *, default_ttl: float, min_ttl: f
 class _ParsedJwksCacheEntry:
     fetched_at: float
     expires_at: float
-    raw_by_kid: dict[str, dict[str, Any]]
     parsed_keys: dict[str, PublicKey]
     parse_errors: dict[str, str]
 
@@ -559,7 +545,6 @@ class JwksKeyStore:
         self._pooled_session: requests.Session | None = None
         self._jwk_fetcher = jwk_fetcher
         self._static_jwks: dict[str, dict[str, Any]] = dict(static_jwks_by_uri or {})
-        self._cache: dict[str, dict[str, dict[str, Any]]] = {}
         self._parsed_keys: dict[str, _ParsedJwksCacheEntry] = {}
         self._uri_locks: dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
@@ -603,7 +588,6 @@ class JwksKeyStore:
             if self._static_jwks.get(jwks_uri) == jwks_payload:
                 return
             self._static_jwks[jwks_uri] = jwks_payload
-            self._cache.pop(jwks_uri, None)
             self._parsed_keys.pop(jwks_uri, None)
 
     @staticmethod
@@ -614,7 +598,6 @@ class JwksKeyStore:
         if not isinstance(keys_list, list) or not keys_list:
             raise AuthenticationError("Identity provider returned an empty or invalid JWKS keyset.")
 
-        raw_by_kid: dict[str, dict[str, Any]] = {}
         parsed_keys: dict[str, PublicKey] = {}
         parse_errors: dict[str, str] = {}
 
@@ -625,7 +608,6 @@ class JwksKeyStore:
             if not raw_kid:
                 continue
             kid_str = str(raw_kid)
-            raw_by_kid[kid_str] = item
             try:
                 parsed_keys[kid_str] = jwk_to_public_key(item)
             except (ValueError, KeyError, TypeError) as exc:
@@ -635,7 +617,6 @@ class JwksKeyStore:
         return _ParsedJwksCacheEntry(
             fetched_at=now,
             expires_at=now + max(0.0, ttl_seconds),
-            raw_by_kid=raw_by_kid,
             parsed_keys=parsed_keys,
             parse_errors=parse_errors,
         )
@@ -718,7 +699,6 @@ class JwksKeyStore:
             fresh_entry = self._fetch_jwks_entry(jwks_uri)
             with self._lock:
                 self._parsed_keys[jwks_uri] = fresh_entry
-                self._cache[jwks_uri] = fresh_entry.raw_by_kid
 
         resolved = self._resolve_from_entry(fresh_entry, kid)
         if resolved is None:
@@ -886,7 +866,7 @@ class IAPJwtVerifier:
         if account_id == "sec-edgar-cicd-sa":
             return (
                 ("authenticated", "service_account", "cicd_probe"),
-                (Permission.RBAC_INSPECT.value,),
+                (),
                 None,
                 None,
             )
@@ -894,7 +874,7 @@ class IAPJwtVerifier:
         if is_explicitly_allowed:
             return (
                 ("authenticated", "service_account"),
-                (Permission.FILINGS_READ.value, Permission.RBAC_INSPECT.value),
+                (Permission.FILINGS_READ.value,),
                 None,
                 None,
             )
@@ -1056,11 +1036,11 @@ class IAPJwtVerifier:
             else email.split("@", 1)[0].replace(".", " ").title()
         )
 
-        sso_federation = "google_workspace_okta_sso"
-        if email.endswith(".gserviceaccount.com"):
-            sso_federation = (
-                "gcp_agent_workload_identity" if agent_identity else "gcp_iam_service_account"
-            )
+        sso_federation = (
+            "gcp_iam_service_account"
+            if email.endswith(".gserviceaccount.com")
+            else "google_workspace_okta_sso"
+        )
 
         return AuthenticatedUser(
             sub=sub.strip(),
@@ -1333,21 +1313,14 @@ __all__ = [
     "JwksKeyStore",
     "clear_security_audit_events",
     "compute_token_fingerprint",
-    "decode_verified_jwt",
-    "ec_public_key_to_jwk",
     "extract_bearer_token_from_request",
     "get_auth_verifier",
     "get_security_audit_events",
     "is_bearer_token_revoked",
     "is_production_iap_mode",
     "issue_local_dev_workspace_sso_token",
-    "jwk_to_public_key",
-    "parse_unverified_jwt",
     "record_security_audit_event",
     "require_authenticated_user",
     "require_permissions",
     "revoke_bearer_token",
-    "rsa_public_key_to_jwk",
-    "sign_jwt_es256",
-    "sign_jwt_rs256",
 ]

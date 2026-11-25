@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
 
-from edgar_capstone.common.env import TRUTHY_ENV_VALUES, env_bool
+from edgar_capstone.common.env import env_bool
 from edgar_capstone.common.formatting import percentile, utc_now_iso
 from edgar_capstone.firestore_stores import (
     DEFAULT_FIRESTORE_DATABASE_ID,
@@ -55,10 +55,7 @@ from edgar_capstone.gcp.defaults import (
 )
 from edgar_capstone.gcp.errors import (
     GcpClientError,
-    GcpNotFoundError,
     GcpRateLimitError,
-    GcpTimeoutError,
-    parse_retry_after,
 )
 from edgar_capstone.observability.tracing import add_span_event, current_trace_correlation
 
@@ -73,12 +70,9 @@ TelemetryBackendMode = Literal["auto", "gcp", "local"]
 DEFAULT_BQ_LLM_TELEMETRY_TABLE = "llm_telemetry_events"
 DEFAULT_BQ_SESSION_TELEMETRY_TABLE = "session_telemetry_events"
 DEFAULT_BQ_AUDIT_LOGS_TABLE = "security_audit_logs"
-DEFAULT_BQ_TELEMETRY_COST_VIEW = "v_telemetry_cost_and_latency"
 
 DEFAULT_MAX_LOCAL_RECORDS = 500
 DEFAULT_MAX_TRACKED_SESSIONS = 2000
-
-_TRUTHY_ENV_VALUES = TRUTHY_ENV_VALUES
 
 __all__ = [
     "BigQueryTelemetrySink",
@@ -86,7 +80,6 @@ __all__ = [
     "DEFAULT_BQ_AUDIT_LOGS_TABLE",
     "DEFAULT_BQ_LLM_TELEMETRY_TABLE",
     "DEFAULT_BQ_SESSION_TELEMETRY_TABLE",
-    "DEFAULT_BQ_TELEMETRY_COST_VIEW",
     "DEFAULT_FIRESTORE_DATABASE_ID",
     "DEFAULT_FIRESTORE_FEEDBACK_COLLECTION",
     "DEFAULT_FIRESTORE_SESSION_COLLECTION",
@@ -96,16 +89,13 @@ __all__ = [
     "FirestoreSessionStore",
     "TelemetryBackendMode",
     "TelemetryConfig",
-    "TelemetryNotFoundError",
     "TelemetryRateLimitError",
     "TelemetrySinkError",
-    "TelemetryTimeoutError",
     "cloud_sink_logger",
     "configure_telemetry_stores",
     "emit_cloud_logging_sink_record",
     "get_feedback_store",
     "get_telemetry_sink",
-    "parse_retry_after",
     "reset_telemetry_stores",
     "session_firestore_doc_id",
 ]
@@ -113,10 +103,6 @@ __all__ = [
 
 class TelemetrySinkError(GcpClientError):
     """Raised when streaming or persisting telemetry/feedback to GCP fails."""
-
-
-class TelemetryNotFoundError(TelemetrySinkError, GcpNotFoundError):
-    """Raised when a BigQuery or Firestore resource returns HTTP 404 Not Found."""
 
 
 class TelemetryRateLimitError(TelemetrySinkError, GcpRateLimitError):
@@ -127,31 +113,23 @@ class TelemetryRateLimitError(TelemetrySinkError, GcpRateLimitError):
         self.retry_after_seconds = retry_after_seconds
 
 
-class TelemetryTimeoutError(TelemetrySinkError, GcpTimeoutError):
-    """Raised when a BigQuery or Firestore request times out."""
-
-
 def _translate_gcp_error(exc: GcpClientError) -> TelemetrySinkError:
     """Translate `GcpClientError` subclasses into matching `Telemetry*Error` instances."""
     if isinstance(exc, TelemetrySinkError):
         return exc
-    if isinstance(exc, GcpTimeoutError):
-        return TelemetryTimeoutError(str(exc), status_code=exc.status_code)
     if isinstance(exc, GcpRateLimitError):
         return TelemetryRateLimitError(
             str(exc),
             retry_after_seconds=exc.retry_after_seconds,
         )
-    if isinstance(exc, GcpNotFoundError):
-        return TelemetryNotFoundError(str(exc), status_code=exc.status_code or 404)
     return TelemetrySinkError(str(exc), status_code=exc.status_code)
 
 
 def _resolve_backend_mode(raw_mode: str) -> TelemetryBackendMode:
     norm = raw_mode.strip().lower()
-    if norm in ("gcp", "live", "firestore", "bigquery"):
+    if norm == "gcp":
         return "gcp"
-    if norm in ("local", "memory"):
+    if norm == "local":
         return "local"
     return "auto"
 
@@ -168,7 +146,6 @@ class TelemetryConfig:
     bq_llm_telemetry_table: str = DEFAULT_BQ_LLM_TELEMETRY_TABLE
     bq_session_telemetry_table: str = DEFAULT_BQ_SESSION_TELEMETRY_TABLE
     bq_audit_logs_table: str = DEFAULT_BQ_AUDIT_LOGS_TABLE
-    bq_telemetry_cost_view: str = DEFAULT_BQ_TELEMETRY_COST_VIEW
     firestore_database_id: str = DEFAULT_FIRESTORE_DATABASE_ID
     firestore_feedback_collection: str = DEFAULT_FIRESTORE_FEEDBACK_COLLECTION
     firestore_session_collection: str = DEFAULT_FIRESTORE_SESSION_COLLECTION
@@ -183,8 +160,7 @@ class TelemetryConfig:
         feedback_backend = _resolve_backend_mode(raw_feedback)
 
         auto_signals = (
-            env_bool("EDGAR_USE_GCP_TELEMETRY", False)
-            or bool(os.environ.get("K_SERVICE", "").strip())
+            bool(os.environ.get("K_SERVICE", "").strip())
             or bool(os.environ.get("BIGQUERY_DATASET_ID", "").strip())
             or bool(os.environ.get("FIRESTORE_DATABASE_ID", "").strip())
             or bool(os.environ.get("FIRESTORE_FEEDBACK_COLLECTION", "").strip())
@@ -206,9 +182,6 @@ class TelemetryConfig:
             ).strip(),
             bq_audit_logs_table=(
                 os.environ.get("BIGQUERY_AUDIT_LOGS_TABLE") or DEFAULT_BQ_AUDIT_LOGS_TABLE
-            ).strip(),
-            bq_telemetry_cost_view=(
-                os.environ.get("BIGQUERY_TELEMETRY_COST_VIEW") or DEFAULT_BQ_TELEMETRY_COST_VIEW
             ).strip(),
             firestore_database_id=(
                 os.environ.get("FIRESTORE_DATABASE_ID") or DEFAULT_FIRESTORE_DATABASE_ID
@@ -232,12 +205,11 @@ def _current_trace_id() -> str | None:
 
 
 def emit_cloud_logging_sink_record(sink_table: str, payload: dict[str, Any]) -> None:
-    """Emit a structured log entry targeted at Cloud Logging -> BigQuery project sinks.
+    """Emit a structured telemetry log entry for Cloud Logging log-based metrics and trace correlation.
 
     The envelope is passed as `json_fields`, so `CloudLoggingJsonFormatter` writes
-    `component` / `log_sink_target` / `event_payload` as top-level `jsonPayload` keys (the
-    `google_logging_project_sink` filter matches `jsonPayload.component`) next to the
-    active trace ID, so every BigQuery telemetry row can be joined back to its Cloud Trace trace.
+    `component` / `log_sink_target` / `event_payload` as top-level `jsonPayload` keys next to
+    the active trace ID, joining telemetry rows back to their Cloud Trace trace.
     """
     envelope = {
         "component": "sec-edgar-telemetry-sink",
@@ -309,9 +281,6 @@ class BigQueryTelemetrySink(BigQueryClientWrapper):
         self.audit_table = validate_bq_identifier(
             self.config.bq_audit_logs_table, "audit_logs_table"
         )
-        self.telemetry_cost_view = validate_bq_identifier(
-            self.config.bq_telemetry_cost_view, "telemetry_cost_view"
-        )
 
         self._max_sessions = max(1, int(max_sessions))
         self._lock = threading.Lock()
@@ -374,10 +343,6 @@ class BigQueryTelemetrySink(BigQueryClientWrapper):
         """Thread-safely clear the in-memory security audit event buffer."""
         with self._lock:
             self._audit_events.clear()
-
-    def _table_ref(self, table_or_view: str) -> str:
-        safe = validate_bq_identifier(table_or_view, "table_or_view")
-        return f"`{self.project_id}.{self.dataset_id}.{safe}`"
 
     def stream_rows(
         self,
@@ -459,7 +424,7 @@ class BigQueryTelemetrySink(BigQueryClientWrapper):
             params.append(make_scalar_param(filter_column, "STRING", cleaned_val))
         sql = (
             f"SELECT {select_columns} "
-            f"FROM {self._table_ref(table_id)} "
+            f"FROM {self.table_ref(table_id)} "
             f"{where_sql}"
             f"ORDER BY {order_by} "
             "LIMIT @limit"
@@ -841,7 +806,7 @@ class BigQueryTelemetrySink(BigQueryClientWrapper):
         background judge finishes, this method updates the matching local turn in place
         (without inflating local turn counts or latency averages), emits a structured Cloud
         Logging sink entry with the full judge rationale, and streams a schema-valid row to
-        ``session_telemetry_events`` via ``insertAll``.
+        ``session_telemetry_events`` via ``insert_rows_json``.
         """
         now_iso = utc_now_iso()
         eff_session_id = (session_id or "").strip() or f"ephemeral-{uuid.uuid4().hex[:10]}"
@@ -1078,94 +1043,6 @@ class BigQueryTelemetrySink(BigQueryClientWrapper):
             filter_value=event_type,
         )
 
-    def query_llm_telemetry_explore(self, *, limit: int = 50) -> list[dict[str, Any]]:
-        """Query aggregated model/agent cost, cached-token savings, and latency rows (SQL view)."""
-        bounded = max(1, min(int(limit), 200))
-        sql = (
-            "SELECT CAST(telemetry_date AS STRING) AS telemetry_date, "
-            "model_name, agent_name, task_category, call_count, "
-            "total_context_tokens, cached_context_tokens, uncached_context_tokens, "
-            "output_tokens, cache_hit_rate, avg_total_latency_ms, "
-            "p95_total_latency_ms, avg_ttft_ms, p95_ttft_ms, "
-            "ttft_slo_compliance_rate, total_cost_usd, "
-            "uncached_baseline_cost_usd, cached_token_savings_usd "
-            f"FROM {self._table_ref(self.telemetry_cost_view)} "
-            "ORDER BY telemetry_date DESC, total_cost_usd DESC "
-            "LIMIT @limit"
-        )
-
-        def _local_aggregate() -> list[dict[str, Any]]:
-            with self._lock:
-                events = list(self._llm_events)
-
-            grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
-            for ev in events:
-                day = str(ev.get("recorded_at") or "")[:10] or datetime.now(UTC).strftime(
-                    "%Y-%m-%d"
-                )
-                key = (
-                    day,
-                    str(ev.get("model_name") or "unknown"),
-                    str(ev.get("agent_name") or "unknown"),
-                    str(ev.get("task_category") or "financial_reasoning"),
-                )
-                grouped[key].append(ev)
-
-            rows: list[dict[str, Any]] = []
-            for (day, model_name, agent_name, task_cat), recs in sorted(
-                grouped.items(), reverse=True
-            ):
-                tot_lats = [float(r.get("total_model_latency_ms") or 0.0) for r in recs]
-                ttfts = [float(r.get("ttft_ms") or 0.0) for r in recs]
-                hits = sum(1 for r in recs if r.get("cache_hit"))
-                slo_ok = sum(1 for r in recs if r.get("within_ttft_slo", True))
-                rows.append(
-                    {
-                        "telemetry_date": day,
-                        "model_name": model_name,
-                        "agent_name": agent_name,
-                        "task_category": task_cat,
-                        "call_count": len(recs),
-                        "total_context_tokens": sum(
-                            int(r.get("total_context_tokens") or 0) for r in recs
-                        ),
-                        "cached_context_tokens": sum(
-                            int(r.get("cached_context_tokens") or 0) for r in recs
-                        ),
-                        "uncached_context_tokens": sum(
-                            int(r.get("uncached_context_tokens") or 0) for r in recs
-                        ),
-                        "output_tokens": sum(
-                            int(r.get("output_tokens") or 0) + int(r.get("thoughts_tokens") or 0)
-                            for r in recs
-                        ),
-                        "cache_hit_rate": round(hits / len(recs), 4),
-                        "avg_total_latency_ms": round(sum(tot_lats) / len(tot_lats), 3),
-                        "p95_total_latency_ms": round(percentile(tot_lats, 95.0), 3),
-                        "avg_ttft_ms": round(sum(ttfts) / len(ttfts), 3),
-                        "p95_ttft_ms": round(percentile(ttfts, 95.0), 3),
-                        "ttft_slo_compliance_rate": round(slo_ok / len(recs), 4),
-                        "total_cost_usd": round(
-                            sum(float(r.get("total_cost_usd") or 0.0) for r in recs), 8
-                        ),
-                        "uncached_baseline_cost_usd": round(
-                            sum(float(r.get("uncached_baseline_cost_usd") or 0.0) for r in recs),
-                            8,
-                        ),
-                        "cached_token_savings_usd": round(
-                            sum(float(r.get("cached_token_savings_usd") or 0.0) for r in recs), 8
-                        ),
-                    }
-                )
-            return rows[:bounded]
-
-        return self._query_with_local_fallback(
-            operation_name="query_llm_telemetry_explore",
-            sql=sql,
-            query_parameters=[make_scalar_param("limit", "INT64", bounded)],
-            local_fallback=_local_aggregate,
-        )
-
     def status_metadata(self) -> dict[str, Any]:
         """Return secret-free diagnostic status of the BigQuery telemetry & audit sinks."""
         attempt_gcp, strict_gcp = self._should_attempt_gcp()
@@ -1190,7 +1067,6 @@ class BigQueryTelemetrySink(BigQueryClientWrapper):
                 "llm_telemetry": f"{self.project_id}.{self.dataset_id}.{self.llm_table}",
                 "session_telemetry": f"{self.project_id}.{self.dataset_id}.{self.session_table}",
                 "security_audit_logs": f"{self.project_id}.{self.dataset_id}.{self.audit_table}",
-                "telemetry_cost_view": f"{self.project_id}.{self.dataset_id}.{self.telemetry_cost_view}",
             },
             "streamed_row_counts": streamed,
             "fallback_counts": fallbacks,
@@ -1219,23 +1095,18 @@ class BigQueryTelemetrySink(BigQueryClientWrapper):
 _TELEMETRY_ENV_KEYS: tuple[str, ...] = (
     "EDGAR_TELEMETRY_BACKEND",
     "EDGAR_FEEDBACK_BACKEND",
-    "EDGAR_SESSION_BACKEND",
-    "EDGAR_USE_GCP_TELEMETRY",
     "K_SERVICE",
     "GCP_PROJECT_ID",
     "GOOGLE_CLOUD_PROJECT",
-    "GCLOUD_PROJECT",
     "EDGAR_GCP_PROJECT_ID",
     "GCP_REGION",
     "GOOGLE_CLOUD_LOCATION",
     "BIGQUERY_LOCATION",
     "EDGAR_GCP_REGION",
     "BIGQUERY_DATASET_ID",
-    "EDGAR_BQ_DATASET",
     "BIGQUERY_LLM_TELEMETRY_TABLE",
     "BIGQUERY_SESSION_TELEMETRY_TABLE",
     "BIGQUERY_AUDIT_LOGS_TABLE",
-    "BIGQUERY_TELEMETRY_COST_VIEW",
     "FIRESTORE_DATABASE_ID",
     "FIRESTORE_FEEDBACK_COLLECTION",
     "FIRESTORE_SESSION_COLLECTION",

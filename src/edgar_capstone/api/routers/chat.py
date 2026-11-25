@@ -6,7 +6,6 @@ import asyncio
 import contextvars
 import json
 import logging
-import sys
 import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -14,9 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
-from edgar_capstone.agents.orchestration.chat_engine import (
-    run_conversational_rag_turn as _default_run_conversational_rag_turn,
-)
+from edgar_capstone.agents.orchestration.chat_engine import run_conversational_rag_turn
 from edgar_capstone.api.dependencies import LiveRuntimeUnavailableError
 from edgar_capstone.api.schemas import ChatQueryRequest
 from edgar_capstone.observability import (
@@ -36,28 +33,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Conversational Analyst"])
 
-# Module attribute alias so tests may patch either `edgar_capstone.api.routers.chat.run_conversational_rag_turn`
-# or legacy `edgar_capstone.server.run_conversational_rag_turn`.
-run_conversational_rag_turn = _default_run_conversational_rag_turn
-
 _GENERIC_STREAM_ERROR_MESSAGE = (
     "An internal error occurred while processing the request. "
     "Please check server logs with the attached trace ID."
 )
 
 ProgressCallback = Callable[[str, str, dict[str, Any] | None], None]
-
-
-def _resolve_chat_turn_runner() -> Callable[..., dict[str, Any]]:
-    """Return the active chat turn callable, honoring patches on either this router or `server`."""
-    if run_conversational_rag_turn is not _default_run_conversational_rag_turn:
-        return run_conversational_rag_turn
-    server_mod = sys.modules.get("edgar_capstone.server")
-    if server_mod is not None:
-        server_fn = getattr(server_mod, "run_conversational_rag_turn", None)
-        if callable(server_fn) and server_fn is not _default_run_conversational_rag_turn:
-            return server_fn
-    return run_conversational_rag_turn
 
 
 def _format_sse_event(event: str, payload: dict[str, Any]) -> str:
@@ -88,12 +69,11 @@ def _execute_and_enrich_chat_turn(
     if on_progress is not None:
         turn_kwargs["on_progress"] = on_progress
 
-    runner = _resolve_chat_turn_runner()
     # Attribute guardrail block audit events (Model Armor / SDP / projection filter), which are
     # raised deep inside the ADK turn without an `AuthenticatedUser`, to this request principal.
     principal_token = bind_audit_principal(user)
     try:
-        turn_result = runner(**turn_kwargs)
+        turn_result = run_conversational_rag_turn(**turn_kwargs)
     except LiveRuntimeUnavailableError:
         raise
     except RuntimeError as exc:

@@ -10,12 +10,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, ParamSpec, TypeVar
 
-import httpx
-
 from edgar_capstone.gcp.errors import (
     GcpRateLimitError,
     GcpTimeoutError,
-    parse_retry_after,
     translate_gcp_sdk_error,
 )
 from edgar_capstone.observability.tracing import (
@@ -52,16 +49,8 @@ def _is_retryable_exception(exc: BaseException) -> tuple[bool, float | None]:
     """Determine if an exception is a transient rate limit (HTTP 429), 5xx, or timeout."""
     if isinstance(exc, (RateLimitExceededError, GcpRateLimitError)):
         return True, exc.retry_after_seconds
-    if hasattr(exc, "retry_after_seconds"):
-        return True, getattr(exc, "retry_after_seconds", None)
-    if isinstance(
-        exc, (UpstreamTimeoutError, GcpTimeoutError, TimeoutError, httpx.TimeoutException)
-    ):
+    if isinstance(exc, (UpstreamTimeoutError, GcpTimeoutError, TimeoutError)):
         return True, None
-    if isinstance(exc, httpx.HTTPStatusError):
-        status = exc.response.status_code
-        if status in (429, 500, 502, 503, 504):
-            return True, parse_retry_after(exc.response)
     exc_module = type(exc).__module__ or ""
     if exc_module.startswith(("google.api_core", "google.genai", "requests.exceptions")):
         translated = translate_gcp_sdk_error(exc)
@@ -113,7 +102,7 @@ def retry_transient_errors(
 
     Unlike ``with_tool_resilience`` (which converts final failures into ADK tool error dicts),
     this decorator preserves the wrapped function's return type and propagates exceptions to
-    callers (e.g., internal RPC clients such as Model Armor, DLP, GCS/Vertex prompt stores).
+    callers (e.g., internal SDK clients such as Model Armor).
     """
     eff_retries = max(1, int(max_retries))
 

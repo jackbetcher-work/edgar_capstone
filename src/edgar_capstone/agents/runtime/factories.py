@@ -40,8 +40,8 @@ from edgar_capstone.agents.tools.sec_tools import (
 )
 from edgar_capstone.agents.tools.sector_tool import SectorThematicMapReduceTool
 
-# The analyst follows the registry's `latest` prompt (v6: agent-driven deterministic tool
-# selection, selective key metrics, structured intent) rather than the store-wide default `v1`.
+# The analyst follows the registry's `latest` prompt (`v7`: agent-driven deterministic tool
+# selection, selective key metrics, citation-coverage rule, structured intent).
 DEFAULT_ANALYST_PROMPT_VERSION = "latest"
 
 

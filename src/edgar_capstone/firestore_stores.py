@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import threading
 import time
 import uuid
@@ -398,10 +397,7 @@ class FirestoreSessionStore(_FirestoreSdkBase):
 
     def is_live_enabled(self) -> bool:
         """Return True when session persistence targets live Cloud Firestore."""
-        from edgar_capstone.telemetry import _resolve_backend_mode
-
-        override = os.environ.get("EDGAR_SESSION_BACKEND", "").strip()
-        mode = _resolve_backend_mode(override) if override else self.config.feedback_backend
+        mode = self.config.feedback_backend
         if self._injected_client is not None:
             return mode != "local"
         if mode == "local":
@@ -440,26 +436,22 @@ class FirestoreSessionStore(_FirestoreSdkBase):
         client = self._get_client()
         doc_ref = self._collection().document(doc_id)
         try:
-            transaction_fn = getattr(client, "transaction", None)
-            if callable(transaction_fn):
-                from google.cloud import firestore
+            from google.cloud import firestore
 
-                transaction = transaction_fn()
+            transaction = client.transaction()
 
-                @firestore.transactional
-                def _upsert(tx: Any) -> None:
-                    snap = doc_ref.get(transaction=tx, timeout=self._default_timeout)
-                    existing = (
-                        _normalize_firestore_dict(snap.to_dict() or {})
-                        if getattr(snap, "exists", False)
-                        else None
-                    )
-                    merged = _merge_session_payload(existing, payload)
-                    tx.set(doc_ref, merged)
+            @firestore.transactional
+            def _upsert(tx: Any) -> None:
+                snap = doc_ref.get(transaction=tx, timeout=self._default_timeout)
+                existing = (
+                    _normalize_firestore_dict(snap.to_dict() or {})
+                    if getattr(snap, "exists", False)
+                    else None
+                )
+                merged = _merge_session_payload(existing, payload)
+                tx.set(doc_ref, merged)
 
-                _upsert(transaction)
-            else:
-                doc_ref.set(dict(payload), timeout=self._default_timeout)
+            _upsert(transaction)
             with self._lock:
                 self._writes += 1
         except Exception as raw_exc:
@@ -528,12 +520,6 @@ class FirestoreSessionStore(_FirestoreSdkBase):
             "writes": writes,
             "last_error": last_err,
         }
-
-    def reset_local_buffers(self) -> None:
-        with self._lock:
-            self._reads = 0
-            self._writes = 0
-            self._last_error = None
 
 
 __all__ = [

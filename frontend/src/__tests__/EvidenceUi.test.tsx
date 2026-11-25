@@ -52,12 +52,16 @@ const RISK_2024 = citation('AAPL_2024_item_1a_0002', {
   section_id: 'item_1a',
   section_title: 'Item 1A. Risk Factors — Macroeconomic and Industry Risks',
   excerpt: RISK_EXCERPT,
-})
-const RISK_2023_DUP = citation('AAPL_2023_item_1a_0002', {
-  fiscal_year: 2023,
-  section_id: 'item_1a',
-  section_title: 'Item 1A. Risk Factors — Macroeconomic and Industry Risks',
-  excerpt: RISK_EXCERPT,
+  duplicate_sources: [
+    {
+      chunk_id: 'AAPL_2023_item_1a_0002',
+      ticker: 'AAPL',
+      fiscal_year: 2023,
+      section_id: 'item_1a',
+      section_title: 'Item 1A. Risk Factors — Macroeconomic and Industry Risks',
+      sec_filing_url: URL_,
+    },
+  ],
 })
 
 function renderTab(props: Partial<Parameters<typeof CitationsTab>[0]> = {}) {
@@ -65,7 +69,7 @@ function renderTab(props: Partial<Parameters<typeof CitationsTab>[0]> = {}) {
   const onOpenFilingSection = vi.fn()
   const utils = render(
     <CitationsTab
-      citations={[GROSS_MARGIN, RISK_2024, RISK_2023_DUP]}
+      citations={[GROSS_MARGIN, RISK_2024]}
       activeChunkId={null}
       sectionFilter="ALL"
       onChangeSectionFilter={vi.fn()}
@@ -234,7 +238,7 @@ describe('ChatTurnItem decluttering', () => {
         explained_flags: 0,
         thresholds: {},
       },
-      citations: [GROSS_MARGIN, GROSS_MARGIN, RISK_2024, RISK_2023_DUP],
+      citations: [GROSS_MARGIN, GROSS_MARGIN, RISK_2024],
       fact_check: {
         passed: true,
         checked_metrics_count: 1,

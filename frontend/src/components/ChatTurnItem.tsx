@@ -68,15 +68,10 @@ function computeProgressPercent(meta: Record<string, unknown> | null | undefined
     const v = meta[k]
     return typeof v === 'number' && Number.isFinite(v) ? v : null
   }
-  const pairs: Array<[number | null, number | null]> = [
-    [num('analyzed'), num('total') ?? num('issuers_in_sector')],
-    [num('batch_completed'), num('total_batches')],
-    [num('completed'), num('total')],
-  ]
-  for (const [completed, total] of pairs) {
-    if (completed !== null && total !== null && total > 0) {
-      return Math.max(0, Math.min(100, Math.round((completed / total) * 100)))
-    }
+  const completed = num('analyzed')
+  const total = num('total') ?? num('issuers_in_sector')
+  if (completed !== null && total !== null && total > 0) {
+    return Math.max(0, Math.min(100, Math.round((completed / total) * 100)))
   }
   return null
 }
@@ -465,7 +460,6 @@ export function ChatTurnItem({
               <GroundedMarkdown
                 turnId={turn.id}
                 markdown={resp.answer_markdown ?? ''}
-                activeChunkId={activeChunkId}
                 isChunkActive={isChunkActive}
                 onSelectCitation={(token) =>
                   onSelectInlineCitation(token, citations)

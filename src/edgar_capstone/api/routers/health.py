@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends
 
+from edgar_capstone.agents.adapters.registry import get_gcp_adapters_status_metadata
 from edgar_capstone.agents.orchestration.chat_engine import (
     ACTIVE_AGENT_NAMES,
     PRIMARY_ORCHESTRATOR_NAME,
@@ -15,7 +16,6 @@ from edgar_capstone.agents.prompts.store import get_prompt_store_status_metadata
 from edgar_capstone.agents.runtime.context_memory import get_conversation_memory_manager
 from edgar_capstone.agents.runtime.live_runtime import get_live_runtime_status_metadata
 from edgar_capstone.agents.runtime.model_config import get_model_strategy_metadata
-from edgar_capstone.agents.tools import get_gcp_adapters_status_metadata
 from edgar_capstone.api.dependencies import get_runtime_sa_config
 from edgar_capstone.gcp.defaults import resolve_gcp_project_id
 from edgar_capstone.observability import (
@@ -44,7 +44,6 @@ def health(
         "runtime_service_account_project_name": runtime_sa.project_name_alias_email,
         "root_agent": PRIMARY_ORCHESTRATOR_NAME,
         "active_agents": active_agents,
-        "sub_agents": active_agents,
         "reasoning_strategy": "structured_react_loop",
         "models": {
             "financial_reasoning": model_meta["financial_reasoning_model"],

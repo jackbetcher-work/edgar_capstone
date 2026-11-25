@@ -16,6 +16,7 @@ from typing import Any
 
 from google.adk.models.base_llm import BaseLlm
 
+from edgar_capstone.agents.adapters.registry import get_active_gcp_tool_adapters
 from edgar_capstone.agents.core.citations import deduplicate_citations_by_text
 from edgar_capstone.agents.orchestration.intent import (
     infer_intent_from_tool_calls,
@@ -60,18 +61,16 @@ from edgar_capstone.agents.tools.runtime import (
 )
 from edgar_capstone.agents.tools.sec_tools import (
     _parse_ticker_list,
-    _profile_to_metric_record,
-    get_active_gcp_tool_adapters,
     get_context_cache_runtime_stats,
     search_10k_chunks_rag,
 )
+from edgar_capstone.agents.tools.variance_engine import _profile_to_metric_record
 from edgar_capstone.common.concurrency import run_parallel_with_context
 from edgar_capstone.observability.tracing import traced
 from edgar_capstone.security.model_armor import (
     GuardrailDecision,
     get_model_armor_guardrail,
 )
-from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 from edgar_capstone.telemetry import get_telemetry_sink
 
 logger = logging.getLogger(__name__)
@@ -839,7 +838,6 @@ def _finalize_turn(
         "disclosure_deltas": bundle.disclosure_deltas if bundle is not None else None,
         "citations": eff_citations,
         "candidates_searched": bundle.candidates_searched if bundle is not None else 0,
-        "context_cache": None,
         "fact_check": fact_check,
         "evaluation": evaluation,
         "react_execution": react_execution,
@@ -898,7 +896,6 @@ def _early_return_response(
             "iterations": 0,
             "steps": [],
             "variance_evaluations": [],
-            "cached_10k_explanations": [],
         },
     )
 
@@ -925,10 +922,7 @@ def _run_prompt_guardrail(
         )
     else:
         guardrail_svc = get_model_armor_guardrail()
-        prompt_decision = guardrail_svc.inspect_user_prompt(
-            query,
-            caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-        )
+        prompt_decision = guardrail_svc.inspect_user_prompt(query)
         elapsed_guard_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
     if prompt_decision.blocked:
@@ -984,7 +978,6 @@ def _run_prompt_guardrail(
                 "iterations": 0,
                 "steps": [],
                 "variance_evaluations": [],
-                "cached_10k_explanations": [],
             },
         )
         return query, prompt_decision, blocked_resp
@@ -1179,16 +1172,10 @@ def _inspect_response_guardrail(
     """Run Model Armor + SEC projection filter once on the synthesized response."""
     t_resp_armor = time.perf_counter()
     guardrail = get_model_armor_guardrail()
-    resp_decision = guardrail.inspect_model_response(
-        answer_markdown,
-        caller_agent="FinancialAnalystAgent",
-    )
+    resp_decision = guardrail.inspect_model_response(answer_markdown)
     raw_llm_text = str(react_result.get("raw_llm_text_for_guardrail") or "")
     if not resp_decision.blocked and raw_llm_text.strip():
-        raw_decision = guardrail.inspect_model_response(
-            raw_llm_text,
-            caller_agent="FinancialAnalystAgent",
-        )
+        raw_decision = guardrail.inspect_model_response(raw_llm_text)
         if raw_decision.blocked:
             resp_decision = raw_decision
 
@@ -1249,9 +1236,6 @@ def _inspect_response_guardrail(
                 "steps": [s.model_dump(mode="json") for s in react_steps],
                 "variance_evaluations": [
                     v.model_dump(mode="json") for v in react_result["variance_evaluations"]
-                ],
-                "cached_10k_explanations": [
-                    e.model_dump(mode="json") for e in react_result["cached_explanations"]
                 ],
             },
         )
@@ -1333,10 +1317,7 @@ def _run_parallel_prepass(
             return memory_mgr.recall_session_context(session_id, user_id=user_id)
         if branch == "guardrail":
             t_g = time.perf_counter()
-            dec = get_model_armor_guardrail().inspect_user_prompt(
-                query,
-                caller_agent=CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-            )
+            dec = get_model_armor_guardrail().inspect_user_prompt(query)
             return dec, (time.perf_counter() - t_g) * 1000.0
         if branch == "catalog":
             return _get_entity_catalog(allow_fetch=True)
@@ -1391,7 +1372,6 @@ def _resolve_and_validate_scope(
         explicit_tickers=list(scope.get("explicit_tickers") or []),
         unknown_entities=list(scope.get("unknown_entities") or []),
         catalog=catalog,
-        memory_context=ctx.memory_ctx,
     )
     pre_notices: list[dict[str, Any]] = list(validation.get("pre_notices") or [])
     public_scope = {
@@ -1496,7 +1476,6 @@ def _verify_and_finalize_success(
     answer_markdown: str = react_result["answer_markdown"]
     citations: list[dict[str, Any]] = react_result["citations"]
     variance_evaluations = react_result["variance_evaluations"]
-    cached_explanations = react_result["cached_explanations"]
     react_steps = react_result["react_steps"]
     eval_report = react_result["evaluation_report"]
     reasoning_model: str = react_result["reasoning_model"]
@@ -1592,7 +1571,6 @@ def _verify_and_finalize_success(
         end_year=public_scope["end_year"],
         variance_highlights=variance_highlights,
         cited_chunk_ids=[c["chunk_id"] for c in citations],
-        cached_10k_keys=[e.cache_key for e in cached_explanations],
         answer_markdown=answer_markdown,
         recalled_prior_memory=bool(ctx.memory_ctx.get("has_prior_memory")),
         topic_epoch=int(public_scope.get("topic_epoch") or 0),
@@ -1642,7 +1620,6 @@ def _verify_and_finalize_success(
             "iterations": len(react_steps),
             "steps": [s.model_dump(mode="json") for s in react_steps],
             "variance_evaluations": [v.model_dump(mode="json") for v in variance_evaluations],
-            "cached_10k_explanations": [e.model_dump(mode="json") for e in cached_explanations],
         },
     )
 

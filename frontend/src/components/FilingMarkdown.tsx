@@ -11,7 +11,6 @@ interface FilingMarkdownProps {
   markdown: string
   /** Leading heading to suppress when it only repeats the card title. */
   omitLeadingHeading?: string | null
-  className?: string
 }
 
 const INLINE_RE = /(\*\*[^*]+\*\*|\*[^*\s][^*]*\*|`[^`]+`)/g
@@ -151,7 +150,6 @@ function renderBlock(block: FilingBlock, idx: number): ReactNode {
 export function FilingMarkdown({
   markdown,
   omitLeadingHeading = null,
-  className = '',
 }: FilingMarkdownProps) {
   const blocks = useMemo(() => {
     const parsed = parseFilingMarkdown(markdown)
@@ -164,7 +162,7 @@ export function FilingMarkdown({
   }, [markdown, omitLeadingHeading])
 
   return (
-    <div className={`filing-prose text-[12.5px] leading-relaxed ${className}`}>
+    <div className="filing-prose text-[12.5px] leading-relaxed">
       {blocks.map(renderBlock)}
     </div>
   )

@@ -6,25 +6,17 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from edgar_capstone.agents.evaluation.judge import (
-        evaluate_variance_explanation,
-        evaluate_variance_explanation_with_latency,
-    )
+    from edgar_capstone.agents.evaluation.judge import evaluate_variance_explanation
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "evaluate_variance_explanation": (
         "edgar_capstone.agents.evaluation.judge",
         "evaluate_variance_explanation",
     ),
-    "evaluate_variance_explanation_with_latency": (
-        "edgar_capstone.agents.evaluation.judge",
-        "evaluate_variance_explanation_with_latency",
-    ),
 }
 
 __all__ = [
     "evaluate_variance_explanation",
-    "evaluate_variance_explanation_with_latency",
 ]
 
 

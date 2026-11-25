@@ -1,13 +1,5 @@
-schema_version: "1.0"
-default_version: "latest"
-description: >
-  Local Git-versioned prompt registry for SEC EDGAR Natural Language Analyst ADK agents
-  and Model Armor compliance policy.
-
 prompts:
   financial_analyst:
-    agent_name: "FinancialAnalystAgent"
-    model: "gemini-3.8-flash"
     latest: "v7"
     versions:
       v7:
@@ -15,8 +7,6 @@ prompts:
         path: "v7/financial_analyst.yaml"
 
   narrative_evaluator:
-    agent_name: "NarrativeEvaluatorAgent"
-    model: "gemini-3.8-flash"
     latest: "v1"
     versions:
       v1:
@@ -24,8 +14,6 @@ prompts:
         path: "v1/narrative_evaluator.yaml"
 
   model_armor_policy:
-    agent_name: "ModelArmorGuardrail"
-    model: "policy"
     latest: "v1"
     versions:
       v1:

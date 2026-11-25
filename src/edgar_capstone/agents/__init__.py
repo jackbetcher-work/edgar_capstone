@@ -3,7 +3,7 @@
 Organized into cohesive subpackages:
 - ``core``: Pydantic schemas, retry/telemetry resilience, and canonical 10-K citation helpers.
 - ``adapters``: Live GCP service adapters (BigQuery, Vertex AI Search, GCS, registry).
-- ``prompts``: Versioned prompt store (local/GCS/Vertex) and prompt compaction/builders.
+- ``prompts``: Local Git-versioned prompt store and prompt compaction/builders.
 - ``tools``: ADK tools, turn-scoped tool state, and deterministic financial/disclosure/sector engines.
 - ``runtime``: ADK execution runtime, agent factories, lifecycle callbacks, and context/memory strategy.
 - ``evaluation``: Claim-by-claim ``AnalystReport`` verification/rendering and Flash LLM-as-a-Judge.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
@@ -22,25 +21,10 @@ from edgar_capstone.security.model_armor.projection_filter import (
     _detect_sensitive_spans,
     _redact_spans,
 )
-from edgar_capstone.security.rbac import CUSTOM_RUNTIME_SA_ACCOUNT_ID
 
 logger = logging.getLogger(__name__)
 
 _HARD_BLOCK_SDP_TYPES: frozenset[str] = frozenset({"GCP_API_KEY", "AUTH_TOKEN"})
-
-
-def schema_safe_block_text(original_text: str, block_message: str) -> str:
-    """Replacement text for a blocked model response that keeps structured outputs parseable.
-
-    FinancialAnalystAgent answers with constrained `AnalystReport` JSON. Replacing a blocked
-    answer with plain text would fail ADK's output-schema validation, crash the run, and lose
-    the block decision, so structured answers get a minimal AnalystReport carrying the
-    block message instead.
-    """
-    stripped = (original_text or "").strip()
-    if stripped.startswith("{") and '"headline"' in stripped:
-        return json.dumps({"headline": block_message, "key_metrics": [], "findings": []})
-    return block_message
 
 
 class ModelArmorGuardrailService:
@@ -64,12 +48,9 @@ class ModelArmorGuardrailService:
         *,
         stage: Literal["prompt", "response"],
         text: str,
-        caller_agent: str,
     ) -> GuardrailDecision:
         """Shared inspection pipeline across both prompt and model-response stages."""
-        _ = caller_agent
         start = time.perf_counter()
-        sa_email, spiffe_id = "", ""
         policy = _load_guardrail_policy_dict()
 
         is_prompt = stage == "prompt"
@@ -107,8 +88,6 @@ class ModelArmorGuardrailService:
                 block_message=block_message,
                 backend_used=backend_used,
                 latency_ms=_elapsed_ms(),
-                s2s_service_account=sa_email,
-                s2s_spiffe_id=spiffe_id,
             )
 
         if self.config.mode == "disabled" or not text or not text.strip():
@@ -121,8 +100,6 @@ class ModelArmorGuardrailService:
                 sanitized_text=text,
                 backend_used="disabled" if self.config.mode == "disabled" else "noop_empty",
                 latency_ms=_elapsed_ms(),
-                s2s_service_account=sa_email,
-                s2s_spiffe_id=spiffe_id,
             )
 
         # 1. Invoke Google Cloud Model Armor (`sanitizeUserPrompt` or `sanitizeModelResponse`)
@@ -259,8 +236,6 @@ class ModelArmorGuardrailService:
                 sdp_info_types=sorted_types,
                 backend_used=ma_summary.backend_used,
                 latency_ms=_elapsed_ms(),
-                s2s_service_account=sa_email,
-                s2s_spiffe_id=spiffe_id,
             )
 
         return GuardrailDecision(
@@ -272,29 +247,17 @@ class ModelArmorGuardrailService:
             sanitized_text=text,
             backend_used=ma_summary.backend_used,
             latency_ms=_elapsed_ms(),
-            s2s_service_account=sa_email,
-            s2s_spiffe_id=spiffe_id,
         )
 
     @traced("guardrail.inspect_user_prompt")
-    def inspect_user_prompt(
-        self,
-        text: str,
-        *,
-        caller_agent: str = CUSTOM_RUNTIME_SA_ACCOUNT_ID,
-    ) -> GuardrailDecision:
+    def inspect_user_prompt(self, text: str) -> GuardrailDecision:
         """Inspect and sanitize an incoming user prompt via Model Armor + SDP + Projection filters."""
-        return self._inspect(stage="prompt", text=text, caller_agent=caller_agent)
+        return self._inspect(stage="prompt", text=text)
 
     @traced("guardrail.inspect_model_response")
-    def inspect_model_response(
-        self,
-        text: str,
-        *,
-        caller_agent: str = "FinancialAnalystAgent",
-    ) -> GuardrailDecision:
+    def inspect_model_response(self, text: str) -> GuardrailDecision:
         """Inspect and sanitize a synthesized model response via Model Armor + SDP + Projection filters."""
-        return self._inspect(stage="response", text=text, caller_agent=caller_agent)
+        return self._inspect(stage="response", text=text)
 
     def to_status_metadata(self) -> dict[str, Any]:
         return {
@@ -306,8 +269,6 @@ class ModelArmorGuardrailService:
             "template_resource_name": self.config.template_resource_name,
             "regional_api_endpoint": self.config.regional_api_endpoint,
             "sdp_action": self.config.sdp_action,
-            "sdp_inspect_template_configured": bool(self.config.sdp_inspect_template_id),
-            "sdp_deidentify_template_configured": bool(self.config.sdp_deidentify_template_id),
             "projection_filter_enabled": self.config.projection_filter_enabled,
             "fail_closed": self.config.fail_closed,
         }

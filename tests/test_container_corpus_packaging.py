@@ -54,7 +54,6 @@ def test_resolve_data_root_falls_back_to_cwd_for_site_packages_installs(
     monkeypatch.delenv("EDGAR_DATA_ROOT", raising=False)
     fake_site_root = tmp_path / "opt" / "venv" / "lib" / "data"
     monkeypatch.setattr(corpus_paths, "_source_tree_data_root", lambda: fake_site_root)
-    monkeypatch.setattr(corpus_paths, "CONTAINER_DATA_ROOT", tmp_path / "missing_app_data")
     app_dir = tmp_path / "app"
     (app_dir / "data").mkdir(parents=True)
     monkeypatch.chdir(app_dir)
@@ -111,11 +110,12 @@ def test_container_smoke_script_fails_without_ui(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from edgar_capstone import server
+    from edgar_capstone.api.routers import spa as spa_router
     from scripts.container_smoke_test import SmokeTestFailure, check_ui
 
     monkeypatch.setenv("FRONTEND_DIST_DIR", str(tmp_path / "missing"))
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(server, "_resolve_frontend_dist_dir", lambda: None)
+    monkeypatch.setattr(spa_router, "_resolve_frontend_dist_dir", lambda: None)
     with TestClient(server.app) as client, pytest.raises(SmokeTestFailure, match="GET /"):
         check_ui(client)
 

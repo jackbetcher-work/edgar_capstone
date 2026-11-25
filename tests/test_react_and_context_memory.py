@@ -611,8 +611,6 @@ def test_structured_react_executor_peer_comparison_with_sync_judge(
     assert out["answer_verified"] is True
     assert out["adk_runtime"]["answer_withheld_reason"] is None
 
-    # No legacy pre-synthesis cached-10K pass; pre-retrieved citations cover both peers directly.
-    assert out["cached_explanations"] == []
     assert len(out["citations"]) >= 2
     assert {c["ticker"] for c in out["citations"]} >= {"AAPL", "NVDA"}
 
@@ -716,7 +714,6 @@ def test_http_chat_multi_turn_memory_recall_and_telemetry_endpoints(
     assert turn1["context_and_memory"]["session_memory"]["persistence"]["persisted"] is True
     assert turn1["react_execution"]["strategy"] == "structured_react_loop"
     assert turn1["react_execution"]["iterations"] >= 3
-    assert turn1["react_execution"]["cached_10k_explanations"] == []
     assert _is_model(turn1["evaluation"]["evaluator_model"], "gemini-3.8-flash")
     assert turn1["context_and_memory"]["models"]["financial_reasoning_model"] == "gemini-3.8-flash"
     assert turn1["context_and_memory"]["turn_context_latency"]["total_calls"] >= 1
@@ -1013,7 +1010,6 @@ def test_react_guided_regeneration_retry_recovers_and_handles_exception(
         },
         variance_reports=[],
         variance_evaluations=[],
-        cached_explanations=[],
         citations=[citation],
         sector_benchmarks=[],
         chunk_health=None,
@@ -1274,7 +1270,6 @@ def test_partial_rejection_coverage_gap_triggers_repair_and_never_regresses(
         },
         variance_reports=[],
         variance_evaluations=[],
-        cached_explanations=[],
         citations=many_cits,
         sector_benchmarks=[],
         chunk_health=None,

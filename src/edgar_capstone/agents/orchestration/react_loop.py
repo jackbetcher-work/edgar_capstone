@@ -43,7 +43,6 @@ from pydantic import ValidationError
 from edgar_capstone.agents.core.citations import merge_citations
 from edgar_capstone.agents.core.schemas import (
     AnalystReport,
-    Cached10KExplanation,
     FactCheckVerification,
     ModelContextLatencyRecord,
     NarrativeEvaluationReport,
@@ -146,11 +145,6 @@ class _BackgroundJudgeManager:
         self._pending: list[Future[Any]] = []
         self._shutting_down = threading.Event()
 
-    @property
-    def is_pool_initialized(self) -> bool:
-        with self._lock:
-            return self._pool is not None
-
     def is_shutting_down(self) -> bool:
         return self._shutting_down.is_set() or sys.is_finalizing()
 
@@ -232,7 +226,6 @@ def _schedule_background_judge(
     response_markdown: str,
     variance_reports: list[dict[str, Any]],
     citations: list[dict[str, Any]],
-    cached_explanations_count: int,
     session_id: str | None = None,
     user_email: str = "analyst",
     intent: str = "longitudinal_single_company",
@@ -259,7 +252,6 @@ def _schedule_background_judge(
                 response_markdown=response_markdown,
                 variance_reports=variance_reports,
                 citations=citations,
-                cached_explanations_count=cached_explanations_count,
                 llm=llm,
                 fact_check=fact_check,
             )
@@ -532,7 +524,6 @@ class _ReasoningInput:
     scope: dict[str, Any]
     initial_outputs: ToolOutputs
     variance_evaluations: list[VarianceEvaluationItem]
-    cached_explanations: list[Cached10KExplanation]
     merged_citations: list[dict[str, Any]]
     memory_context: dict[str, Any] | None
     session_id: str | None
@@ -714,11 +705,9 @@ class StructuredReActExecutor:
     def __init__(
         self,
         *,
-        max_iterations: int = 5,
         reasoning_llm: BaseLlm | None = None,
         judge_llm: BaseLlm | None = None,
     ) -> None:
-        self.max_iterations = max_iterations
         self.reasoning_llm = reasoning_llm
         self.judge_llm = judge_llm
 
@@ -792,7 +781,6 @@ class StructuredReActExecutor:
         scope: dict[str, Any],
         variance_reports: list[dict[str, Any]],
         variance_evaluations: list[VarianceEvaluationItem],
-        cached_explanations: list[Cached10KExplanation],
         citations: list[dict[str, Any]],
         sector_benchmarks: list[dict[str, Any]],
         chunk_health: dict[str, Any] | None,
@@ -817,7 +805,6 @@ class StructuredReActExecutor:
             scope=scope,
             variance_reports=variance_reports,
             variance_evaluations=[v.model_dump(mode="json") for v in variance_evaluations],
-            cached_explanations=[c.model_dump(mode="json") for c in cached_explanations],
             citations=citations,
             sector_benchmarks=sector_benchmarks,
             chunk_health=chunk_health,
@@ -933,7 +920,6 @@ class StructuredReActExecutor:
                 scope=req.scope,
                 variance_reports=tool_outputs.variance_reports,
                 variance_evaluations=req.variance_evaluations,
-                cached_explanations=req.cached_explanations,
                 citations=req.merged_citations,
                 sector_benchmarks=tool_outputs.sector_benchmarks,
                 chunk_health=tool_outputs.chunk_health,
@@ -1021,7 +1007,6 @@ class StructuredReActExecutor:
                 scope=req.scope,
                 variance_reports=init_out.variance_reports,
                 variance_evaluations=req.variance_evaluations,
-                cached_explanations=req.cached_explanations,
                 citations=req.merged_citations,
                 sector_benchmarks=init_out.sector_benchmarks,
                 chunk_health=init_out.chunk_health,
@@ -1167,7 +1152,6 @@ class StructuredReActExecutor:
         scope: dict[str, Any],
         variance_reports: list[dict[str, Any]],
         merged_citations: list[dict[str, Any]],
-        cached_explanations_count: int,
         outcome: _SynthesisOutcome,
         session_id: str | None,
         user_id: str,
@@ -1208,7 +1192,6 @@ class StructuredReActExecutor:
                 response_markdown=outcome.answer_markdown,
                 variance_reports=variance_reports,
                 citations=merged_citations,
-                cached_explanations_count=cached_explanations_count,
                 llm=self.judge_llm,
                 fact_check=outcome.fact_check_verification,
             )
@@ -1281,7 +1264,6 @@ class StructuredReActExecutor:
             response_markdown=outcome.answer_markdown,
             variance_reports=variance_reports,
             citations=merged_citations,
-            cached_explanations_count=cached_explanations_count,
             session_id=session_id,
             user_email=user_id,
             intent=intent,
@@ -1365,9 +1347,6 @@ class StructuredReActExecutor:
         )
         react_steps: list[ReActStep] = [step_1]
 
-        # Pre-pass citations are already coverage-balanced by hybrid RAG; cached 10-K sections
-        # are queried on demand by the agent via QueryCached10KTool instead of a redundant pre-pass.
-        cached_explanations: list[Cached10KExplanation] = []
         merged_citations = list(citations)
 
         # Iteration 2: Live synthesis & claim verification (with optional tool-less repair pass)
@@ -1378,7 +1357,6 @@ class StructuredReActExecutor:
                 scope=scope,
                 initial_outputs=initial_outputs,
                 variance_evaluations=variance_evaluations,
-                cached_explanations=cached_explanations,
                 merged_citations=merged_citations,
                 memory_context=memory_context,
                 session_id=session_id,
@@ -1419,14 +1397,12 @@ class StructuredReActExecutor:
                     if live_stream_result.thoughts
                     else (
                         f"Executed live ADK Runner ({reasoning_model}, SSE streaming) combining deterministic "
-                        f"variances with {len(cached_explanations)} cached 10-K explanation(s) and "
-                        f"{len(merged_citations)} grounded citation(s)."
+                        f"variances with {len(merged_citations)} grounded citation(s)."
                     )
                 ),
                 action="adk_runner.FinancialAnalystAgent(SSE)",
                 action_input={
                     "model": reasoning_model,
-                    "cached_explanations_count": len(cached_explanations),
                     "citation_count": len(merged_citations),
                 },
                 observation=(
@@ -1457,7 +1433,6 @@ class StructuredReActExecutor:
             scope=scope,
             variance_reports=hydrated_reports,
             merged_citations=merged_citations,
-            cached_explanations_count=len(cached_explanations),
             outcome=outcome,
             session_id=telemetry_session_id or session_id,
             user_id=user_id,
@@ -1552,7 +1527,6 @@ class StructuredReActExecutor:
             "agent_intent": outcome.agent_intent,
             "agent_tool_calls": list(live_stream_result.function_calls),
             "variance_evaluations": variance_evaluations,
-            "cached_explanations": cached_explanations,
             "react_steps": react_steps,
             "evaluation_report": eval_report,
             "judge_mode": judge_mode,

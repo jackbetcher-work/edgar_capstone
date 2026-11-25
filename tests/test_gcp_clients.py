@@ -57,26 +57,20 @@ def test_gcp_defaults_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in (
         "GCP_PROJECT_ID",
         "GOOGLE_CLOUD_PROJECT",
-        "GCLOUD_PROJECT",
         "EDGAR_GCP_PROJECT_ID",
         "GCP_REGION",
         "GOOGLE_CLOUD_LOCATION",
         "BIGQUERY_LOCATION",
         "EDGAR_GCP_REGION",
         "SEC_CORPUS_BUCKET",
-        "EDGAR_GCS_BUCKET",
         "BIGQUERY_DATASET_ID",
-        "EDGAR_BQ_DATASET",
         "SEC_EDGAR_USER_AGENT",
-        "SEC_USER_AGENT",
     ):
         monkeypatch.delenv(key, raising=False)
 
     assert resolve_gcp_project_id() == DEFAULT_PROJECT_ID
     monkeypatch.setenv("EDGAR_GCP_PROJECT_ID", "p-legacy")
     assert resolve_gcp_project_id() == "p-legacy"
-    monkeypatch.setenv("GCLOUD_PROJECT", "p-gcloud")
-    assert resolve_gcp_project_id() == "p-gcloud"
     monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "p-google")
     assert resolve_gcp_project_id() == "p-google"
     monkeypatch.setenv("GCP_PROJECT_ID", "p-canonical")
@@ -88,23 +82,16 @@ def test_gcp_defaults_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
     assert resolve_gcp_location(allow_global=False) == DEFAULT_LOCATION
 
     assert resolve_corpus_bucket("gs://my-bucket/") == "my-bucket"
-    monkeypatch.setenv("EDGAR_GCS_BUCKET", "gs://legacy-bucket/")
-    assert resolve_corpus_bucket() == "legacy-bucket"
     monkeypatch.setenv("SEC_CORPUS_BUCKET", "canonical-bucket")
     assert resolve_corpus_bucket() == "canonical-bucket"
     monkeypatch.delenv("SEC_CORPUS_BUCKET")
-    monkeypatch.delenv("EDGAR_GCS_BUCKET")
     assert resolve_corpus_bucket() == DEFAULT_BUCKET_NAME
 
     assert resolve_bq_dataset_id() == DEFAULT_BIGQUERY_DATASET_ID
-    monkeypatch.setenv("EDGAR_BQ_DATASET", "legacy_ds")
-    assert resolve_bq_dataset_id() == "legacy_ds"
     monkeypatch.setenv("BIGQUERY_DATASET_ID", "canon_ds")
     assert resolve_bq_dataset_id() == "canon_ds"
 
     assert resolve_sec_user_agent() == DEFAULT_SEC_USER_AGENT
-    monkeypatch.setenv("SEC_USER_AGENT", "LegacyUA test@example.com")
-    assert resolve_sec_user_agent() == "LegacyUA test@example.com"
     monkeypatch.setenv("SEC_EDGAR_USER_AGENT", "CanonicalUA test@example.com")
     assert resolve_sec_user_agent() == "CanonicalUA test@example.com"
 

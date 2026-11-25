@@ -124,10 +124,6 @@ export function App() {
     }
   }, [handleApiAuthFailure])
 
-  useEffect(() => {
-    document.documentElement.setAttribute('data-theme', 'terminal')
-  }, [])
-
   // Discover IAP / Google Workspace Okta SSO configuration & initialize session
   useEffect(() => {
     let active = true
@@ -344,7 +340,6 @@ export function App() {
               t.id === turnId
                 ? {
                     ...t,
-                    progressStage: progress.stage,
                     progressMessage: progress.message,
                     progressMeta: progress.meta ?? null,
                     progressElapsedMs: progress.elapsed_ms,

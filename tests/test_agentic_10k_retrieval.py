@@ -68,7 +68,6 @@ def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() 
                 ],
             }
         ],
-        cached_explanations=[{"cache_key": "NVDA_2026_item_7", "extracted_explanations": ["x"]}],
         citations=[
             {
                 "chunk_id": f"NVDA_2026_item_7_{i:04d}",
@@ -86,10 +85,9 @@ def test_synthesis_prompt_carries_facts_and_retrieval_brief_not_full_sections() 
     )
     assert "<10k_section" not in prompt
     assert "## Evidence Coverage" in prompt
-    # Leads are capped in count (12) and length (850 chars) and point at citable chunk ids
+    # Leads are capped in count (12) and length (1200 chars) and point at citable chunk ids
     assert prompt.count('"chunk_id": "NVDA_2026_item_7_') == 12
-    assert long_excerpt[:900] not in prompt
-    assert '"pre_queried_sections"' in prompt
+    assert long_excerpt[:1250] not in prompt
     # Suggested retrieval targets are surfaced once, not duplicated inside the evaluations JSON
     assert prompt.count("operating income & margin variance drivers") == 1
     assert "NVDA FY2026 revenue operating income ..." not in prompt
@@ -326,7 +324,7 @@ def test_qualitative_turn_retrieval_and_citations_resolve_without_variances(
 
 
 def test_judge_sees_the_passages_the_report_cites() -> None:
-    from edgar_capstone.agents.runtime.live_runtime import select_citations_for_judge
+    from edgar_capstone.agents.prompts.builders import select_citations_for_judge
 
     citations = [
         {"chunk_id": f"NVDA_2026_item_1a_{i:04d}", "excerpt": "x" * 5000} for i in range(40)

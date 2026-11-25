@@ -11,10 +11,6 @@ description: >
   (no extra retrieval or re-prompting). Everything else is unchanged from v6: agent-selected
   deterministic engines, `key_metrics` only for figures asked about, canonical `intent`,
   quote-verified findings, fiscal-calendar awareness, and strict XBRL provenance.
-safety_policy:
-  model_armor_template: "sec-edgar-analyst-armor"
-  enforce_sdp_filter: true
-  enforce_projection_filter: true
 variables:
   analyst_model: "gemini-3.8-flash"
 template: |

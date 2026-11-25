@@ -123,8 +123,6 @@ export function buildXbrlFactFromFlag(
     xbrlConcept: flag.source.xbrl_concept,
     priorXbrlConcept: flag.source.prior_xbrl_concept ?? null,
     denominatorXbrlConcept: flag.source.denominator_xbrl_concept ?? null,
-    priorDenominatorXbrlConcept:
-      flag.source.prior_denominator_xbrl_concept ?? null,
     secFilingUrl: flag.source.sec_filing_url,
     priorSecFilingUrl: flag.source.prior_sec_filing_url,
   }

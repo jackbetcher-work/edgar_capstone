@@ -17,7 +17,6 @@ from edgar_capstone.agents.evaluation.structured_report import (
 from edgar_capstone.agents.runtime.callbacks import verify_narrative_against_calculations
 from edgar_capstone.agents.tools.variance_engine import _build_variance_reports_from_profiles
 from edgar_capstone.dataset.models import FinancialDataProfile
-from edgar_capstone.security.model_armor import schema_safe_block_text
 from tests.fake_gcp import use_fake_gcp_adapters
 from tests.structured_report_helpers import verbatim_quote
 
@@ -266,14 +265,6 @@ def test_report_is_trimmed_and_parsed_from_adk_state(
     assert verified.verification.findings_total == 6  # capped
     assert verified.verification.findings_verified == 6
     assert verified.verification.metrics_dropped == ["ZZZZ:net_income"]
-
-
-def test_guardrail_block_keeps_structured_output_parseable() -> None:
-    original = AnalystReport(headline="price target of $260").model_dump_json()
-    replaced = schema_safe_block_text(original, "Blocked by policy.")
-    assert AnalystReport.model_validate_json(replaced).headline == "Blocked by policy."
-    assert "notes" not in json.loads(replaced)
-    assert schema_safe_block_text("plain markdown", "Blocked by policy.") == "Blocked by policy."
 
 
 def test_table_aware_figure_verification_honors_chunk_scale_and_rejects_ungrounded() -> None:

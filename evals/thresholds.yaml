@@ -1,6 +1,5 @@
 # Golden eval regression gates for `make eval-all` (scripts/run_evals.py).
-# Any gate below its threshold fails the run (exit code 1). Values mirror the targets in
-# docs/project_reference.md (Secs. 5 and 10); judge thresholds are initial assumptions to tune.
+# Any gate below its threshold fails the run (exit code 1).
 gates:
   # Share of scored items whose deterministic variances match the golden numbers, whose
   # `required_in_narrative` percentages appear in the answer, and whose fact-check passed.

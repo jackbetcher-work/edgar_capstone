@@ -9,7 +9,6 @@ import type {
   XbrlFactSelection,
 } from '../types/edgar'
 import {
-  formatSignedBps,
   formatSignedDeltaUsd,
   formatSignedPercent,
   formatUsdCompact,
@@ -33,9 +32,6 @@ const METRIC_LABELS: Record<StructuredKeyMetric['metric'], string> = {
   operating_income: 'Operating Income',
   net_income: 'Net Income',
   research_and_development: 'R&D Expense',
-  operating_margin: 'Operating Margin',
-  net_margin: 'Net Margin',
-  rd_intensity: 'R&D Intensity',
 }
 
 function resolveVarianceMetric(
@@ -51,24 +47,6 @@ function resolveVarianceMetric(
       return rep.net_income_variance
     case 'research_and_development':
       return rep.research_and_development_variance ?? null
-    default:
-      return null
-  }
-}
-
-function resolveMarginBps(
-  rep: CompanyVarianceReport,
-  metric: StructuredKeyMetric['metric']
-): number | null {
-  switch (metric) {
-    case 'operating_margin':
-      return rep.operating_margin_bps_delta
-    case 'net_margin':
-      return rep.net_margin_bps_delta
-    case 'rd_intensity':
-      return rep.rd_intensity_bps_delta ?? null
-    default:
-      return null
   }
 }
 
@@ -92,14 +70,6 @@ function formatKeyMetricSummary(
     return {
       text,
       fact: buildXbrlFactFromVariance(rep, mv, label),
-    }
-  }
-
-  const bps = resolveMarginBps(rep, metric)
-  if (bps !== null && bps !== undefined) {
-    return {
-      text: `FY${rep.start_year}→FY${rep.end_year}: ${formatSignedBps(bps)}`,
-      fact: null,
     }
   }
   return null

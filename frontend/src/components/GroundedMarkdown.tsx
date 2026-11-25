@@ -10,7 +10,7 @@ import { humanizeXbrlConcept, shortCitationTopic } from '../utils/xbrlLabels'
 interface GroundedMarkdownProps {
   turnId: string
   markdown: string
-  activeChunkId: string | null
+  activeChunkId?: string | null
   /**
    * Optional matcher so chips citing a de-duplicated passage highlight together
    * with the merged source card; defaults to exact chunk-ID equality.
@@ -33,10 +33,10 @@ interface BulletItem {
   children: Array<{ text: string; idx: number }>
 }
 
-/** Implementation-detail suffixes that mean nothing to an analyst reading the answer. */
-const HEADING_NOISE_RE = /\s*\((?:deterministic(?: engine)?|rule-based)\)\s*$/i
+/** Implementation-detail suffix stripped from section headings. */
+const HEADING_NOISE_RE = /\s*\(deterministic(?: engine)?\)\s*$/i
 /** Sub-bullet emitted under each finding: `*Evidence:* "verbatim quote"`. */
-const EVIDENCE_PREFIX_RE = /^\*{0,2}(?:Evidence|Supporting evidence|Quote)\s*:\s*\*{0,2}\s*/i
+const EVIDENCE_PREFIX_RE = /^\*{0,2}Evidence\s*:\s*\*{0,2}\s*/i
 
 function renderFormattedInlineText(text: string, keyPrefix: string): ReactNode[] {
   const pattern = /(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g

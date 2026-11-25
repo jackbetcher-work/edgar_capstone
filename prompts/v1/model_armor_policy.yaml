@@ -6,9 +6,6 @@ model: "policy"
 description: >
   Versioned policy specification for Google Cloud Model Armor, Sensitive Data Protection
   (SDP / Cloud DLP), and SEC 10-K financial projection / MNPI leak filters.
-variables:
-  default_template_id: "sec-edgar-analyst-armor"
-  max_verified_fiscal_year: "2026"
 policy:
   blocked_prompt_message: >
     Request blocked by SEC Analyst Model Armor & compliance guardrails: I can only answer
@@ -137,5 +134,3 @@ policy:
     - "price"
     - "growth"
     - "valuation"
-template: |
-  Managed Google Cloud Model Armor (`{{default_template_id}}`) + Cloud SDP/DLP + SEC Financial Projection Compliance Policy (max verified fiscal year: FY{{max_verified_fiscal_year}}).

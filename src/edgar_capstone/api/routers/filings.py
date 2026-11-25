@@ -10,11 +10,8 @@ from edgar_capstone.agents.orchestration.chat_engine import (
     list_curated_companies,
     lookup_cached_profile,
 )
-from edgar_capstone.agents.tools import (
-    get_active_gcp_tool_adapters,
-    load_cached_10k_section,
-)
 from edgar_capstone.agents.tools.runtime import tool_turn_context
+from edgar_capstone.agents.tools.sec_tools import load_cached_10k_section
 from edgar_capstone.api.dependencies import audited_permissions
 from edgar_capstone.common.domain import normalize_edgar_ticker
 from edgar_capstone.security.auth import (
@@ -26,29 +23,13 @@ from edgar_capstone.security.rbac import Permission
 
 router = APIRouter(tags=["SEC Filings"])
 
-_SECTION_PROFILE_META_FIELDS: tuple[str, ...] = (
-    "cik",
-    "accession_number",
-    "filing_date",
-    "period_of_report",
-    "gics_sector",
-    "gics_sub_industry",
-)
 
-
-def _enrich_section_response(
-    ticker: str,
+def _load_section_response(
+    norm_ticker: str,
     fiscal_year: int,
     section_id: str,
     max_chars: int,
 ) -> dict[str, Any]:
-    norm_ticker = normalize_edgar_ticker(ticker)
-    if not norm_ticker:
-        raise HTTPException(
-            status_code=422,
-            detail="ticker must contain at least one non-whitespace character",
-        )
-
     cached_prof = lookup_cached_profile(norm_ticker, fiscal_year)
     if cached_prof is not None:
         with tool_turn_context(cached_profiles=[cached_prof]):
@@ -67,19 +48,6 @@ def _enrich_section_response(
         )
     if res.get("status") == "error":
         raise HTTPException(status_code=404, detail=res.get("message", "Section not found"))
-
-    if any(field not in res for field in _SECTION_PROFILE_META_FIELDS):
-        matched_prof = cached_prof
-        if matched_prof is None:
-            profiles = get_active_gcp_tool_adapters().bigquery.fetch_profiles(
-                tickers={norm_ticker},
-                start_year=fiscal_year,
-                end_year=fiscal_year,
-            )
-            matched_prof = profiles[0] if profiles else None
-        if matched_prof is not None:
-            for field in _SECTION_PROFILE_META_FIELDS:
-                res.setdefault(field, getattr(matched_prof, field))
     return res
 
 
@@ -118,8 +86,8 @@ def get_cached_section(
         tickers=[norm_ticker],
         detail=f"FY{fiscal_year} {section_id}",
     )
-    return _enrich_section_response(
-        ticker=norm_ticker,
+    return _load_section_response(
+        norm_ticker=norm_ticker,
         fiscal_year=fiscal_year,
         section_id=section_id,
         max_chars=max_chars,

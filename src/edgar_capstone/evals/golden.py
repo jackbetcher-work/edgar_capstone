@@ -394,7 +394,7 @@ def refresh_expected_values(
     if item.is_safety or not item.expected_variances:
         return item
     if calculate_fn is None:
-        from edgar_capstone.agents.tools import calculate_period_variances
+        from edgar_capstone.agents.tools.sec_tools import calculate_period_variances
 
         calculate_fn = calculate_period_variances
 

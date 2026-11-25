@@ -34,7 +34,6 @@ from edgar_capstone.common.domain import (
     CANONICAL_GICS_SECTORS,
     canonicalize_gics_sector,
     normalize_edgar_ticker,
-    sha256_text,
 )
 from edgar_capstone.common.formatting import parse_model_output
 from edgar_capstone.observability.tracing import set_span_attributes, traced
@@ -533,7 +532,6 @@ def classify_scope_and_continuity(
             user_id="scope_resolver",
             session_id=f"scope-resolve-{uuid.uuid4().hex[:10]}",
             app_name="edgar_scope_app",
-            state_delta={"_model_armor_verified_prompt_sha256": sha256_text(prompt)},
             use_adk_app=False,
             backend=resolved.backend,
             max_llm_calls=2,

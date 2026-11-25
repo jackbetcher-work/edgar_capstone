@@ -7,8 +7,8 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 
-class FilingScopeMixin(BaseModel):
-    """Shared SEC 10-K filing filter fields with cross-field fiscal-year validation."""
+class ChatQueryRequest(BaseModel):
+    """Conversational Hybrid RAG analyst query payload with fiscal-year validation."""
 
     tickers: str = Field(
         default="ALL",
@@ -34,20 +34,6 @@ class FilingScopeMixin(BaseModel):
         le=2035,
         description="Inclusive ending fiscal year.",
     )
-
-    @model_validator(mode="after")
-    def _validate_year_range(self) -> FilingScopeMixin:
-        if self.start_year > self.end_year:
-            raise ValueError(
-                f"start_year ({self.start_year}) must be less than or equal to "
-                f"end_year ({self.end_year})."
-            )
-        return self
-
-
-class ChatQueryRequest(FilingScopeMixin):
-    """Conversational Hybrid RAG analyst query payload."""
-
     query: str = Field(
         ..., min_length=2, description="Natural-language financial analyst question."
     )
@@ -62,6 +48,15 @@ class ChatQueryRequest(FilingScopeMixin):
         max_length=128,
         description="Optional persistent user-scoped conversation session ID.",
     )
+
+    @model_validator(mode="after")
+    def _validate_year_range(self) -> ChatQueryRequest:
+        if self.start_year > self.end_year:
+            raise ValueError(
+                f"start_year ({self.start_year}) must be less than or equal to "
+                f"end_year ({self.end_year})."
+            )
+        return self
 
 
 class SsoTokenExchangeRequest(BaseModel):
@@ -111,6 +106,5 @@ __all__ = [
     "ChatQueryRequest",
     "DevWorkspaceSsoLoginRequest",
     "FeedbackRequest",
-    "FilingScopeMixin",
     "SsoTokenExchangeRequest",
 ]

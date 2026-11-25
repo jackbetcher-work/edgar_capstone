@@ -6,11 +6,12 @@ import importlib
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from edgar_capstone.agents.adapters.registry import (
+        get_active_gcp_tool_adapters,
+        get_gcp_adapters_status_metadata,
+    )
     from edgar_capstone.agents.tools.sec_tools import (
         calculate_period_variances,
-        get_active_gcp_tool_adapters,
-        get_full_10k_section,
-        get_gcp_adapters_status_metadata,
         load_cached_10k_section,
         query_analytics_view,
         search_10k_chunks_rag,
@@ -22,12 +23,11 @@ _EXPORTS: dict[str, tuple[str, str]] = {
         "calculate_period_variances",
     ),
     "get_active_gcp_tool_adapters": (
-        "edgar_capstone.agents.tools.sec_tools",
+        "edgar_capstone.agents.adapters.registry",
         "get_active_gcp_tool_adapters",
     ),
-    "get_full_10k_section": ("edgar_capstone.agents.tools.sec_tools", "get_full_10k_section"),
     "get_gcp_adapters_status_metadata": (
-        "edgar_capstone.agents.tools.sec_tools",
+        "edgar_capstone.agents.adapters.registry",
         "get_gcp_adapters_status_metadata",
     ),
     "load_cached_10k_section": (
@@ -41,7 +41,6 @@ _EXPORTS: dict[str, tuple[str, str]] = {
 __all__ = [
     "calculate_period_variances",
     "get_active_gcp_tool_adapters",
-    "get_full_10k_section",
     "get_gcp_adapters_status_metadata",
     "load_cached_10k_section",
     "query_analytics_view",

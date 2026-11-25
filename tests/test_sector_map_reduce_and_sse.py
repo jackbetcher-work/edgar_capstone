@@ -312,7 +312,9 @@ def test_sse_chat_stream_and_user_scoped_sessions_endpoints() -> None:
             "total_latency_ms": 125.0,
         }
 
-    with patch("edgar_capstone.server.run_conversational_rag_turn", side_effect=_fake_turn):
+    with patch(
+        "edgar_capstone.api.routers.chat.run_conversational_rag_turn", side_effect=_fake_turn
+    ):
         resp = client.post(
             "/api/v1/chat/stream",
             headers=alice_headers,
@@ -339,7 +341,7 @@ def test_sse_chat_stream_and_user_scoped_sessions_endpoints() -> None:
 
     # SSE error event path
     with patch(
-        "edgar_capstone.server.run_conversational_rag_turn",
+        "edgar_capstone.api.routers.chat.run_conversational_rag_turn",
         side_effect=RuntimeError("live backend error"),
     ):
         err_resp = client.post(

@@ -29,7 +29,6 @@ from edgar_capstone.agents.tools.runtime import (
     merge_disclosure_deltas,
     turn_map_llm,
 )
-from edgar_capstone.agents.tools.sec_tools import _record_gcp_backend_invocation
 from edgar_capstone.common.domain import canonicalize_gics_sector
 
 _DIGEST_MAX_CITATIONS = 12
@@ -167,12 +166,6 @@ def sector_thematic_map_reduce(
         state[STATE_RETRIEVED_CITATIONS] = merge_citations(
             existing, list(result.get("citations") or [])
         )
-    _record_gcp_backend_invocation(
-        tool_context,
-        tool_name="sector_thematic_map_reduce",
-        data_source="gcp",
-        services_hit=["bigquery", "vertex_ai"],
-    )
     return _compact_sector_digest(result)
 
 

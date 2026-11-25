@@ -45,7 +45,6 @@ STATE_SECTOR_COVERAGE = "sector_coverage"
 STATE_SECTOR_MAP_SUMMARIES = "sector_map_summaries"
 STATE_CHUNK_HEALTH = "chunk_health"
 STATE_ANALYTICS_VIEW_RESULTS = "analytics_view_results"
-STATE_LOOKER_RESULTS = STATE_ANALYTICS_VIEW_RESULTS  # backward-compatible alias
 STATE_RETRIEVED_CITATIONS = "retrieved_citations"
 
 # Deterministic engines whose outputs surface as UI payloads (cards, badges, XBRL chips).
@@ -56,7 +55,6 @@ DETERMINISTIC_TOOL_NAMES: frozenset[str] = frozenset(
         "compare_disclosures_across_years",
         "sector_thematic_map_reduce",
         "query_analytics_view",
-        "fetch_financial_metrics",
     }
 )
 
@@ -425,7 +423,6 @@ __all__ = [
     "STATE_CHUNK_HEALTH",
     "STATE_DISCLOSURE_DELTAS",
     "STATE_DISCLOSURE_DELTA_SUMMARY",
-    "STATE_LOOKER_RESULTS",
     "STATE_MATERIAL_FLAGS",
     "STATE_MATERIAL_FLAG_SUMMARY",
     "STATE_RETRIEVED_CITATIONS",

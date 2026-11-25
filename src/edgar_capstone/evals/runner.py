@@ -295,8 +295,6 @@ JudgeFn = Callable[..., Any]
 
 
 def detect_environment() -> str:
-    if os.environ.get("BUILD_ID") and os.environ.get("PROJECT_ID"):
-        return "cloud_build"
     if os.environ.get("GITHUB_ACTIONS") == "true":
         return "github_actions"
     return "local"
@@ -324,7 +322,7 @@ def _default_turn_fn() -> TurnFn:
 
 
 def _default_judge_fn() -> JudgeFn:
-    from edgar_capstone.agents.evaluation import evaluate_variance_explanation
+    from edgar_capstone.agents.evaluation.judge import evaluate_variance_explanation
 
     return evaluate_variance_explanation
 
@@ -435,15 +433,11 @@ def _score_with_judge(
 ) -> None:
     """Invoke the LLM judge and populate quality/faithfulness scores on `res`."""
     try:
-        cached_count = len(
-            (response.get("react_execution") or {}).get("cached_10k_explanations") or []
-        )
         report = judge_fn(
             query=item.query,
             response_markdown=response.get("answer_markdown") or "",
             variance_reports=response.get("variance_reports") or [],
             citations=response.get("citations") or [],
-            cached_explanations_count=cached_count,
             reference_explanation=item.reference_explanation,
         )
         judged = report.model_dump(mode="json") if hasattr(report, "model_dump") else dict(report)
@@ -452,10 +446,7 @@ def _score_with_judge(
             / 2.0,
             4,
         )
-        raw_prec = judged.get("citation_precision_score")
-        res.citation_precision_score = (
-            float(raw_prec) if raw_prec is not None else float(judged["citation_grounding_score"])
-        )
+        res.citation_precision_score = float(judged["citation_precision_score"])
         res.explanation_quality_score = float(judged["explanation_quality_score"])
         res.thematic_consistency_score = float(judged["thematic_consistency_score"])
         res.judge_grade = judged.get("grade")

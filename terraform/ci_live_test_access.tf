@@ -4,10 +4,8 @@
 # There is no offline/local data mode: the pytest suite, the golden evals, and the
 # container smoke test read BigQuery `sec_edgar`, Vertex AI Search, Vertex AI
 # embeddings, and the GCS SEC corpus bucket, and call Gemini + Model Armor on
-# Vertex AI. The CI identities that run them get least-privilege READ access here:
-#   - GitHub Actions: the keyless WIF service account (cicd_runner)
-#   - Cloud Build:    the trigger service account (cloudbuild_runner), when enabled
-# Both are already listed as trusted ingress identities in vpc_service_controls.tf.
+# access and call Gemini + Model Armor on Vertex AI. The GitHub Actions keyless
+# WIF service account (cicd_runner) gets least-privilege READ access here.
 # Telemetry and feedback stay in memory during tests (EDGAR_TELEMETRY_BACKEND=local,
 # EDGAR_FEEDBACK_BACKEND=local), so no write roles are granted.
 
@@ -73,8 +71,7 @@ resource "google_project_iam_member" "ci_live_test_modelarmor_user" {
   member  = each.value
 }
 
-# Cloud Sensitive Data Protection (DLP) content:deidentify, which the guardrail calls on every
-# prompt and response alongside Model Armor's basic SDP.
+# Cloud Sensitive Data Protection (DLP) user role for Model Armor advanced SDP templates.
 resource "google_project_iam_member" "ci_live_test_dlp_user" {
   for_each = local.ci_live_test_principals
 

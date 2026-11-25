@@ -27,7 +27,7 @@ access_logger = logging.getLogger("edgar_capstone.access")
 
 TRACE_ID_HEADER = "X-Trace-Id"
 REQUEST_ID_HEADER = "X-Request-Id"
-DEFAULT_QUIET_PATHS: tuple[str, ...] = ("/health", "/healthz")
+DEFAULT_QUIET_PATHS: tuple[str, ...] = ("/health",)
 
 
 class RequestTelemetryMiddleware:
@@ -187,7 +187,7 @@ class RequestTelemetryMiddleware:
 
 
 def _route_template(scope: Scope) -> str | None:
-    """Return the matched route template (e.g. `/api/v1/explore/{explore_name}`)."""
+    """Return the matched route template (e.g. `/api/v1/sessions/{session_id}`)."""
     route = scope.get("route")
     route_path = getattr(route, "path", None)
     return str(route_path) if route_path else None

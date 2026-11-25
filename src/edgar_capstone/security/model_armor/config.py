@@ -6,7 +6,7 @@ import logging
 import os
 import string
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -22,21 +22,12 @@ from edgar_capstone.gcp.paths import resolve_asset_dir
 
 logger = logging.getLogger(__name__)
 
-ModelArmorMode = Literal["auto", "gcp", "live", "emulator", "disabled"]
+ModelArmorMode = Literal["auto", "gcp", "emulator", "disabled"]
 SdpActionMode = Literal["deidentify", "block"]
 GuardrailAction = Literal["allowed", "sanitized", "blocked"]
 
 DEFAULT_MODEL_ARMOR_TEMPLATE_ID = "sec-edgar-analyst-armor"
 DEFAULT_MODEL_ARMOR_LOCATION = "us-central1"
-
-DEFAULT_SDP_INFO_TYPES: tuple[str, ...] = (
-    "US_SOCIAL_SECURITY_NUMBER",
-    "CREDIT_CARD_NUMBER",
-    "EMAIL_ADDRESS",
-    "PHONE_NUMBER",
-    "GCP_API_KEY",
-    "AUTH_TOKEN",
-)
 
 _SAFE_EMAIL_DOMAIN_SUFFIXES: tuple[str, ...] = (
     "iam.gserviceaccount.com",
@@ -147,8 +138,6 @@ class ModelArmorConfig:
     project_id: str = DEFAULT_PROJECT_ID
     location: str = DEFAULT_MODEL_ARMOR_LOCATION
     template_id: str = DEFAULT_MODEL_ARMOR_TEMPLATE_ID
-    sdp_inspect_template_id: str | None = None
-    sdp_deidentify_template_id: str | None = None
     sdp_action: SdpActionMode = "deidentify"
     projection_filter_enabled: bool = True
     fail_closed: bool = True
@@ -157,10 +146,10 @@ class ModelArmorConfig:
     @classmethod
     def from_env(cls) -> ModelArmorConfig:
         raw_mode = os.environ.get("EDGAR_MODEL_ARMOR_MODE", "auto").strip().lower()
-        if raw_mode not in ("auto", "gcp", "live", "emulator", "disabled"):
+        if raw_mode not in ("auto", "gcp", "emulator", "disabled"):
             raise ValueError(
                 f"Unsupported EDGAR_MODEL_ARMOR_MODE={raw_mode!r}; expected "
-                "'auto', 'gcp', 'live', 'emulator', or 'disabled'."
+                "'auto', 'gcp', 'emulator', or 'disabled'."
             )
         project_id = resolve_gcp_project_id()
         explicit_loc = os.environ.get("MODEL_ARMOR_LOCATION", "").strip() or None
@@ -192,9 +181,6 @@ class ModelArmorConfig:
             project_id=project_id,
             location=location,
             template_id=raw_template,
-            sdp_inspect_template_id=os.environ.get("SDP_INSPECT_TEMPLATE_ID", "").strip() or None,
-            sdp_deidentify_template_id=os.environ.get("SDP_DEIDENTIFY_TEMPLATE_ID", "").strip()
-            or None,
             sdp_action=sdp_action,
             projection_filter_enabled=env_bool("MODEL_ARMOR_PROJECTION_FILTER_ENABLED", True),
             fail_closed=env_bool("MODEL_ARMOR_FAIL_CLOSED", True),
@@ -224,8 +210,6 @@ class ModelArmorSanitizationSummary:
     sdp_deidentified_text: str | None
     invocation_result: str = "SUCCESS"
     backend_used: str = "gcp_model_armor_v1"
-    raw_response: dict[str, Any] = field(default_factory=dict)
-    sdp_executed: bool = False
 
 
 @dataclass(frozen=True)
@@ -243,8 +227,6 @@ class GuardrailDecision:
     block_message: str = ""
     backend_used: str = "gcp_model_armor_v1"
     latency_ms: float = 0.0
-    s2s_service_account: str = ""
-    s2s_spiffe_id: str = ""
 
     def to_audit_dict(self) -> dict[str, Any]:
         return {
@@ -256,53 +238,7 @@ class GuardrailDecision:
             "sdp_info_types": list(self.sdp_info_types),
             "backend_used": self.backend_used,
             "latency_ms": round(self.latency_ms, 2),
-            "s2s_service_account": self.s2s_service_account,
-            "s2s_spiffe_id": self.s2s_spiffe_id,
         }
-
-    @classmethod
-    def from_audit_dict(
-        cls,
-        data: dict[str, Any],
-        *,
-        text: str = "",
-        block_message: str | None = None,
-    ) -> GuardrailDecision:
-        """Reconstruct a `GuardrailDecision` from a serialized `to_audit_dict()` payload."""
-        blocked = bool(data.get("blocked", False))
-        sdp_redacted = bool(data.get("sdp_redacted", False))
-        raw_action = data.get("action")
-        if raw_action in ("allowed", "sanitized", "blocked"):
-            action: GuardrailAction = raw_action
-        else:
-            action = "blocked" if blocked else ("sanitized" if sdp_redacted else "allowed")
-
-        raw_cats = data.get("matched_categories") or ()
-        matched_categories = (
-            tuple(str(c) for c in raw_cats)
-            if raw_cats
-            else (("policy_violation",) if blocked else ())
-        )
-        resolved_block_msg = (
-            str(block_message)
-            if block_message is not None
-            else str(data.get("block_message") or "")
-        )
-        return cls(
-            action=action,
-            blocked=blocked,
-            sdp_redacted=sdp_redacted,
-            projection_blocked=bool(data.get("projection_blocked", False)),
-            original_text=text,
-            sanitized_text="" if blocked else text,
-            matched_categories=matched_categories,
-            sdp_info_types=tuple(str(t) for t in (data.get("sdp_info_types") or ())),
-            block_message=resolved_block_msg,
-            backend_used=str(data.get("backend_used") or "gcp_model_armor_v1"),
-            latency_ms=float(data.get("latency_ms") or 0.0),
-            s2s_service_account=str(data.get("s2s_service_account") or ""),
-            s2s_spiffe_id=str(data.get("s2s_spiffe_id") or ""),
-        )
 
 
 def _enum_name(val: Any, default: str) -> str:
@@ -321,12 +257,6 @@ def _is_match_found(state: Any) -> bool:
     return name.endswith("MATCH_FOUND") and not name.endswith("NO_MATCH_FOUND")
 
 
-def _is_execution_success(state: Any) -> bool:
-    if isinstance(state, int) and not isinstance(state, bool):
-        return state == 1  # FilterExecutionState.EXECUTION_SUCCESS
-    return _enum_name(state, "").endswith("EXECUTION_SUCCESS")
-
-
 def parse_model_armor_proto(
     response: Any,
     *,
@@ -343,8 +273,6 @@ def parse_model_armor_proto(
             sdp_deidentified_text=None,
             invocation_result="FAILURE",
             backend_used=backend_used,
-            raw_response={},
-            sdp_executed=False,
         )
 
     match_state = _enum_name(
@@ -389,7 +317,6 @@ def parse_model_armor_proto(
             if _is_match_found(getattr(sub, "match_state", None)):
                 blocking.append(key)
 
-    sdp_executed = False
     sdp_matched = False
     sdp_info_types: list[str] = []
     sdp_deid_text: str | None = None
@@ -399,8 +326,6 @@ def parse_model_armor_proto(
         sdp_res = sdp_entry.sdp_filter_result
         if "inspect_result" in sdp_res:
             insp = sdp_res.inspect_result
-            if _is_execution_success(insp.execution_state) or _is_match_found(insp.match_state):
-                sdp_executed = True
             if _is_match_found(insp.match_state):
                 sdp_matched = True
                 for finding in getattr(insp, "findings", None) or ():
@@ -409,8 +334,6 @@ def parse_model_armor_proto(
                         sdp_info_types.append(str(it_name))
         if "deidentify_result" in sdp_res:
             deid = sdp_res.deidentify_result
-            if _is_execution_success(deid.execution_state) or _is_match_found(deid.match_state):
-                sdp_executed = True
             if _is_match_found(deid.match_state):
                 sdp_matched = True
                 data_obj = getattr(deid, "data", None)
@@ -423,14 +346,6 @@ def parse_model_armor_proto(
     if _is_match_found(match_state) and not blocking and not sdp_matched:
         blocking.append("policy_violation")
 
-    raw_dict: dict[str, Any] = {}
-    to_dict_fn = getattr(type(response), "to_dict", None)
-    if callable(to_dict_fn):
-        try:
-            raw_dict = to_dict_fn(response)
-        except Exception:
-            raw_dict = {}
-
     return ModelArmorSanitizationSummary(
         filter_match_state=match_state,
         blocking_categories=tuple(dict.fromkeys(blocking)),
@@ -439,6 +354,4 @@ def parse_model_armor_proto(
         sdp_deidentified_text=sdp_deid_text,
         invocation_result=inv_result,
         backend_used=backend_used,
-        raw_response=raw_dict,
-        sdp_executed=sdp_executed,
     )

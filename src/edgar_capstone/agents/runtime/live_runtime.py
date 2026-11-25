@@ -435,7 +435,6 @@ def run_adk_agent_stream(
         set_span_attributes(**{"adk.agent_name": getattr(agent, "name", type(agent).__name__)})
         memory_mgr = get_conversation_memory_manager()
         session_svc = memory_mgr.adk_session_service
-        memory_svc = memory_mgr.adk_memory_service
         raw_session_id = (session_id or "").strip()
         session_was_generated = not raw_session_id
         eff_session_id = raw_session_id or f"adk-sess-{uuid.uuid4().hex[:12]}"
@@ -476,7 +475,6 @@ def run_adk_agent_stream(
         runner = Runner(
             app=adk_app,
             session_service=session_svc,
-            memory_service=memory_svc,
             auto_create_session=True,
         )
 
@@ -563,7 +561,6 @@ def run_live_adk_financial_reasoning(
     scope: dict[str, Any],
     variance_reports: list[dict[str, Any]],
     variance_evaluations: list[dict[str, Any]],
-    cached_explanations: list[dict[str, Any]],
     citations: list[dict[str, Any]],
     sector_benchmarks: list[dict[str, Any]],
     chunk_health: dict[str, Any] | None,
@@ -602,15 +599,12 @@ def run_live_adk_financial_reasoning(
         low_thinking=low_thinking,
     )
 
-    cache_hits = sum(1 for c in cached_explanations if c.get("cache_hit"))
-    cache_misses = max(0, len(cached_explanations) - cache_hits)
     prompt_text = build_financial_reasoning_prompt(
         query=query,
         intent=intent,
         scope=scope,
         variance_reports=variance_reports,
         variance_evaluations=variance_evaluations,
-        cached_explanations=cached_explanations,
         citations=citations,
         sector_benchmarks=sector_benchmarks,
         chunk_health=chunk_health,
@@ -636,10 +630,7 @@ def run_live_adk_financial_reasoning(
     state_seed: dict[str, Any] = {
         **turn_scoped_state_seed(citations=list(citations), prior=prior_outputs),
         "memory_context": dict(memory_context or {}),
-        "context_cache_stats": {
-            "hits": cache_hits,
-            "misses": cache_misses,
-        },
+        "context_cache_stats": {"hits": 0, "misses": 0},
     }
 
     eff_max_llm_calls = (
@@ -668,7 +659,6 @@ def run_live_adk_narrative_evaluation(
     response_markdown: str,
     variance_reports: list[dict[str, Any]],
     citations: list[dict[str, Any]],
-    cached_explanations_count: int = 0,
     resolution: LiveRuntimeResolution | None = None,
     custom_llm: BaseLlm | None = None,
     reference_explanation: str | None = None,
@@ -697,7 +687,6 @@ def run_live_adk_narrative_evaluation(
         response_markdown=response_markdown,
         variance_reports=variance_reports,
         judge_citations=judge_citations,
-        cached_explanations_count=cached_explanations_count,
         reference_explanation=reference_explanation,
     )
 
@@ -739,12 +728,9 @@ __all__ = [
     "LiveBackendType",
     "LiveRuntimeResolution",
     "build_adk_llm_for_task",
-    "build_financial_reasoning_prompt",
-    "build_narrative_evaluation_prompt",
     "get_live_runtime_status_metadata",
     "resolve_live_adk_runtime",
     "run_adk_agent_stream",
     "run_live_adk_financial_reasoning",
     "run_live_adk_narrative_evaluation",
-    "select_citations_for_judge",
 ]

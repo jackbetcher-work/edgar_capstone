@@ -72,10 +72,6 @@ def _normalize_section_id(
     return "item_1a" if risk_hits > mda_hits else "item_7"
 
 
-def _default_section_title(sec_id: SectionId) -> str:
-    return SECTION_TITLES[sec_id]
-
-
 def _proto_struct_to_dict(obj: Any) -> dict[str, Any]:
     """Convert a protobuf ``Struct`` / ``MapComposite`` / ``dict`` into a plain Python ``dict``."""
     if obj is None:
@@ -350,20 +346,14 @@ class VertexAISearchAdapter:
         end_year: int,
     ) -> list[dict[str, Any]]:
         """Normalize a single Discovery Engine ``SearchResult`` into passage dicts."""
-        doc = item.get("document") if isinstance(item, dict) else getattr(item, "document", None)
+        doc = getattr(item, "document", None)
         if doc is None:
             return []
-        if isinstance(doc, dict):
-            doc_id = str(doc.get("id") or f"vais_doc_{doc_rank}")
-            struct_data = doc.get("structData") or doc.get("struct_data") or {}
-            derived = doc.get("derivedStructData") or doc.get("derived_struct_data") or {}
-            content_uri = str((doc.get("content") or {}).get("uri") or "")
-        else:
-            doc_id = str(getattr(doc, "id", "") or f"vais_doc_{doc_rank}")
-            struct_data = _proto_struct_to_dict(getattr(doc, "struct_data", None))
-            derived = _proto_struct_to_dict(getattr(doc, "derived_struct_data", None))
-            content_obj = getattr(doc, "content", None)
-            content_uri = str(getattr(content_obj, "uri", "") or "")
+        doc_id = str(getattr(doc, "id", "") or f"vais_doc_{doc_rank}")
+        struct_data = _proto_struct_to_dict(getattr(doc, "struct_data", None))
+        derived = _proto_struct_to_dict(getattr(doc, "derived_struct_data", None))
+        content_obj = getattr(doc, "content", None)
+        content_uri = str(getattr(content_obj, "uri", "") or "")
 
         ticker = str(struct_data.get("ticker") or "").strip().upper()
         fy_raw = struct_data.get("fiscal_year")
@@ -419,7 +409,7 @@ class VertexAISearchAdapter:
                     "filing_date": str(struct_data.get("filing_date") or "") or None,
                     "accession_number": str(struct_data.get("accession_number") or "") or None,
                     "section_id": resolved_sec,
-                    "section_title": str(raw_title or _default_section_title(resolved_sec)),
+                    "section_title": str(raw_title or SECTION_TITLES[resolved_sec]),
                     "chunk_text": seg_text,
                     "sec_filing_url": sec_url,
                     "unstructured_gcs_uri": gcs_uri,

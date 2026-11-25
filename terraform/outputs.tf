@@ -48,16 +48,6 @@ output "yoy_variance_view_fqn" {
   value       = "${var.project_id}.${google_bigquery_dataset.sec_edgar.dataset_id}.${google_bigquery_table.v_financial_variances_yoy.table_id}"
 }
 
-output "vertex_ai_connection_name" {
-  description = "Full resource name of the BigQuery Vertex AI Cloud Resource Connection."
-  value       = google_bigquery_connection.vertex_ai.name
-}
-
-output "vertex_ai_connection_service_account" {
-  description = "Google-managed service account attached to the BigQuery Vertex AI connection."
-  value       = google_bigquery_connection.vertex_ai.cloud_resource[0].service_account_id
-}
-
 output "vertex_ai_search_datastore_id" {
   description = "Resource ID of the Vertex AI Search (Discovery Engine) 10-K unstructured datastore."
   value       = var.enable_vertex_ai_search ? google_discovery_engine_data_store.sec_10k_corpus[0].id : null

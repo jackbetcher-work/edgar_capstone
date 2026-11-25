@@ -1,8 +1,8 @@
-"""Conversational Session State, Compaction, Memory Bank, and ADK `App` Assembly.
+"""Conversational Session State, Compaction, and ADK `App` Assembly.
 
-Configures ADK `ContextCacheConfig`, token-triggered `EventsCompactionConfig`, bounded
-`InMemorySessionService` / `BoundedInMemoryMemoryService`, and tenant-isolated multi-turn
-conversational memory backed by `SessionStoreProtocol` (Cloud Firestore SDK in production).
+Configures ADK `ContextCacheConfig`, token-triggered `EventsCompactionConfig`,
+`InMemorySessionService`, and tenant-isolated multi-turn conversational memory backed by
+`SessionStoreProtocol` (Cloud Firestore SDK in production).
 Model tier routing lives in `runtime/model_config.py`; latency/cost attribution lives in
 `runtime/latency_tracker.py`.
 """
@@ -23,7 +23,6 @@ from google.adk.agents.context_cache_config import ContextCacheConfig
 from google.adk.apps import App
 from google.adk.apps.app import EventsCompactionConfig
 from google.adk.apps.llm_event_summarizer import LlmEventSummarizer
-from google.adk.memory import InMemoryMemoryService
 from google.adk.models import Gemini
 from google.adk.models.base_llm import BaseLlm
 from google.adk.plugins.base_plugin import BasePlugin
@@ -36,10 +35,7 @@ from edgar_capstone.agents.runtime.model_config import (
     DEFAULT_CONTEXT_CACHE_INTERVALS,
     DEFAULT_CONTEXT_CACHE_MIN_TOKENS,
     DEFAULT_CONTEXT_CACHE_TTL_SECONDS,
-    DEFAULT_MAX_ADK_MEMORY_SESSIONS,
     DEFAULT_MAX_LOCAL_SESSIONS,
-    EPHEMERAL_AGENT_NAMES,
-    is_ephemeral_session_id,
     resolve_model_for_task,
 )
 from edgar_capstone.common.formatting import utc_now_iso
@@ -59,61 +55,6 @@ class SessionStoreProtocol(Protocol):
     def delete_session(self, user_id: str, session_id: str) -> bool: ...
     def list_sessions(self, user_id: str, *, limit: int = 25) -> list[dict[str, Any]]: ...
     def status_metadata(self) -> dict[str, Any]: ...
-
-
-class BoundedInMemoryMemoryService(InMemoryMemoryService):
-    """LRU-bounded ADK `InMemoryMemoryService` that ignores ephemeral utility sessions."""
-
-    def __init__(self, *, max_sessions: int = DEFAULT_MAX_ADK_MEMORY_SESSIONS) -> None:
-        super().__init__()
-        self._max_sessions = max(1, int(max_sessions))
-        self._insertion_order: OrderedDict[tuple[tuple[str, str], str | None], None] = OrderedDict()
-
-    async def add_session_to_memory(self, session: Any) -> None:
-        session_id = getattr(session, "id", None)
-        if is_ephemeral_session_id(session_id):
-            return
-        await super().add_session_to_memory(session)
-        user_key = (str(getattr(session, "app_name", "")), str(getattr(session, "user_id", "")))
-        with self._lock:
-            entry_key = (user_key, session_id)
-            self._insertion_order.pop(entry_key, None)
-            self._insertion_order[entry_key] = None
-            while len(self._insertion_order) > self._max_sessions:
-                (old_user_key, old_sid), _ = self._insertion_order.popitem(last=False)
-                user_map = self._session_events.get(old_user_key)
-                if user_map is not None:
-                    user_map.pop(old_sid, None)
-                    if not user_map:
-                        self._session_events.pop(old_user_key, None)
-
-    def drop_session(self, session_id: str, candidate_users: set[str]) -> bool:
-        """Drop all cached memory events for `session_id` (and topic epochs) owned by `candidate_users`."""
-        removed = False
-        topic_prefix = f"{session_id}::topic-"
-        with self._lock:
-            for user_key in list(self._session_events.keys()):
-                if user_key[1] in candidate_users:
-                    user_map = self._session_events.get(user_key)
-                    if user_map is None:
-                        continue
-                    matching_sids = [
-                        sid
-                        for sid in list(user_map.keys())
-                        if sid == session_id
-                        or (isinstance(sid, str) and sid.startswith(topic_prefix))
-                    ]
-                    for sid in matching_sids:
-                        user_map.pop(sid, None)
-                        self._insertion_order.pop((user_key, sid), None)
-                        removed = True
-                    if not user_map:
-                        self._session_events.pop(user_key, None)
-        return removed
-
-    def tracked_session_count(self) -> int:
-        with self._lock:
-            return len(self._insertion_order)
 
 
 def adk_session_id_for_topic(session_id: str | None, topic_epoch: int) -> str | None:
@@ -162,7 +103,6 @@ class TurnMemoryEntry:
     end_year: int
     variance_highlights: list[str] = field(default_factory=list)
     cited_chunk_ids: list[str] = field(default_factory=list)
-    cached_10k_keys: list[str] = field(default_factory=list)
     token_estimate: int = 0
     topic_epoch: int = 0
 
@@ -229,7 +169,6 @@ class SessionMemoryState:
                     end_year=int(t.get("end_year") or 2026),
                     variance_highlights=[str(x) for x in (t.get("variance_highlights") or [])],
                     cited_chunk_ids=[str(x) for x in (t.get("cited_chunk_ids") or [])],
-                    cached_10k_keys=[str(x) for x in (t.get("cached_10k_keys") or [])],
                     token_estimate=int(t.get("token_estimate") or 0),
                     topic_epoch=int(t.get("topic_epoch") or 0),
                 )
@@ -297,19 +236,14 @@ class ConversationMemoryManager:
         session_store: SessionStoreProtocol | None = None,
         refresh_ttl_seconds: float = 5.0,
         max_local_sessions: int = DEFAULT_MAX_LOCAL_SESSIONS,
-        max_adk_memory_sessions: int = DEFAULT_MAX_ADK_MEMORY_SESSIONS,
     ) -> None:
         self.token_threshold = token_threshold
         self.retention_turns = retention_turns
         self.refresh_ttl_seconds = float(refresh_ttl_seconds)
         self._max_local_sessions = max(1, int(max_local_sessions))
-        self._max_adk_memory_sessions = max(1, int(max_adk_memory_sessions))
         self._explicit_store = session_store
         self._default_store: SessionStoreProtocol | None = None
         self.adk_session_service = InMemorySessionService()
-        self.adk_memory_service = BoundedInMemoryMemoryService(
-            max_sessions=self._max_adk_memory_sessions
-        )
         self._lock = threading.Lock()
         self._session_locks: dict[tuple[str, str], threading.Lock] = {}
         # LRU-bounded map keyed by (norm_user_id, norm_session_id) -> (loaded_monotonic, SessionMemoryState)
@@ -373,8 +307,7 @@ class ConversationMemoryManager:
                     for sid in matching_sids:
                         del user_sessions[sid]
                         removed_session = True
-        removed_memory = self.adk_memory_service.drop_session(session_id, candidate_users)
-        return removed_session or removed_memory
+        return removed_session
 
     def _load_or_refresh_session(
         self,
@@ -555,7 +488,6 @@ class ConversationMemoryManager:
         end_year: int,
         variance_highlights: list[str] | None = None,
         cited_chunk_ids: list[str] | None = None,
-        cached_10k_keys: list[str] | None = None,
         answer_markdown: str = "",
         recalled_prior_memory: bool | None = None,
         topic_epoch: int | None = None,
@@ -612,7 +544,6 @@ class ConversationMemoryManager:
                         end_year=end_year,
                         variance_highlights=list(variance_highlights or []),
                         cited_chunk_ids=list(cited_chunk_ids or []),
-                        cached_10k_keys=list(cached_10k_keys or []),
                         token_estimate=estimate_token_count(turn_text),
                         topic_epoch=eff_epoch,
                     )
@@ -744,9 +675,6 @@ class ConversationMemoryManager:
             self._sessions.clear()
             self._session_locks.clear()
             self.adk_session_service = InMemorySessionService()
-            self.adk_memory_service = BoundedInMemoryMemoryService(
-                max_sessions=self._max_adk_memory_sessions
-            )
 
 
 _GLOBAL_MEMORY_MANAGER = ConversationMemoryManager()
@@ -760,26 +688,13 @@ def get_conversation_memory_manager() -> ConversationMemoryManager:
 async def after_agent_memory_callback(
     callback_context: CallbackContext,
 ) -> genai_types.Content | None:
-    """ADK `after_agent_callback` persisting non-ephemeral sessions to Memory Bank & tracking duration."""
+    """ADK `after_agent_callback` tracking agent end-to-end duration."""
     state = callback_context.state
     start_ts = state.get("_agent_start_monotonic")
     if start_ts is not None:
         state["last_agent_total_duration_ms"] = round(
             (time.perf_counter() - float(start_ts)) * 1000.0, 3
         )
-    agent_name = str(getattr(callback_context, "agent_name", "") or "")
-    adk_session = getattr(callback_context, "session", None)
-    sess_id = getattr(adk_session, "id", None) or state.get("session_id")
-    if agent_name in EPHEMERAL_AGENT_NAMES or (
-        sess_id is not None and is_ephemeral_session_id(str(sess_id))
-    ):
-        return None
-    add_mem = getattr(callback_context, "add_session_to_memory", None)
-    if callable(add_mem):
-        try:
-            await add_mem()
-        except Exception as exc:
-            logger.debug("Optional ADK Memory Bank sync skipped: %s", exc)
     return None
 
 

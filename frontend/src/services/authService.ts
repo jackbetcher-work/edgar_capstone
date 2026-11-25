@@ -3,7 +3,7 @@ import type {
   AuthenticatedUserProfile,
   SsoSessionResponse,
 } from '../types/edgar'
-import { ApiAuthError, buildAuthError, requestJson } from './httpClient'
+import { ApiAuthError, requestJson } from './httpClient'
 
 export { ApiAuthError }
 
@@ -54,12 +54,6 @@ export function buildAuthorizedHeaders(
     headers.Authorization = `Bearer ${token}`
   }
   return headers
-}
-
-export async function parseAuthErrorResponse(
-  res: Response
-): Promise<ApiAuthError> {
-  return buildAuthError(res, clearStoredBearerToken)
 }
 
 export async function fetchAuthDiscoveryConfig(): Promise<{

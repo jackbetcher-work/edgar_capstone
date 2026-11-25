@@ -118,7 +118,7 @@ class ModelArmorClient:
     def _should_use_live_gcp(self) -> bool:
         if self.config.mode in ("disabled", "emulator"):
             return False
-        if self.config.mode in ("gcp", "live"):
+        if self.config.mode == "gcp":
             return True
         if self._injected_client is not None or self._credentials is not None:
             return True

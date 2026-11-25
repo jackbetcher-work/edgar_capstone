@@ -192,18 +192,12 @@ describe('edgarApi SSE parsing & payloads', () => {
     ).rejects.toThrow('stream ended before emitting a final grounded result')
   })
 
-  it('supports non-SSE JSON fallback and rejects invalid JSON fallback', async () => {
+  it('rejects streaming responses with an empty body', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response(JSON.stringify({ status: 'success', answer_markdown: 'json fallback' }), {
+      new Response(null, {
         status: 200,
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'text/event-stream' },
       })
-    )
-    const ok = await executeConversationalRagQueryStream('q')
-    expect(ok.answer_markdown).toBe('json fallback')
-
-    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response('not-json', { status: 200, headers: { 'Content-Type': 'application/json' } })
     )
     await expect(executeConversationalRagQueryStream('q')).rejects.toBeInstanceOf(
       BackendUnavailableError

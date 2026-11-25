@@ -461,7 +461,6 @@ def test_prompt_carries_flags_and_disclosure_deltas() -> None:
         scope={"tickers_csv": "NVDA", "start_year": 2024, "end_year": 2026},
         variance_reports=[],
         variance_evaluations=[],
-        cached_explanations=[],
         citations=[],
         sector_benchmarks=[],
         chunk_health=None,

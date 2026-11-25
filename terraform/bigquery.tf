@@ -14,35 +14,6 @@ resource "google_bigquery_dataset" "sec_edgar" {
 }
 
 # ------------------------------------------------------------------------------
-# BigQuery Cloud Resource Connection (Vertex AI Embeddings & GCS Object Tables)
-# ------------------------------------------------------------------------------
-resource "google_bigquery_connection" "vertex_ai" {
-  project       = var.project_id
-  connection_id = var.vertex_connection_id
-  location      = var.region
-  friendly_name = "SEC EDGAR Vertex AI & GCS RAG Connection"
-  description   = "Enables BigQuery ML.GENERATE_EMBEDDING via Vertex AI and Object Tables over the SEC 10-K GCS bucket."
-
-  cloud_resource {}
-
-  depends_on = [google_project_service.required_apis]
-}
-
-# Allow Google-managed BigQuery connection service account (bqcx-*) to propagate
-# to global IAM / Cloud Storage before binding bucket-level IAM policies.
-resource "time_sleep" "wait_for_bq_connection_sa" {
-  depends_on      = [google_bigquery_connection.vertex_ai]
-  create_duration = "15s"
-}
-
-resource "google_project_iam_member" "bq_connection_vertex_user" {
-  project    = var.project_id
-  role       = "roles/aiplatform.user"
-  member     = "serviceAccount:${google_bigquery_connection.vertex_ai.cloud_resource[0].service_account_id}"
-  depends_on = [time_sleep.wait_for_bq_connection_sa]
-}
-
-# ------------------------------------------------------------------------------
 # 1. Native Structured Financial Metrics Table (Partitioned & Clustered)
 # ------------------------------------------------------------------------------
 resource "google_bigquery_table" "financial_metrics" {
@@ -159,7 +130,7 @@ resource "google_bigquery_job" "seed_filing_chunks" {
 }
 
 # ------------------------------------------------------------------------------
-# 6. Deterministic Period-over-Period Financial Variance View
+# 5. Deterministic Period-over-Period Financial Variance View
 # ------------------------------------------------------------------------------
 resource "google_bigquery_table" "v_financial_variances_yoy" {
   project             = var.project_id

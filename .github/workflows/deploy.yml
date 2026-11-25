@@ -8,7 +8,6 @@ name: SEC EDGAR Analyst CI/CD Pipeline
 on:
   push:
     branches:
-      - main
       - "**"
   # Eval gate mode. Resolved as: workflow_dispatch input > repo variable EVAL_GATE_MODE > 'skip'.
   #   skip     - eval does not run; deploy goes ahead right after build (default).
@@ -211,7 +210,6 @@ jobs:
 
       - name: Run live golden evaluation regression gates
         env:
-          EDGAR_TEST_PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
           GCP_PROJECT_ID: ${{ env.GCP_PROJECT_ID }}
           GOOGLE_CLOUD_PROJECT: ${{ env.GCP_PROJECT_ID }}
           GOOGLE_CLOUD_LOCATION: ${{ env.GCP_REGION }}

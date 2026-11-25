@@ -21,17 +21,6 @@ from edgar_capstone.observability.tracing import traced
 
 IntentSource = Literal["agent", "tool_inference", "scope_gate"]
 
-TurnIntentType = Literal[
-    "longitudinal_single_company",
-    "multi_company_peer_comparison",
-    "thematic_trend_tracking",
-    "chunk_health_monitoring",
-    "clarification_needed",
-    "out_of_corpus",
-    "projection_compliance_block",
-    "safety_guardrail_block",
-]
-
 QUERY_INTENT_VALUES: tuple[str, ...] = tuple(get_args(QueryIntentType))
 
 _THEMATIC_TOOLS = frozenset({"compare_disclosures_across_years", "sector_thematic_map_reduce"})
@@ -96,7 +85,6 @@ __all__ = [
     "QUERY_INTENT_VALUES",
     "IntentSource",
     "QueryIntentType",
-    "TurnIntentType",
     "infer_intent_from_tool_calls",
     "is_sector_wide_scope",
     "resolve_turn_intent",

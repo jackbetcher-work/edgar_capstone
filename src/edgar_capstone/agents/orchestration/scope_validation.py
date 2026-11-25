@@ -1290,7 +1290,6 @@ def validate_query_scope_and_coverage(
     explicit_tickers: list[str],
     unknown_entities: list[str],
     catalog: EntityCatalog,
-    memory_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate whether a query can proceed, requires clarification, or is out of corpus.
 

@@ -45,13 +45,11 @@ export interface NumericCitation {
   fiscal_year: number
   metric: string
   value?: number | null
-  unit?: string
   period_of_report?: string | null
   filing_date?: string | null
   accession_number?: string | null
   xbrl_concept?: string | null
   sec_filing_url?: string | null
-  derived_from?: NumericCitation[]
 }
 
 export interface CoverageNotice {
@@ -59,7 +57,7 @@ export interface CoverageNotice {
   severity: 'info' | 'warning'
   message: string
   tickers?: string[]
-  missing_fiscal_years?: number[]
+  missing_years?: number[]
 }
 
 export interface SectorCoverageMetadata {
@@ -141,7 +139,7 @@ export interface CompanyVarianceReport {
   revenue_variance: MetricVariance
   operating_income_variance: MetricVariance
   net_income_variance: MetricVariance
-  /** Absent in older payloads; direction 'unavailable' when the issuer reports no R&D line. */
+  /** Direction 'unavailable' when the issuer reports no R&D line. */
   research_and_development_variance?: MetricVariance | null
   operating_margin_bps_delta: number | null
   net_margin_bps_delta: number | null
@@ -153,18 +151,6 @@ export interface CompanyVarianceReport {
   accession_numbers?: Record<string, string>
   metric_provenance?: Record<string, Record<string, string | null>>
   derived_margin_inputs?: Record<string, NumericCitation[]>
-}
-
-export interface SectorBenchmarkRow {
-  gics_sector: string
-  fiscal_year: number
-  company_count: number
-  tickers: string[]
-  total_sector_revenue: number | null
-  avg_company_revenue: number | null
-  total_sector_operating_income: number | null
-  total_sector_net_income: number | null
-  total_sector_research_and_development?: number | null
 }
 
 export interface CitationDuplicateSource {
@@ -202,9 +188,6 @@ export interface StructuredKeyMetric {
     | 'operating_income'
     | 'net_income'
     | 'research_and_development'
-    | 'operating_margin'
-    | 'net_margin'
-    | 'rd_intensity'
 }
 
 export interface StructuredFinding {
@@ -401,14 +384,10 @@ export interface ChatProgressEvent {
   elapsed_ms?: number
 }
 
-/** Who determined the turn intent (agent tool calls vs. turn-gate scope checks). */
-export type IntentSource = 'agent' | 'tool_inference' | 'scope_gate'
-
 export interface ChatTurnResponse {
   status: 'success' | 'blocked' | 'clarification' | 'out_of_corpus' | 'error'
   model_armor_blocked: boolean
   intent: QueryIntentType
-  intent_source?: IntentSource
   orchestrator: string
   resolved_scope: ResolvedQueryScope
   answer_markdown: string
@@ -420,17 +399,10 @@ export interface ChatTurnResponse {
   sector_coverage?: SectorCoverageMetadata | null
   missing_tickers?: string[]
   structured_report?: StructuredAnalystReport | null
-  report_verification?: {
-    passed?: boolean
-    findings_verified?: number
-    findings_rejected?: number
-    unsupported_claims_count?: number
-  } | null
   // Deterministic engine outputs are agent-invoked tools: each is empty/null
   // unless the agent called the matching tool during the turn.
   /** `[]` unless the agent called `calculate_period_variances`. */
   variance_reports?: CompanyVarianceReport[]
-  sector_benchmarks?: SectorBenchmarkRow[]
   /** `[]` unless the agent called `flag_material_variances`. */
   material_variance_flags?: MaterialVarianceFlag[]
   material_variance_summary?: MaterialVarianceSummary | null
@@ -496,7 +468,6 @@ export interface XbrlFactSelection {
   xbrlConcept?: string | null
   priorXbrlConcept?: string | null
   denominatorXbrlConcept?: string | null
-  priorDenominatorXbrlConcept?: string | null
   secFilingUrl?: string | null
   priorSecFilingUrl?: string | null
   derivedFrom?: NumericCitation[]
@@ -508,7 +479,6 @@ export interface ConversationTurn {
   userQuery: string
   response: ChatTurnResponse | null
   isLoading: boolean
-  progressStage?: string
   progressMessage?: string
   progressMeta?: Record<string, unknown> | null
   progressElapsedMs?: number
@@ -537,15 +507,6 @@ export interface AuthenticatedUserProfile {
   iap_assertion_verified: boolean
 }
 
-export interface CloudIdentityRoleSpec {
-  role: string
-  display_name: string
-  description: string
-  cloud_identity_groups: string[]
-  gcp_iam_roles: string[]
-  permissions: string[]
-}
-
 export interface AuthDiscoveryConfig {
   status: string
   auth_required: boolean
@@ -569,22 +530,6 @@ export interface AuthDiscoveryConfig {
     audience_configured: boolean
     session_auth_enabled?: boolean
     default_role?: string | null
-  }
-  rbac?: {
-    management_plane: string
-    principal_syntax: string
-    cloud_identity_domain: string
-    individual_user_bindings_allowed: boolean
-    roles: CloudIdentityRoleSpec[]
-  }
-  service_account?: {
-    account_id: string
-    email: string
-    project_name_email: string
-    pattern: string
-    project_id: string
-    project_name: string
-    default_compute_sa_prohibited: boolean
   }
 }
 

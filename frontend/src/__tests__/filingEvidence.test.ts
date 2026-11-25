@@ -180,44 +180,36 @@ describe('parseFilingMarkdown', () => {
 })
 
 describe('dedupeCitations', () => {
-  it('collapses repeated chunk IDs and identical passages under different IDs', () => {
-    const a = cit('NVDA_2025_item_1a_0004', `[NVDA (NVIDIA) | FY2025 Form 10-K | Item 1A]\n\n${RISK_TEXT}`)
-    const sameId = { ...a }
-    const nextYear = cit('NVDA_2026_item_1a_0005', `[NVDA (NVIDIA) | FY2026 Form 10-K | Item 1A]\n\n${RISK_TEXT}`, {
-      fiscal_year: 2026,
+  it('collapses repeated chunk IDs and expands backend duplicate_sources aliases', () => {
+    const a = cit('NVDA_2025_item_1a_0004', `[NVDA (NVIDIA) | FY2025 Form 10-K | Item 1A]\n\n${RISK_TEXT}`, {
+      duplicate_sources: [
+        {
+          chunk_id: 'NVDA_2026_item_1a_0005',
+          ticker: 'NVDA',
+          fiscal_year: 2026,
+          section_id: 'item_1a',
+          section_title: 'Item 1A. Risk Factors',
+          sec_filing_url: 'https://www.sec.gov/x',
+        },
+      ],
     })
+    const sameId = { ...a }
     const different = cit('NVDA_2026_item_7_0002', 'Revenue for fiscal year 2026 was $215.9 billion, up 65% from a year ago.', {
       section_id: 'item_7',
     })
 
-    const result = dedupeCitations([a, sameId, nextYear, different])
+    const result = dedupeCitations([a, sameId, different])
     expect(result.groups).toHaveLength(2)
     expect(result.groups[0].primary.chunk_id).toBe('NVDA_2025_item_1a_0004')
     expect(result.groups[0].duplicates.map((d) => d.chunk_id)).toEqual(['NVDA_2026_item_1a_0005'])
     expect(result.aliasOf['NVDA_2026_item_1a_0005']).toBe('NVDA_2025_item_1a_0004')
-    expect(countDistinctCitations([a, sameId, nextYear, different])).toBe(2)
+    expect(countDistinctCitations([a, sameId, different])).toBe(2)
   })
 
-  it('merges near-identical boilerplate within a section and keeps the fuller excerpt', () => {
-    const base = `${RISK_TEXT} ${RISK_TEXT.replace('Our operations', 'Our results')} These risks are described further in Item 7 and in the notes to our consolidated financial statements included elsewhere in this annual report.`
-    const tweaked = base.replace('significant cost', 'substantial cost')
-    const clipped = cit('NVDA_2024_item_1a_0003', base.slice(0, 180), { fiscal_year: 2024 })
-    const full = cit('NVDA_2025_item_1a_0004', base)
-    const nearDup = cit('NVDA_2026_item_1a_0004', tweaked, { fiscal_year: 2026 })
-
-    const { groups, aliasOf } = dedupeCitations([clipped, full, nearDup])
-    expect(groups).toHaveLength(1)
-    expect(groups[0].primary.chunk_id).toBe('NVDA_2025_item_1a_0004')
-    expect(aliasOf['NVDA_2024_item_1a_0003']).toBe('NVDA_2025_item_1a_0004')
-    expect(aliasOf['NVDA_2026_item_1a_0004']).toBe('NVDA_2025_item_1a_0004')
-  })
-
-  it('does not merge similar text across different sections or distinct passages', () => {
+  it('preserves distinct backend-deduplicated citations untouched', () => {
     const risk = cit('A_item_1a', RISK_TEXT)
-    const mdna = cit('A_item_7', RISK_TEXT.replace('significant cost', 'substantial cost'), {
-      section_id: 'item_7',
-    })
-    const other = cit('B_item_1a', 'Our manufacturing depends on a limited number of foundry partners in Taiwan, and disruption there could materially harm supply.')
+    const mdna = cit('A_item_7', RISK_TEXT, { section_id: 'item_7' })
+    const other = cit('B_item_1a', 'Our manufacturing depends on a limited number of foundry partners in Taiwan.')
     expect(dedupeCitations([risk, mdna, other]).groups).toHaveLength(3)
   })
 })

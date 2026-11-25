@@ -39,16 +39,12 @@ _DISALLOWED_DEFAULT_SA_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 class Permission(StrEnum):
-    """Granular permission actions governed by Cloud Identity Group RBAC and Agent Identities."""
+    """Granular permission actions governed by Cloud Identity Group RBAC."""
 
     FILINGS_READ = "filings:read"
-    VARIANCES_CALCULATE = "variances:calculate"
     CHAT_QUERY = "chat:query"
     FEEDBACK_SUBMIT = "feedback:submit"
-    CHUNK_HEALTH_READ = "chunk_health:read"
     AUDIT_READ = "audit:read"
-    SECRETS_INSPECT = "secrets:inspect"
-    RBAC_INSPECT = "rbac:inspect"
     RBAC_ADMIN = "rbac:admin"
 
 
@@ -57,22 +53,16 @@ ADMIN_PERMISSIONS: frozenset[str] = frozenset(p.value for p in Permission)
 ANALYST_PERMISSIONS: frozenset[str] = frozenset(
     {
         Permission.FILINGS_READ.value,
-        Permission.VARIANCES_CALCULATE.value,
         Permission.CHAT_QUERY.value,
         Permission.FEEDBACK_SUBMIT.value,
-        Permission.CHUNK_HEALTH_READ.value,
         Permission.AUDIT_READ.value,
-        Permission.SECRETS_INSPECT.value,
-        Permission.RBAC_INSPECT.value,
     }
 )
 
 VIEWER_PERMISSIONS: frozenset[str] = frozenset(
     {
         Permission.FILINGS_READ.value,
-        Permission.CHUNK_HEALTH_READ.value,
         Permission.AUDIT_READ.value,
-        Permission.RBAC_INSPECT.value,
     }
 )
 

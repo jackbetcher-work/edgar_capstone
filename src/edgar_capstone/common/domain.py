@@ -70,7 +70,6 @@ RETRIEVAL_TOOL_NAMES: frozenset[str] = frozenset(
 VARIANCE_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "calculate_period_variances",
-        "fetch_financial_metrics",
         "query_analytics_view",
         "flag_material_variances",
     }

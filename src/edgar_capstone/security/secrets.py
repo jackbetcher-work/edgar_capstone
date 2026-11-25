@@ -65,7 +65,6 @@ _SKIPPED_DIR_PARTS: frozenset[str] = frozenset({".terraform", "__pycache__", ".g
 _REPO_SCAN_GLOBS: tuple[str, ...] = (
     ".github/workflows/*.yml",
     ".github/workflows/*.yaml",
-    "cloudbuild.yaml",
     "Dockerfile",
     "terraform/**/*.tf",
     "terraform/**/*.tfvars.example",

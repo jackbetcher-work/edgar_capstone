@@ -9,7 +9,6 @@ DEFAULT_PROJECT_NAME = "fde-sec-edgar-sandbox-dev"
 DEFAULT_BUCKET_NAME = "fde-sec-edgar-sandbox-dev-sec-corpus"
 DEFAULT_LOCATION = "us-central1"
 DEFAULT_BIGQUERY_DATASET_ID = "sec_edgar"
-CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 # Pinned by SEC fair-access policy & `test_rbac_and_agent_identities.py`
 DEFAULT_SEC_USER_AGENT = (
@@ -31,7 +30,7 @@ def resolve_gcp_project_id(
     """Resolve the active GCP project ID with uniform precedence across the codebase.
 
     Precedence: explicit arg > ``GCP_PROJECT_ID`` > ``GOOGLE_CLOUD_PROJECT`` >
-    ``GCLOUD_PROJECT`` > legacy ``EDGAR_GCP_PROJECT_ID`` > ``default``.
+    ``EDGAR_GCP_PROJECT_ID`` > ``default``.
     """
     if explicit and explicit.strip():
         return explicit.strip()
@@ -39,7 +38,6 @@ def resolve_gcp_project_id(
         _first_non_empty_env(
             "GCP_PROJECT_ID",
             "GOOGLE_CLOUD_PROJECT",
-            "GCLOUD_PROJECT",
             "EDGAR_GCP_PROJECT_ID",
         )
         or default
@@ -73,12 +71,8 @@ def resolve_corpus_bucket(
     *,
     default: str = DEFAULT_BUCKET_NAME,
 ) -> str:
-    """Resolve the SEC corpus GCS bucket name (accepting canonical and legacy env vars)."""
-    raw = (
-        (explicit or "").strip()
-        or _first_non_empty_env("SEC_CORPUS_BUCKET", "EDGAR_GCS_BUCKET")
-        or default
-    )
+    """Resolve the SEC corpus GCS bucket name."""
+    raw = (explicit or "").strip() or _first_non_empty_env("SEC_CORPUS_BUCKET") or default
     if raw.startswith("gs://"):
         raw = raw[len("gs://") :]
     return raw.strip("/")
@@ -89,10 +83,10 @@ def resolve_bq_dataset_id(
     *,
     default: str = DEFAULT_BIGQUERY_DATASET_ID,
 ) -> str:
-    """Resolve the BigQuery dataset ID (accepting canonical and legacy env vars)."""
+    """Resolve the BigQuery dataset ID."""
     if explicit and explicit.strip():
         return explicit.strip()
-    return _first_non_empty_env("BIGQUERY_DATASET_ID", "EDGAR_BQ_DATASET") or default
+    return _first_non_empty_env("BIGQUERY_DATASET_ID") or default
 
 
 def resolve_sec_user_agent(
@@ -100,7 +94,7 @@ def resolve_sec_user_agent(
     *,
     default: str = DEFAULT_SEC_USER_AGENT,
 ) -> str:
-    """Resolve the SEC EDGAR User-Agent header (accepting both ``SEC_EDGAR_USER_AGENT`` and ``SEC_USER_AGENT``)."""
+    """Resolve the SEC EDGAR User-Agent header."""
     if explicit and explicit.strip():
         return explicit.strip()
-    return _first_non_empty_env("SEC_EDGAR_USER_AGENT", "SEC_USER_AGENT") or default
+    return _first_non_empty_env("SEC_EDGAR_USER_AGENT") or default

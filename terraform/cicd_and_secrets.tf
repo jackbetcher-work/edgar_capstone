@@ -86,12 +86,6 @@ resource "google_service_account_iam_member" "github_wif_impersonation" {
 # ------------------------------------------------------------------------------
 # Terraform is the single source of truth for Cloud Run configuration & env vars;
 # GitHub Actions pushes new images via `gcloud run services update --image=...`.
-import {
-  for_each = var.enable_cloud_run_service ? toset(["0"]) : toset([])
-  to       = google_cloud_run_v2_service.sec_edgar_analyst[0]
-  id       = "projects/${var.project_id}/locations/${var.region}/services/${var.cloud_run_service_name}"
-}
-
 resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
   # google-beta: `iap_enabled` is still a beta-only field in provider 6.x.
   provider = google-beta
@@ -209,16 +203,6 @@ resource "google_cloud_run_v2_service" "sec_edgar_analyst" {
       env {
         name  = "MODEL_ARMOR_TEMPLATE_ID"
         value = var.model_armor_template_id
-      }
-
-      env {
-        name  = "SDP_INSPECT_TEMPLATE_ID"
-        value = var.enable_model_armor ? google_data_loss_prevention_inspect_template.sec_edgar_sdp_inspect[0].id : ""
-      }
-
-      env {
-        name  = "SDP_DEIDENTIFY_TEMPLATE_ID"
-        value = var.enable_model_armor ? google_data_loss_prevention_deidentify_template.sec_edgar_sdp_deidentify[0].id : ""
       }
 
       env {

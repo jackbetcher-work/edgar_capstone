@@ -126,17 +126,12 @@ export async function executeConversationalRagQueryStream(
     { onUnauthorized: clearStoredBearerToken }
   )
 
-  const contentType = (res.headers.get('content-type') || '').toLowerCase()
-  if (contentType.includes('application/json') || !res.body) {
-    try {
-      return (await res.json()) as ChatTurnResponse
-    } catch {
-      throw new BackendUnavailableError(
-        endpoint,
-        res.status,
-        'response was not valid JSON'
-      )
-    }
+  if (!res.body) {
+    throw new BackendUnavailableError(
+      endpoint,
+      res.status,
+      'streaming response body was empty'
+    )
   }
 
   const reader = res.body.getReader()

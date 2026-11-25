@@ -32,10 +32,8 @@ class PromptArtifact:
     model: str = ""
     description: str = ""
     variables: dict[str, str] = field(default_factory=dict)
-    safety_policy: dict[str, Any] = field(default_factory=dict)
     raw_metadata: dict[str, Any] = field(default_factory=dict)
     source_backend: str = "local"
-    source_uri: str = ""
 
     def render(self, variables: dict[str, Any] | None = None) -> str:
         """Render `{{var}}` placeholders using artifact defaults overridden by `variables`."""
@@ -56,7 +54,6 @@ def _runtime_model_variables() -> dict[str, str]:
     return {
         "analyst_model": resolve_model_for_task("financial_reasoning"),
         "flash_model": resolve_model_for_task("evaluation"),
-        "lite_model": resolve_model_for_task("sector_map_reduce"),
     }
 
 
@@ -139,10 +136,8 @@ class VersionedPromptStore:
             model=str(raw.get("model") or ""),
             description=str(raw.get("description") or "").strip(),
             variables={str(k): str(v) for k, v in (raw.get("variables") or {}).items()},
-            safety_policy=dict(raw.get("safety_policy") or {}),
             raw_metadata=dict(raw),
             source_backend="local",
-            source_uri=str(full_path),
         )
         with self._lock:
             self._artifact_cache[cache_key] = artifact

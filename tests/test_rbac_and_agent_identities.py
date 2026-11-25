@@ -133,7 +133,7 @@ def test_cloud_identity_group_rbac_policy_mapping_and_formatting() -> None:
     assert set(v_perms) == set(VIEWER_PERMISSIONS)
     assert v_groups == ("group:sec-edgar-viewers@fde-workspace.corp",)
     assert Permission.CHAT_QUERY.value not in v_perms
-    assert Permission.VARIANCES_CALCULATE.value not in v_perms
+    assert Permission.FEEDBACK_SUBMIT.value not in v_perms
 
     # Analyst receives operational permissions without admin governance
     a_roles, a_perms, a_groups = policy.resolve_human_access(user_groups=("sec-edgar-analysts",))

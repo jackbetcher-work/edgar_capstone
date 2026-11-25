@@ -85,9 +85,7 @@ logger = logging.getLogger(__name__)
 TRACER_NAME = "edgar_capstone"
 DEFAULT_SERVICE_NAME = "sec-edgar-analyst"
 DEFAULT_SERVICE_NAMESPACE = "sec-edgar"
-DEFAULT_EXCLUDED_URLS = r"/health$,/healthz$,/assets/,/favicon\.ico$,/vite\.svg$"
-# Fallback alias retained for backward compatibility; canonical default lives in gcp.defaults.
-DEFAULT_TRACE_PROJECT_ID = DEFAULT_PROJECT_ID
+DEFAULT_EXCLUDED_URLS = r"/health$,/assets/,/favicon\.ico$,/vite\.svg$"
 ADK_CAPTURE_CONTENT_ENV = "ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS"
 OTEL_SEMCONV_STABILITY_OPT_IN_ENV = "OTEL_SEMCONV_STABILITY_OPT_IN"
 OTEL_GENAI_CAPTURE_CONTENT_ENV = "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT"
@@ -152,7 +150,7 @@ class TracingConfig:
     sample_ratio: float = 1.0
     service_name: str = DEFAULT_SERVICE_NAME
     service_version: str = "unknown"
-    project_id: str = DEFAULT_TRACE_PROJECT_ID
+    project_id: str = DEFAULT_PROJECT_ID
     environment: str = "local"
     capture_message_content: bool = True
     capture_message_content_mode: str = DEFAULT_CAPTURE_CONTENT_MODE
