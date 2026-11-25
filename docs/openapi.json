@@ -1,0 +1,967 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "SEC EDGAR Natural Language Analyst API",
+    "description": "Cloud Run FastAPI backend for deterministic SEC 10-K financial variance calculations, metadata-filtered Hybrid RAG search, and ADK agent orchestration. Internal APIs are protected via Identity-Aware Proxy (IAP) and Google Workspace Okta/SSO JWT Bearer authentication.",
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Health",
+        "description": "Cloud Run external health check and readiness probe endpoint.",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Health Health Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/config": {
+      "get": {
+        "tags": [
+          "Authentication & RBAC"
+        ],
+        "summary": "Auth Discovery Config",
+        "description": "Return public SSO, IAP, Cloud Identity RBAC, and Agent Identity metadata (no secrets).",
+        "operationId": "auth_discovery_config_api_v1_auth_config_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Auth Discovery Config Api V1 Auth Config Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/sso/exchange": {
+      "post": {
+        "tags": [
+          "Authentication & RBAC"
+        ],
+        "summary": "Exchange Sso Id Token",
+        "description": "Validate a Google Workspace / Okta SSO / IAP OIDC ID token for API Bearer access.",
+        "operationId": "exchange_sso_id_token_api_v1_auth_sso_exchange_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SsoTokenExchangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Exchange Sso Id Token Api V1 Auth Sso Exchange Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/sso/dev-token": {
+      "post": {
+        "tags": [
+          "Authentication & RBAC"
+        ],
+        "summary": "Mint Local Dev Sso Token",
+        "description": "Issue a signed ES256 Workspace/Okta JWT for local development (disabled in Cloud Run).",
+        "operationId": "mint_local_dev_sso_token_api_v1_auth_sso_dev_token_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DevWorkspaceSsoLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Mint Local Dev Sso Token Api V1 Auth Sso Dev Token Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/me": {
+      "get": {
+        "tags": [
+          "Authentication & RBAC"
+        ],
+        "summary": "Get Authenticated Session",
+        "description": "Return the verified Google Workspace / Okta SSO & IAP principal for the active Bearer JWT.",
+        "operationId": "get_authenticated_session_api_v1_auth_me_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Authenticated Session Api V1 Auth Me Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": [
+          "Authentication & RBAC"
+        ],
+        "summary": "Logout Authenticated Session",
+        "description": "Revoke the active Bearer JWT and record a session logout audit event.",
+        "operationId": "logout_authenticated_session_api_v1_auth_logout_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Logout Authenticated Session Api V1 Auth Logout Post"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/audit": {
+      "get": {
+        "tags": [
+          "Authentication & RBAC"
+        ],
+        "summary": "List Security Audit Trail",
+        "description": "Retrieve structured authentication and 10-K report access audit logs.",
+        "operationId": "list_security_audit_trail_api_v1_auth_audit_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response List Security Audit Trail Api V1 Auth Audit Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/rbac/policies": {
+      "get": {
+        "tags": [
+          "Authentication & RBAC"
+        ],
+        "summary": "Admin Rbac Governance Policies",
+        "description": "Administrative endpoint restricted strictly to Cloud Identity `admin` group principals.",
+        "operationId": "admin_rbac_governance_policies_api_v1_admin_rbac_policies_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Admin Rbac Governance Policies Api V1 Admin Rbac Policies Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/companies": {
+      "get": {
+        "tags": [
+          "SEC Filings"
+        ],
+        "summary": "Get Companies",
+        "description": "List all curated S&P 500 issuers, GICS sectors, and available fiscal years.",
+        "operationId": "get_companies_api_v1_companies_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Get Companies Api V1 Companies Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/section": {
+      "get": {
+        "tags": [
+          "SEC Filings"
+        ],
+        "summary": "Get Cached Section",
+        "description": "Load a cached 10-K filing section (Item 1A Risk Factors or Item 7 MD&A) for the split-pane viewer.",
+        "operationId": "get_cached_section_api_v1_section_get",
+        "parameters": [
+          {
+            "name": "ticker",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16,
+              "default": "NVDA",
+              "title": "Ticker"
+            }
+          },
+          {
+            "name": "fiscal_year",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 2035,
+              "minimum": 2015,
+              "default": 2026,
+              "title": "Fiscal Year"
+            }
+          },
+          {
+            "name": "section_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "item_1a",
+                "item_7"
+              ],
+              "type": "string",
+              "default": "item_7",
+              "title": "Section Id"
+            }
+          },
+          {
+            "name": "max_chars",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 50000,
+              "minimum": 500,
+              "default": 32000,
+              "title": "Max Chars"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Cached Section Api V1 Section Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/chat": {
+      "post": {
+        "tags": [
+          "Conversational Analyst"
+        ],
+        "summary": "Conversational Rag Chat",
+        "description": "Execute a source-grounded conversational Hybrid RAG query with ADK Runner / ReAct trace & fact-check.",
+        "operationId": "conversational_rag_chat_api_v1_chat_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatQueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Conversational Rag Chat Api V1 Chat Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/chat/stream": {
+      "post": {
+        "tags": [
+          "Conversational Analyst"
+        ],
+        "summary": "Conversational Rag Chat Stream",
+        "description": "Stream live Server-Sent Events (SSE) progress updates followed by the final grounded chat response.",
+        "operationId": "conversational_rag_chat_stream_api_v1_chat_stream_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatQueryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "List User Chat Sessions",
+        "description": "List persistent analyst chat sessions belonging solely to the authenticated user.",
+        "operationId": "list_user_chat_sessions_api_v1_sessions_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 100,
+              "minimum": 1,
+              "default": 25,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response List User Chat Sessions Api V1 Sessions Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{session_id}": {
+      "delete": {
+        "tags": [
+          "Sessions"
+        ],
+        "summary": "Delete User Chat Session",
+        "description": "Delete a persistent analyst chat session scoped strictly to the authenticated user.",
+        "operationId": "delete_user_chat_session_api_v1_sessions__session_id__delete",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Delete User Chat Session Api V1 Sessions  Session Id  Delete"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/telemetry/sessions": {
+      "get": {
+        "tags": [
+          "Telemetry & Audit"
+        ],
+        "summary": "Get Session And Tool Telemetry",
+        "description": "Retrieve conversational session length, companies analyzed, report counts, tool usage, and BigQuery sink metrics.",
+        "operationId": "get_session_and_tool_telemetry_api_v1_telemetry_sessions_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "session_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Session And Tool Telemetry Api V1 Telemetry Sessions Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/feedback": {
+      "post": {
+        "tags": [
+          "Feedback"
+        ],
+        "summary": "Submit Analyst Feedback",
+        "description": "Persist analyst thumbs-up/down audit feedback and optional comment to Firestore.",
+        "operationId": "submit_analyst_feedback_api_v1_feedback_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FeedbackRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Submit Analyst Feedback Api V1 Feedback Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": [
+          "Feedback"
+        ],
+        "summary": "List Analyst Feedback",
+        "description": "List persisted analyst feedback ratings and audit comments from Firestore.",
+        "operationId": "list_analyst_feedback_api_v1_feedback_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 50,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "rating",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "up",
+                    "down"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Rating"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response List Analyst Feedback Api V1 Feedback Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ChatQueryRequest": {
+        "properties": {
+          "tickers": {
+            "type": "string",
+            "title": "Tickers",
+            "description": "Comma-separated SEC ticker symbols or 'ALL'.",
+            "default": "ALL"
+          },
+          "gics_sector": {
+            "type": "string",
+            "title": "Gics Sector",
+            "description": "GICS sector filter or 'ALL'.",
+            "default": "ALL"
+          },
+          "section_id": {
+            "type": "string",
+            "title": "Section Id",
+            "description": "10-K section filter ('item_1a', 'item_7', or 'ALL').",
+            "default": "ALL"
+          },
+          "start_year": {
+            "type": "integer",
+            "maximum": 2035.0,
+            "minimum": 2015.0,
+            "title": "Start Year",
+            "description": "Inclusive starting fiscal year.",
+            "default": 2024
+          },
+          "end_year": {
+            "type": "integer",
+            "maximum": 2035.0,
+            "minimum": 2015.0,
+            "title": "End Year",
+            "description": "Inclusive ending fiscal year.",
+            "default": 2026
+          },
+          "query": {
+            "type": "string",
+            "minLength": 2,
+            "title": "Query",
+            "description": "Natural-language financial analyst question."
+          },
+          "top_k": {
+            "type": "integer",
+            "maximum": 25.0,
+            "minimum": 1.0,
+            "title": "Top K",
+            "description": "Maximum number of Hybrid RAG filing chunks to retrieve.",
+            "default": 8
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id",
+            "description": "Optional persistent user-scoped conversation session ID."
+          }
+        },
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "title": "ChatQueryRequest",
+        "description": "Conversational Hybrid RAG analyst query payload with fiscal-year validation."
+      },
+      "DevWorkspaceSsoLoginRequest": {
+        "properties": {
+          "email": {
+            "type": "string",
+            "maxLength": 254,
+            "minLength": 5,
+            "title": "Email",
+            "description": "Google Workspace corporate email federated via Okta SSO.",
+            "default": "analyst@fde-workspace.corp"
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Name",
+            "description": "Display name for the simulated analyst principal.",
+            "default": "Senior Financial Analyst"
+          },
+          "groups": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Groups",
+            "description": "Cloud Identity / Okta SSO group memberships."
+          }
+        },
+        "type": "object",
+        "title": "DevWorkspaceSsoLoginRequest",
+        "description": "Local development Workspace/Okta SSO broker request payload (disabled in Cloud Run)."
+      },
+      "FeedbackRequest": {
+        "properties": {
+          "message_id": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Message Id",
+            "description": "Assistant message identifier."
+          },
+          "rating": {
+            "type": "string",
+            "enum": [
+              "up",
+              "down"
+            ],
+            "title": "Rating",
+            "description": "Analyst rating ('up' or 'down')."
+          },
+          "comment": {
+            "type": "string",
+            "maxLength": 1000,
+            "title": "Comment",
+            "description": "Optional audit note.",
+            "default": ""
+          },
+          "query": {
+            "type": "string",
+            "maxLength": 1000,
+            "title": "Query",
+            "description": "Original analyst query text.",
+            "default": ""
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Session Id"
+          },
+          "tickers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Tickers"
+          },
+          "intent": {
+            "type": "string",
+            "maxLength": 128,
+            "title": "Intent",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "message_id",
+          "rating"
+        ],
+        "title": "FeedbackRequest",
+        "description": "Analyst thumbs-up/down audit feedback persisted to Firestore."
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "SsoTokenExchangeRequest": {
+        "properties": {
+          "id_token": {
+            "type": "string",
+            "minLength": 16,
+            "title": "Id Token",
+            "description": "OIDC / IAP signed JWT bearer token."
+          }
+        },
+        "type": "object",
+        "required": [
+          "id_token"
+        ],
+        "title": "SsoTokenExchangeRequest",
+        "description": "OIDC / Google IAP signed JWT exchange payload."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

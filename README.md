@@ -233,8 +233,8 @@ See [`evals/README.md`](evals/README.md) for the record schema and gate definiti
 
 ## Deployment and Access
 
-- **CI/CD:** [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) is the single CI/CD pipeline using keyless Workload Identity Federation (`sec-edgar-cicd-sa` with `roles/run.developer`). It runs lint, tests, and a container smoke test, an optional `eval-all` stage on `main` (defaults to `skip`; set `EVAL_GATE_MODE` or `eval_mode` to `advisory` or `blocking` to enable), then updates the Cloud Run service image (`gcloud run services update --image=...`) while Terraform owns service configuration.
-- **Infrastructure:** everything is provisioned by Terraform; see [`terraform/README.md`](terraform/README.md).
+- **CI/CD:** [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) is the single CI/CD pipeline using keyless Workload Identity Federation (`sec-edgar-cicd-sa` with `roles/run.developer`). It runs lint, tests, and a container smoke test, an optional `eval-all` stage on `main` (defaults to `skip`; set `EVAL_GATE_MODE` or `eval_mode` to `advisory` or `blocking` to enable), then performs a staged **canary Cloud Run rollout** (`--no-traffic --tag canary` → 10% canary traffic soak → 100% promotion) with **automated rollback** to the previous stable revision on failure, while Terraform owns service configuration.
+- **Infrastructure & Ops:** everything is provisioned by Terraform ([`terraform/README.md`](terraform/README.md)); see [`docs/adrs.md`](docs/adrs.md) for architecture decision records, [`docs/api.md`](docs/api.md) / [`docs/openapi.json`](docs/openapi.json) for the API contract, and [`docs/runbook.md`](docs/runbook.md) for incident triage and rollback procedures.
 - **Access:** IAP fronts the Cloud Run service, so the app is never anonymous. To share it:
   1. Add groups or domains to `iap_authorized_principals` in [`terraform/variables.tf`](terraform/variables.tf) or a tfvars file. Individual `user:` bindings are rejected.
      ```hcl
@@ -280,5 +280,5 @@ See [`evals/README.md`](evals/README.md) for the record schema and gate definiti
 ├── scripts/                 # CLIs: dataset/vector DB build, corpus publishing, evals, smoke test
 ├── terraform/               # GCP infrastructure as code
 ├── tests/                   # pytest suite (offline unit/integration + `@pytest.mark.live` GCP/Gemini tests)
-└── docs/                    # Observability guide
+└── docs/                    # ADRs, API guide & OpenAPI spec, runbook, observability guide
 ```

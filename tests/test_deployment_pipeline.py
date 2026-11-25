@@ -87,17 +87,25 @@ def test_github_actions_pipeline_stages_and_triggers() -> None:
     assert eval_job.get("needs") == "build"
     assert "scripts/run_evals.py --write-bigquery" in json.dumps(eval_job["steps"])
 
-    # Stage 3: deploy (image-only rollout so Terraform remains the single source of truth for env vars)
+    # Stage 3: deploy (image-only canary rollout + automated rollback; Terraform owns env vars)
     deploy_job = jobs["deploy"]
     assert deploy_job.get("needs") == ["build", "eval"]
     deploy_step = next(s for s in deploy_job["steps"] if s.get("id") == "deploy_cloud_run")
     assert "gcloud run services update" in deploy_step["run"]
     assert "--image" in deploy_step["run"]
+    assert "--no-traffic" in deploy_step["run"]
+    assert "--tag canary" in deploy_step["run"]
+    assert "gcloud run services update-traffic" in deploy_step["run"]
     assert "--startup-probe" in deploy_step["run"]
     assert "httpGet.path=/health," in deploy_step["run"]
     verify_step = next(s for s in deploy_job["steps"] if s.get("id") == "verify_revision")
     assert "latestReadyRevisionName" in verify_step["run"]
     assert "iapEnabled" in verify_step["run"]
+    assert "--to-revisions=" in verify_step["run"]
+    rollback_step = next(s for s in deploy_job["steps"] if s.get("id") == "rollback_cloud_run")
+    assert "failure()" in rollback_step["if"]
+    assert "gcloud run services update-traffic" in rollback_step["run"]
+    assert "${PREV_REV}=100" in rollback_step["run"]
 
 
 def test_no_secrets_or_keys_exposed_in_repository() -> None:

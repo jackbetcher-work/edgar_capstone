@@ -38,6 +38,8 @@ env:
   GAR_REPOSITORY: sec-edgar-repo
   SERVICE_NAME: sec-edgar-analyst
   IMAGE_URI: us-central1-docker.pkg.dev/iron-radio-514217-q7/sec-edgar-repo/sec-edgar-analyst
+  CANARY_TRAFFIC_PERCENT: "10"
+  CANARY_SOAK_SECONDS: "15"
 
 jobs:
   # ============================================================================
@@ -247,10 +249,11 @@ jobs:
           echo "::warning::Live golden eval gates FAILED, but eval mode is advisory. Deploy continues anyway."
 
   # ============================================================================
-  # Stage 3: Deploy — Image-only Cloud Run rollout (Terraform owns env/IAP/SA)
+  # Stage 3: Deploy — Canary Cloud Run rollout with automated rollback
+  # (Terraform owns env vars, scaling, IAP, and runtime SA)
   # ============================================================================
   deploy:
-    name: Deploy Stage - Google Cloud Run Image Rollout
+    name: Deploy Stage - Google Cloud Run Canary Rollout & Rollback
     needs:
       - build
       - eval
@@ -272,25 +275,90 @@ jobs:
       - name: Set up gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Roll out new container image to Google Cloud Run
+      - name: Deploy candidate revision (--no-traffic) and route canary traffic
         id: deploy_cloud_run
         run: |
           set -euo pipefail
           IMAGE_TAG="${{ env.IMAGE_URI }}:${{ github.sha }}"
+
+          # Record the currently serving stable revision before deploying the candidate
+          prev_svc="$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --project "${{ env.GCP_PROJECT_ID }}" --region "${{ env.GCP_REGION }}" --format=json)"
+          PREV_REV="$(jq -r '
+            ([.status.traffic[]? | select((.percent // 0) > 0)] | sort_by(-.percent) | .[0].revisionName)
+            // .status.latestReadyRevisionName
+            // ""
+          ' <<<"${prev_svc}")"
+          echo "prev_revision=${PREV_REV}" >> "${GITHUB_OUTPUT}"
+          echo "Previous stable revision: ${PREV_REV:-<none>}"
+
+          # 1. Roll out candidate revision with 0% traffic so /health startup probe passes first
           gcloud run services update "${{ env.SERVICE_NAME }}" \
             --project "${{ env.GCP_PROJECT_ID }}" \
             --region "${{ env.GCP_REGION }}" \
             --image "${IMAGE_TAG}" \
+            --no-traffic \
+            --tag canary \
             --update-labels "commit_sha=${{ github.sha }},deployed_by=github-actions" \
             --remove-labels "managed-by,commit-sha" \
             --startup-probe "httpGet.path=/health,initialDelaySeconds=0,periodSeconds=10,timeoutSeconds=5,failureThreshold=24"
 
-      - name: Verify the new revision passed its /health probe and serves all traffic
+          post_svc="$(gcloud run services describe "${{ env.SERVICE_NAME }}" \
+            --project "${{ env.GCP_PROJECT_ID }}" --region "${{ env.GCP_REGION }}" --format=json)"
+          NEW_REV="$(jq -r '.status.latestCreatedRevisionName // ""' <<<"${post_svc}")"
+          echo "new_revision=${NEW_REV}" >> "${GITHUB_OUTPUT}"
+          echo "Candidate revision: ${NEW_REV}"
+
+          # 2. Shift canary traffic split (10% candidate / 90% stable) when a prior revision exists
+          CANARY_PCT="${{ env.CANARY_TRAFFIC_PERCENT }}"
+          if [[ -n "${PREV_REV}" && "${PREV_REV}" != "${NEW_REV}" ]]; then
+            STABLE_PCT="$((100 - CANARY_PCT))"
+            echo "Shifting canary traffic: ${NEW_REV}=${CANARY_PCT}%, ${PREV_REV}=${STABLE_PCT}%"
+            gcloud run services update-traffic "${{ env.SERVICE_NAME }}" \
+              --project "${{ env.GCP_PROJECT_ID }}" \
+              --region "${{ env.GCP_REGION }}" \
+              --to-revisions="${NEW_REV}=${CANARY_PCT},${PREV_REV}=${STABLE_PCT}"
+          else
+            echo "No distinct prior revision; routing 100% traffic to ${NEW_REV}"
+            gcloud run services update-traffic "${{ env.SERVICE_NAME }}" \
+              --project "${{ env.GCP_PROJECT_ID }}" \
+              --region "${{ env.GCP_REGION }}" \
+              --to-revisions="${NEW_REV}=100"
+          fi
+
+      - name: Verify canary health, promote to 100%, and confirm IAP & /health probe
         id: verify_revision
         env:
           EXPECTED_IMAGE: ${{ env.IMAGE_URI }}:${{ github.sha }}
+          PREV_REV: ${{ steps.deploy_cloud_run.outputs.prev_revision }}
+          NEW_REV: ${{ steps.deploy_cloud_run.outputs.new_revision }}
         run: |
           set -euo pipefail
+
+          # Confirm candidate revision is Ready before and after canary soak window
+          check_revision_ready() {
+            local rev_json ready_status
+            rev_json="$(gcloud run revisions describe "${NEW_REV}" \
+              --project "${GCP_PROJECT_ID}" --region "${GCP_REGION}" --format=json)"
+            ready_status="$(jq -r '.status.conditions[]? | select(.type == "Ready") | .status' <<<"${rev_json}")"
+            echo "revision=${NEW_REV} ready_condition=${ready_status}"
+            [[ "${ready_status}" == "True" ]] || { echo "::error::Revision ${NEW_REV} Ready condition is '${ready_status}'."; return 1; }
+          }
+
+          check_revision_ready
+          if [[ -n "${PREV_REV}" && "${PREV_REV}" != "${NEW_REV}" ]]; then
+            echo "Soaking canary revision ${NEW_REV} (${CANARY_TRAFFIC_PERCENT}% traffic) for ${CANARY_SOAK_SECONDS}s..."
+            sleep "${CANARY_SOAK_SECONDS}"
+            check_revision_ready
+
+            echo "Canary healthy; promoting ${NEW_REV} to 100% traffic..."
+            gcloud run services update-traffic "${SERVICE_NAME}" \
+              --project "${GCP_PROJECT_ID}" \
+              --region "${GCP_REGION}" \
+              --to-revisions="${NEW_REV}=100" \
+              --remove-tags=canary
+          fi
+
           svc="$(gcloud run services describe "${SERVICE_NAME}" \
             --project "${GCP_PROJECT_ID}" --region "${GCP_REGION}" --format=json)"
 
@@ -312,4 +380,23 @@ jobs:
           [[ "${image}" == "${EXPECTED_IMAGE}" ]] || { echo "::error::Service image is ${image}, expected ${EXPECTED_IMAGE}."; fail=1; }
           [[ "${probe_path}" == "/health" ]] || { echo "::error::Startup probe is not GET /health (got '${probe_path}')."; fail=1; }
           [[ "${traffic}" == "100" ]] || { echo "::error::Revision ${ready} serves ${traffic}% of traffic, expected 100%."; fail=1; }
+          [[ "${iap}" == "true" ]] || { echo "::error::Direct Cloud Run IAP is not enabled (iapEnabled=${iap})."; fail=1; }
           if (( fail )); then exit 1; fi
+
+      - name: Roll back traffic to previous stable revision on failure
+        id: rollback_cloud_run
+        if: failure() && steps.deploy_cloud_run.outputs.prev_revision != ''
+        env:
+          PREV_REV: ${{ steps.deploy_cloud_run.outputs.prev_revision }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Canary rollout or verification failed; rolling back 100% traffic to ${PREV_REV}."
+          gcloud run services update-traffic "${SERVICE_NAME}" \
+            --project "${GCP_PROJECT_ID}" \
+            --region "${GCP_REGION}" \
+            --to-revisions="${PREV_REV}=100"
+          gcloud run services update-traffic "${SERVICE_NAME}" \
+            --project "${GCP_PROJECT_ID}" \
+            --region "${GCP_REGION}" \
+            --remove-tags=canary || true
+          echo "Rollback complete: 100% of traffic restored to ${PREV_REV}."
